@@ -1,34 +1,81 @@
-import { useEffect, useState } from 'react';
-import '../styles/globals.css';
+import React, { useEffect, useState } from 'react';
+import Tabs from '../components/Tabs';
+import SignalCard from '../components/SignalCard';
 
-export default function App({ Component, pageProps }) {
-  const [theme, setTheme] = useState('light');
+const fetcher = (url) => fetch(url).then((r) => r.json());
+
+export default function Home() {
+  const [active, setActive] = useState('combined');
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const d = await fetcher('/api/crypto');
+      setData(d);
+    } catch (e) {
+      setData({ error: e.message });
+    }
+    setLoading(false);
+  };
 
   useEffect(() => {
-    const stored = localStorage.getItem('theme');
-    if (stored) setTheme(stored);
-    else {
-      const prefers = window.matchMedia('(prefers-color-scheme: dark)').matches;
-      setTheme(prefers ? 'dark' : 'light');
-    }
+    load();
+    const iv = setInterval(load, 10 * 60 * 1000); // refresh na 10 minuta
+    return () => clearInterval(iv);
   }, []);
 
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem('theme', theme);
-  }, [theme]);
-
-  const toggle = () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'));
+  const tabs = [
+    { key: 'combined', label: 'Crypto top signals' },
+    { key: 'football', label: 'Football (coming)' },
+  ];
 
   return (
-    <div style={{ maxWidth: 1100, margin: '0 auto', padding: 16 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <h1 style={{ margin: 0, fontSize: '1.5rem' }}>Predict Scores (clean start)</h1>
-        <button onClick={toggle} style={{ padding: '6px 12px', cursor: 'pointer' }}>
-          {theme === 'dark' ? 'Light' : 'Dark'} mode
-        </button>
-      </div>
-      <Component {...pageProps} />
+    <div>
+      <Tabs tabs={tabs} active={active} onChange={setActive} />
+      {loading && <div className="card">Učitavanje signala...</div>}
+      {!loading && data?.error && (
+        <div className="card">
+          Greška: <pre>{data.error}</pre>
+        </div>
+      )}
+      {!loading && !data?.error && (
+        <>
+          {active === 'combined' && (
+            <div>
+              <div style={{ marginBottom: 8, fontSize: '0.75rem' }}>
+                Ažurirano: {new Date(data.generated_at).toLocaleString('sr-RS')}
+              </div>
+              <h2 style={{ marginTop: 0 }}>Combined Top 10</h2>
+              {data.combined.map((it) => (
+                <SignalCard key={`${it.symbol}-${it.timeframe}`} item={it} />
+              ))}
+
+              {['15m', '30m', '1h', '4h'].map((tf) => (
+                <div key={tf}>
+                  <h3>Top 10 — {tf}</h3>
+                  {data.byTimeframe[tf] && data.byTimeframe[tf].length > 0 ? (
+                    data.byTimeframe[tf].map((it) => (
+                      <SignalCard key={`${it.symbol}-${tf}`} item={it} />
+                    ))
+                  ) : (
+                    <div className="card small">Nema jakih signala za {tf}</div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {active === 'football' && (
+            <div className="card">
+              <div style={{ fontWeight: 600 }}>Football predikcije još nisu integrisane.</div>
+              <div className="small">
+                Pošalji mi te tri sportske API source informacije (endpoint format / primer odgovora i kako želiš konsenzus), pa ti odmah dam `/api/football.js` koji ih kombinuje.
+              </div>
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
