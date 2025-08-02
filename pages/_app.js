@@ -27,7 +27,7 @@ function HeaderControls() {
     return () => clearInterval(iv);
   }, []);
 
-  const formatRemaining = (target) => {
+  const fmt = (target) => {
     if (!target) return '—';
     const diff = Math.max(0, Math.floor((target - now) / 1000));
     const m = Math.floor(diff / 60);
@@ -69,10 +69,10 @@ function HeaderControls() {
       </div>
       <div style={{ display: 'flex', gap: 16, alignItems: 'center', fontSize: '0.8rem' }}>
         <div>
-          Crypto in: <strong>{formatRemaining(nextCryptoUpdate)}</strong>
+          Crypto in: <strong>{fmt(nextCryptoUpdate)}</strong>
         </div>
         <div>
-          Football in: <strong>{formatRemaining(nextFootballUpdate)}</strong>
+          Football in: <strong>{fmt(nextFootballUpdate)}</strong>
         </div>
       </div>
     </div>
