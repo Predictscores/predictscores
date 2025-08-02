@@ -1,9 +1,9 @@
 // pages/api/crypto.js
 const COINGECKO_BASE = 'https://api.coingecko.com/api/v3';
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minuta
+const CACHE_TTL_MS = 10 * 60 * 1000;
 let cache = {
   timestamp: 0,
-  data: null
+  data: null,
 };
 
 function pctChange(oldP, newP) {
@@ -33,7 +33,6 @@ function computeRSI(prices, period = 14) {
 
 function deriveAggregateSignal(priceSeriesMinutes) {
   const now = Date.now();
-  // hourly for last ~24h
   const hourly = [];
   for (let h = 24; h >= 1; h--) {
     const target = now - h * 3600 * 1000;
@@ -53,7 +52,6 @@ function deriveAggregateSignal(priceSeriesMinutes) {
 
   const rsi = computeRSI(hourly, 14);
 
-  // 4h momentum
   const target4h = now - 4 * 3600 * 1000;
   let price4hAgo = priceSeriesMinutes[0][1];
   let minDiff4h = Math.abs(priceSeriesMinutes[0][0] - target4h);
@@ -107,7 +105,7 @@ function deriveAggregateSignal(priceSeriesMinutes) {
     latest_price: Number(latestPrice.toFixed(6)),
     price_history_24h: priceSeriesMinutes
       .slice(-1440)
-      .map(([, price]) => Number(price.toFixed(6)))
+      .map(([, price]) => Number(price.toFixed(6))),
   };
 }
 
@@ -149,23 +147,23 @@ export default async function handler(req, res) {
           name: coin.name,
           current_price: agg.latest_price,
           ...agg,
-          last_updated: new Date().toISOString()
+          last_updated: new Date().toISOString(),
         });
       })
     );
 
     signals.sort((a, b) => b.confidence - a.confidence);
-    const cryptoTop = signals.slice(0, 10); // top 10 sada
+    const cryptoTop = signals.slice(0, 10);
 
     const payload = {
       cryptoTop,
-      footballTop: [], // placeholder
-      generated_at: new Date().toISOString()
+      footballTop: [],
+      generated_at: new Date().toISOString(),
     };
 
     cache = {
       timestamp: now,
-      data: payload
+      data: payload,
     };
 
     return res.status(200).json(payload);
