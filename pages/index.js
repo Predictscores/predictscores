@@ -36,52 +36,57 @@ export default function Home() {
 
   return (
     <div>
-      {/* Title */}
       <div style={{ marginBottom: 16 }}>
         <h1 style={{ margin: 0 }}>AI Top fudbalske i Kripto Prognoze</h1>
       </div>
 
-      {/* Combined view */}
-      <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-        {/* Football 30% */}
-        <div style={{ flex: '0 0 30%', minWidth: 260 }}>
-          <h2 style={{ marginTop: 0, fontSize: '1.1rem' }}>Football top 3</h2>
-          {loadingFootball && <div className="card">Učitavanje fudbalskih predikcija...</div>}
-          {!loadingFootball && errorFootball && (
-            <div className="card" style={{ color: 'crimson' }}>
-              Greška: {errorFootball}
+      {/* Pair rows: 3 rows each with football + crypto */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+        {[0, 1, 2].map((i) => (
+          <div
+            key={i}
+            style={{
+              display: 'flex',
+              gap: 16,
+              flexWrap: 'wrap',
+              alignItems: 'flex-start',
+            }}
+          >
+            {/* Football side (30%) */}
+            <div style={{ flex: '0 0 30%', minWidth: 260 }}>
+              {loadingFootball && i === 0 && <div className="card">Učitavanje fudbalskih predikcija...</div>}
+              {!loadingFootball && errorFootball && i === 0 && (
+                <div className="card" style={{ color: 'crimson' }}>
+                  Greška: {errorFootball}
+                </div>
+              )}
+              {!loadingFootball && (!footballData?.footballTop || footballData.footballTop.length === 0) && (
+                <div className="card small">
+                  Nema fudbalskih predikcija. Pošalji izvore + konsenzus pravila da ubacim realne top 3.
+                </div>
+              )}
+              {!loadingFootball && footballData?.footballTop && footballData.footballTop[i] && (
+                <SignalCard item={footballData.footballTop[i]} isFootball />
+              )}
             </div>
-          )}
-          {!loadingFootball &&
-            (!footballData?.footballTop || footballData.footballTop.length === 0) && (
-              <div className="card small">
-                Nema fudbalskih predikcija. Pošalji izvore + konsenzus pravila da ubacim realne top 3.
-              </div>
-            )}
-          {!loadingFootball &&
-            footballData?.footballTop &&
-            footballData.footballTop.slice(0, 3).map((f, i) => (
-              <SignalCard key={`f-${i}`} item={f} isFootball />
-            ))}
-        </div>
 
-        {/* Crypto 70% */}
-        <div style={{ flex: '1 1 70%', minWidth: 320 }}>
-          <h2 style={{ marginTop: 0, fontSize: '1.1rem' }}>Crypto top 3</h2>
-          {loadingCrypto && <div className="card">Učitavanje kripto signala...</div>}
-          {!loadingCrypto && errorCrypto && (
-            <div className="card" style={{ color: 'crimson' }}>
-              Greška: {errorCrypto}
+            {/* Crypto side (70%) */}
+            <div style={{ flex: '1 1 70%', minWidth: 320 }}>
+              {loadingCrypto && i === 0 && <div className="card">Učitavanje kripto signala...</div>}
+              {!loadingCrypto && errorCrypto && i === 0 && (
+                <div className="card" style={{ color: 'crimson' }}>
+                  Greška: {errorCrypto}
+                </div>
+              )}
+              {!loadingCrypto && cryptoData?.cryptoTop && cryptoData.cryptoTop[i] && (
+                <SignalCard item={cryptoData.cryptoTop[i]} />
+              )}
+              {!loadingCrypto && (!cryptoData?.cryptoTop || !cryptoData.cryptoTop[i]) && i === 0 && (
+                <div className="card small">Nema jakih kripto signala.</div>
+              )}
             </div>
-          )}
-          {!loadingCrypto && topCrypto.length === 0 && (
-            <div className="card small">Nema jakih kripto signala.</div>
-          )}
-          {!loadingCrypto &&
-            topCrypto.map((it, i) => (
-              <SignalCard key={`c-${i}`} item={it} />
-            ))}
-        </div>
+          </div>
+        ))}
       </div>
     </div>
   );
