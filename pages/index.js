@@ -1,16 +1,17 @@
 // pages/index.js
-import React, { useState, useMemo } from 'react';
+import React, { useMemo } from 'react';
 import SignalCard from '../components/SignalCard';
 import { useData } from '../contexts/DataContext';
 
-const tabLabels = {
-  combined: 'Combined',
-  football: 'Football',
-  crypto: 'Crypto',
+const formatRemaining = (target) => {
+  if (!target) return '—';
+  const diff = Math.max(0, Math.floor((target - Date.now()) / 1000));
+  const m = Math.floor(diff / 60);
+  const s = diff % 60;
+  return `${m}m ${s.toString().padStart(2, '0')}s`;
 };
 
 export default function Home() {
-  const [activeTab, setActiveTab] = useState('combined');
   const {
     cryptoData,
     footballData,
@@ -18,113 +19,51 @@ export default function Home() {
     loadingFootball,
     errorCrypto,
     errorFootball,
+    refreshAll,
+    nextCryptoUpdate,
+    nextFootballUpdate,
   } = useData();
 
-  const topCryptoCombined = useMemo(() => {
+  const topCrypto = useMemo(() => {
     if (!cryptoData?.cryptoTop) return [];
     return cryptoData.cryptoTop.slice(0, 3);
   }, [cryptoData]);
 
-  const topFootballCombined = useMemo(() => {
+  const topFootball = useMemo(() => {
     if (!footballData?.footballTop) return [];
     return footballData.footballTop.slice(0, 3);
   }, [footballData]);
 
   return (
     <div>
-      {/* Tabs */}
-      <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
-        {Object.entries(tabLabels).map(([key, label]) => (
+      {/* Header title & explanation */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 16 }}>
+        <h1 style={{ margin: 0 }}>AI Top fudbalske i Kripto Prognoze</h1>
+        <div style={{ fontSize: '0.9rem' }}>
+          Prikazujemo po <strong>3 najjača fudbalska</strong> i <strong>3 najjača kripto</strong> signala
+          sortirana po očekivanoj tačnosti (confidence). Kombinovani prikaz je dole: levo fudbal (30%),
+          desno kripto (70%). Jednim klikom osveži sve podatke. Confidence level indikator je na dnu.
+        </div>
+        <div style={{ marginTop: 8, display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
           <button
-            key={key}
-            onClick={() => setActiveTab(key)}
-            className={`tab-btn ${activeTab === key ? 'active' : ''}`}
-            style={{
-              padding: '8px 16px',
-              cursor: 'pointer',
-              fontWeight: 600,
-              background: 'transparent',
-              border: 'none',
-            }}
+            onClick={refreshAll}
+            className="button"
+            style={{ minWidth: 140, fontWeight: 600 }}
           >
-            {label}
+            Refresh sve
           </button>
-        ))}
-      </div>
-
-      {/* Combined */}
-      {activeTab === 'combined' && (
-        <div style={{ display: 'flex', gap: 16 }}>
-          {/* Football left 30% */}
-          <div style={{ flex: '0 0 30%' }}>
-            <h2 style={{ marginTop: 0 }}>Football top 3</h2>
-            {loadingFootball && <div className="card">Učitavanje fudbalskih predikcija...</div>}
-            {!loadingFootball && errorFootball && (
-              <div className="card" style={{ color: 'crimson' }}>
-                Greška: {errorFootball}
-              </div>
-            )}
-            {!loadingFootball &&
-              (!footballData?.footballTop || footballData.footballTop.length === 0) && (
-                <div className="card small">
-                  Nema fudbalskih predikcija. Pošalji izvore i konsenzus pravila da ubacim realne top 3.
-                </div>
-              )}
-            {!loadingFootball &&
-              footballData?.footballTop &&
-              footballData.footballTop.slice(0, 3).map((f, i) => (
-                <div className="card" key={`combined-football-${i}`} style={{ marginBottom: 12 }}>
-                  <div style={{ fontWeight: 600 }}>
-                    {f.match || 'Match'} — {f.prediction || 'Type'}
-                  </div>
-                  <div>Confidence: {f.confidence || '—'}%</div>
-                  <div>Odds: {f.odds || '-'}</div>
-                  <div className="small">{f.note || ''}</div>
-                </div>
-              ))}
-          </div>
-
-          {/* Crypto right 70% */}
-          <div style={{ flex: '1 1 70%' }}>
-            <h2 style={{ marginTop: 0 }}>Crypto top 3</h2>
-            {loadingCrypto && <div className="card">Učitavanje kripto signala...</div>}
-            {!loadingCrypto && errorCrypto && (
-              <div className="card" style={{ color: 'crimson' }}>
-                Greška: {errorCrypto}
-              </div>
-            )}
-            {!loadingCrypto && topCryptoCombined.length === 0 && (
-              <div className="card small">Nema jakih kripto signala.</div>
-            )}
-            {!loadingCrypto &&
-              topCryptoCombined.map((it) => (
-                <SignalCard
-                  key={`combined-crypto-${it.symbol}`}
-                  item={{
-                    symbol: it.symbol,
-                    name: it.name,
-                    current_price: it.current_price,
-                    direction: it.direction,
-                    confidence: it.confidence,
-                    priceChangePercent: it.priceChangePercent,
-                    rsi: it.rsi,
-                    expected_range: it.expected_range,
-                    stop_loss: it.stop_loss,
-                    take_profit: it.take_profit,
-                    volatility: it.volatility,
-                    price_history_24h: it.price_history_24h,
-                    timeframe: 'combined',
-                  }}
-                />
-              ))}
+          <div className="small">
+            Crypto update za: <strong>{formatRemaining(nextCryptoUpdate)}</strong> | Football update za:{' '}
+            <strong>{formatRemaining(nextFootballUpdate)}</strong>
           </div>
         </div>
-      )}
+      </div>
 
-      {/* Football only */}
-      {activeTab === 'football' && (
-        <div>
-          <h2 style={{ marginTop: 0 }}>Football daily predictions</h2>
+      {/* Combined view */}
+      <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+        {/* Football 30% */}
+        <div style={{ flex: '0 0 30%', minWidth: 260 }}>
+          <h2 style={{ marginTop: 0, fontSize: '1.1rem' }}>Football top 3</h2>
           {loadingFootball && <div className="card">Učitavanje fudbalskih predikcija...</div>}
           {!loadingFootball && errorFootball && (
             <div className="card" style={{ color: 'crimson' }}>
@@ -134,61 +73,94 @@ export default function Home() {
           {!loadingFootball &&
             (!footballData?.footballTop || footballData.footballTop.length === 0) && (
               <div className="card small">
-                Fudbal još nije konfigurisan. Pošalji mi izvore + konsenzus da napravim realne top 10.
+                Nema fudbalskih predikcija. Pošalji izvore + konsenzus pravila da ubacim realne top 3.
               </div>
             )}
           {!loadingFootball &&
             footballData?.footballTop &&
-            footballData.footballTop.map((f, i) => (
-              <div className="card" key={`football-only-${i}`} style={{ marginBottom: 12 }}>
-                <div style={{ fontWeight: 600 }}>
-                  {f.match || 'Match'} — {f.prediction || 'Type'}
-                </div>
-                <div>Confidence: {f.confidence || '—'}%</div>
-                <div>Odds: {f.odds || '-'}</div>
-                <div className="small">{f.note || ''}</div>
-              </div>
+            footballData.footballTop.slice(0, 3).map((f, i) => (
+              <SignalCard key={`f-${i}`} item={f} isFootball />
             ))}
         </div>
-      )}
 
-      {/* Crypto only */}
-      {activeTab === 'crypto' && (
-        <div>
-          <h2 style={{ marginTop: 0 }}>Crypto signals (top 10+)</h2>
+        {/* Crypto 70% */}
+        <div style={{ flex: '1 1 70%', minWidth: 320 }}>
+          <h2 style={{ marginTop: 0, fontSize: '1.1rem' }}>Crypto top 3</h2>
           {loadingCrypto && <div className="card">Učitavanje kripto signala...</div>}
           {!loadingCrypto && errorCrypto && (
             <div className="card" style={{ color: 'crimson' }}>
               Greška: {errorCrypto}
             </div>
           )}
-          {!loadingCrypto && (!cryptoData?.cryptoTop || cryptoData.cryptoTop.length === 0) && (
-            <div className="card small">Nema trenutno jakih kripto signala.</div>
+          {!loadingCrypto && topCrypto.length === 0 && (
+            <div className="card small">Nema jakih kripto signala.</div>
           )}
           {!loadingCrypto &&
-            cryptoData?.cryptoTop &&
-            cryptoData.cryptoTop.map((it, i) => (
-              <SignalCard
-                key={`crypto-only-${i}-${it.symbol}`}
-                item={{
-                  symbol: it.symbol,
-                  name: it.name,
-                  current_price: it.current_price,
-                  direction: it.direction,
-                  confidence: it.confidence,
-                  priceChangePercent: it.priceChangePercent,
-                  rsi: it.rsi,
-                  expected_range: it.expected_range,
-                  stop_loss: it.stop_loss,
-                  take_profit: it.take_profit,
-                  volatility: it.volatility,
-                  price_history_24h: it.price_history_24h,
-                  timeframe: 'crypto',
-                }}
-              />
+            topCrypto.map((it, i) => (
+              <SignalCard key={`c-${i}`} item={it} />
             ))}
         </div>
-      )}
+      </div>
+
+      {/* Legend / Confidence key at bottom */}
+      <div
+        style={{
+          marginTop: 32,
+          display: 'flex',
+          gap: 24,
+          flexWrap: 'wrap',
+          alignItems: 'center',
+          paddingTop: 12,
+          borderTop: '1px solid var(--border)',
+        }}
+      >
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <div
+            style={{
+              width: 16,
+              height: 16,
+              borderRadius: 4,
+              background: '#10b981',
+              display: 'inline-block',
+            }}
+          ></div>
+          <div style={{ fontSize: '0.85rem' }}>
+            <strong>High</strong> &gt;= 80% (zeleno)
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <div
+            style={{
+              width: 16,
+              height: 16,
+              borderRadius: 4,
+              background: '#2563eb',
+              display: 'inline-block',
+            }}
+          ></div>
+          <div style={{ fontSize: '0.85rem' }}>
+            <strong>Moderate</strong> 50–79% (plavo)
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <div
+            style={{
+              width: 16,
+              height: 16,
+              borderRadius: 4,
+              background: '#d97706',
+              display: 'inline-block',
+            }}
+          ></div>
+          <div style={{ fontSize: '0.85rem' }}>
+            <strong>Low</strong> &lt; 50% (žuto)
+          </div>
+        </div>
+        <div style={{ marginLeft: 'auto', fontSize: '0.75rem' }}>
+          <div>Objašnjenje: Kombinujemo trend (4h momentum) i RSI da dobijemo confidence score. Najjači
+          signali su prikazani gore. Fudbal i kripto su sortirani po očekivanoj tačnosti.</div>
+        </div>
+      </div>
     </div>
   );
 }
