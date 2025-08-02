@@ -1,33 +1,61 @@
+/* globals.css */
 :root {
-  --bg:#f5f5f5;
-  --fg:#1f2937;
-  --card:#ffffff;
-  --radius:12px;
-  --shadow:0 10px 25px -10px rgba(0,0,0,0.15);
-  --transition:.2s ease;
+  --bg: #f5f5f5;
+  --fg: #1f2937;
+  --card: #ffffff;
+  --radius: 12px;
+  --shadow: 0 10px 25px -10px rgba(0, 0, 0, 0.15);
+  --transition: .2s ease;
+  --border: #d1d5db;
   font-size: 90%; /* -20% font */
-  font-family: system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  line-height: 1.35;
 }
 
 [data-theme="dark"] {
-  --bg:#0f1119;
-  --fg:#e5e9f2;
-  --card:#1f2335;
+  --bg: #0f1119;
+  --fg: #e5e9f2;
+  --card: #1f2335;
+  --border: #2f334a;
+}
+
+* {
+  box-sizing: border-box;
 }
 
 body {
-  margin:0;
+  margin: 0;
   background: var(--bg);
   color: var(--fg);
-  min-height:100vh;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
+
+h1, h2, h3 {
+  margin: 0 0 8px;
+  font-weight: 600;
+}
+
+p {
+  margin: 0 0 8px;
+}
+
 .card {
   background: var(--card);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
-  padding:16px;
+  padding: 16px;
   transition: var(--transition);
+  border: 1px solid transparent;
+  position: relative;
 }
+
+.card.small {
+  padding: 12px;
+  font-size: .9em;
+}
+
 .tab-btn {
   background: transparent;
   border: none;
@@ -35,10 +63,112 @@ body {
   cursor: pointer;
   font-weight: 600;
   border-bottom: 2px solid transparent;
+  position: relative;
+  transition: var(--transition);
+  color: var(--fg);
 }
 .tab-btn.active {
   border-bottom: 2px solid #2563eb;
 }
+.tab-btn:hover:not(.active) {
+  background: rgba(0,0,0,0.03);
+  border-radius: 6px;
+}
+
 .small {
   font-size: 0.8em;
+}
+
+.flex-split {
+  display: flex;
+  gap: 16px;
+}
+
+.button {
+  padding: 6px 12px;
+  cursor: pointer;
+  font-weight: 600;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  transition: var(--transition);
+}
+
+.button-primary {
+  background: #2563eb;
+  color: white;
+  border: none;
+}
+
+.tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.65em;
+  background: rgba(37, 99, 235, 0.1);
+  color: #2563eb;
+}
+
+.inline {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.separator {
+  height: 1px;
+  background: var(--border);
+  margin: 12px 0;
+}
+
+.code-block {
+  background: rgba(0,0,0,0.05);
+  padding: 8px;
+  border-radius: 6px;
+  overflow: auto;
+  font-family: monospace;
+  font-size: 0.75rem;
+}
+
+@media (max-width: 1024px) {
+  .flex-split {
+    flex-direction: column;
+  }
+}
+
+a {
+  color: #2563eb;
+  text-decoration: none;
+}
+
+.badge {
+  background: #10b981;
+  color: white;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.65em;
+  display: inline-block;
+}
+
+.countdown {
+  font-weight: 600;
+}
+
+img {
+  max-width: 100%;
+  display: block;
+  border-radius: 6px;
+}
+
+.metric {
+  display: inline-block;
+  margin-right: 8px;
+}
+
+.label {
+  font-weight: 600;
+}
+
+.overflow-scroll {
+  overflow: auto;
 }
