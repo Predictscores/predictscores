@@ -27,7 +27,15 @@ function HeaderControls() {
     return () => clearInterval(iv);
   }, []);
 
-  const fmt = (target) => {
+  // unified next update (earliest of the two)
+  const nextUpdate = (() => {
+    if (!nextCryptoUpdate && !nextFootballUpdate) return null;
+    if (!nextCryptoUpdate) return nextFootballUpdate;
+    if (!nextFootballUpdate) return nextCryptoUpdate;
+    return Math.min(nextCryptoUpdate, nextFootballUpdate);
+  })();
+
+  const formatRemaining = (target) => {
     if (!target) return '—';
     const diff = Math.max(0, Math.floor((target - now) / 1000));
     const m = Math.floor(diff / 60);
@@ -39,42 +47,32 @@ function HeaderControls() {
     <div
       style={{
         display: 'flex',
-        gap: 12,
-        justifyContent: 'space-between',
+        justifyContent: 'flex-end',
         alignItems: 'center',
-        marginBottom: 12,
-        flexWrap: 'wrap',
+        gap: 12,
+        padding: '8px 0',
       }}
     >
-      <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-        <button
-          onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
-          style={{ padding: '6px 12px', cursor: 'pointer' }}
-        >
-          {theme === 'dark' ? 'Light' : 'Dark'} mode
-        </button>
-        <button
-          onClick={refreshAll}
-          style={{
-            padding: '6px 12px',
-            cursor: 'pointer',
-            fontWeight: 600,
-            borderRadius: 6,
-            border: '1px solid var(--border)',
-            background: 'transparent',
-          }}
-        >
-          Refresh all
-        </button>
-      </div>
-      <div style={{ display: 'flex', gap: 16, alignItems: 'center', fontSize: '0.8rem' }}>
-        <div>
-          Crypto in: <strong>{fmt(nextCryptoUpdate)}</strong>
-        </div>
-        <div>
-          Football in: <strong>{fmt(nextFootballUpdate)}</strong>
-        </div>
-      </div>
+      <div className="small">Next update in: <strong>{formatRemaining(nextUpdate)}</strong></div>
+      <button
+        onClick={refreshAll}
+        style={{
+          padding: '6px 12px',
+          cursor: 'pointer',
+          fontWeight: 600,
+          borderRadius: 6,
+          border: '1px solid var(--border)',
+          background: 'transparent',
+        }}
+      >
+        Refresh all
+      </button>
+      <button
+        onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+        style={{ padding: '6px 12px', cursor: 'pointer' }}
+      >
+        {theme === 'dark' ? 'Light' : 'Dark'} mode
+      </button>
     </div>
   );
 }
