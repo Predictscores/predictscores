@@ -36,27 +36,9 @@ export default function Home() {
 
   return (
     <div>
-      {/* Header title & explanation */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 16 }}>
+      {/* Title */}
+      <div style={{ marginBottom: 16 }}>
         <h1 style={{ margin: 0 }}>AI Top fudbalske i Kripto Prognoze</h1>
-        <div style={{ fontSize: '0.9rem' }}>
-          Prikazujemo po <strong>3 najjača fudbalska</strong> i <strong>3 najjača kripto</strong> signala
-          sortirana po očekivanoj tačnosti (confidence). Kombinovani prikaz je dole: levo fudbal (30%),
-          desno kripto (70%). Jednim klikom osveži sve podatke. Confidence level indikator je na dnu.
-        </div>
-        <div style={{ marginTop: 8, display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
-          <button
-            onClick={refreshAll}
-            className="button"
-            style={{ minWidth: 140, fontWeight: 600 }}
-          >
-            Refresh sve
-          </button>
-          <div className="small">
-            Crypto update za: <strong>{formatRemaining(nextCryptoUpdate)}</strong> | Football update za:{' '}
-            <strong>{formatRemaining(nextFootballUpdate)}</strong>
-          </div>
-        </div>
       </div>
 
       {/* Combined view */}
@@ -99,66 +81,6 @@ export default function Home() {
             topCrypto.map((it, i) => (
               <SignalCard key={`c-${i}`} item={it} />
             ))}
-        </div>
-      </div>
-
-      {/* Legend / Confidence key at bottom */}
-      <div
-        style={{
-          marginTop: 32,
-          display: 'flex',
-          gap: 24,
-          flexWrap: 'wrap',
-          alignItems: 'center',
-          paddingTop: 12,
-          borderTop: '1px solid var(--border)',
-        }}
-      >
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <div
-            style={{
-              width: 16,
-              height: 16,
-              borderRadius: 4,
-              background: '#10b981',
-              display: 'inline-block',
-            }}
-          ></div>
-          <div style={{ fontSize: '0.85rem' }}>
-            <strong>High</strong> &gt;= 80% (zeleno)
-          </div>
-        </div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <div
-            style={{
-              width: 16,
-              height: 16,
-              borderRadius: 4,
-              background: '#2563eb',
-              display: 'inline-block',
-            }}
-          ></div>
-          <div style={{ fontSize: '0.85rem' }}>
-            <strong>Moderate</strong> 50–79% (plavo)
-          </div>
-        </div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <div
-            style={{
-              width: 16,
-              height: 16,
-              borderRadius: 4,
-              background: '#d97706',
-              display: 'inline-block',
-            }}
-          ></div>
-          <div style={{ fontSize: '0.85rem' }}>
-            <strong>Low</strong> &lt; 50% (žuto)
-          </div>
-        </div>
-        <div style={{ marginLeft: 'auto', fontSize: '0.75rem' }}>
-          <div>Objašnjenje: Kombinujemo trend (4h momentum) i RSI da dobijemo confidence score. Najjači
-          signali su prikazani gore. Fudbal i kripto su sortirani po očekivanoj tačnosti.</div>
         </div>
       </div>
     </div>
