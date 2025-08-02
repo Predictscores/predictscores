@@ -1,5 +1,35 @@
 import React from 'react';
 
+function buildQuickChartUrl(symbol, prices24h = []) {
+  const labels = prices24h.map((_, i) => i);
+  const data = prices24h.map((p) => Number(p.toFixed(4)));
+  const config = {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: symbol,
+          data,
+          fill: false,
+          tension: 0.3
+        }
+      ]
+    },
+    options: {
+      plugins: {
+        legend: { display: false }
+      },
+      scales: {
+        x: { display: false }
+      }
+    }
+  };
+  return `https://quickchart.io/chart?width=300&height=120&c=${encodeURIComponent(
+    JSON.stringify(config)
+  )}`;
+}
+
 export default function SignalCard({ item }) {
   const isLong = item.direction === 'LONG';
   return (
@@ -20,34 +50,12 @@ export default function SignalCard({ item }) {
         <div>
           SL: {item.stop_loss} / TP: {item.take_profit}
         </div>
+        <div style={{ fontSize: '0.7em', marginTop: 4 }}>Volatility: {item.volatility}%</div>
       </div>
       <div style={{ width: 320 }}>
         <img
           alt="chart"
-          src={`https://quickchart.io/chart?c=${encodeURIComponent(
-            JSON.stringify({
-              type: 'line',
-              data: {
-                labels: Array(24)
-                  .fill(0)
-                  .map((_, i) => i),
-                datasets: [
-                  {
-                    label: item.symbol,
-                    data: Array(24)
-                      .fill(item.current_price || 0)
-                      .map((v, i) => v * (1 + (Math.sin(i / 3) * 0.005))),
-                    fill: false,
-                    tension: 0.3,
-                  },
-                ],
-              },
-              options: {
-                plugins: { legend: { display: false } },
-                scales: { x: { display: false } },
-              },
-            })
-          )}`}
+          src={buildQuickChartUrl(item.symbol, item.price_history_24h || [])}
           style={{ width: '100%', borderRadius: 6 }}
         />
       </div>
