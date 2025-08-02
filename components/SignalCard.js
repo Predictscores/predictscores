@@ -32,13 +32,12 @@ function buildQuickChartUrl(symbol, prices24h = []) {
 }
 
 function confidenceLevel(conf) {
-  if (conf >= 80) return { label: 'High', color: '#10b981' }; // green
-  if (conf >= 50) return { label: 'Moderate', color: '#2563eb' }; // blue
-  return { label: 'Low', color: '#d97706' }; // yellow/orange
+  if (conf >= 80) return { label: 'High', color: '#10b981' };
+  if (conf >= 50) return { label: 'Moderate', color: '#2563eb' };
+  return { label: 'Low', color: '#d97706' };
 }
 
 export default function SignalCard({ item, isFootball }) {
-  // isFootball distinguishes football card structure vs crypto
   const conf = item.confidence ?? 0;
   const { label: confLabel, color: confColor } = confidenceLevel(conf);
   return (
@@ -56,17 +55,16 @@ export default function SignalCard({ item, isFootball }) {
       <div style={{ flex: '1 1 220px', minWidth: 220 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start' }}>
           <div style={{ fontWeight: 600, marginBottom: 4 }}>
-            {item.symbol && (
+            {isFootball ? (
+              <>
+                {item.match} — {item.prediction}
+              </>
+            ) : (
               <>
                 {item.symbol} — {item.name}{' '}
                 <span style={{ fontSize: '0.65em', color: '#6b7280' }}>
                   [{item.timeframe || ''}]
                 </span>
-              </>
-            )}
-            {isFootball && (
-              <>
-                {item.match || 'Match'} — {item.prediction || 'Type'}
               </>
             )}
           </div>
@@ -83,7 +81,7 @@ export default function SignalCard({ item, isFootball }) {
             {confLabel} ({conf}%)
           </div>
         </div>
-        {item.current_price !== undefined && (
+        {!isFootball && item.current_price !== undefined && (
           <div>Entry price: ${Number(item.current_price).toFixed(4)}</div>
         )}
         {isFootball ? (
@@ -116,9 +114,6 @@ export default function SignalCard({ item, isFootball }) {
             src={buildQuickChartUrl(item.symbol || '', item.price_history_24h || [])}
             style={{ width: '100%', borderRadius: 6 }}
           />
-        )}
-        {isFootball && item.extra && (
-          <div className="small">{item.extra}</div>
         )}
       </div>
     </div>
