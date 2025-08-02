@@ -18,8 +18,8 @@ export function DataProvider({ children }) {
   const [nextCryptoUpdate, setNextCryptoUpdate] = useState(null);
   const [nextFootballUpdate, setNextFootballUpdate] = useState(null);
 
-  const CRYPTO_INTERVAL = 10 * 60 * 1000; // 10m
-  const FOOTBALL_INTERVAL = 30 * 60 * 1000; // 30m
+  const CRYPTO_INTERVAL = 10 * 60 * 1000;
+  const FOOTBALL_INTERVAL = 30 * 60 * 1000;
 
   const fetchCrypto = useCallback(async () => {
     setLoadingCrypto(true);
@@ -62,30 +62,34 @@ export function DataProvider({ children }) {
   useEffect(() => {
     fetchCrypto();
     fetchFootball();
-    const ivCrypto = setInterval(fetchCrypto, CRYPTO_INTERVAL);
-    const ivFootball = setInterval(fetchFootball, FOOTBALL_INTERVAL);
+    const iv1 = setInterval(fetchCrypto, CRYPTO_INTERVAL);
+    const iv2 = setInterval(fetchFootball, FOOTBALL_INTERVAL);
     return () => {
-      clearInterval(ivCrypto);
-      clearInterval(ivFootball);
+      clearInterval(iv1);
+      clearInterval(iv2);
     };
   }, [fetchCrypto, fetchFootball]);
 
-  const value = {
-    cryptoData,
-    footballData,
-    loadingCrypto,
-    loadingFootball,
-    errorCrypto,
-    errorFootball,
-    refreshCrypto: fetchCrypto,
-    refreshFootball: fetchFootball,
-    refreshAll: () => {
-      fetchCrypto();
-      fetchFootball();
-    },
-    nextCryptoUpdate,
-    nextFootballUpdate,
-  };
-
-  return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
+  return (
+    <DataContext.Provider
+      value={{
+        cryptoData,
+        footballData,
+        loadingCrypto,
+        loadingFootball,
+        errorCrypto,
+        errorFootball,
+        refreshCrypto: fetchCrypto,
+        refreshFootball: fetchFootball,
+        refreshAll: () => {
+          fetchCrypto();
+          fetchFootball();
+        },
+        nextCryptoUpdate,
+        nextFootballUpdate,
+      }}
+    >
+      {children}
+    </DataContext.Provider>
+  );
 }
