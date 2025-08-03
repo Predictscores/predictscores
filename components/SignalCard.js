@@ -21,9 +21,15 @@ const SignalCard = ({ data, type }) => {
     timeframe,
   } = data;
 
-  // Generiši chartConfig kao JSON string za QuickChart
-  const chartConfig = price_history_24h
-    ? encodeURIComponent(JSON.stringify({
+  // Badge klasa prema confidence-u
+  let badgeClass = 'badge ';
+  if (confidence >= 85) badgeClass += 'badge-high';
+  else if (confidence >= 55) badgeClass += 'badge-moderate';
+  else badgeClass += 'badge-low';
+
+  // Chart preko QuickChart (png)
+  const chartUrl = price_history_24h
+    ? `https://quickchart.io/chart?width=340&height=70&c=${encodeURIComponent(JSON.stringify({
         type: 'line',
         data: {
           labels: price_history_24h.map((_, i) => i),
@@ -31,7 +37,7 @@ const SignalCard = ({ data, type }) => {
             {
               label: symbol,
               data: price_history_24h.slice(-288),
-              borderColor: '#3b82f6',
+              borderColor: '#2563eb',
               fill: false,
             },
           ],
@@ -41,52 +47,34 @@ const SignalCard = ({ data, type }) => {
           elements: { point: { radius: 0 } },
           plugins: { legend: { display: false } },
         },
-      }))
+      }))}`
     : null;
-
-  const chartUrl = chartConfig
-    ? `https://quickchart.io/chart?width=300&height=100&c=${chartConfig}`
-    : null;
-
-  const confidenceColor =
-    confidence >= 85 ? 'text-green-500' : confidence >= 55 ? 'text-blue-500' : 'text-yellow-500';
 
   return (
-    <div className="border rounded p-4 w-full bg-card text-card-foreground">
-      <div className="flex justify-between items-center mb-2">
+    <div className="bg-card rounded p-4 text-card-foreground" style={{ minWidth: 290, maxWidth: 390, flex: 1 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
         <div>
-          <h3 className="text-lg font-semibold">
-            {name || symbol}{' '}
-            {timeframe && <span className="text-xs text-muted-foreground">[{timeframe}]</span>}
-          </h3>
-          <p className={`text-sm ${confidenceColor}`}>Confidence: {confidence}%</p>
+          <div style={{ fontWeight: 600, fontSize: 17 }}>
+            {name || symbol}
+            {timeframe && <span style={{ fontSize: 13, color: '#b0b3b8', marginLeft: 4 }}>[{timeframe}]</span>}
+          </div>
         </div>
-        <div className="text-right text-sm">
-          {type === 'crypto' && <p>Signal: {direction}</p>}
-          {type === 'football' && <p>{prediction}</p>}
-          {odds && <p>Odds: {odds}</p>}
-        </div>
+        <span className={badgeClass}>{confidence}%</span>
       </div>
-
-      {note && <p className="text-sm italic text-muted-foreground mb-2">{note}</p>}
-
+      <div style={{ fontSize: 15, marginBottom: 7 }}>
+        {type === 'crypto' && <span><b>Signal:</b> {direction}<br /></span>}
+        {type === 'football' && <span><b>Pick:</b> {prediction}<br /></span>}
+        {odds && <span><b>Odds:</b> {odds}<br /></span>}
+      </div>
+      {note && <div className="text-muted-foreground" style={{ fontSize: 14, fontStyle: 'italic', marginBottom: 8 }}>{note}</div>}
       {type === 'crypto' && (
-        <div className="grid grid-cols-2 gap-1 text-sm mb-2">
-          <p>Range: {expected_range}</p>
-          <p>SL: {stop_loss}</p>
-          <p>TP: {take_profit}</p>
-          <p>Price: ${current_price}</p>
+        <div style={{ fontSize: 14, marginBottom: 6 }}>
+          <span><b>Range:</b> {expected_range} &nbsp; <b>SL:</b> {stop_loss} &nbsp; <b>TP:</b> {take_profit}</span><br />
+          <span><b>Price:</b> ${current_price}</span>
         </div>
       )}
-
-      <div className="my-2 border-t border-muted w-full"></div>
-
       {chartUrl && (
-        <img
-          src={chartUrl}
-          alt="Chart"
-          className="w-full h-auto rounded shadow-sm"
-        />
+        <img src={chartUrl} alt="Chart" style={{ width: '100%', height: 68, borderRadius: 7, marginTop: 7, background: "#18191c" }} />
       )}
     </div>
   );
