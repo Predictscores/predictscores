@@ -6,7 +6,6 @@ if (!API_FOOTBALL_KEY) {
   console.warn('Missing API_FOOTBALL_KEY in env');
 }
 
-// Simple in-memory caches (cold start reset)
 const fixturesCache = {};
 const leagueStandingsCache = {};
 const teamFormCache = {};
@@ -14,7 +13,6 @@ const teamFormCache = {};
 const CACHE_TTL_MS = 1000 * 60 * 30; // 30 minutes
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 const fetchWithRetry = async (url, options = {}, retries = 2) => {
   try {
     const res = await fetch(url, options);
@@ -38,9 +36,9 @@ const fetchWithRetry = async (url, options = {}, retries = 2) => {
 
 const getTodayDateStr = () => {
   const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, '0');
-  const day = String(now.getDate()).padStart(2, '0');
+  const year = now.getUTCFullYear();
+  const month = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(now.getUTCDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 };
 
@@ -64,7 +62,7 @@ const getFixturesForDate = async (dateStr) => {
     timestamp: Date.now(),
     data: fixtures,
   };
-  return fixtures;
+  return { fixtures, raw: payload };
 };
 
 const getLeagueStandings = async (leagueId, season) => {
@@ -251,12 +249,19 @@ const compute1X2Model = async (fixture) => {
 
 export default async function handler(req, res) {
   try {
-    const today = getTodayDateStr();
-    const fixtures = await getFixturesForDate(today);
+    const dateParam = req.query.date;
+    const today = dateParam || getTodayDateStr();
+    const { fixtures, raw } = await getFixturesForDate(today);
+
     if (!fixtures || fixtures.length === 0) {
-      return res
-        .status(200)
-        .json({ picks: [], message: 'No fixtures today' });
+      return res.status(200).json({
+        picks: [],
+        message: 'No fixtures for date',
+        debug: {
+          requested_date: today,
+          rawResponse: raw,
+        },
+      });
     }
 
     const enriched = [];
@@ -301,6 +306,10 @@ export default async function handler(req, res) {
         confidence: p.model.confidence,
         rankScore: p.rankScore,
       })),
+      debug: {
+        requested_date: today,
+        total_fetched: fixtures.length,
+      },
     });
   } catch (err) {
     console.error('select-matches error', err);
