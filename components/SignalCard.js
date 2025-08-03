@@ -20,7 +20,6 @@ const SignalCard = ({ data, type }) => {
     timeframe,
   } = data;
 
-  // Confidence color logic (fallback safe)
   const getConfidenceColor = (val) => {
     if (typeof val !== 'number') return 'bg-gray-500';
     if (val >= 85) return 'bg-green-400';
@@ -30,7 +29,7 @@ const SignalCard = ({ data, type }) => {
 
   return (
     <div className="flex w-full rounded-2xl bg-[#1f2339] text-white shadow-md p-6 flex-col md:flex-row gap-6">
-      {/* Info side */}
+      {/* Info */}
       <div className="flex-1 flex flex-col justify-between">
         <div className="flex items-start gap-2 mb-2 flex-wrap">
           <div className="flex-1 min-w-0">
@@ -64,19 +63,18 @@ const SignalCard = ({ data, type }) => {
           )}
         </div>
 
-        {/* Content based on type */}
         {type === 'football' && (
-          <div className="flex flex-col gap-1">
-            <p className="text-sm">
+          <div className="flex flex-col gap-1 text-sm">
+            <div>
               <span className="font-semibold">Pick:</span> {prediction || '—'}
-            </p>
+            </div>
             {odds && (
-              <p className="text-sm">
+              <div>
                 <span className="font-semibold">Odds:</span> {odds}
-              </p>
+              </div>
             )}
             {note && (
-              <p className="text-xs italic text-gray-400 mt-1">{note}</p>
+              <div className="text-xs italic text-gray-400 mt-1">{note}</div>
             )}
           </div>
         )}
@@ -108,7 +106,7 @@ const SignalCard = ({ data, type }) => {
         )}
       </div>
 
-      {/* Chart side (only for crypto) */}
+      {/* Chart */}
       {type === 'crypto' && (
         <div className="flex-shrink-0 w-full md:w-[380px]">
           <div className="w-full rounded-xl overflow-hidden">
