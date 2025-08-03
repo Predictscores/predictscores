@@ -1,121 +1,95 @@
-// components/SignalCard.js
+// FILE: components/SignalCard.js
+
 import React from 'react';
+import QuickChart from 'quickchart-js';
 
-function buildQuickChartUrl(symbol, prices24h = []) {
-  const labels = prices24h.map((_, i) => i);
-  const data = prices24h.map((p) => Number(p.toFixed(4)));
-  const config = {
-    type: 'line',
-    data: {
-      labels,
-      datasets: [
-        {
-          label: symbol,
-          data,
-          fill: false,
-          tension: 0.3,
-        },
-      ],
-    },
-    options: {
-      plugins: {
-        legend: { display: false },
-      },
-      scales: {
-        x: { display: false },
-      },
-    },
-  };
-  return `https://quickchart.io/chart?width=300&height=120&c=${encodeURIComponent(
-    JSON.stringify(config)
-  )}`;
-}
+const SignalCard = ({ data, type }) => {
+  if (!data) return null;
 
-function confidenceLevel(conf) {
-  if (conf >= 80) return { label: 'High', color: '#10b981' };
-  if (conf >= 50) return { label: 'Moderate', color: '#2563eb' };
-  return { label: 'Low', color: '#d97706' };
-}
+  const {
+    symbol,
+    name,
+    direction,
+    confidence,
+    expected_range,
+    stop_loss,
+    take_profit,
+    current_price,
+    odds,
+    prediction,
+    note,
+    price_history_24h,
+    timeframe,
+  } = data;
 
-export default function SignalCard({ item, isFootball }) {
-  const conf = item.confidence ?? 0;
-  const { label: confLabel, color: confColor } = confidenceLevel(conf);
+  const chartUrl = price_history_24h
+    ? new QuickChart()
+        .setConfig({
+          type: 'line',
+          data: {
+            labels: price_history_24h.map((_, i) => i),
+            datasets: [
+              {
+                label: symbol,
+                data: price_history_24h.slice(-288),
+                borderColor: '#3b82f6',
+                fill: false,
+              },
+            ],
+          },
+          options: {
+            scales: { x: { display: false }, y: { display: false } },
+            elements: { point: { radius: 0 } },
+            plugins: { legend: { display: false } },
+          },
+        })
+        .setWidth(300)
+        .setHeight(100)
+        .getUrl()
+    : null;
+
+  const confidenceColor =
+    confidence >= 85 ? 'text-green-500' : confidence >= 55 ? 'text-blue-500' : 'text-yellow-500';
+
   return (
-    <div
-      className="card"
-      style={{
-        display: 'flex',
-        gap: 16,
-        marginBottom: 12,
-        fontSize: '0.85rem',
-        flexWrap: 'wrap',
-        alignItems: 'flex-start',
-      }}
-    >
-      <div style={{ flex: '1 1 220px', minWidth: 220 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start' }}>
-          <div style={{ fontWeight: 600, marginBottom: 4 }}>
-            {isFootball ? (
-              <>
-                {item.match} — {item.prediction}
-              </>
-            ) : (
-              <>
-                {item.symbol} — {item.name}{' '}
-                <span style={{ fontSize: '0.65em', color: '#6b7280' }}>
-                  [{item.timeframe || ''}]
-                </span>
-              </>
-            )}
-          </div>
-          <div
-            style={{
-              padding: '4px 10px',
-              borderRadius: 999,
-              background: confColor,
-              color: 'white',
-              fontSize: '0.6rem',
-              fontWeight: 600,
-            }}
-          >
-            {confLabel} ({conf}%)
-          </div>
+    <div className="border rounded p-4 w-full bg-card text-card-foreground">
+      <div className="flex justify-between items-center mb-2">
+        <div>
+          <h3 className="text-lg font-semibold">
+            {name || symbol}{' '}
+            {timeframe && <span className="text-xs text-muted-foreground">[{timeframe}]</span>}
+          </h3>
+          <p className={`text-sm ${confidenceColor}`}>Confidence: {confidence}%</p>
         </div>
-        {!isFootball && item.current_price !== undefined && (
-          <div>Entry price: ${Number(item.current_price).toFixed(4)}</div>
-        )}
-        {isFootball ? (
-          <>
-            <div>Odds: {item.odds || '-'}</div>
-            <div>Confidence raw: {conf}%</div>
-            {item.note && <div className="small">{item.note}</div>}
-          </>
-        ) : (
-          <>
-            <div>
-              Signal:{' '}
-              <span style={{ color: item.direction === 'LONG' ? '#10b981' : '#dc2626' }}>
-                {item.direction}
-              </span>
-            </div>
-            <div>Price change (4h trend): {item.priceChangePercent}%</div>
-            <div>RSI: {item.rsi}</div>
-            <div>
-              SL: {item.stop_loss} / TP: {item.take_profit}
-            </div>
-            <div className="small">Volatility: {item.volatility}%</div>
-          </>
-        )}
+        <div className="text-right text-sm">
+          {type === 'crypto' && <p>Signal: {direction}</p>}
+          {type === 'football' && <p>{prediction}</p>}
+          {odds && <p>Odds: {odds}</p>}
+        </div>
       </div>
-      <div style={{ flex: '0 0 320px', minWidth: 260 }}>
-        {!isFootball && (
-          <img
-            alt="chart"
-            src={buildQuickChartUrl(item.symbol || '', item.price_history_24h || [])}
-            style={{ width: '100%', borderRadius: 6 }}
-          />
-        )}
-      </div>
+
+      {note && <p className="text-sm italic text-muted-foreground mb-2">{note}</p>}
+
+      {type === 'crypto' && (
+        <div className="grid grid-cols-2 gap-1 text-sm mb-2">
+          <p>Range: {expected_range}</p>
+          <p>SL: {stop_loss}</p>
+          <p>TP: {take_profit}</p>
+          <p>Price: ${current_price}</p>
+        </div>
+      )}
+
+      <div className="my-2 border-t border-muted w-full"></div>
+
+      {chartUrl && (
+        <img
+          src={chartUrl}
+          alt="Chart"
+          className="w-full h-auto rounded shadow-sm"
+        />
+      )}
     </div>
   );
-}
+};
+
+export default SignalCard;
