@@ -1,9 +1,5 @@
 // FILE: pages/api/value-bets.js
 
-// Uses selects from select-matches (model) and The Odds API to compute edge for 1X2 outcomes.
-// Expects POST body: { picks: [ ... ] , sport_key: "soccer_brazil" } 
-// If picks not provided, requires query param ?date=YYYY-MM-DD and will internally call /api/select-matches to fetch them (best-effort).
-
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
 if (!ODDS_API_KEY) {
   console.warn('Missing ODDS_API_KEY in env');
@@ -31,7 +27,6 @@ const fetchWithRetry = async (url, options = {}, retries = 2) => {
   }
 };
 
-// Remove vig for a single bookmaker's 1X2 odds
 const removeVig = (h, d, a) => {
   const impliedH = 1 / h;
   const impliedD = 1 / d;
@@ -44,7 +39,6 @@ const removeVig = (h, d, a) => {
   };
 };
 
-// Average consensus from multiple bookmakers: input array of no-vig probs per book
 const consensusNoVig = (books) => {
   if (!books || books.length === 0) return null;
   let sumHome = 0,
@@ -58,7 +52,6 @@ const consensusNoVig = (books) => {
   const avgHome = sumHome / books.length;
   const avgDraw = sumDraw / books.length;
   const avgAway = sumAway / books.length;
-  // renormalize just in case
   const total = avgHome + avgDraw + avgAway;
   return {
     home: avgHome / total,
@@ -67,9 +60,21 @@ const consensusNoVig = (books) => {
   };
 };
 
-const fetchOddsForMatch = async (sportKey, homeName, awayName, dateISO) => {
-  // The Odds API v4 h2h odds for given sport. regions=eu, market=h2h
-  // You may adjust region or oddsFormat if needed.
+const buildSelectMatchesUrl = (req, dateParam) => {
+  let origin = '';
+  if (process.env.VERCEL_URL) {
+    origin = `https://${process.env.VERCEL_URL}`;
+  } else if (req.headers['x-forwarded-proto'] && req.headers.host) {
+    origin = `${req.headers['x-forwarded-proto']}://${req.headers.host}`;
+  } else if (req.headers.host) {
+    origin = `https://${req.headers.host}`;
+  } else {
+    origin = 'http://localhost:3000';
+  }
+  return `${origin}/api/select-matches${dateParam ? `?date=${dateParam}` : ''}`;
+};
+
+const fetchOddsForMatch = async (sportKey, homeName, awayName) => {
   const base = `https://api.the-odds-api.com/v4/sports/${encodeURIComponent(
     sportKey
   )}/odds/`;
@@ -78,7 +83,6 @@ const fetchOddsForMatch = async (sportKey, homeName, awayName, dateISO) => {
     markets: 'h2h',
     oddsFormat: 'decimal',
     dateFormat: 'iso',
-    // optionally &bookmakers=... to restrict
     apiKey: ODDS_API_KEY,
   });
   const url = `${base}?${params.toString()}`;
@@ -86,23 +90,22 @@ const fetchOddsForMatch = async (sportKey, homeName, awayName, dateISO) => {
   const data = await fetchWithRetry(url);
   if (!Array.isArray(data)) return null;
 
-  // Match by teams and approximate time: The Odds API returns multiple events; find best match
-  // We'll try to find event where home and away names appear (case-insensitive substring)
+  const normalizedHome = homeName.toLowerCase();
+  const normalizedAway = awayName.toLowerCase();
+
+  // find best matching event
   const matchEvent = data.find((ev) => {
-    const teams = ev.home_team?.toLowerCase() || '';
-    const opp = ev.away_team?.toLowerCase() || '';
-    const homeLower = homeName.toLowerCase();
-    const awayLower = awayName.toLowerCase();
-    const nameMatch =
-      (teams.includes(homeLower) && opp.includes(awayLower)) ||
-      (teams.includes(awayLower) && opp.includes(homeLower)); // tolerate order swap
-    // Optionally check start_time proximity if dateISO provided
-    return nameMatch;
+    const ht = (ev.home_team || '').toLowerCase();
+    const at = (ev.away_team || '').toLowerCase();
+    const matchA =
+      ht.includes(normalizedHome) && at.includes(normalizedAway);
+    const matchB =
+      ht.includes(normalizedAway) && at.includes(normalizedHome);
+    return matchA || matchB;
   });
 
   if (!matchEvent) return null;
 
-  // Extract h2h odds from all bookmakers for that event
   const books = [];
   if (Array.isArray(matchEvent.bookmakers)) {
     matchEvent.bookmakers.forEach((bm) => {
@@ -112,21 +115,17 @@ const fetchOddsForMatch = async (sportKey, homeName, awayName, dateISO) => {
           drawO = null,
           awayO = null;
         h2hMarket.outcomes.forEach((o) => {
-          if (o.name.toLowerCase() === matchEvent.home_team.toLowerCase()) {
+          const name = (o.name || '').toLowerCase();
+          if (name === (matchEvent.home_team || '').toLowerCase()) {
             homeO = o.price;
-          } else if (o.name.toLowerCase() === matchEvent.away_team.toLowerCase()) {
+          } else if (name === (matchEvent.away_team || '').toLowerCase()) {
             awayO = o.price;
-          } else if (
-            o.name.toLowerCase() === 'draw' ||
-            o.name.toLowerCase() === 'tie'
-          ) {
+          } else if (name === 'draw' || name === 'tie') {
             drawO = o.price;
           }
         });
-        // Only include if all three exist
         if (homeO && drawO && awayO) {
-          const noVig = removeVig(homeO, drawO, awayO);
-          books.push(noVig);
+          books.push(removeVig(homeO, drawO, awayO));
         }
       }
     });
@@ -143,22 +142,16 @@ const fetchOddsForMatch = async (sportKey, homeName, awayName, dateISO) => {
 
 export default async function handler(req, res) {
   try {
-    let picks = null;
     const { sport_key } = req.query;
-    const body = req.method === 'POST' ? await req.json() : {};
+    const dateParam = req.query.date || '';
+    const body = req.method === 'POST' ? req.body : {};
+
+    let picks = null;
     if (body.picks && Array.isArray(body.picks) && body.picks.length > 0) {
       picks = body.picks;
     } else {
-      // fallback: call select-matches internally
-      const dateParam = req.query.date || '';
-      // build URL assuming same origin; if VERCEL_URL exists, prefer that
-      const baseHost =
-        process.env.VERCEL_URL && !process.env.VERCEL_URL.startsWith('http')
-          ? `https://${process.env.VERCEL_URL}`
-          : '';
-      const selectUrl = `${
-        baseHost || ''
-      }/api/select-matches${dateParam ? `?date=${dateParam}` : ''}`;
+      // internal fetch to select-matches using full URL
+      const selectUrl = buildSelectMatchesUrl(req, dateParam);
       const selRes = await fetch(selectUrl);
       const selJson = await selRes.json();
       picks = selJson.picks || [];
@@ -177,46 +170,36 @@ export default async function handler(req, res) {
 
     const valueCandidates = [];
 
-    // For each pick (match), get market consensus and compute edge for each outcome
     for (const pick of picks) {
       const homeName = pick.teams.home.name || '';
       const awayName = pick.teams.away.name || '';
-      // sport_key must be provided or guess generic soccer
-      const sportKey = sport_key || 'soccer'; // user can pass e.g. soccer_brazil if needed
+      const sportKey = sport_key || 'soccer';
       const oddsData = await fetchOddsForMatch(
         sportKey,
         homeName,
-        awayName,
-        null
+        awayName
       );
       if (!oddsData || !oddsData.consensus) {
-        continue; // skip if no market data
+        continue;
       }
-      const marketProb = oddsData.consensus; // {home, draw, away}
+      const marketProb = oddsData.consensus;
       const modelProbs = pick.model_probs || {};
 
-      // For each outcome compute edge
       ['home', 'draw', 'away'].forEach((key) => {
         const model_p = modelProbs[key] ?? 0;
         const market_p = marketProb[key] ?? 0;
-        // final consensus
         const final_prob = (model_p + market_p) / 2;
         const edge = final_prob - market_p;
-        // Only positive value bets with decent model confidence (optional threshold)
         if (edge >= 0.05) {
           valueCandidates.push({
             fixture_id: pick.fixture_id,
             league: pick.league,
             teams: pick.teams,
             datetime_local: pick.datetime_local,
-            pick: key, // 'home' | 'draw' | 'away'
+            pick: key,
             model_prob: model_p,
             market_prob: market_p,
             edge,
-            odds_implied: {
-              // reverse implied from market_prob before removing vig is not available here; we can approximate from consensus
-              implied_no_vig: market_p,
-            },
             raw_market: oddsData.raw_event,
             predicted_model: pick.predicted,
             model_confidence: pick.confidence,
@@ -225,9 +208,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // Sort descending edge
     valueCandidates.sort((a, b) => b.edge - a.edge);
-    // Top 4
     const top = valueCandidates.slice(0, 4);
 
     return res.status(200).json({
