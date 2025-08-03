@@ -5,8 +5,9 @@ if (!ODDS_API_KEY) {
   console.warn('Missing ODDS_API_KEY in env');
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 const fetchWithRetry = async (url, options = {}, retries = 2) => {
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   try {
     const res = await fetch(url, options);
     if (!res.ok) {
@@ -93,7 +94,6 @@ const fetchOddsForMatch = async (sportKey, homeName, awayName) => {
   const normalizedHome = homeName.toLowerCase();
   const normalizedAway = awayName.toLowerCase();
 
-  // find best matching event
   const matchEvent = data.find((ev) => {
     const ht = (ev.home_team || '').toLowerCase();
     const at = (ev.away_team || '').toLowerCase();
@@ -147,20 +147,41 @@ export default async function handler(req, res) {
     const body = req.method === 'POST' ? req.body : {};
 
     let picks = null;
+    let selectUrl = buildSelectMatchesUrl(req, dateParam);
+    let selectMatchesRaw = null;
+
     if (body.picks && Array.isArray(body.picks) && body.picks.length > 0) {
       picks = body.picks;
     } else {
-      // internal fetch to select-matches using full URL
-      const selectUrl = buildSelectMatchesUrl(req, dateParam);
-      const selRes = await fetch(selectUrl);
-      const selJson = await selRes.json();
-      picks = selJson.picks || [];
+      // fetch select-matches with resilience to non-JSON
+      let selRes;
+      try {
+        selRes = await fetch(selectUrl);
+        const contentType = selRes.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const selJson = await selRes.json();
+          picks = selJson.picks || [];
+          selectMatchesRaw = selJson;
+        } else {
+          // got HTML or something unexpected
+          const text = await selRes.text();
+          selectMatchesRaw = { unexpected: text };
+          picks = [];
+        }
+      } catch (e) {
+        selectMatchesRaw = { fetch_error: e.message };
+        picks = [];
+      }
     }
 
     if (!picks || picks.length === 0) {
       return res.status(400).json({
         error: 'No picks provided or retrieved from select-matches',
         picks: [],
+        debug: {
+          select_matches_url: selectUrl,
+          select_matches_raw: selectMatchesRaw,
+        },
       });
     }
 
@@ -215,6 +236,9 @@ export default async function handler(req, res) {
       value_bets: top,
       all_candidates: valueCandidates,
       source_sport_key: sport_key || 'soccer',
+      debug: {
+        select_matches_url: selectUrl,
+      },
     });
   } catch (err) {
     console.error('value-bets error', err);
