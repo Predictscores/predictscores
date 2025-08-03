@@ -8,19 +8,14 @@ export default function Home() {
   const {
     cryptoData,
     footballData,
-    loading,
     refreshAll,
     nextCryptoUpdate,
     nextFootballUpdate,
   } = useContext(DataContext);
 
-  const formatTime = (timestamp) => {
-    if (!timestamp) return '';
-    const date = new Date(timestamp);
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  };
-
+  // Countdown helper
   const getCountdown = (targetTime) => {
+    if (!targetTime) return '--';
     const diff = targetTime - Date.now();
     if (diff <= 0) return 'Now';
     const mins = Math.floor(diff / 60000);
@@ -28,53 +23,63 @@ export default function Home() {
     return `${mins}m ${secs}s`;
   };
 
+  // Format vreme
+  const formatTime = (timestamp) => {
+    if (!timestamp) return '';
+    const date = new Date(timestamp);
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  };
+
   return (
-    <main className="min-h-screen p-4 bg-background text-foreground">
-      <div className="flex justify-between items-center mb-4">
-        <h1 className="text-2xl font-bold">AI Top fudbalske i Kripto Prognoze</h1>
-        <div className="flex items-center space-x-2">
-          <button
-            onClick={refreshAll}
-            className="px-3 py-1 border rounded text-sm hover:bg-accent"
-          >
-            Refresh all
-          </button>
-          <button
-            onClick={() => {
-              document.documentElement.classList.toggle('dark');
-            }}
-            className="px-3 py-1 border rounded text-sm hover:bg-accent"
-          >
-            Light mode
-          </button>
+    <main style={{ minHeight: "100vh", background: "#18191c", color: "#f3f4f6", padding: "0 0 40px 0" }}>
+      <div style={{ maxWidth: 830, margin: "0 auto" }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, marginTop: 32 }}>
+          <h1 style={{ fontSize: 38, fontWeight: 700, letterSpacing: "-1.5px" }}>AI Top fudbalske i Kripto Prognoze</h1>
+          <div>
+            <button className="btn" onClick={refreshAll}>Refresh all</button>
+            <button
+              className="btn"
+              onClick={() => document.documentElement.classList.toggle('dark')}
+            >
+              Dark mode
+            </button>
+          </div>
         </div>
-      </div>
 
-      <div className="text-sm mb-6 text-muted-foreground">
-        <div>Football last generated: {formatTime(footballData?.generated_at)}</div>
-        <div>Crypto next refresh in: {getCountdown(nextCryptoUpdate)}</div>
-      </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", fontSize: 17, marginBottom: 14 }}>
+          <span>Next update in: <b>{getCountdown(Math.min(nextCryptoUpdate || Infinity, nextFootballUpdate || Infinity))}</b></span>
+        </div>
 
-      <div className="mb-6">
-        <h2 className="text-xl font-semibold mb-2">Combined Top Picks</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {[0, 1, 2].map((i) => (
-            <div key={i} className="flex gap-4">
-              {footballData?.footballTop?.[i] && (
-                <SignalCard data={footballData.footballTop[i]} type="football" />
-              )}
-              {cryptoData?.cryptoTop?.[i] && (
-                <SignalCard data={cryptoData.cryptoTop[i]} type="crypto" />
-              )}
+        <div style={{ marginBottom: 22 }}>
+          <div style={{ display: "flex", gap: 14 }}>
+            <div>
+              <span style={{ fontWeight: 600 }}>Football last generated:</span>{" "}
+              {formatTime(footballData?.generated_at)}
             </div>
-          ))}
+            <div>
+              <span style={{ fontWeight: 600 }}>Crypto next refresh in:</span>{" "}
+              {getCountdown(nextCryptoUpdate)}
+            </div>
+          </div>
         </div>
-      </div>
 
-      <div className="text-sm text-center text-muted-foreground mt-10">
-        Confidence: <span className="text-green-500">🟢 High (≥85%)</span> ·{' '}
-        <span className="text-blue-500">🔵 Moderate (55–84%)</span> ·{' '}
-        <span className="text-yellow-500">🟡 Low (&lt;55%)</span>
+        <h2 style={{ fontSize: 27, fontWeight: 700, marginBottom: 20 }}>Combined Top Picks</h2>
+        {[0, 1, 2].map((i) => (
+          <div className="card-row" key={i}>
+            {footballData?.footballTop?.[i] && (
+              <SignalCard data={footballData.footballTop[i]} type="football" />
+            )}
+            {cryptoData?.cryptoTop?.[i] && (
+              <SignalCard data={cryptoData.cryptoTop[i]} type="crypto" />
+            )}
+          </div>
+        ))}
+
+        <div className="confidence-legend">
+          Confidence: <span className="high">🟢 High (≥85%)</span> ·{" "}
+          <span className="moderate">🔵 Moderate (55–84%)</span> ·{" "}
+          <span className="low">🟡 Low (&lt;55%)</span>
+        </div>
       </div>
     </main>
   );
