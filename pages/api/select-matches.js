@@ -4,9 +4,8 @@ import { getTopMatches } from '../../lib/matchSelector';
 
 export default async function handler(req, res) {
   try {
-    const dateParam = req.query.date; // format YYYY-MM-DD or undefined for today
+    const dateParam = req.query.date; // optional YYYY-MM-DD
     const result = await getTopMatches(dateParam);
-    // result has { picks: [...], debug: {...} }
     return res.status(200).json({
       picks: result.picks,
       debug: result.debug,
