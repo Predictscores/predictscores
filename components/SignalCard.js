@@ -20,17 +20,58 @@ const SignalCard = ({ data, type }) => {
     timeframe,
   } = data;
 
-  const getConfidenceColor = (val) => {
-    if (typeof val !== 'number') return 'bg-gray-500';
-    if (val >= 85) return 'bg-green-400';
-    if (val >= 55) return 'bg-blue-400';
-    return 'bg-yellow-300';
+  // Determine level
+  const getConfidenceLevel = (val) => {
+    if (typeof val !== 'number') return 'unknown';
+    if (val > 90) return 'explosive';
+    if (val >= 80) return 'high';
+    if (val >= 55) return 'moderate';
+    return 'low';
   };
 
+  const level = getConfidenceLevel(confidence);
+
+  // Color mapping
+  const barColor = {
+    low: 'bg-yellow-400',
+    moderate: 'bg-blue-400',
+    high: 'bg-green-400',
+    explosive: 'bg-gradient-to-b from-orange-400 to-red-500',
+    unknown: 'bg-gray-500',
+  }[level];
+
+  const badgeBg = {
+    low: 'bg-yellow-400',
+    moderate: 'bg-blue-400',
+    high: 'bg-green-400',
+    explosive: 'bg-gradient-to-r from-orange-400 to-red-500',
+    unknown: 'bg-gray-500',
+  }[level];
+
+  const levelLabel = {
+    low: 'Low',
+    moderate: 'Moderate',
+    high: 'High',
+    explosive: '🔥 Explosive',
+    unknown: 'Unknown',
+  }[level];
+
   return (
-    <div className="flex w-full rounded-2xl bg-[#1f2339] text-white shadow-md p-6 flex-col md:flex-row gap-6">
+    <div
+      className={`relative flex w-full rounded-2xl bg-[#1f2339] text-white shadow-md p-6 flex-col md:flex-row gap-6 signal-card-hover`}
+    >
+      {/* Vertical bar indicator */}
+      <div className="absolute left-0 top-0 bottom-0 w-1 rounded-l-2xl">
+        <div
+          className={`h-full ${barColor} ${
+            level === 'explosive' ? 'opacity-90' : ''
+          }`}
+          style={level === 'explosive' ? { boxShadow: '0 0 12px 2px rgba(255,99,0,0.8)' } : {}}
+        />
+      </div>
+
       {/* Info */}
-      <div className="flex-1 flex flex-col justify-between">
+      <div className="flex-1 flex flex-col justify-between pl-3">
         <div className="flex items-start gap-2 mb-2 flex-wrap">
           <div className="flex-1 min-w-0">
             <h3 className="text-lg font-bold truncate">
@@ -43,22 +84,31 @@ const SignalCard = ({ data, type }) => {
             </h3>
           </div>
           {typeof confidence === 'number' && (
-            <div className="flex items-center gap-2">
-              <div
-                className={`w-3 h-3 rounded-full ${getConfidenceColor(
-                  confidence
-                )}`}
-              />
-              <div className="text-xs font-semibold">
-                {confidence}%{' '}
-                <span className="text-gray-400">
-                  {confidence >= 85
-                    ? 'High'
-                    : confidence >= 55
-                    ? 'Moderate'
-                    : 'Low'}
+            <div
+              className={`flex items-center gap-2 text-xs font-semibold px-3 py-1 rounded-full ${
+                level === 'explosive' ? 'pulse-fire' : ''
+              }`}
+              style={
+                level === 'explosive'
+                  ? {
+                      background:
+                        'linear-gradient(135deg, rgba(251,146,60,1) 0%, rgba(239,68,68,1) 100%)',
+                      color: 'white',
+                    }
+                  : {}
+              }
+            >
+              {level === 'explosive' ? (
+                <span className="mr-1">🔥</span>
+              ) : null}
+              <span>
+                {confidence}%
+                <span className="ml-1 text-gray-300">
+                  {level === 'explosive'
+                    ? ''
+                    : levelLabel[level] && ` ${levelLabel[level]}`}
                 </span>
-              </div>
+              </span>
             </div>
           )}
         </div>
