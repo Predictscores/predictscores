@@ -1,8 +1,8 @@
 // FILE: pages/index.js
 
 import { useContext } from 'react';
-import { DataContext } from '@/contexts/DataContext';
-import SignalCard from '@/components/SignalCard';
+import { DataContext } from '../contexts/DataContext';
+import SignalCard from '../components/SignalCard';
 
 export default function Home() {
   const {
