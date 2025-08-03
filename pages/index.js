@@ -10,6 +10,21 @@ const TABS = {
   CRYPTO: 'crypto',
 };
 
+const formatTime = (timestamp) => {
+  if (!timestamp) return '—';
+  const d = new Date(timestamp);
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+};
+
+const getCountdown = (targetTime) => {
+  if (!targetTime) return '—';
+  const diff = targetTime - Date.now();
+  if (diff <= 0) return 'Now';
+  const m = Math.floor(diff / 60000);
+  const s = Math.floor((diff % 60000) / 1000);
+  return `${m}m ${s.toString().padStart(2, '0')}s`;
+};
+
 export default function Home() {
   const {
     cryptoData,
@@ -24,7 +39,6 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState(TABS.COMBINED);
   const [isDark, setIsDark] = useState(false);
 
-  // Dark mode persistence
   useEffect(() => {
     const stored = localStorage.getItem('dark-mode');
     if (stored === 'true') {
@@ -51,20 +65,6 @@ export default function Home() {
     localStorage.setItem('dark-mode', newDark ? 'true' : 'false');
   };
 
-  // Info bar helpers
-  const formatTime = (timestamp) => {
-    if (!timestamp) return '—';
-    const d = new Date(timestamp);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  };
-  const getCountdown = (targetTime) => {
-    if (!targetTime) return '—';
-    const diff = targetTime - Date.now();
-    if (diff <= 0) return 'Now';
-    const m = Math.floor(diff / 60000);
-    const s = Math.floor((diff % 60000) / 1000);
-    return `${m}m ${s.toString().padStart(2, '0')}s`;
-  };
   const nextUpdate = (() => {
     if (!nextCryptoUpdate && !nextFootballUpdate) return null;
     if (!nextCryptoUpdate) return nextFootballUpdate;
@@ -79,7 +79,7 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-[#18191c] text-white">
       {/* Header */}
-      <header className="w-full flex items-center justify-between py-4 px-6">
+      <header className="flex items-center justify-between py-4 px-0">
         <div className="text-xl font-bold">AI Top fudbalske i Kripto Prognoze</div>
         <div className="flex gap-3">
           <button
@@ -98,8 +98,8 @@ export default function Home() {
       </header>
 
       {/* Tabs */}
-      <div className="w-full flex justify-center mt-2">
-        <div className="flex gap-1 bg-[#1f2339] rounded-full overflow-hidden">
+      <div className="flex justify-center mt-3">
+        <div className="inline-flex bg-[#1f2339] rounded-full overflow-hidden">
           <button
             onClick={() => setActiveTab(TABS.COMBINED)}
             className={`px-5 py-2 text-sm font-semibold transition ${
@@ -134,7 +134,7 @@ export default function Home() {
       </div>
 
       {/* Info bar */}
-      <div className="flex flex-col md:flex-row justify-center gap-6 mt-4 px-6 text-sm text-gray-300 font-medium">
+      <div className="flex flex-col md:flex-row justify-center gap-6 mt-4 px-0 text-sm text-gray-300 font-medium">
         <div>
           <span className="text-white">Football last generated:</span>{' '}
           {formatTime(footballData?.generated_at)}
@@ -149,13 +149,13 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Content */}
-      <main className="mt-8 space-y-10 px-6">
+      {/* Main content */}
+      <main className="mt-8 space-y-10 px-0">
         {(loadingFootball || loadingCrypto) && (
           <div className="text-center text-gray-400">Učitavanje podataka...</div>
         )}
 
-        {/* Combined view */}
+        {/* Combined */}
         {activeTab === TABS.COMBINED && (
           <div className="space-y-10">
             {combinedPairs.map((i) => (
@@ -167,9 +167,7 @@ export default function Home() {
                 {/* Football 33% */}
                 <div className="md:w-1/3 flex">
                   {topFootball[i] ? (
-                    <div className="w-full">
-                      <SignalCard data={topFootball[i]} type="football" />
-                    </div>
+                    <SignalCard data={topFootball[i]} type="football" />
                   ) : (
                     <div className="w-full bg-[#1f2339] p-5 rounded-2xl text-gray-400">
                       Nema dostupne fudbalske prognoze
@@ -179,9 +177,7 @@ export default function Home() {
                 {/* Crypto 67% */}
                 <div className="md:w-2/3 flex">
                   {topCrypto[i] ? (
-                    <div className="w-full">
-                      <SignalCard data={topCrypto[i]} type="crypto" />
-                    </div>
+                    <SignalCard data={topCrypto[i]} type="crypto" />
                   ) : (
                     <div className="w-full bg-[#1f2339] p-5 rounded-2xl text-gray-400">
                       Nema dostupnog kripto signala
@@ -246,7 +242,7 @@ export default function Home() {
       </main>
 
       {/* Footer */}
-      <footer className="mt-16 mb-8 px-6 text-center text-sm text-gray-400">
+      <footer className="mt-16 mb-8 text-center text-sm text-gray-400">
         <div className="inline-flex gap-2 flex-wrap justify-center">
           <div>
             <span className="font-semibold">Confidence:</span>{' '}
