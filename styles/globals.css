@@ -1,66 +1,31 @@
-/* styles/globals.css */
+/* FILE: styles/globals.css */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
 body {
-  background: #18181b;
-  color: #f4f4f5;
-  margin: 0;
-  font-family: 'Inter', sans-serif;
-}
-[data-theme='light'] body {
-  background: #fff;
-  color: #232323;
-}
-.signal-card {
-  background: #232333;
-  border-radius: 18px;
-  padding: 2rem 1.5rem 1rem 1.5rem;
-  margin-bottom: 1.5rem;
-  box-shadow: 0 3px 16px #0002;
-  min-width: 220px;
-  max-width: 600px;
-}
-[data-theme='light'] .signal-card {
-  background: #f4f7fa;
-  color: #18181b;
-}
-.signal-card-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-.signal-title {
-  font-size: 1.18rem;
-  display: flex;
-  align-items: center;
-  gap: 0.5em;
-}
-.signal-timeframe {
-  font-size: 0.92em;
-  color: #aaa;
-  margin-left: 0.2em;
-}
-.confidence-badge {
-  border-radius: 9999px;
-  color: #fff;
-  padding: 0.35em 1em;
-  font-size: 1em;
-  font-weight: 600;
-  display: inline-block;
-  margin-top: 0.1em;
-}
-.signal-note {
-  color: #9ca3af;
-  font-size: 0.98em;
-  margin-top: 0.5em;
-}
-.signal-chart-wrapper {
-  margin-top: 0.8em;
-  border-radius: 12px;
-  overflow: hidden;
-  box-shadow: 0 1px 8px #0001;
+  @apply bg-[#18191c] text-white;
+  font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
 }
 
-@media (max-width: 700px) {
-  .signal-card { max-width: 98vw; }
-  .combined-grid { flex-direction: column; gap: 1rem; }
+.bg-card {
+  @apply bg-white dark:bg-[#23272f];
+}
+.text-card-foreground {
+  @apply text-gray-900 dark:text-gray-100;
+}
+.hover\:bg-accent:hover {
+  @apply bg-gray-100 dark:bg-gray-700;
+}
+.text-muted-foreground {
+  @apply text-gray-400 dark:text-gray-400;
+}
+.border-muted {
+  @apply border-gray-200 dark:border-gray-600;
+}
+
+/* Remove scroll bar for horizontal overflow */
+::-webkit-scrollbar {
+  display: none;
 }
