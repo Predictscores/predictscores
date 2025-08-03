@@ -23,15 +23,29 @@ export default function Home() {
   } = useContext(DataContext);
 
   const [activeTab, setActiveTab] = useState(TABS.COMBINED);
-  const [isDark, setIsDark] = useState(
-    () => localStorage.getItem('dark-mode') === 'true'
-  );
+  const [isDark, setIsDark] = useState(false); // don't access localStorage here
 
-  // Sync dark mode class
+  // initialize theme from localStorage / system preference
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const stored = localStorage.getItem('dark-mode');
+    if (stored === 'true') {
+      setIsDark(true);
+    } else if (stored === 'false') {
+      setIsDark(false);
+    } else {
+      const prefers = window.matchMedia('(prefers-color-scheme: dark)').matches;
+      if (prefers) setIsDark(true);
+    }
+  }, []);
+
+  // apply theme and persist
   useEffect(() => {
     if (isDark) document.documentElement.classList.add('dark');
     else document.documentElement.classList.remove('dark');
-    localStorage.setItem('dark-mode', isDark ? 'true' : 'false');
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('dark-mode', isDark ? 'true' : 'false');
+    }
   }, [isDark]);
 
   // Helpers
@@ -48,12 +62,6 @@ export default function Home() {
     const s = Math.floor((diff % 60000) / 1000);
     return `${m}m ${s.toString().padStart(2, '0')}s`;
   };
-  const nextUpdate = (() => {
-    if (!nextCryptoUpdate && !nextFootballUpdate) return null;
-    if (!nextCryptoUpdate) return nextFootballUpdate;
-    if (!nextFootballUpdate) return nextCryptoUpdate;
-    return Math.min(nextCryptoUpdate, nextFootballUpdate);
-  })();
 
   const topFootball = footballData?.footballTop || [];
   const topCrypto = cryptoData?.cryptoTop || [];
@@ -124,7 +132,6 @@ export default function Home() {
           <span className="text-white">Crypto next refresh:</span>{' '}
           {getCountdown(nextCryptoUpdate)}
         </div>
-        {/* removed unified next update per request */}
       </div>
 
       {/* Main content */}
