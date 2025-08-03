@@ -27,16 +27,22 @@ const SignalCard = ({ data, type }) => {
   else if (confidence >= 55) badgeClass += 'badge-moderate';
   else badgeClass += 'badge-low';
 
-  // Chart preko QuickChart (png)
-  const chartUrl = price_history_24h
+  // --- FIX: QuickChart — prikaz samo do 100 tačaka, downsampling ---
+  let chartData = price_history_24h || [];
+  if (chartData.length > 100) {
+    const step = Math.ceil(chartData.length / 100);
+    chartData = chartData.filter((_, idx) => idx % step === 0);
+  }
+
+  const chartUrl = chartData.length
     ? `https://quickchart.io/chart?width=340&height=70&c=${encodeURIComponent(JSON.stringify({
         type: 'line',
         data: {
-          labels: price_history_24h.map((_, i) => i),
+          labels: chartData.map((_, i) => i),
           datasets: [
             {
               label: symbol,
-              data: price_history_24h.slice(-288),
+              data: chartData,
               borderColor: '#2563eb',
               fill: false,
             },
