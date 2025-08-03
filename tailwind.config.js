@@ -1,4 +1,4 @@
-// tailwind.config.js
+// FILE: tailwind.config.js
 module.exports = {
   darkMode: 'class',
   content: [
