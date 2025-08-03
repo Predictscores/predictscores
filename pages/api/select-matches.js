@@ -2,10 +2,15 @@
 
 // Note: assumes Node 18+ where global fetch exists.
 const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
+const FOOTBALL_DATA_KEY = process.env.FOOTBALL_DATA_KEY;
 if (!API_FOOTBALL_KEY) {
   console.warn('Missing API_FOOTBALL_KEY in env');
 }
+if (!FOOTBALL_DATA_KEY) {
+  console.warn('Missing FOOTBALL_DATA_KEY in env');
+}
 
+// Simple in-memory caches (cold start reset)
 const fixturesCache = {};
 const leagueStandingsCache = {};
 const teamFormCache = {};
@@ -42,10 +47,27 @@ const getTodayDateStr = () => {
   return `${year}-${month}-${day}`;
 };
 
-const getFixturesForDate = async (dateStr) => {
+const toLocalTimeString = (utcDateStr) => {
+  try {
+    const d = new Date(utcDateStr);
+    return d.toLocaleString('en-GB', {
+      timeZone: 'Europe/Belgrade',
+      hour: '2-digit',
+      minute: '2-digit',
+      day: '2-digit',
+      month: '2-digit',
+    });
+  } catch {
+    return utcDateStr;
+  }
+};
+
+/* === Primary API-Football helpers === */
+const getFixturesFromApiFootball = async (dateStr) => {
   if (
     fixturesCache[dateStr] &&
-    Date.now() - fixturesCache[dateStr].timestamp < CACHE_TTL_MS
+    Date.now() - fixturesCache[dateStr].timestamp < CACHE_TTL_MS &&
+    fixturesCache[dateStr].source === 'api-football'
   ) {
     return fixturesCache[dateStr].data;
   }
@@ -61,8 +83,10 @@ const getFixturesForDate = async (dateStr) => {
   fixturesCache[dateStr] = {
     timestamp: Date.now(),
     data: fixtures,
+    source: 'api-football',
+    raw: payload,
   };
-  return { fixtures, raw: payload };
+  return fixtures;
 };
 
 const getLeagueStandings = async (leagueId, season) => {
@@ -165,21 +189,6 @@ const getTeamForm = async (teamId) => {
   return form;
 };
 
-const toLocalTimeString = (utcDateStr) => {
-  try {
-    const d = new Date(utcDateStr);
-    return d.toLocaleString('en-GB', {
-      timeZone: 'Europe/Belgrade',
-      hour: '2-digit',
-      minute: '2-digit',
-      day: '2-digit',
-      month: '2-digit',
-    });
-  } catch {
-    return utcDateStr;
-  }
-};
-
 const compute1X2Model = async (fixture) => {
   const FORM_WEIGHT = 0.5;
   const TABLE_WEIGHT = 0.3;
@@ -247,11 +256,124 @@ const compute1X2Model = async (fixture) => {
   };
 };
 
+/* === Fallback: Football-Data.org simple heuristic model === */
+const getFixturesFromFootballData = async (dateStr) => {
+  // football-data.org v4 matches endpoint
+  const cacheKey = `fd-${dateStr}`;
+  if (
+    fixturesCache[cacheKey] &&
+    Date.now() - fixturesCache[cacheKey].timestamp < CACHE_TTL_MS
+  ) {
+    return fixturesCache[cacheKey].data;
+  }
+
+  const url = `https://api.football-data.org/v4/matches?dateFrom=${dateStr}&dateTo=${dateStr}`;
+  const payload = await fetchWithRetry(url, {
+    headers: {
+      'X-Auth-Token': FOOTBALL_DATA_KEY,
+    },
+  });
+
+  const matches = payload.matches || [];
+  // Normalize to similar shape as API-Football minimal needed fields
+  const normalized = matches.map((m) => {
+    return {
+      fixture: {
+        id: m.id,
+        date: m.utcDate,
+        venue: { name: m.venue || null },
+      },
+      league: {
+        id: m.competition?.id,
+        name: m.competition?.name,
+        country: m.competition?.area?.name,
+        season: m.season?.startDate
+          ? new Date(m.season.startDate).getFullYear()
+          : new Date().getFullYear(),
+      },
+      teams: {
+        home: { id: m.homeTeam.id, name: m.homeTeam.name },
+        away: { id: m.awayTeam.id, name: m.awayTeam.name },
+      },
+    };
+  });
+
+  fixturesCache[cacheKey] = {
+    timestamp: Date.now(),
+    data: normalized,
+    source: 'football-data',
+    raw: payload,
+  };
+  return normalized;
+};
+
+const computeFallback1X2Model = async (fixture) => {
+  // Simple heuristic: home advantage + base probabilities
+  const HOME_ADVANTAGE = 0.08;
+  const BASE_DRAW = 0.25;
+  // naive: start with neutral 0.5 home, 0.25 draw, 0.25 away then shift
+  let probHome = 0.5 + HOME_ADVANTAGE; // 0.58
+  let probAway = 0.25 - HOME_ADVANTAGE / 2; // 0.21
+  let probDraw = BASE_DRAW; // 0.25
+  // normalize to sum 1
+  const total = probHome + probDraw + probAway;
+  probHome /= total;
+  probDraw /= total;
+  probAway /= total;
+
+  const probs = [
+    { key: 'home', val: probHome },
+    { key: 'draw', val: probDraw },
+    { key: 'away', val: probAway },
+  ].sort((a, b) => b.val - a.val);
+  const top = probs[0];
+  const second = probs[1];
+  const confidence = top.val - second.val;
+
+  return {
+    model_probs: {
+      home: probHome,
+      draw: probDraw,
+      away: probAway,
+    },
+    predicted: top.key,
+    confidence,
+    topProbability: top.val,
+  };
+};
+
 export default async function handler(req, res) {
   try {
     const dateParam = req.query.date;
     const today = dateParam || getTodayDateStr();
-    const { fixtures, raw } = await getFixturesForDate(today);
+
+    // Try API-Football first
+    let fixtures = [];
+    let sourceUsed = '';
+    let rawResponse = null;
+
+    try {
+      const fromApiFootball = await getFixturesFromApiFootball(today);
+      rawResponse = fixturesCache[today]?.raw || null;
+
+      // detect suspended or errors
+      if (
+        fixturesCache[today]?.raw?.errors ||
+        (Array.isArray(fromApiFootball) && fromApiFootball.length === 0 &&
+          fixturesCache[today]?.raw?.errors)
+      ) {
+        throw new Error('API-Football failed or suspended');
+      }
+
+      fixtures = fromApiFootball;
+      sourceUsed = 'api-football';
+    } catch (e) {
+      // fallback to football-data.org
+      const fromFD = await getFixturesFromFootballData(today);
+      rawResponse = fixturesCache[`fd-${today}`]?.raw || null;
+      fixtures = fromFD;
+      sourceUsed = 'football-data';
+    }
 
     if (!fixtures || fixtures.length === 0) {
       return res.status(200).json({
@@ -259,7 +381,8 @@ export default async function handler(req, res) {
         message: 'No fixtures for date',
         debug: {
           requested_date: today,
-          rawResponse: raw,
+          sourceUsed,
+          rawResponse,
         },
       });
     }
@@ -267,7 +390,12 @@ export default async function handler(req, res) {
     const enriched = [];
     for (const f of fixtures) {
       try {
-        const model = await compute1X2Model(f);
+        let model;
+        if (sourceUsed === 'api-football') {
+          model = await compute1X2Model(f);
+        } else {
+          model = await computeFallback1X2Model(f);
+        }
         const rankScore = model.topProbability * (1 + model.confidence);
         enriched.push({
           fixture_id: f.fixture.id,
@@ -280,14 +408,14 @@ export default async function handler(req, res) {
             home: f.teams.home,
             away: f.teams.away,
           },
-          venue: f.fixture.venue,
-          datetime_utc: f.fixture.date,
-          datetime_local: toLocalTimeString(f.fixture.date),
+          venue: f.fixture?.venue,
+          datetime_utc: f.fixture?.date,
+          datetime_local: toLocalTimeString(f.fixture?.date),
           model,
           rankScore,
         });
       } catch (e) {
-        console.error('Model compute error for fixture', f.fixture.id, e);
+        console.error('Model compute error for fixture', f.fixture?.id, e);
       }
     }
 
@@ -308,6 +436,7 @@ export default async function handler(req, res) {
       })),
       debug: {
         requested_date: today,
+        sourceUsed,
         total_fetched: fixtures.length,
       },
     });
