@@ -124,6 +124,43 @@ function deriveSignal(priceSeries, timeframeMin) {
   };
 }
 
+function computeSMA(prices, window) {
+  if (!prices || prices.length < window) return null;
+  const slice = prices.slice(prices.length - window);
+  const sum = slice.reduce((acc, p) => acc + p, 0);
+  return sum / window;
+}
+
+function computeCrossoverSignal(priceSeries) {
+  if (!priceSeries || priceSeries.length === 0) return null;
+  const now = Date.now();
+  // extract prices within last 30 minutes to ensure we have enough for 20 and 5
+  const longWindowMin = 20;
+  const shortWindowMin = 5;
+  const threshold = now - longWindowMin * 60 * 1000;
+  const recentPoints = priceSeries
+    .filter(([ts]) => ts >= threshold)
+    .map(([, price]) => price);
+  if (recentPoints.length < shortWindowMin) return null;
+
+  const shortSMA = computeSMA(recentPoints, Math.min(shortWindowMin, recentPoints.length));
+  const longSMA = computeSMA(recentPoints, Math.min(longWindowMin, recentPoints.length));
+  if (shortSMA === null || longSMA === null) return null;
+
+  const direction = shortSMA > longSMA ? 'LONG' : 'SHORT';
+  const rel = longSMA > 0 ? Math.abs(shortSMA - longSMA) / longSMA : 0;
+  let confidence = Math.min(rel * 2, 1); // amplify
+  confidence = Math.round(confidence * 100);
+
+  return {
+    direction,
+    confidence,
+    short_ma: Number(shortSMA.toFixed(4)),
+    long_ma: Number(longSMA.toFixed(4)),
+    edge: Number(rel.toFixed(4)),
+  };
+}
+
 function mergeBestPerCoin(signalsByTf) {
   const best = {};
   Object.entries(signalsByTf).forEach(([tf, arr]) => {
@@ -154,6 +191,13 @@ const STUB = [
     current_price: 50000,
     price_history_24h: Array(1440).fill(50000).map((v, i) => v + Math.sin(i / 50)),
     timeframe: '4h',
+    crossover: {
+      direction: 'LONG',
+      confidence: 80,
+      short_ma: 50010,
+      long_ma: 49900,
+      edge: 0.002,
+    },
   },
   {
     symbol: 'ETH',
@@ -169,6 +213,13 @@ const STUB = [
     current_price: 3200,
     price_history_24h: Array(1440).fill(3200).map((v, i) => v + Math.cos(i / 40)),
     timeframe: '4h',
+    crossover: {
+      direction: 'SHORT',
+      confidence: 75,
+      short_ma: 3190,
+      long_ma: 3210,
+      edge: 0.003,
+    },
   },
 ];
 
@@ -190,16 +241,26 @@ export default async function handler(req, res) {
           if (!chart || !chart.prices || chart.prices.length < 100) return;
 
           Object.entries(timeframeDefs).forEach(([label, mins]) => {
-            const sig = deriveSignal(chart.prices, mins);
-            if (!sig) return;
+            const trendSig = deriveSignal(chart.prices, mins);
+            const crossoverSig = computeCrossoverSignal(chart.prices);
+            if (!trendSig) return;
             const item = {
               symbol: coin.symbol.toUpperCase(),
               name: coin.name,
-              current_price: Number(sig.latest_price?.toFixed ? sig.latest_price.toFixed(6) : sig.latest_price),
-              ...sig,
+              current_price: Number(trendSig.latest_price?.toFixed ? trendSig.latest_price.toFixed(6) : trendSig.latest_price),
+              direction: trendSig.direction,
+              confidence: trendSig.confidence,
+              priceChangePercent: trendSig.priceChangePercent,
+              rsi: trendSig.rsi,
+              volatility: trendSig.volatility,
+              expected_range: trendSig.expected_range,
+              stop_loss: trendSig.stop_loss,
+              take_profit: trendSig.take_profit,
               price_history_24h: chart.prices
                 .slice(-1440)
                 .map(([, p]) => Number(p.toFixed ? p.toFixed(6) : p)),
+              timeframe: label,
+              crossover: crossoverSig,
             };
             byTimeframe[label].push(item);
           });
@@ -226,7 +287,7 @@ export default async function handler(req, res) {
           combined: STUB,
           cryptoTop: STUB,
           generated_at: new Date().toISOString(),
-          fallback: true
+          fallback: true,
         },
       };
       return res.status(200).json(cache.data);
@@ -241,7 +302,6 @@ export default async function handler(req, res) {
 
     cache = { timestamp: now, data: payload };
     return res.status(200).json(payload);
-
   } catch (err) {
     console.error('Crypto signal error:', err);
     const fallback = {
