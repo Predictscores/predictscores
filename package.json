@@ -14,6 +14,6 @@
     "next": "15.4.5",
     "react": "18.2.0",
     "react-dom": "18.2.0",
-    "quickchart-js": "^4.2.2"
+    "quickchart-js": "^3.4.0"
   }
 }
