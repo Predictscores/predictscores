@@ -1,5 +1,7 @@
 // FILE: pages/api/value-bets.js
 
+import { getTopMatches } from '../../lib/matchSelector';
+
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
 if (!ODDS_API_KEY) {
   console.warn('Missing ODDS_API_KEY in env');
@@ -61,20 +63,6 @@ const consensusNoVig = (books) => {
   };
 };
 
-const buildSelectMatchesUrl = (req, dateParam) => {
-  let origin = '';
-  if (process.env.VERCEL_URL) {
-    origin = `https://${process.env.VERCEL_URL}`;
-  } else if (req.headers['x-forwarded-proto'] && req.headers.host) {
-    origin = `${req.headers['x-forwarded-proto']}://${req.headers.host}`;
-  } else if (req.headers.host) {
-    origin = `https://${req.headers.host}`;
-  } else {
-    origin = 'http://localhost:3000';
-  }
-  return `${origin}/api/select-matches${dateParam ? `?date=${dateParam}` : ''}`;
-};
-
 const fetchOddsForMatch = async (sportKey, homeName, awayName) => {
   const base = `https://api.the-odds-api.com/v4/sports/${encodeURIComponent(
     sportKey
@@ -91,8 +79,8 @@ const fetchOddsForMatch = async (sportKey, homeName, awayName) => {
   const data = await fetchWithRetry(url);
   if (!Array.isArray(data)) return null;
 
-  const normalizedHome = homeName.toLowerCase();
-  const normalizedAway = awayName.toLowerCase();
+  const normalizedHome = (homeName || '').toLowerCase();
+  const normalizedAway = (awayName || '').toLowerCase();
 
   const matchEvent = data.find((ev) => {
     const ht = (ev.home_team || '').toLowerCase();
@@ -133,9 +121,8 @@ const fetchOddsForMatch = async (sportKey, homeName, awayName) => {
 
   if (books.length === 0) return null;
 
-  const consensus = consensusNoVig(books);
   return {
-    consensus,
+    consensus: consensusNoVig(books),
     raw_event: matchEvent,
   };
 };
@@ -143,45 +130,15 @@ const fetchOddsForMatch = async (sportKey, homeName, awayName) => {
 export default async function handler(req, res) {
   try {
     const { sport_key } = req.query;
-    const dateParam = req.query.date || '';
-    const body = req.method === 'POST' ? req.body : {};
+    const dateParam = req.query.date || undefined;
 
-    let picks = null;
-    let selectUrl = buildSelectMatchesUrl(req, dateParam);
-    let selectMatchesRaw = null;
-
-    if (body.picks && Array.isArray(body.picks) && body.picks.length > 0) {
-      picks = body.picks;
-    } else {
-      // fetch select-matches with resilience to non-JSON
-      let selRes;
-      try {
-        selRes = await fetch(selectUrl);
-        const contentType = selRes.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-          const selJson = await selRes.json();
-          picks = selJson.picks || [];
-          selectMatchesRaw = selJson;
-        } else {
-          // got HTML or something unexpected
-          const text = await selRes.text();
-          selectMatchesRaw = { unexpected: text };
-          picks = [];
-        }
-      } catch (e) {
-        selectMatchesRaw = { fetch_error: e.message };
-        picks = [];
-      }
-    }
+    const selectResult = await getTopMatches(dateParam);
+    const picks = selectResult.picks || [];
 
     if (!picks || picks.length === 0) {
       return res.status(400).json({
-        error: 'No picks provided or retrieved from select-matches',
-        picks: [],
-        debug: {
-          select_matches_url: selectUrl,
-          select_matches_raw: selectMatchesRaw,
-        },
+        error: 'No picks available from model',
+        debug: selectResult.debug,
       });
     }
 
@@ -195,14 +152,8 @@ export default async function handler(req, res) {
       const homeName = pick.teams.home.name || '';
       const awayName = pick.teams.away.name || '';
       const sportKey = sport_key || 'soccer';
-      const oddsData = await fetchOddsForMatch(
-        sportKey,
-        homeName,
-        awayName
-      );
-      if (!oddsData || !oddsData.consensus) {
-        continue;
-      }
+      const oddsData = await fetchOddsForMatch(sportKey, homeName, awayName);
+      if (!oddsData || !oddsData.consensus) continue;
       const marketProb = oddsData.consensus;
       const modelProbs = pick.model_probs || {};
 
@@ -236,9 +187,7 @@ export default async function handler(req, res) {
       value_bets: top,
       all_candidates: valueCandidates,
       source_sport_key: sport_key || 'soccer',
-      debug: {
-        select_matches_url: selectUrl,
-      },
+      debug: selectResult.debug,
     });
   } catch (err) {
     console.error('value-bets error', err);
