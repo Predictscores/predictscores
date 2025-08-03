@@ -1,158 +1,81 @@
-// pages/index.js
-import React, { useState, useMemo } from 'react';
-import SignalCard from '../components/SignalCard';
-import { useData } from '../contexts/DataContext';
+// FILE: pages/index.js
+
+import { useContext } from 'react';
+import { DataContext } from '@/contexts/DataContext';
+import SignalCard from '@/components/SignalCard';
 
 export default function Home() {
-  const [activeTab, setActiveTab] = useState('combined'); // combined / football / crypto
   const {
     cryptoData,
     footballData,
-    loadingCrypto,
-    loadingFootball,
-    errorCrypto,
-    errorFootball,
-  } = useData();
+    loading,
+    refreshAll,
+    nextCryptoUpdate,
+    nextFootballUpdate,
+  } = useContext(DataContext);
 
-  const topCrypto3 = useMemo(() => {
-    if (!cryptoData?.cryptoTop) return [];
-    return cryptoData.cryptoTop.slice(0, 3);
-  }, [cryptoData]);
+  const formatTime = (timestamp) => {
+    if (!timestamp) return '';
+    const date = new Date(timestamp);
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  };
 
-  const topCryptoAll = useMemo(() => {
-    return cryptoData?.cryptoTop || [];
-  }, [cryptoData]);
-
-  const topFootball3 = useMemo(() => {
-    if (!footballData?.footballTop) return [];
-    return footballData.footballTop.slice(0, 3);
-  }, [footballData]);
+  const getCountdown = (targetTime) => {
+    const diff = targetTime - Date.now();
+    if (diff <= 0) return 'Now';
+    const mins = Math.floor(diff / 60000);
+    const secs = Math.floor((diff % 60000) / 1000);
+    return `${mins}m ${secs}s`;
+  };
 
   return (
-    <div>
-      {/* Title */}
-      <div style={{ marginBottom: 16 }}>
-        <h1 style={{ margin: 0 }}>AI Top fudbalske i Kripto Prognoze</h1>
-      </div>
-
-      {/* Tabs */}
-      <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
-        {['combined', 'football', 'crypto'].map((t) => (
+    <main className="min-h-screen p-4 bg-background text-foreground">
+      <div className="flex justify-between items-center mb-4">
+        <h1 className="text-2xl font-bold">AI Top fudbalske i Kripto Prognoze</h1>
+        <div className="flex items-center space-x-2">
           <button
-            key={t}
-            onClick={() => setActiveTab(t)}
-            className={`tab-btn ${activeTab === t ? 'active' : ''}`}
-            style={{
-              padding: '8px 16px',
-              cursor: 'pointer',
-              fontWeight: 600,
-              background: 'transparent',
-              border: 'none',
-            }}
+            onClick={refreshAll}
+            className="px-3 py-1 border rounded text-sm hover:bg-accent"
           >
-            {t === 'combined' ? 'Combined' : t === 'football' ? 'Football' : 'Crypto'}
+            Refresh all
           </button>
-        ))}
+          <button
+            onClick={() => {
+              document.documentElement.classList.toggle('dark');
+            }}
+            className="px-3 py-1 border rounded text-sm hover:bg-accent"
+          >
+            Light mode
+          </button>
+        </div>
       </div>
 
-      {/* Combined */}
-      {activeTab === 'combined' && (
-        <div>
-          {/* Pair rows: 3 pairs football + crypto */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {[0, 1, 2].map((i) => (
-              <div
-                key={i}
-                style={{
-                  display: 'flex',
-                  gap: 16,
-                  flexWrap: 'wrap',
-                  alignItems: 'flex-start',
-                }}
-              >
-                {/* Football side (30%) */}
-                <div style={{ flex: '0 0 30%', minWidth: 260 }}>
-                  {i === 0 && <h2 style={{ marginTop: 0, fontSize: '1.1rem' }}>Football top 3</h2>}
-                  {loadingFootball && i === 0 && <div className="card">Učitavanje fudbalskih predikcija...</div>}
-                  {!loadingFootball && errorFootball && i === 0 && (
-                    <div className="card" style={{ color: 'crimson' }}>
-                      Greška: {errorFootball}
-                    </div>
-                  )}
-                  {!loadingFootball && (!footballData?.footballTop || footballData.footballTop.length === 0) && (
-                    <div className="card small">
-                      Nema fudbalskih predikcija. Pošalji izvore + konsenzus pravila da ubacim realne top 3.
-                    </div>
-                  )}
-                  {!loadingFootball && footballData?.footballTop && footballData.footballTop[i] && (
-                    <SignalCard item={footballData.footballTop[i]} isFootball />
-                  )}
-                </div>
+      <div className="text-sm mb-6 text-muted-foreground">
+        <div>Football last generated: {formatTime(footballData?.generated_at)}</div>
+        <div>Crypto next refresh in: {getCountdown(nextCryptoUpdate)}</div>
+      </div>
 
-                {/* Crypto side (70%) */}
-                <div style={{ flex: '1 1 70%', minWidth: 320 }}>
-                  {i === 0 && <h2 style={{ marginTop: 0, fontSize: '1.1rem' }}>Crypto top 3</h2>}
-                  {loadingCrypto && i === 0 && <div className="card">Učitavanje kripto signala...</div>}
-                  {!loadingCrypto && errorCrypto && i === 0 && (
-                    <div className="card" style={{ color: 'crimson' }}>
-                      Greška: {errorCrypto}
-                    </div>
-                  )}
-                  {!loadingCrypto && cryptoData?.cryptoTop && cryptoData.cryptoTop[i] && (
-                    <SignalCard item={cryptoData.cryptoTop[i]} />
-                  )}
-                  {!loadingCrypto && (!cryptoData?.cryptoTop || !cryptoData.cryptoTop[i]) && i === 0 && (
-                    <div className="card small">Nema jakih kripto signala.</div>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
+      <div className="mb-6">
+        <h2 className="text-xl font-semibold mb-2">Combined Top Picks</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="flex gap-4">
+              {footballData?.footballTop?.[i] && (
+                <SignalCard data={footballData.footballTop[i]} type="football" />
+              )}
+              {cryptoData?.cryptoTop?.[i] && (
+                <SignalCard data={cryptoData.cryptoTop[i]} type="crypto" />
+              )}
+            </div>
+          ))}
         </div>
-      )}
+      </div>
 
-      {/* Football only */}
-      {activeTab === 'football' && (
-        <div>
-          <h2 style={{ marginTop: 0, fontSize: '1.1rem' }}>Football top 3</h2>
-          {loadingFootball && <div className="card">Učitavanje fudbalskih predikcija...</div>}
-          {!loadingFootball && errorFootball && (
-            <div className="card" style={{ color: 'crimson' }}>
-              Greška: {errorFootball}
-            </div>
-          )}
-          {!loadingFootball && (!footballData?.footballTop || footballData.footballTop.length === 0) && (
-            <div className="card small">
-              Nema fudbalskih predikcija. Pošalji izvore + konsenzus pravila da ubacim realne top 3.
-            </div>
-          )}
-          {!loadingFootball &&
-            footballData?.footballTop &&
-            footballData.footballTop.map((f, i) => (
-              <SignalCard key={`football-only-${i}`} item={f} isFootball />
-            ))}
-        </div>
-      )}
-
-      {/* Crypto only */}
-      {activeTab === 'crypto' && (
-        <div>
-          <h2 style={{ marginTop: 0, fontSize: '1.1rem' }}>Crypto signals</h2>
-          {loadingCrypto && <div className="card">Učitavanje kripto signala...</div>}
-          {!loadingCrypto && errorCrypto && (
-            <div className="card" style={{ color: 'crimson' }}>
-              Greška: {errorCrypto}
-            </div>
-          )}
-          {!loadingCrypto && (!cryptoData?.cryptoTop || cryptoData.cryptoTop.length === 0) && (
-            <div className="card small">Nema trenutno jakih kripto signala.</div>
-          )}
-          {!loadingCrypto &&
-            topCryptoAll.map((it, i) => (
-              <SignalCard key={`crypto-only-${i}-${it.symbol}`} item={it} />
-            ))}
-        </div>
-      )}
-    </div>
+      <div className="text-sm text-center text-muted-foreground mt-10">
+        Confidence: <span className="text-green-500">🟢 High (≥85%)</span> ·{' '}
+        <span className="text-blue-500">🔵 Moderate (55–84%)</span> ·{' '}
+        <span className="text-yellow-500">🟡 Low (&lt;55%)</span>
+      </div>
+    </main>
   );
 }
