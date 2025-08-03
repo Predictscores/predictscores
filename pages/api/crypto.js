@@ -64,9 +64,8 @@ async function fetchMarketChart(id, days = 1) {
 function deriveSignal(priceSeries, timeframeMin) {
   if (!priceSeries || priceSeries.length === 0) return null;
   const now = Date.now();
-  // Extract price array
   const prices = priceSeries.map(([, p]) => p);
-  // Get price timeframeMin minutes ago
+
   const targetAgo = now - timeframeMin * 60 * 1000;
   let priceAgo = priceSeries[0][1];
   let minDiff = Math.abs(priceSeries[0][0] - targetAgo);
@@ -77,13 +76,11 @@ function deriveSignal(priceSeries, timeframeMin) {
       priceAgo = price;
     }
   }
-  const latestPrice = priceSeries[priceSeries.length - 1][1];
-  const priceChange = pctChange(priceAgo, latestPrice); // in %
 
-  // Momentum score (scaled)
+  const latestPrice = priceSeries[priceSeries.length - 1][1];
+  const priceChange = pctChange(priceAgo, latestPrice);
   const momentumScore = clamp((Math.abs(priceChange) / 10) * 50, 0, 50);
 
-  // RSI over last N = min(prices.length, timeframeMin * 2) to give some window
   const windowSize = Math.min(prices.length, Math.max(5, timeframeMin));
   const recent = prices.slice(-windowSize - 1);
   const rsi = computeRSI(recent, Math.min(14, windowSize));
@@ -95,7 +92,6 @@ function deriveSignal(priceSeries, timeframeMin) {
   else if (priceChange < 0 && rsi < 50) direction = 'SHORT';
   else direction = priceChange >= 0 ? 'LONG' : 'SHORT';
 
-  // Volatility: std dev of returns over last few points
   const returns = [];
   for (let i = 1; i < prices.length; i++) {
     returns.push(pctChange(prices[i - 1], prices[i]));
@@ -183,20 +179,9 @@ export default async function handler(req, res) {
       return res.status(200).json(cache.data);
     }
 
-    // Fetch coins
-    const topCoins = await fetchTopCoins(); // CoinGecko
-    const timeframeDefs = {
-      '15m': 15,
-      '30m': 30,
-      '1h': 60,
-      '4h': 240,
-    };
-    const byTimeframe = {
-      '15m': [],
-      '30m': [],
-      '1h': [],
-      '4h': [],
-    };
+    const topCoins = await fetchTopCoins();
+    const timeframeDefs = { '15m': 15, '30m': 30, '1h': 60, '4h': 240 };
+    const byTimeframe = { '15m': [], '30m': [], '1h': [], '4h': [] };
 
     await Promise.all(
       topCoins.map(async (coin) => {
@@ -204,7 +189,6 @@ export default async function handler(req, res) {
           const chart = await fetchMarketChart(coin.id);
           if (!chart || !chart.prices || chart.prices.length < 100) return;
 
-          // For each timeframe derive signal
           Object.entries(timeframeDefs).forEach(([label, mins]) => {
             const sig = deriveSignal(chart.prices, mins);
             if (!sig) return;
@@ -225,17 +209,28 @@ export default async function handler(req, res) {
       })
     );
 
-    // sort & trim
     Object.keys(byTimeframe).forEach((tf) => {
       byTimeframe[tf].sort((a, b) => b.confidence - a.confidence);
       byTimeframe[tf] = byTimeframe[tf].slice(0, 10);
     });
 
-    // combined top (best per coin)
     const combined = mergeBestPerCoin(byTimeframe);
-
-    // For backward compatibility with UI expecting cryptoTop:
     const cryptoTop = combined;
+
+    if (cryptoTop.length === 0) {
+      console.warn("Fallback: No crypto signals generated, using STUB");
+      cache = {
+        timestamp: now,
+        data: {
+          byTimeframe: { '15m': [], '30m': [], '1h': [], '4h': [] },
+          combined: STUB,
+          cryptoTop: STUB,
+          generated_at: new Date().toISOString(),
+          fallback: true
+        },
+      };
+      return res.status(200).json(cache.data);
+    }
 
     const payload = {
       byTimeframe,
@@ -244,15 +239,11 @@ export default async function handler(req, res) {
       generated_at: new Date().toISOString(),
     };
 
-    cache = {
-      timestamp: now,
-      data: payload,
-    };
-
+    cache = { timestamp: now, data: payload };
     return res.status(200).json(payload);
+
   } catch (err) {
     console.error('Crypto signal error:', err);
-    // fallback stub
     const fallback = {
       byTimeframe: { '15m': [], '30m': [], '1h': [], '4h': [] },
       combined: STUB,
