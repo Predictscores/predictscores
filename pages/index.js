@@ -24,7 +24,7 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState(TABS.COMBINED);
   const [isDark, setIsDark] = useState(false);
 
-  // Dark mode persistence & initial
+  // Dark mode persistence
   useEffect(() => {
     const stored = localStorage.getItem('dark-mode');
     if (stored === 'true') {
@@ -34,7 +34,6 @@ export default function Home() {
       document.documentElement.classList.remove('dark');
       setIsDark(false);
     } else {
-      // detect
       const prefers = window.matchMedia('(prefers-color-scheme: dark)').matches;
       if (prefers) {
         document.documentElement.classList.add('dark');
@@ -52,7 +51,7 @@ export default function Home() {
     localStorage.setItem('dark-mode', newDark ? 'true' : 'false');
   };
 
-  // Helpers for info bar
+  // Info bar helpers
   const formatTime = (timestamp) => {
     if (!timestamp) return '—';
     const d = new Date(timestamp);
@@ -73,18 +72,15 @@ export default function Home() {
     return Math.min(nextCryptoUpdate, nextFootballUpdate);
   })();
 
-  // Data slices
   const topFootball = footballData?.footballTop || [];
   const topCrypto = cryptoData?.cryptoTop || [];
-
-  // Combined top 3 pairs
-  const pairs = [0, 1, 2];
+  const combinedPairs = [0, 1, 2];
 
   return (
     <div className="min-h-screen bg-[#18191c] text-white">
       {/* Header */}
       <header className="w-full flex items-center justify-between py-4 px-6">
-        <div className="text-lg font-bold">AI Top fudbalske i Kripto Prognoze</div>
+        <div className="text-xl font-bold">AI Top fudbalske i Kripto Prognoze</div>
         <div className="flex gap-3">
           <button
             onClick={refreshAll}
@@ -138,7 +134,7 @@ export default function Home() {
       </div>
 
       {/* Info bar */}
-      <div className="max-w-full flex flex-col md:flex-row justify-center gap-6 mt-4 px-6 text-sm text-gray-300 font-medium">
+      <div className="flex flex-col md:flex-row justify-center gap-6 mt-4 px-6 text-sm text-gray-300 font-medium">
         <div>
           <span className="text-white">Football last generated:</span>{' '}
           {formatTime(footballData?.generated_at)}
@@ -153,21 +149,22 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Main content */}
+      {/* Content */}
       <main className="mt-8 space-y-10 px-6">
         {(loadingFootball || loadingCrypto) && (
           <div className="text-center text-gray-400">Učitavanje podataka...</div>
         )}
 
+        {/* Combined view */}
         {activeTab === TABS.COMBINED && (
           <div className="space-y-10">
-            {pairs.map((i) => (
+            {combinedPairs.map((i) => (
               <div
-                className="flex flex-col md:flex-row gap-2"
                 key={i}
+                className="flex flex-col md:flex-row gap-2"
                 style={{ alignItems: 'stretch' }}
               >
-                {/* Football - 33% */}
+                {/* Football 33% */}
                 <div className="md:w-1/3 flex">
                   {topFootball[i] ? (
                     <div className="w-full">
@@ -179,7 +176,7 @@ export default function Home() {
                     </div>
                   )}
                 </div>
-                {/* Crypto - 67% */}
+                {/* Crypto 67% */}
                 <div className="md:w-2/3 flex">
                   {topCrypto[i] ? (
                     <div className="w-full">
@@ -201,6 +198,7 @@ export default function Home() {
           </div>
         )}
 
+        {/* Football only */}
         {activeTab === TABS.FOOTBALL && (
           <>
             <h2 className="text-2xl font-bold">Top Football Picks</h2>
@@ -223,6 +221,7 @@ export default function Home() {
           </>
         )}
 
+        {/* Crypto only */}
         {activeTab === TABS.CRYPTO && (
           <>
             <h2 className="text-2xl font-bold">Top Crypto Signals</h2>
@@ -248,7 +247,7 @@ export default function Home() {
 
       {/* Footer */}
       <footer className="mt-16 mb-8 px-6 text-center text-sm text-gray-400">
-        <div className="inline-flex gap-2">
+        <div className="inline-flex gap-2 flex-wrap justify-center">
           <div>
             <span className="font-semibold">Confidence:</span>{' '}
           </div>
