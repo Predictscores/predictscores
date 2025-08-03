@@ -1,7 +1,6 @@
 // FILE: components/SignalCard.js
 
 import React from 'react';
-import QuickChart from 'quickchart-js';
 
 const SignalCard = ({ data, type }) => {
   if (!data) return null;
@@ -22,30 +21,31 @@ const SignalCard = ({ data, type }) => {
     timeframe,
   } = data;
 
-  const chartUrl = price_history_24h
-    ? new QuickChart()
-        .setConfig({
-          type: 'line',
-          data: {
-            labels: price_history_24h.map((_, i) => i),
-            datasets: [
-              {
-                label: symbol,
-                data: price_history_24h.slice(-288),
-                borderColor: '#3b82f6',
-                fill: false,
-              },
-            ],
-          },
-          options: {
-            scales: { x: { display: false }, y: { display: false } },
-            elements: { point: { radius: 0 } },
-            plugins: { legend: { display: false } },
-          },
-        })
-        .setWidth(300)
-        .setHeight(100)
-        .getUrl()
+  // Generiši chartConfig kao JSON string za QuickChart
+  const chartConfig = price_history_24h
+    ? encodeURIComponent(JSON.stringify({
+        type: 'line',
+        data: {
+          labels: price_history_24h.map((_, i) => i),
+          datasets: [
+            {
+              label: symbol,
+              data: price_history_24h.slice(-288),
+              borderColor: '#3b82f6',
+              fill: false,
+            },
+          ],
+        },
+        options: {
+          scales: { x: { display: false }, y: { display: false } },
+          elements: { point: { radius: 0 } },
+          plugins: { legend: { display: false } },
+        },
+      }))
+    : null;
+
+  const chartUrl = chartConfig
+    ? `https://quickchart.io/chart?width=300&height=100&c=${chartConfig}`
     : null;
 
   const confidenceColor =
