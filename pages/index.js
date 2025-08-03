@@ -33,7 +33,6 @@ export default function Home() {
     loadingFootball,
     refreshAll,
     nextCryptoUpdate,
-    nextFootballUpdate,
   } = useContext(DataContext);
 
   const [activeTab, setActiveTab] = useState(TABS.COMBINED);
@@ -65,32 +64,25 @@ export default function Home() {
     localStorage.setItem('dark-mode', newDark ? 'true' : 'false');
   };
 
-  const nextUpdate = (() => {
-    if (!nextCryptoUpdate && !nextFootballUpdate) return null;
-    if (!nextCryptoUpdate) return nextFootballUpdate;
-    if (!nextFootballUpdate) return nextCryptoUpdate;
-    return Math.min(nextCryptoUpdate, nextFootballUpdate);
-  })();
-
   const topFootball = footballData?.footballTop || [];
   const topCrypto = cryptoData?.cryptoTop || [];
   const combinedPairs = [0, 1, 2];
 
   return (
-    <div className="min-h-screen bg-[#18191c] text-white">
+    <div className="min-h-screen bg-white text-gray-900 dark:bg-[#18191c] dark:text-white">
       {/* Header */}
       <header className="flex items-center justify-between py-4 px-0">
         <div className="text-xl font-bold">AI Top fudbalske i Kripto Prognoze</div>
         <div className="flex gap-3">
           <button
             onClick={refreshAll}
-            className="px-4 py-2 rounded-md bg-[#23272f] hover:bg-[#2f3344] transition font-medium"
+            className="px-4 py-2 rounded-md bg-[#23272f] hover:bg-[#2f3344] text-white transition font-medium"
           >
             Refresh all
           </button>
           <button
             onClick={toggleDark}
-            className="px-4 py-2 rounded-md bg-[#23272f] hover:bg-[#2f3344] transition font-medium"
+            className="px-4 py-2 rounded-md bg-[#23272f] hover:bg-[#2f3344] text-white transition font-medium"
           >
             {isDark ? 'Light mode' : 'Dark mode'}
           </button>
@@ -133,7 +125,7 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Info bar */}
+      {/* Info bar (only football + crypto refresh) */}
       <div className="flex flex-col md:flex-row justify-center gap-6 mt-4 px-0 text-sm text-gray-300 font-medium">
         <div>
           <span className="text-white">Football last generated:</span>{' '}
@@ -143,25 +135,22 @@ export default function Home() {
           <span className="text-white">Crypto next refresh:</span>{' '}
           {getCountdown(nextCryptoUpdate)}
         </div>
-        <div>
-          <span className="text-white">Next update in:</span>{' '}
-          {nextUpdate ? getCountdown(nextUpdate) : '—'}
-        </div>
       </div>
 
       {/* Main content */}
       <main className="mt-8 space-y-10 px-0">
         {(loadingFootball || loadingCrypto) && (
-          <div className="text-center text-gray-400">Učitavanje podataka...</div>
+          <div className="text-center text-gray-500">Učitavanje podataka...</div>
         )}
 
-        {/* Combined */}
         {activeTab === TABS.COMBINED && (
           <div className="space-y-10">
             {combinedPairs.map((i) => (
               <div
                 key={i}
-                className="flex flex-col md:flex-row gap-2"
+                className={`flex flex-col md:flex-row gap-2 ${
+                  i === 0 ? 'best-pick' : ''
+                }`}
                 style={{ alignItems: 'stretch' }}
               >
                 {/* Football 33% */}
@@ -194,7 +183,6 @@ export default function Home() {
           </div>
         )}
 
-        {/* Football only */}
         {activeTab === TABS.FOOTBALL && (
           <>
             <h2 className="text-2xl font-bold">Top Football Picks</h2>
@@ -217,7 +205,6 @@ export default function Home() {
           </>
         )}
 
-        {/* Crypto only */}
         {activeTab === TABS.CRYPTO && (
           <>
             <h2 className="text-2xl font-bold">Top Crypto Signals</h2>
@@ -241,18 +228,18 @@ export default function Home() {
         )}
       </main>
 
-      {/* Footer */}
+      {/* Footer legend */}
       <footer className="mt-16 mb-8 text-center text-sm text-gray-400">
-        <div className="inline-flex gap-2 flex-wrap justify-center">
-          <div>
-            <span className="font-semibold">Confidence:</span>{' '}
-          </div>
-          <div className="flex gap-1">
-            <div>🟢 High (≥85%)</div>
-            <div>·</div>
-            <div>🔵 Moderate (55–84%)</div>
-            <div>·</div>
-            <div>🟡 Low (&lt;55%)</div>
+        <div className="inline-flex flex-wrap justify-center gap-2">
+          <div className="font-semibold">Confidence:</div>
+          <div className="flex gap-1 items-center">
+            <div className="legend-item">🟡 Low (&lt;55%)</div>
+            <div className="legend-sep"> </div>
+            <div className="legend-item">🔵 Moderate (55–80%)</div>
+            <div className="legend-sep"> </div>
+            <div className="legend-item">🟢 High (80–90%)</div>
+            <div className="legend-sep"> </div>
+            <div className="legend-item">🔥 Explosive (&gt;90%)</div>
           </div>
         </div>
       </footer>
