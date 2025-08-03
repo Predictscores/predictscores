@@ -1,7 +1,7 @@
-// contexts/DataContext.js
+// FILE: contexts/DataContext.js
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
 
-const DataContext = createContext(null);
+export const DataContext = createContext(null); // OVO JE PRAVI EXPORT!
 
 export function useData() {
   return useContext(DataContext);
