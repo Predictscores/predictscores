@@ -1,6 +1,6 @@
 // FILE: pages/index.js
 
-import { useContext, useState } from 'react';
+import { useContext, useState, useEffect } from 'react';
 import { DataContext } from '../contexts/DataContext';
 import SignalCard from '../components/SignalCard';
 
@@ -15,6 +15,27 @@ export default function Home() {
 
   // Tabs: 'combined' (default), 'football', 'crypto'
   const [tab, setTab] = useState('combined');
+  const [theme, setTheme] = useState('dark');
+
+  // Uvezi dark/light mode iz localStorage na početku
+  useEffect(() => {
+    const stored = window.localStorage.getItem('theme');
+    if (stored === 'light') {
+      setTheme('light');
+      document.documentElement.setAttribute('data-theme', 'light');
+    } else {
+      setTheme('dark');
+      document.documentElement.setAttribute('data-theme', 'dark');
+    }
+  }, []);
+
+  // Menja dark/light mod
+  const toggleTheme = () => {
+    const next = theme === 'dark' ? 'light' : 'dark';
+    setTheme(next);
+    document.documentElement.setAttribute('data-theme', next);
+    window.localStorage.setItem('theme', next);
+  };
 
   // Helperi
   const getCountdown = (targetTime) => {
@@ -32,29 +53,36 @@ export default function Home() {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
 
-  // Tabovi: samo 'combined' prikazuje parove, ostali su stub
+  // Grid layout za combined tab (football 33%, crypto 66%)
+  const renderCombinedRow = (i) => (
+    <div className="combined-grid" key={i}>
+      <div className="football-col">
+        {footballData?.footballTop?.[i] && (
+          <SignalCard data={footballData.footballTop[i]} type="football" theme={theme} />
+        )}
+      </div>
+      <div className="crypto-col">
+        {cryptoData?.cryptoTop?.[i] && (
+          <SignalCard data={cryptoData.cryptoTop[i]} type="crypto" theme={theme} />
+        )}
+      </div>
+    </div>
+  );
+
+  // Kartice po tabovima
   let tabContent = null;
   if (tab === 'combined') {
     tabContent = (
       <div>
-        {[0, 1, 2].map((i) => (
-          <div className="card-row" key={i} style={{ marginBottom: 26, gap: 22 }}>
-            {footballData?.footballTop?.[i] && (
-              <SignalCard data={footballData.footballTop[i]} type="football" />
-            )}
-            {cryptoData?.cryptoTop?.[i] && (
-              <SignalCard data={cryptoData.cryptoTop[i]} type="crypto" />
-            )}
-          </div>
-        ))}
+        {[0, 1, 2].map((i) => renderCombinedRow(i))}
       </div>
     );
   } else if (tab === 'football') {
     tabContent = (
       <div>
         {footballData?.footballTop?.map((item, idx) => (
-          <div style={{ marginBottom: 22 }}>
-            <SignalCard key={idx} data={item} type="football" />
+          <div className="card-row" key={idx}>
+            <SignalCard data={item} type="football" theme={theme} />
           </div>
         ))}
       </div>
@@ -63,72 +91,70 @@ export default function Home() {
     tabContent = (
       <div>
         {cryptoData?.cryptoTop?.map((item, idx) => (
-          <div style={{ marginBottom: 22 }}>
-            <SignalCard key={idx} data={item} type="crypto" />
+          <div className="card-row" key={idx}>
+            <SignalCard data={item} type="crypto" theme={theme} />
           </div>
         ))}
       </div>
     );
   }
 
-  // Da footer bude zalepnjen za dno
-  const pageStyle = {
-    minHeight: '100vh',
-    background: "#18191c",
-    color: "#f3f4f6",
-    display: 'flex',
-    flexDirection: 'column'
-  };
-
-  const mainStyle = {
-    maxWidth: 830,
-    margin: "0 auto",
-    flex: 1,
-    display: 'flex',
-    flexDirection: 'column',
-    justifyContent: 'flex-start',
-  };
-
   return (
-    <div style={pageStyle}>
-      {/* Header i kontrole */}
+    <div style={{
+      minHeight: '100vh',
+      background: "var(--page-bg, #18191c)",
+      color: "var(--page-fg, #f4f4f5)",
+      display: 'flex',
+      flexDirection: 'column'
+    }}>
+      {/* Header: naslov i kontrole u istoj liniji */}
       <div style={{
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
-        margin: '38px auto 0',
-        maxWidth: 830,
-        width: '100%'
+        margin: '36px auto 0',
+        maxWidth: 900,
+        width: '100%',
+        gap: 20
       }}>
         <h1 style={{
-          fontSize: 36,
+          fontSize: 34,
           fontWeight: 700,
           letterSpacing: "-1.5px",
-          textAlign: 'left'
+          textAlign: 'left',
+          margin: 0,
+          lineHeight: 1.2
         }}>
           AI Top fudbalske i Kripto Prognoze
         </h1>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <span style={{ fontSize: 17, fontWeight: 500, marginRight: 14 }}>
-            Next update in: <b>{getCountdown(Math.min(nextCryptoUpdate || Infinity, nextFootballUpdate || Infinity))}</b>
-          </span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <button className="btn" onClick={refreshAll}>Refresh all</button>
-          {/* Dark mode dugme (samo placeholder dok ne rešiš CSS) */}
-          <button
-            className="btn"
-            onClick={() => document.documentElement.classList.toggle('dark')}
-            style={{ opacity: 0.6, pointerEvents: 'none' }}
-            title="Dark mode (još nije funkcionalno)"
-          >
-            Dark mode
+          <button className="btn" onClick={toggleTheme}>
+            {theme === "dark" ? "Light mode" : "Dark mode"}
           </button>
         </div>
       </div>
 
+      {/* Meta info (ispod headera, centrirano) */}
+      <div style={{
+        display: "flex", justifyContent: "center", gap: 34,
+        fontSize: 17, margin: "17px 0 8px 0"
+      }}>
+        <span>
+          <span style={{ fontWeight: 600 }}>Football last generated:</span> {formatTime(footballData?.generated_at)}
+        </span>
+        <span>
+          <span style={{ fontWeight: 600 }}>Crypto next refresh in:</span> {getCountdown(nextCryptoUpdate)}
+        </span>
+        <span>
+          <span style={{ fontWeight: 600 }}>Next update in:</span> <b>{getCountdown(Math.min(nextCryptoUpdate || Infinity, nextFootballUpdate || Infinity))}</b>
+        </span>
+      </div>
+
       {/* Tabs */}
       <div style={{
-        margin: '34px auto 24px',
-        maxWidth: 600,
+        margin: '28px auto 22px',
+        maxWidth: 680,
         display: 'flex',
         justifyContent: 'center',
         gap: 10,
@@ -147,20 +173,14 @@ export default function Home() {
         >Crypto</button>
       </div>
 
-      {/* Meta info (ispod tabova) */}
-      <div style={{
-        display: "flex", justifyContent: "center", gap: 30, fontSize: 17, marginBottom: 13
+      {/* Main kartice */}
+      <main style={{
+        maxWidth: 900, margin: "0 auto", flex: 1, display: 'flex',
+        flexDirection: 'column', justifyContent: 'flex-start'
       }}>
-        <span>
-          <span style={{ fontWeight: 600 }}>Football last generated:</span> {formatTime(footballData?.generated_at)}
-        </span>
-        <span>
-          <span style={{ fontWeight: 600 }}>Crypto next refresh in:</span> {getCountdown(nextCryptoUpdate)}
-        </span>
-      </div>
-
-      <main style={mainStyle}>
-        <h2 style={{ fontSize: 25, fontWeight: 700, marginBottom: 18, textAlign: 'left' }}>
+        <h2 style={{
+          fontSize: 25, fontWeight: 700, marginBottom: 18, textAlign: 'left'
+        }}>
           {tab === 'combined'
             ? 'Combined Top Picks'
             : tab === 'football'
@@ -170,9 +190,9 @@ export default function Home() {
         {tabContent}
       </main>
 
-      {/* Footer sa legendom za badge */}
+      {/* Footer legenda */}
       <footer style={{
-        margin: "38px 0 17px 0",
+        margin: "34px 0 12px 0",
         padding: 0,
         width: "100%",
         textAlign: "center",
