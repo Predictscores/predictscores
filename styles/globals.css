@@ -1,32 +1,118 @@
 /* FILE: styles/globals.css */
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
+/* Osnovni stil za dark/light background */
 body {
-  @apply bg-background text-foreground;
+  background: #18191c;
+  color: #f3f4f6;
+  font-family: 'Inter', Arial, sans-serif;
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
 }
 
-/* Card style */
 .bg-card {
-  @apply bg-white dark:bg-gray-800;
+  background: #23262e;
 }
 .text-card-foreground {
-  @apply text-gray-900 dark:text-gray-100;
+  color: #f3f4f6;
 }
 
-/* Accent hover */
-.hover\\:bg-accent:hover {
-  @apply bg-gray-100 dark:bg-gray-700;
-}
-
-/* Muted text */
 .text-muted-foreground {
-  @apply text-gray-500 dark:text-gray-400;
+  color: #b0b3b8;
 }
 
-/* Border-muted */
 .border-muted {
-  @apply border-gray-200 dark:border-gray-600;
+  border-color: #23262e;
 }
+
+.rounded {
+  border-radius: 18px;
+}
+
+.p-4 {
+  padding: 1.2rem;
+}
+
+/* Confidence badge */
+.badge {
+  display: inline-block;
+  padding: 0.18em 0.9em;
+  border-radius: 1em;
+  font-weight: bold;
+  font-size: 0.9em;
+  margin-left: 0.5em;
+}
+.badge-high {
+  background: #16a34a;
+  color: #fff;
+}
+.badge-moderate {
+  background: #2563eb;
+  color: #fff;
+}
+.badge-low {
+  background: #facc15;
+  color: #23262e;
+}
+
+/* Dugmad */
+button, .btn {
+  border: 1px solid #343541;
+  background: #23262e;
+  color: #f3f4f6;
+  border-radius: 10px;
+  padding: 0.6em 1.3em;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s;
+  margin-right: 0.6em;
+}
+button:hover, .btn:hover {
+  background: #343541;
+}
+
+.tabs {
+  display: flex;
+  gap: 1em;
+  margin-bottom: 2em;
+  margin-top: 1em;
+}
+.tab {
+  padding: 0.4em 1.2em;
+  border-radius: 1.2em;
+  background: #23262e;
+  color: #f3f4f6;
+  cursor: pointer;
+  font-weight: 500;
+  border: none;
+}
+.tab.active, .tab:active {
+  background: #2563eb;
+  color: #fff;
+}
+
+.card-row {
+  display: flex;
+  gap: 1em;
+  margin-bottom: 1em;
+}
+
+/* Responsive - na mobilnom kartice jedna ispod druge */
+@media (max-width: 700px) {
+  .card-row {
+    flex-direction: column;
+    gap: 0.7em;
+  }
+}
+
+/* Footer legenda */
+.confidence-legend {
+  text-align: center;
+  color: #b0b3b8;
+  font-size: 1em;
+  margin-top: 3em;
+  margin-bottom: 1em;
+}
+.confidence-legend .high { color: #16a34a; }
+.confidence-legend .moderate { color: #2563eb; }
+.confidence-legend .low { color: #facc15; }
