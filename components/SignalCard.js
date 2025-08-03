@@ -1,8 +1,9 @@
-// FILE: components/SignalCard.js
+// components/SignalCard.js
 
 import React from 'react';
+import TradingViewChart from './TradingViewChart';
 
-const SignalCard = ({ data, type }) => {
+const SignalCard = ({ data, type, theme = "dark" }) => {
   if (!data) return null;
 
   const {
@@ -17,70 +18,45 @@ const SignalCard = ({ data, type }) => {
     odds,
     prediction,
     note,
-    price_history_24h,
     timeframe,
   } = data;
 
-  // Badge klasa prema confidence-u
-  let badgeClass = 'badge ';
-  if (confidence >= 85) badgeClass += 'badge-high';
-  else if (confidence >= 55) badgeClass += 'badge-moderate';
-  else badgeClass += 'badge-low';
-
-  // --- FIX: QuickChart — prikaz samo do 100 tačaka, downsampling ---
-  let chartData = price_history_24h || [];
-  if (chartData.length > 100) {
-    const step = Math.ceil(chartData.length / 100);
-    chartData = chartData.filter((_, idx) => idx % step === 0);
-  }
-
-  const chartUrl = chartData.length
-    ? `https://quickchart.io/chart?width=340&height=70&c=${encodeURIComponent(JSON.stringify({
-        type: 'line',
-        data: {
-          labels: chartData.map((_, i) => i),
-          datasets: [
-            {
-              label: symbol,
-              data: chartData,
-              borderColor: '#2563eb',
-              fill: false,
-            },
-          ],
-        },
-        options: {
-          scales: { x: { display: false }, y: { display: false } },
-          elements: { point: { radius: 0 } },
-          plugins: { legend: { display: false } },
-        },
-      }))}`
-    : null;
+  const confidenceColor =
+    confidence >= 85 ? 'bg-green-500' : confidence >= 55 ? 'bg-blue-500' : 'bg-yellow-500';
 
   return (
-    <div className="bg-card rounded p-4 text-card-foreground" style={{ minWidth: 290, maxWidth: 390, flex: 1 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+    <div className="signal-card">
+      <div className="signal-card-header">
         <div>
-          <div style={{ fontWeight: 600, fontSize: 17 }}>
-            {name || symbol}
-            {timeframe && <span style={{ fontSize: 13, color: '#b0b3b8', marginLeft: 4 }}>[{timeframe}]</span>}
+          <div className="signal-title">
+            <span className="font-bold">{name || symbol}</span>
+            {timeframe && <span className="signal-timeframe">[{timeframe}]</span>}
+          </div>
+          <div className="confidence-badge" style={{ background: confidence >= 85 ? "#22c55e" : confidence >= 55 ? "#3b82f6" : "#facc15" }}>
+            {confidence}%
           </div>
         </div>
-        <span className={badgeClass}>{confidence}%</span>
       </div>
-      <div style={{ fontSize: 15, marginBottom: 7 }}>
-        {type === 'crypto' && <span><b>Signal:</b> {direction}<br /></span>}
-        {type === 'football' && <span><b>Pick:</b> {prediction}<br /></span>}
-        {odds && <span><b>Odds:</b> {odds}<br /></span>}
-      </div>
-      {note && <div className="text-muted-foreground" style={{ fontSize: 14, fontStyle: 'italic', marginBottom: 8 }}>{note}</div>}
-      {type === 'crypto' && (
-        <div style={{ fontSize: 14, marginBottom: 6 }}>
-          <span><b>Range:</b> {expected_range} &nbsp; <b>SL:</b> {stop_loss} &nbsp; <b>TP:</b> {take_profit}</span><br />
-          <span><b>Price:</b> ${current_price}</span>
+
+      {type === 'football' && (
+        <div className="mt-2 mb-2">
+          <div><b>Pick:</b> {prediction}</div>
+          {odds && <div><b>Odds:</b> {odds}</div>}
+          {note && <div className="signal-note">{note}</div>}
         </div>
       )}
-      {chartUrl && (
-        <img src={chartUrl} alt="Chart" style={{ width: '100%', height: 68, borderRadius: 7, marginTop: 7, background: "#18191c" }} />
+
+      {type === 'crypto' && (
+        <>
+          <div className="mt-2 mb-2">
+            <div><b>Signal:</b> {direction}</div>
+            <div><b>Range:</b> {expected_range} &nbsp; <b>SL:</b> {stop_loss} &nbsp; <b>TP:</b> {take_profit}</div>
+            <div><b>Price:</b> ${current_price}</div>
+          </div>
+          <div className="signal-chart-wrapper">
+            <TradingViewChart symbol={symbol ? symbol.toUpperCase() + "USDT" : "BTCUSDT"} theme={theme} height={120} />
+          </div>
+        </>
       )}
     </div>
   );
