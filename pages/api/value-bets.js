@@ -2,29 +2,54 @@ import { fetchSportmonksFixtures } from "@/lib/sources/sportmonks";
 import { fetchOddsForFixtures } from "@/lib/sources/theOddsApi";
 import { calculateEdge } from "@/lib/utils/edge";
 
+// Helper fallback: generiši predloge na osnovu modela ako nema kvota
+function modelOnlyPicks(fixtures) {
+  return fixtures.map(fixture => ({
+    fixture_id: fixture.id,
+    type: "MODEL_ONLY",
+    selection: "1", // Zamisli da je home favorit
+    model_prob: 0.45,
+    fallback: true,
+    reason: "model-only fallback (no odds data)",
+    teams: {
+      home: fixture.localTeam.data,
+      away: fixture.visitorTeam.data,
+    },
+    league: fixture.league.data,
+    datetime_local: fixture.time,
+    confidence: 30,
+  }));
+}
+
 export default async function handler(req, res) {
-  const today = new Date().toISOString().slice(0, 10); // format YYYY-MM-DD
-
   try {
+    const today = new Date().toISOString().slice(0, 10);
+
+    // 1. Povuci mečeve
     const fixtures = await fetchSportmonksFixtures(today);
-    const oddsMap = await fetchOddsForFixtures(fixtures.map((f) => f.id));
+    if (!fixtures || fixtures.length === 0) {
+      return res.status(200).json({ value_bets: [], reason: "No fixtures today" });
+    }
 
-    const valueBets = fixtures.map((fixture) => {
-      const model_probs = {
-        home: 0.45,
-        draw: 0.25,
-        away: 0.3,
-      };
+    // 2. Povuci kvote (probaj H2H market samo)
+    let oddsMap = {};
+    try {
+      oddsMap = await fetchOddsForFixtures(
+        fixtures.map(f => f.id),
+        "h2h" // SAMO 1X2 market!
+      );
+    } catch (err) {
+      console.warn("No odds data or market fetch failed, fallback to model-only.");
+      oddsMap = {};
+    }
 
-      const selection = Object.entries(model_probs).reduce((a, b) =>
-        b[1] > a[1] ? b : a
-      )[0];
-
+    // 3. Generiši value bet predloge (ako nema kvota, fallback na model)
+    const valueBets = fixtures.map(fixture => {
       const pick = {
         fixture_id: fixture.id,
         type: "MODEL_ONLY",
-        selection: selection === "home" ? "1" : selection === "draw" ? "X" : "2",
-        model_prob: model_probs[selection],
+        selection: "1",
+        model_prob: 0.45,
         fallback: true,
         reason: "model-only fallback",
         teams: {
@@ -36,31 +61,25 @@ export default async function handler(req, res) {
         confidence: 30,
       };
 
-      const matchingOdds = oddsMap[fixture.id];
+      // Ako postoji H2H kvota, koristi je!
+      const oddsEvent = oddsMap[fixture.id];
       if (
-        matchingOdds &&
-        Array.isArray(matchingOdds.bookmakers) &&
-        matchingOdds.bookmakers.length > 0 &&
-        Array.isArray(matchingOdds.bookmakers[0].markets)
+        oddsEvent &&
+        Array.isArray(oddsEvent.bookmakers) &&
+        oddsEvent.bookmakers.length > 0
       ) {
-        for (const market of matchingOdds.bookmakers[0].markets) {
-          const outcome = market.outcomes?.find(
-            (o) =>
-              (o.name === "Home" && pick.selection === "1") ||
-              (o.name === "Draw" && pick.selection === "X") ||
-              (o.name === "Away" && pick.selection === "2")
-          );
-
-          if (outcome && outcome.price) {
-            pick.market_odds = outcome.price;
-            const implied = 1 / outcome.price;
-            pick.market_prob = implied;
-            pick.edge = calculateEdge(pick.model_prob, implied);
-            pick.confidence = Math.round(
-              Math.max(0, Math.min(100, pick.edge * 100 / implied))
-            );
+        // Pronađi 1X2 market i home/draw/away kvote
+        const h2hMarket = oddsEvent.bookmakers[0].markets?.find(m => m.key === "h2h");
+        if (h2hMarket && Array.isArray(h2hMarket.outcomes)) {
+          const home = h2hMarket.outcomes.find(o => o.name === "Home");
+          if (home) {
+            pick.type = "MODEL+ODDS";
+            pick.market_odds = home.price;
+            pick.market_prob = 1 / home.price;
+            pick.edge = calculateEdge(pick.model_prob, pick.market_prob);
+            pick.confidence = Math.round(Math.max(0, Math.min(100, pick.edge * 100 / pick.market_prob)));
             pick.fallback = false;
-            pick.reason = "model + odds match";
+            pick.reason = "model + odds";
           }
         }
       }
@@ -71,6 +90,6 @@ export default async function handler(req, res) {
     res.status(200).json({ value_bets: valueBets });
   } catch (err) {
     console.error("API ERROR /value-bets:", err);
-    res.status(500).json({ error: "Failed to fetch value bets" });
+    res.status(200).json({ value_bets: [], error: "internal error fallback" });
   }
 }
