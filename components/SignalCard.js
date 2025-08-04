@@ -14,7 +14,7 @@ const computeConsensus = (trend, crossover) => {
 
 const Badge = ({ children, className = '' }) => (
   <div
-    className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-semibold ${className}`}
+    className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-semibold ${className}`}
   >
     {children}
   </div>
@@ -24,7 +24,7 @@ const ConfidenceBadge = ({ confidence }) => {
   if (confidence > 90) {
     return (
       <Badge className="bg-gradient-to-r from-red-500 to-yellow-400 text-white">
-        🔥 Bomba {confidence}%
+        🔥 {confidence}%
       </Badge>
     );
   }
@@ -40,26 +40,26 @@ const ConfidenceBadge = ({ confidence }) => {
 const DirectionBadge = ({ direction }) => {
   if (direction === 'LONG') {
     return (
-      <div className="text-green-300 font-bold flex items-center gap-1">
+      <div className="text-green-300 font-bold flex items-center gap-1 text-sm">
         ▲ LONG
       </div>
     );
   }
   if (direction === 'SHORT') {
     return (
-      <div className="text-red-300 font-bold flex items-center gap-1">
+      <div className="text-red-300 font-bold flex items-center gap-1 text-sm">
         ▼ SHORT
       </div>
     );
   }
   return (
-    <div className="text-gray-300 font-semibold flex items-center gap-1">
+    <div className="text-gray-300 font-semibold flex items-center gap-1 text-sm">
       {direction}
     </div>
   );
 };
 
-const Sparkline = ({ history = [], width = 100, height = 28 }) => {
+const Sparkline = ({ history = [], width = 100, height = 24 }) => {
   if (!history || history.length === 0) return null;
   const slice = history.slice(-60);
   const prices = slice.map((p) => (typeof p === 'number' ? p : p));
@@ -103,8 +103,8 @@ const Sparkline = ({ history = [], width = 100, height = 28 }) => {
 };
 
 const FootballContent = ({ data }) => (
-  <div className="flex-1 flex flex-col justify-between min-h-[140px]">
-    <div className="flex items-center mb-1">
+  <div className="flex-1 flex flex-col justify-between">
+    <div className="flex items-center mb-0">
       <div className="text-lg font-bold mr-2">{data.prediction || data.name || 'Pick'}</div>
       {data.timeframe && (
         <div className="text-[10px] px-2 py-1 bg-[#222741] rounded-full">
@@ -115,19 +115,19 @@ const FootballContent = ({ data }) => (
         <ConfidenceBadge confidence={data.confidence ?? 0} />
       </div>
     </div>
-    <div className="text-sm">
+    <div className="text-sm mt-1">
       {data.prediction && (
-        <p>
+        <p className="leading-tight">
           <span className="font-bold">Pick:</span> {data.prediction}
         </p>
       )}
       {data.odds && (
-        <p>
+        <p className="leading-tight">
           <span className="font-bold">Odds:</span> {data.odds}
         </p>
       )}
       {data.note && (
-        <p className="text-xs italic text-gray-400 mt-1">{data.note}</p>
+        <p className="text-xs italic text-gray-400 mt-1 leading-tight">{data.note}</p>
       )}
     </div>
   </div>
@@ -143,8 +143,8 @@ const CryptoMetrics = ({ sig }) => {
   const showConsensus = consensus != null;
 
   return (
-    <div className="flex-1 flex flex-col justify-between min-h-[140px]">
-      <div className="flex justify-between items-start mb-2 flex-wrap gap-2">
+    <div className="flex-1 flex flex-col justify-between">
+      <div className="flex justify-between items-start mb-1 flex-wrap gap-1">
         <div className="flex gap-2 items-center flex-wrap">
           <div className="text-xl font-bold">{sig.symbol}</div>
           <div className="text-xs text-gray-400">{sig.name}</div>
@@ -155,7 +155,7 @@ const CryptoMetrics = ({ sig }) => {
           )}
         </div>
         <div className="flex flex-col items-end gap-1">
-          <div className="flex gap-2 flex-wrap">
+          <div className="flex gap-1 flex-wrap">
             <ConfidenceBadge confidence={sig.confidence} />
             {crossover && crossover.confidence != null && (
               <ConfidenceBadge confidence={crossover.confidence} />
@@ -163,22 +163,20 @@ const CryptoMetrics = ({ sig }) => {
           </div>
           {showConsensus && (
             <div>
-              <Badge className="bg-blue-600 text-white text-[10px]">
-                Consensus {consensus}%
-              </Badge>
+              <Badge className="bg-blue-600 text-white">Consensus {consensus}%</Badge>
             </div>
           )}
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 text-[12px] mb-2">
-        <div className="space-y-1">
+      <div className="grid grid-cols-2 gap-2 text-[11px] mb-1">
+        <div className="space-y-0.5">
           <div className="font-semibold">Trend</div>
           <DirectionBadge direction={sig.direction} />
           <div className="font-semibold mt-1">RSI</div>
           <div>{sig.rsi != null ? sig.rsi : '—'}</div>
         </div>
-        <div className="space-y-1">
+        <div className="space-y-0.5">
           <div className="font-semibold">Crossover</div>
           {crossover ? (
             <DirectionBadge direction={crossover.direction} />
@@ -223,10 +221,10 @@ const SignalCard = ({ data, type }) => {
   const consensus = computeConsensus(trend, crossover);
 
   return (
-    <div className="flex flex-row h-full w-full rounded-2xl bg-[#1f234f] text-white shadow p-5 items-stretch relative overflow-hidden min-h-[150px]">
-      {/* accent bar: fixed width, full height */}
+    <div className="flex flex-row w-full rounded-2xl bg-[#1f234f] text-white shadow p-4 items-stretch relative overflow-hidden">
+      {/* accent bar */}
       <div
-        className={`flex-shrink-0 w-1 rounded-l-xl mr-4 ${
+        className={`flex-shrink-0 w-1 rounded-l-xl mr-3 ${
           type === 'crypto'
             ? confidence > 90
               ? 'bg-gradient-to-b from-red-400 to-yellow-300'
@@ -243,25 +241,23 @@ const SignalCard = ({ data, type }) => {
         }`}
       />
 
-      {/* Main content area */}
-      <div className="flex-1 flex flex-col pr-4">
+      <div className="flex-1 flex flex-col pr-2">
         {type === 'football' && <FootballContent data={data} />}
         {type === 'crypto' && <CryptoMetrics sig={data} />}
       </div>
 
-      {/* Chart for crypto, right side; on very small screens it will wrap below naturally */}
       {type === 'crypto' && (
-        <div className="flex-shrink-0 w-[300px] ml-4 flex flex-col justify-between">
-          <div className="mb-2">
+        <div className="flex-shrink-0 w-[280px] ml-3 flex flex-col justify-between">
+          <div className="mb-1">
             <iframe
               title={`tv-${data.symbol || 'chart'}`}
               src={`https://s.tradingview.com/widgetembed/?symbol=${(data.symbol || '')
                 .toUpperCase()}USDT&interval=15&theme=dark&style=1&timezone=Etc/UTC&studies=[]&hide_side_toolbar=true&hide_legend=true&withdateranges=false&saveimage=false&hideideas=true&toolbar_bg=2c2d3e&locale=en`}
               width="100%"
-              height="120"
+              height="100"
               frameBorder="0"
               allowTransparency={true}
-              style={{ borderRadius: 10, border: 0 }}
+              style={{ borderRadius: 8, border: 0, minHeight: 100 }}
             />
           </div>
           <div className="text-[10px] text-gray-400">
@@ -273,7 +269,7 @@ const SignalCard = ({ data, type }) => {
         </div>
       )}
 
-      {/* strong consensus badge */}
+      {/* strong consensus highlight */}
       {type === 'crypto' && consensus != null && consensus > 90 && (
         <div className="absolute top-2 right-2">
           <div className="px-2 py-1 rounded bg-yellow-400 text-black text-[10px] font-bold flex items-center gap-1">
