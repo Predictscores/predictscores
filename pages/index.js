@@ -23,6 +23,7 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState(TABS.COMBINED);
   const [isDark, setIsDark] = useState(false);
 
+  // Dark mode persistence / init
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const stored = localStorage.getItem('dark-mode');
@@ -104,7 +105,7 @@ export default function Home() {
           <div className="text-xl font-bold">AI Top fudbalske i Kripto Prognoze</div>
         </div>
 
-        {/* right: controls + timers */}
+        {/* right: controls + pill timers */}
         <div className="flex flex-col items-end gap-2">
           <div className="flex gap-3">
             <button
@@ -120,25 +121,28 @@ export default function Home() {
               {isDark ? 'Light mode' : 'Dark mode'}
             </button>
           </div>
-          <div className="flex flex-col text-sm text-gray-300 font-medium">
-            <div>
-              <span className="text-white">Football last generated:</span>{' '}
-              {formatTime(footballData?.generated_at)}
-            </div>
-            <div className="mt-1">
-              <span className="text-white">Crypto next refresh:</span>{' '}
-              {getCountdown(nextCryptoUpdate)}
+          <div className="flex">
+            <div className="bg-[#1f2339] px-4 py-2 rounded-full flex flex-col sm:flex-row gap-2 text-sm text-gray-300 font-medium">
+              <div className="flex gap-1 items-center">
+                <span className="text-white">Crypto next refresh:</span>
+                <span className="font-mono">{getCountdown(nextCryptoUpdate)}</span>
+              </div>
+              <div className="flex gap-1 items-center">
+                <span className="text-white">Football last generated:</span>
+                <span className="font-mono">{formatTime(footballData?.generated_at)}</span>
+              </div>
             </div>
           </div>
         </div>
       </header>
 
-      <main className="mt-6 space-y-4 px-6">
+      {/* Main content */}
+      <main className="mt-2 space-y-4 px-6">
         {(loadingFootball || loadingCrypto) && (
           <div className="text-center text-gray-400">Učitavanje podataka...</div>
         )}
 
-        {/* Combined */}
+        {/* Combined view */}
         {activeTab === TABS.COMBINED && (
           <>
             {topFootball.length === 0 && topCrypto.length === 0 && (
