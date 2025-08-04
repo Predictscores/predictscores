@@ -2,6 +2,8 @@
 import { fetchSportmonksFixtures } from "../../lib/sources/sportmonks";
 import { fetchOdds } from "../../lib/sources/theOddsApi";
 
+const oddsCache = {}; // simple in-memory short-lived cache
+
 function normalizeName(name = "") {
   return name.trim().toLowerCase();
 }
@@ -24,11 +26,26 @@ async function fetchSportmonksFixturesWithRetry(date, retries = 3, baseDelay = 5
       if (attempt === retries - 1 || !isServerError) {
         throw e;
       }
-      console.warn(`SportMonks fetch attempt ${attempt + 1} failed, retrying...`, e.message);
+      console.warn(
+        `SportMonks fetch attempt ${attempt + 1} failed, retrying...`,
+        e.message
+      );
       await new Promise((r) => setTimeout(r, baseDelay * (attempt + 1)));
     }
   }
   throw new Error("Failed to fetch SportMonks fixtures after retries");
+}
+
+async function getCachedOdds(sportKey) {
+  const now = Date.now();
+  const cacheEntry = oddsCache[sportKey];
+  if (cacheEntry && now - cacheEntry.ts < 30 * 1000) {
+    console.log("Using cached odds for", sportKey);
+    return cacheEntry.data;
+  }
+  const data = await fetchOdds(sportKey);
+  oddsCache[sportKey] = { ts: now, data };
+  return data;
 }
 
 export default async function handler(req, res) {
@@ -38,6 +55,7 @@ export default async function handler(req, res) {
     min_edge = 0.05,
     min_odds = 1.3,
     fixture_id,
+    max_bookmakers = 5,
   } = req.query;
 
   console.log("ENV KEYS:", {
@@ -51,12 +69,11 @@ export default async function handler(req, res) {
     const raw = await fetchSportmonksFixturesWithRetry(date);
     let fixtures = (raw.data || []).filter((f) => f.time?.status === "NS");
 
-    // optional single-fixture filter to save downstream work / API usage
     if (fixture_id) {
       fixtures = fixtures.filter((f) => String(f.id) === String(fixture_id));
     }
 
-    const oddsRaw = await fetchOdds(sport_key);
+    const oddsRaw = await getCachedOdds(sport_key);
     const oddsMap = {};
     oddsRaw.forEach((o) => {
       const home = normalizeName(o.home_team);
@@ -64,7 +81,8 @@ export default async function handler(req, res) {
       oddsMap[`${home}|${away}`] = o;
     });
 
-    const value_bets = [];
+    const intermediate = [];
+    const hasModelOddsFor = new Set(); // track fixture+market that got MODEL+ODDS
 
     for (const f of fixtures) {
       const homeName = normalizeName(f.localTeam.data.name);
@@ -72,7 +90,7 @@ export default async function handler(req, res) {
       const key = `${homeName}|${awayName}`;
       const o = oddsMap[key];
 
-      // placeholders for model output (replace later with real model)
+      // placeholder model outputs (swap for real model later)
       const model_probs = { home: 0.45, draw: 0.25, away: 0.3 };
       const model_over25 = 0.32;
       const model_btts = 0.4;
@@ -82,7 +100,8 @@ export default async function handler(req, res) {
       }
 
       if (o && Array.isArray(o.bookmakers)) {
-        for (const b of o.bookmakers) {
+        const bookmakers = o.bookmakers.slice(0, Number(max_bookmakers));
+        for (const b of bookmakers) {
           // 1X2
           const h2hMarket = b.markets?.find((m) => m.key === "h2h");
           if (h2hMarket) {
@@ -103,7 +122,8 @@ export default async function handler(req, res) {
                 const marketProb = impliedProbFromPrice(outcome.price);
                 const edge = calculateEdge(modelProb, marketProb);
                 if (edge >= Number(min_edge)) {
-                  value_bets.push({
+                  const confidence = Math.min(100, Math.round(edge * 1000)); // scaled for visibility
+                  const bet = {
                     fixture_id: f.id,
                     market: "1X2",
                     selection: outcomeName,
@@ -112,7 +132,7 @@ export default async function handler(req, res) {
                     market_odds: outcome.price,
                     market_prob: Number(marketProb.toFixed(3)),
                     edge: Number(edge.toFixed(3)),
-                    confidence: Math.min(100, Math.round(edge * 100)),
+                    confidence,
                     teams: {
                       home: f.localTeam.data,
                       away: f.visitorTeam.data,
@@ -121,7 +141,9 @@ export default async function handler(req, res) {
                     datetime_local: f.time,
                     fallback: false,
                     reason: "model+odds",
-                  });
+                  };
+                  intermediate.push(bet);
+                  hasModelOddsFor.add(`${f.id}|1X2`);
                 }
               }
             }
@@ -137,7 +159,8 @@ export default async function handler(req, res) {
               const marketProb = impliedProbFromPrice(overOutcome.price);
               const edge = calculateEdge(model_over25, marketProb);
               if (edge >= Number(min_edge)) {
-                value_bets.push({
+                const confidence = Math.min(100, Math.round(edge * 1000)); // scaled
+                const bet = {
                   fixture_id: f.id,
                   market: "Over/Under 2.5",
                   selection: "Over 2.5",
@@ -146,7 +169,7 @@ export default async function handler(req, res) {
                   market_odds: overOutcome.price,
                   market_prob: Number(marketProb.toFixed(3)),
                   edge: Number(edge.toFixed(3)),
-                  confidence: Math.min(100, Math.round(edge * 100)),
+                  confidence,
                   teams: {
                     home: f.localTeam.data,
                     away: f.visitorTeam.data,
@@ -155,53 +178,60 @@ export default async function handler(req, res) {
                   datetime_local: f.time,
                   fallback: false,
                   reason: "model+odds",
-                });
+                };
+                intermediate.push(bet);
+                hasModelOddsFor.add(`${f.id}|Over/Under 2.5`);
               }
             }
           }
         }
       }
 
-      // Fallbacks
+      // Fallbacks: only if no MODEL+ODDS existed for that fixture+market
       const best1X2 = Object.entries(model_probs).sort((a, b) => b[1] - a[1])[0];
       const selectionMapping = {
         home: f.localTeam.data.name,
         away: f.visitorTeam.data.name,
         draw: "Draw",
       };
-      value_bets.push({
-        fixture_id: f.id,
-        market: "1X2",
-        selection: selectionMapping[best1X2[0]],
-        type: "MODEL_ONLY",
-        model_prob: Number(best1X2[1].toFixed(3)),
-        confidence: Math.min(100, Math.round(best1X2[1] * 100)),
-        teams: {
-          home: f.localTeam.data,
-          away: f.visitorTeam.data,
-        },
-        league: f.league.data,
-        datetime_local: f.time,
-        fallback: true,
-        reason: "model-only",
-      });
-      value_bets.push({
-        fixture_id: f.id,
-        market: "Over/Under 2.5",
-        selection: "Over 2.5",
-        type: "MODEL_ONLY",
-        model_prob: Number(model_over25.toFixed(3)),
-        confidence: Math.min(100, Math.round(model_over25 * 100)),
-        teams: {
-          home: f.localTeam.data,
-          away: f.visitorTeam.data,
-        },
-        league: f.league.data,
-        datetime_local: f.time,
-        fallback: true,
-        reason: "model-only",
-      });
-      value_bets.push({
+      if (!hasModelOddsFor.has(`${f.id}|1X2`)) {
+        intermediate.push({
+          fixture_id: f.id,
+          market: "1X2",
+          selection: selectionMapping[best1X2[0]],
+          type: "MODEL_ONLY",
+          model_prob: Number(best1X2[1].toFixed(3)),
+          confidence: Math.min(100, Math.round(best1X2[1] * 100)), // lower-scale fallback
+          teams: {
+            home: f.localTeam.data,
+            away: f.visitorTeam.data,
+          },
+          league: f.league.data,
+          datetime_local: f.time,
+          fallback: true,
+          reason: "model-only",
+        });
+      }
+      if (!hasModelOddsFor.has(`${f.id}|Over/Under 2.5`)) {
+        intermediate.push({
+          fixture_id: f.id,
+          market: "Over/Under 2.5",
+          selection: "Over 2.5",
+          type: "MODEL_ONLY",
+          model_prob: Number(model_over25.toFixed(3)),
+          confidence: Math.min(100, Math.round(model_over25 * 100)),
+          teams: {
+            home: f.localTeam.data,
+            away: f.visitorTeam.data,
+          },
+          league: f.league.data,
+          datetime_local: f.time,
+          fallback: true,
+          reason: "model-only",
+        });
+      }
+      // BTTS fallback (always)
+      intermediate.push({
         fixture_id: f.id,
         market: "BTTS",
         selection: "Yes",
@@ -219,10 +249,29 @@ export default async function handler(req, res) {
       });
     }
 
+    // dedupe: keep best edge per fixture+market+selection
+    const bestMap = {};
+    for (const bet of intermediate) {
+      const key = `${bet.fixture_id}|${bet.market}|${bet.selection}`;
+      // prefer MODEL+ODDS over MODEL_ONLY if same edge tie
+      if (
+        !bestMap[key] ||
+        (bet.type === "MODEL+ODDS" && bestMap[key].type === "MODEL_ONLY") ||
+        (bet.edge || 0) > (bestMap[key].edge || 0)
+      ) {
+        bestMap[key] = bet;
+      }
+    }
+    const value_bets = Object.values(bestMap);
+
     res.status(200).json({
       value_bets,
-      all_candidates: value_bets,
-      debug: { total_fetched: fixtures.length },
+      all_candidates: intermediate,
+      debug: {
+        total_fetched: fixtures.length,
+        returned_before_dedupe: intermediate.length,
+        returned_after_dedupe: value_bets.length,
+      },
     });
   } catch (err) {
     console.error("/api/value-bets error:", err);
