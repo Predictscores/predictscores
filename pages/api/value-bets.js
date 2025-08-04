@@ -1,50 +1,43 @@
-import { fetchSportmonksFixtures } from "@/lib/sources/sportmonks";
-import { fetchOddsForFixtures } from "@/lib/sources/theOddsApi";
-import { calculateEdge } from "@/lib/utils/edge";
+import getSportMonksFixtures from "@/lib/sources/sportmonks";
+import getOdds from "@/lib/sources/theOddsApi";
 
-// Helper fallback: generiši predloge na osnovu modela ako nema kvota
-function modelOnlyPicks(fixtures) {
-  return fixtures.map(fixture => ({
-    fixture_id: fixture.id,
-    type: "MODEL_ONLY",
-    selection: "1", // Zamisli da je home favorit
-    model_prob: 0.45,
-    fallback: true,
-    reason: "model-only fallback (no odds data)",
-    teams: {
-      home: fixture.localTeam.data,
-      away: fixture.visitorTeam.data,
-    },
-    league: fixture.league.data,
-    datetime_local: fixture.time,
-    confidence: 30,
-  }));
+// (dummy) simple edge calc
+function calculateEdge(modelProb, marketProb) {
+  if (!modelProb || !marketProb) return 0;
+  return modelProb - marketProb;
 }
 
 export default async function handler(req, res) {
   try {
+    const apiKeySM = process.env.SPORTMONKS_API_KEY;
+    const apiKeyOdds = process.env.ODDS_API_KEY;
     const today = new Date().toISOString().slice(0, 10);
 
     // 1. Povuci mečeve
-    const fixtures = await fetchSportmonksFixtures(today);
-    if (!fixtures || fixtures.length === 0) {
-      return res.status(200).json({ value_bets: [], reason: "No fixtures today" });
-    }
+    const fixtures = await getSportMonksFixtures(today, apiKeySM);
 
-    // 2. Povuci kvote (probaj H2H market samo)
-    let oddsMap = {};
+    // 2. Povuci kvote (The Odds API)
+    let odds = [];
     try {
-      oddsMap = await fetchOddsForFixtures(
-        fixtures.map(f => f.id),
-        "h2h" // SAMO 1X2 market!
-      );
+      odds = await getOdds("soccer", apiKeyOdds); // sport_key je najčešće "soccer"
     } catch (err) {
-      console.warn("No odds data or market fetch failed, fallback to model-only.");
-      oddsMap = {};
+      odds = [];
     }
 
-    // 3. Generiši value bet predloge (ako nema kvota, fallback na model)
+    // Mapiraj Odds API events po home+away team name radi spajanja sa fixtures
+    const oddsMap = {};
+    odds.forEach(event => {
+      const h = (event.home_team || "").toLowerCase();
+      const a = (event.away_team || "").toLowerCase();
+      oddsMap[`${h}|${a}`] = event;
+    });
+
+    // 3. Generiši value bet predloge (samo 1X2 market)
     const valueBets = fixtures.map(fixture => {
+      const home = fixture.localTeam?.data?.name?.toLowerCase() || "";
+      const away = fixture.visitorTeam?.data?.name?.toLowerCase() || "";
+      const oddsEvent = oddsMap[`${home}|${away}`];
+
       const pick = {
         fixture_id: fixture.id,
         type: "MODEL_ONLY",
@@ -61,21 +54,14 @@ export default async function handler(req, res) {
         confidence: 30,
       };
 
-      // Ako postoji H2H kvota, koristi je!
-      const oddsEvent = oddsMap[fixture.id];
-      if (
-        oddsEvent &&
-        Array.isArray(oddsEvent.bookmakers) &&
-        oddsEvent.bookmakers.length > 0
-      ) {
-        // Pronađi 1X2 market i home/draw/away kvote
-        const h2hMarket = oddsEvent.bookmakers[0].markets?.find(m => m.key === "h2h");
-        if (h2hMarket && Array.isArray(h2hMarket.outcomes)) {
-          const home = h2hMarket.outcomes.find(o => o.name === "Home");
-          if (home) {
+      if (oddsEvent && oddsEvent.bookmakers?.length > 0) {
+        const h2h = oddsEvent.bookmakers[0].markets.find(m => m.key === "h2h");
+        if (h2h && h2h.outcomes?.length > 0) {
+          const homeOut = h2h.outcomes.find(o => o.name === "Home");
+          if (homeOut) {
             pick.type = "MODEL+ODDS";
-            pick.market_odds = home.price;
-            pick.market_prob = 1 / home.price;
+            pick.market_odds = homeOut.price;
+            pick.market_prob = 1 / homeOut.price;
             pick.edge = calculateEdge(pick.model_prob, pick.market_prob);
             pick.confidence = Math.round(Math.max(0, Math.min(100, pick.edge * 100 / pick.market_prob)));
             pick.fallback = false;
@@ -89,7 +75,6 @@ export default async function handler(req, res) {
 
     res.status(200).json({ value_bets: valueBets });
   } catch (err) {
-    console.error("API ERROR /value-bets:", err);
     res.status(200).json({ value_bets: [], error: "internal error fallback" });
   }
 }
