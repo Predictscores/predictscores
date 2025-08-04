@@ -2,7 +2,6 @@
 import { fetchSportmonksFixtures } from "../../lib/sources/sportmonks";
 import { fetchOdds } from "../../lib/sources/theOddsApi";
 
-// helpers
 function normalizeName(name = "") {
   return name.trim().toLowerCase();
 }
@@ -15,7 +14,6 @@ function calculateEdge(modelProb, marketProb) {
   return marketProb ? modelProb - marketProb : 0;
 }
 
-// reuse retry wrapper like in select-matches if needed
 async function fetchSportmonksFixturesWithRetry(date, retries = 3, baseDelay = 500) {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
@@ -49,11 +47,9 @@ export default async function handler(req, res) {
   if (!date) return res.status(400).json({ error: "missing date" });
 
   try {
-    // 1. Get fixtures + placeholder model probs (should eventually come from shared model logic)
     const raw = await fetchSportmonksFixturesWithRetry(date);
     const fixtures = (raw.data || []).filter((f) => f.time?.status === "NS");
 
-    // 2. Get odds (only h2h and totals expected from theOddsApi helper)
     const oddsRaw = await fetchOdds(sport_key);
     const oddsMap = {};
     oddsRaw.forEach((o) => {
@@ -70,15 +66,18 @@ export default async function handler(req, res) {
       const key = `${homeName}|${awayName}`;
       const o = oddsMap[key];
 
-      // Placeholder model probabilities - replace with real model later
+      // placeholders for model output
       const model_probs = { home: 0.45, draw: 0.25, away: 0.3 };
-      const model_over25 = 0.32; // placeholder for Over 2.5
-      const model_btts = 0.4; // placeholder for BTTS
+      const model_over25 = 0.32;
+      const model_btts = 0.4;
 
-      // 1X2 bets: check h2h market
+      if (!o) {
+        console.warn(`No odds entry for fixture key ${key}`);
+      }
+
       if (o && Array.isArray(o.bookmakers)) {
         for (const b of o.bookmakers) {
-          // H2H
+          // 1X2
           const h2hMarket = b.markets?.find((m) => m.key === "h2h");
           if (h2hMarket) {
             for (const outcome of h2hMarket.outcomes) {
@@ -91,7 +90,7 @@ export default async function handler(req, res) {
               } else if (outcomeName === "draw") {
                 modelProb = model_probs.draw;
               } else {
-                continue; // unknown outcome
+                continue;
               }
 
               if (outcome.price >= Number(min_odds)) {
@@ -125,7 +124,6 @@ export default async function handler(req, res) {
           // Over/Under 2.5
           const totalsMarket = b.markets?.find((m) => m.key === "totals");
           if (totalsMarket) {
-            // Find Over 2.5 outcome
             const overOutcome = totalsMarket.outcomes.find((oc) =>
               oc.name.toLowerCase().includes("over 2.5")
             );
@@ -158,9 +156,8 @@ export default async function handler(req, res) {
         }
       }
 
-      // Fallback / model-only suggestions if nothing passed filters
-      // 1X2 fallback: pick top model outcome
-      const best1X2 = Object.entries(model_probs).sort((a, b) => b[1] - a[1])[0]; // e.g., ["home", 0.45]
+      // Fallbacks
+      const best1X2 = Object.entries(model_probs).sort((a, b) => b[1] - a[1])[0];
       const selectionMapping = {
         home: f.localTeam.data.name,
         away: f.visitorTeam.data.name,
@@ -182,8 +179,6 @@ export default async function handler(req, res) {
         fallback: true,
         reason: "model-only",
       });
-
-      // Over/Under 2.5 fallback (model-only over)
       value_bets.push({
         fixture_id: f.id,
         market: "Over/Under 2.5",
@@ -200,8 +195,6 @@ export default async function handler(req, res) {
         fallback: true,
         reason: "model-only",
       });
-
-      // BTTS fallback (no odds integration here)
       value_bets.push({
         fixture_id: f.id,
         market: "BTTS",
