@@ -19,41 +19,35 @@ export default function Home() {
     loadingFootball,
     refreshAll,
     nextCryptoUpdate,
-    nextFootballUpdate,
   } = useContext(DataContext);
 
   const [activeTab, setActiveTab] = useState(TABS.COMBINED);
-  const [isDark, setIsDark] = useState(false); // don't access localStorage here
+  const [isDark, setIsDark] = useState(false);
 
-  // initialize theme from localStorage / system preference
+  // theme init (browser only)
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const stored = localStorage.getItem('dark-mode');
-    if (stored === 'true') {
-      setIsDark(true);
-    } else if (stored === 'false') {
-      setIsDark(false);
-    } else {
+    if (stored === 'true') setIsDark(true);
+    else if (stored === 'false') setIsDark(false);
+    else {
       const prefers = window.matchMedia('(prefers-color-scheme: dark)').matches;
       if (prefers) setIsDark(true);
     }
   }, []);
 
-  // apply theme and persist
   useEffect(() => {
     if (isDark) document.documentElement.classList.add('dark');
     else document.documentElement.classList.remove('dark');
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('dark-mode', isDark ? 'true' : 'false');
-    }
+    if (typeof window !== 'undefined') localStorage.setItem('dark-mode', isDark ? 'true' : 'false');
   }, [isDark]);
 
-  // Helpers
   const formatTime = (timestamp) => {
     if (!timestamp) return '—';
     const d = new Date(timestamp);
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
+
   const getCountdown = (targetTime) => {
     if (!targetTime) return '—';
     const diff = targetTime - Date.now();
@@ -69,10 +63,11 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-[#18191c] text-white">
-      {/* Header */}
+      {/* Header + tabs + controls */}
       <header className="w-full flex flex-col md:flex-row items-start md:items-center justify-between py-4 px-6 gap-4">
         <div className="text-xl font-bold">AI Top fudbalske i Kripto Prognoze</div>
-        <div className="flex flex-wrap items-center gap-3 ml-auto">
+
+        <div className="flex flex-wrap items-center gap-4 ml-auto">
           <div className="flex gap-1 bg-[#1f2339] rounded-full overflow-hidden">
             <button
               onClick={() => setActiveTab(TABS.COMBINED)}
@@ -105,7 +100,7 @@ export default function Home() {
               Crypto
             </button>
           </div>
-          <div className="flex gap-3 ml-auto">
+          <div className="flex gap-3">
             <button
               onClick={refreshAll}
               className="px-4 py-2 rounded-md bg-[#23272f] hover:bg-[#2f3344] transition font-medium"
@@ -123,7 +118,7 @@ export default function Home() {
       </header>
 
       {/* Info bar */}
-      <div className="max-w-full flex flex-col md:flex-row justify-center gap-6 mt-2 px-6 text-sm text-gray-300 font-medium">
+      <div className="flex flex-col md:flex-row justify-center gap-8 mt-2 px-6 text-sm text-gray-300 font-medium">
         <div>
           <span className="text-white">Football last generated:</span>{' '}
           {formatTime(footballData?.generated_at)}
@@ -134,37 +129,34 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Main content */}
+      {/* Content */}
       <main className="mt-8 space-y-10 px-6">
         {(loadingFootball || loadingCrypto) && (
-          <div className="text-center text-gray-400">
-            Učitavanje podataka...
-          </div>
+          <div className="text-center text-gray-400">Učitavanje podataka...</div>
         )}
 
-        {/* Combined view */}
+        {/* Combined */}
         {activeTab === TABS.COMBINED && (
-          <div className="space-y-10">
+          <>
+            {topFootball.length === 0 && topCrypto.length === 0 && (
+              <div className="text-center text-gray-400 mb-6">
+                Nema dostupnih kombinovanih predloga.
+              </div>
+            )}
             {combinedPairs.map((i) => (
-              <div
-                key={i}
-                className="flex flex-col md:flex-row gap-4"
-                style={{ alignItems: 'stretch' }}
-              >
+              <div key={i} className="grid grid-cols-12 gap-6 items-stretch">
                 {/* Football 33% */}
-                <div className="md:w-1/3 flex">
+                <div className="col-span-12 md:col-span-4 flex">
                   {topFootball[i] ? (
-                    <div className="w-full">
-                      <div className="relative">
-                        {i === 0 && (
-                          <div className="absolute -top-4 left-0">
-                            <div className="inline-flex px-3 py-1 rounded-full bg-gradient-to-r from-yellow-400 to-red-500 text-xs font-bold">
-                              Best Combined Pick
-                            </div>
+                    <div className="w-full relative">
+                      {i === 0 && (
+                        <div className="absolute -top-4 left-0 z-10">
+                          <div className="inline-flex px-3 py-1 rounded-full bg-gradient-to-r from-yellow-400 to-red-500 text-xs font-bold">
+                            Best Combined Pick
                           </div>
-                        )}
-                        <SignalCard data={topFootball[i]} type="football" />
-                      </div>
+                        </div>
+                      )}
+                      <SignalCard data={topFootball[i]} type="football" />
                     </div>
                   ) : (
                     <div className="w-full bg-[#1f2339] p-5 rounded-2xl text-gray-400">
@@ -172,8 +164,9 @@ export default function Home() {
                     </div>
                   )}
                 </div>
+
                 {/* Crypto 67% */}
-                <div className="md:w-2/3 flex">
+                <div className="col-span-12 md:col-span-8 flex">
                   {topCrypto[i] ? (
                     <div className="w-full">
                       <SignalCard data={topCrypto[i]} type="crypto" />
@@ -186,12 +179,7 @@ export default function Home() {
                 </div>
               </div>
             ))}
-            {topFootball.length === 0 && topCrypto.length === 0 && (
-              <div className="text-center text-gray-400">
-                Nema dostupnih kombinovanih predloga.
-              </div>
-            )}
-          </div>
+          </>
         )}
 
         {/* Football only */}
