@@ -2,19 +2,44 @@
 
 import { selectMatchesForDate } from '../../lib/matchSelector';
 
-/** Helpers */
-function normalizeName(name) {
-  if (!name) return '';
-  return name.toLowerCase().replace(/\s+/g, '').replace(/[^\w]/g, '');
+/* Utility: Levenshtein distance for fuzzy string similarity */
+function levenshtein(a = '', b = '') {
+  const matrix = Array.from({ length: b.length + 1 }, (_, i) =>
+    Array.from({ length: a.length + 1 }, (_, j) => 0)
+  );
+  for (let i = 0; i <= b.length; i++) matrix[i][0] = i;
+  for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      const cost = a[j - 1].toLowerCase() === b[i - 1].toLowerCase() ? 0 : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1, // deletion
+        matrix[i][j - 1] + 1, // insertion
+        matrix[i - 1][j - 1] + cost // substitution
+      );
+    }
+  }
+  return matrix[b.length][a.length];
+}
+
+function similarity(a = '', b = '') {
+  if (!a || !b) return 0;
+  const dist = levenshtein(a.toLowerCase(), b.toLowerCase());
+  const maxLen = Math.max(a.length, b.length);
+  if (maxLen === 0) return 1;
+  return 1 - dist / maxLen; // normalized [0,1]
+}
+
+function normalizeName(name = '') {
+  return name.toLowerCase().replace(/[\W_]+/g, '');
 }
 
 function computeEdge(model_prob, market_no_vig_prob) {
   return model_prob - market_no_vig_prob;
 }
 
-/**
- * Extract consensus no-vig probabilities from The Odds API event object.
- */
+/* Consensus extraction same as before */
 function extractConsensusNoVig(oddsEvent) {
   if (!oddsEvent || !Array.isArray(oddsEvent.bookmakers)) return {};
   const aggregate = {
@@ -52,7 +77,6 @@ function extractConsensusNoVig(oddsEvent) {
       }
 
       if (market.key === 'totals') {
-        // looking for Over/Under 2.5 specifically
         const over = market.outcomes.find((o) => o.name.toLowerCase().startsWith('over 2.5'));
         const under = market.outcomes.find((o) => o.name.toLowerCase().startsWith('under 2.5'));
         if (!over || !under) continue;
@@ -87,33 +111,21 @@ function extractConsensusNoVig(oddsEvent) {
   }
 
   const consensus = {};
-  if (aggregate.h2h.home.length) {
-    consensus.home = aggregate.h2h.home.reduce((a, b) => a + b, 0) / aggregate.h2h.home.length;
-  }
-  if (aggregate.h2h.draw.length) {
-    consensus.draw = aggregate.h2h.draw.reduce((a, b) => a + b, 0) / aggregate.h2h.draw.length;
-  }
-  if (aggregate.h2h.away.length) {
-    consensus.away = aggregate.h2h.away.reduce((a, b) => a + b, 0) / aggregate.h2h.away.length;
-  }
-  if (aggregate.over25.length) {
-    consensus.over25 = aggregate.over25.reduce((a, b) => a + b, 0) / aggregate.over25.length;
-  }
-  if (aggregate.btts_yes.length) {
-    consensus.btts_yes = aggregate.btts_yes.reduce((a, b) => a + b, 0) / aggregate.btts_yes.length;
-  }
+  if (aggregate.h2h.home.length) consensus.home = aggregate.h2h.home.reduce((a, b) => a + b, 0) / aggregate.h2h.home.length;
+  if (aggregate.h2h.draw.length) consensus.draw = aggregate.h2h.draw.reduce((a, b) => a + b, 0) / aggregate.h2h.draw.length;
+  if (aggregate.h2h.away.length) consensus.away = aggregate.h2h.away.reduce((a, b) => a + b, 0) / aggregate.h2h.away.length;
+  if (aggregate.over25.length) consensus.over25 = aggregate.over25.reduce((a, b) => a + b, 0) / aggregate.over25.length;
+  if (aggregate.btts_yes.length) consensus.btts_yes = aggregate.btts_yes.reduce((a, b) => a + b, 0) / aggregate.btts_yes.length;
 
   return consensus;
 }
 
-/**
- * Fetch odds events from The Odds API and match to pick (fuzzy on team names)
- */
-async function fetchOddsEvent(pick) {
+/* Fetch all relevant odds events once per request */
+let cachedOddsEvents = null;
+async function fetchAllOddsEvents() {
+  if (cachedOddsEvents) return cachedOddsEvents;
   const apiKey = process.env.ODDS_API_KEY;
-  if (!apiKey) return null;
-
-  // Fetch upcoming soccer odds (limited window)
+  if (!apiKey) return [];
   const url = new URL('https://api.the-odds-api.com/v4/sports/soccer/odds/');
   url.searchParams.set('regions', 'eu');
   url.searchParams.set('markets', 'h2h,totals,bothTeamsToScore');
@@ -123,37 +135,54 @@ async function fetchOddsEvent(pick) {
   url.searchParams.set('daysFrom', '0');
   url.searchParams.set('daysTo', '1');
 
-  let resp;
   try {
-    resp = await fetch(url.toString());
+    const res = await fetch(url.toString());
+    if (!res.ok) return [];
+    const events = await res.json();
+    cachedOddsEvents = Array.isArray(events) ? events : [];
+    return cachedOddsEvents;
   } catch (e) {
-    return null;
+    return [];
   }
-  if (!resp.ok) return null;
+}
 
-  const events = await resp.json();
+/* Best-match logic with fuzzy similarity */
+function findBestMatchEvent(pick, events) {
   const targetHome = normalizeName(pick.teams.home.name);
   const targetAway = normalizeName(pick.teams.away.name);
 
-  for (const ev of events) {
-    const evHome = normalizeName(ev.home_team);
-    const evAway = normalizeName(ev.away_team);
-    const homeMatch = evHome.includes(targetHome) || targetHome.includes(evHome);
-    const awayMatch = evAway.includes(targetAway) || targetAway.includes(evAway);
-    const swapHome = evHome.includes(targetAway) || targetAway.includes(evHome);
-    const swapAway = evAway.includes(targetHome) || targetHome.includes(evAway);
+  let best = null;
+  let bestScore = 0;
 
-    if ((homeMatch && awayMatch) || (swapHome && swapAway)) {
-      return ev;
+  for (const ev of events) {
+    const evHome = normalizeName(ev.home_team || '');
+    const evAway = normalizeName(ev.away_team || '');
+
+    // similarity per side
+    const homeSim = similarity(evHome, targetHome);
+    const awaySim = similarity(evAway, targetAway);
+    const reversedHomeSim = similarity(evHome, targetAway);
+    const reversedAwaySim = similarity(evAway, targetHome);
+
+    // two possibilities: direct or swapped (home/away)
+    const directScore = (homeSim + awaySim) / 2;
+    const swappedScore = (reversedHomeSim + reversedAwaySim) / 2;
+
+    const candidateScore = Math.max(directScore, swappedScore);
+
+    if (candidateScore > bestScore) {
+      bestScore = candidateScore;
+      best = { event: ev, score: candidateScore, direct: directScore >= swappedScore };
     }
   }
-  return null;
+
+  return best ? best : null;
 }
 
 export default async function handler(req, res) {
   try {
     const { sport_key = 'soccer', date, min_edge: me, min_odds: mo } = req.query;
-    const minEdge = parseFloat(me ?? '0.03'); // mekše po defaultu
+    const minEdge = parseFloat(me ?? '0.03');
     const minOdds = parseFloat(mo ?? '1.2');
 
     const selectResp = await selectMatchesForDate(date);
@@ -170,6 +199,14 @@ export default async function handler(req, res) {
         },
       });
     }
+
+    const allOddsEvents = await fetchAllOddsEvents();
+    const rawSample = allOddsEvents.slice(0, 5).map((ev) => ({
+      home_team: ev.home_team,
+      away_team: ev.away_team,
+      commence_time: ev.commence_time,
+      bookmakers_count: Array.isArray(ev.bookmakers) ? ev.bookmakers.length : 0,
+    }));
 
     const candidates = [];
     const perPickDebug = [];
@@ -188,20 +225,41 @@ export default async function handler(req, res) {
         consensus: {},
         matched_odds_event: null,
         edges: [],
+        best_match_score: null,
+        best_match_names: null,
       };
 
-      // fetch real odds event
-      const oddsEvent = await fetchOddsEvent(p);
-      if (oddsEvent) {
-        pickDebug.matched_odds_event = {
-          home_team: oddsEvent.home_team,
-          away_team: oddsEvent.away_team,
-          commence_time: oddsEvent.commence_time,
-          bookmakers_count: Array.isArray(oddsEvent.bookmakers) ? oddsEvent.bookmakers.length : 0,
-        };
+      // find best fuzzy match
+      let matchedOddsEvent = null;
+      let matchInfo = null;
+      if (allOddsEvents.length > 0) {
+        const best = findBestMatchEvent(p, allOddsEvents);
+        if (best && best.score >= 0.6) {
+          matchedOddsEvent = best.event;
+          pickDebug.best_match_score = Number(best.score.toFixed(3));
+          pickDebug.best_match_names = {
+            home: best.event.home_team,
+            away: best.event.away_team,
+            direct: best.direct,
+          };
+          pickDebug.matched_odds_event = {
+            home_team: matchedOddsEvent.home_team,
+            away_team: matchedOddsEvent.away_team,
+            commence_time: matchedOddsEvent.commence_time,
+            bookmakers_count: Array.isArray(matchedOddsEvent.bookmakers) ? matchedOddsEvent.bookmakers.length : 0,
+          };
+        } else if (best) {
+          // keep best score for visibility, but no match if below threshold
+          pickDebug.best_match_score = Number(best.score.toFixed(3));
+          pickDebug.best_match_names = {
+            home: best.event.home_team,
+            away: best.event.away_team,
+            direct: best.direct,
+          };
+        }
       }
 
-      const consensus = extractConsensusNoVig(oddsEvent);
+      const consensus = extractConsensusNoVig(matchedOddsEvent);
       pickDebug.consensus = consensus;
 
       // 1X2
@@ -272,7 +330,7 @@ export default async function handler(req, res) {
         }
       }
 
-      // Over/Under 2.5 (Over)
+      // Over/Under 2.5
       if ((p.over25_probability != null || consensus.over25 != null)) {
         const model_prob_over = p.over25_probability != null ? p.over25_probability : consensus.over25 || 0;
         const market_no_vig_prob = consensus.over25;
@@ -308,11 +366,9 @@ export default async function handler(req, res) {
       perPickDebug.push(pickDebug);
     }
 
-    // sort by edge descending
     candidates.sort((a, b) => b.edge - a.edge);
     let value_bets = candidates.slice(0, 4);
 
-    // fallback to model-only if no value bets
     if (value_bets.length === 0) {
       const fallback = picks
         .filter((p) => p.predicted && p.model_probs)
@@ -350,6 +406,7 @@ export default async function handler(req, res) {
         candidate_count: candidates.length,
         thresholds: { min_edge: minEdge, min_odds: minOdds },
         used_odds_api: !!process.env.ODDS_API_KEY,
+        raw_odds_events_sample: rawSample,
       },
     });
   } catch (err) {
