@@ -37,6 +37,7 @@ export default async function handler(req, res) {
     date,
     min_edge = 0.05,
     min_odds = 1.3,
+    fixture_id,
   } = req.query;
 
   console.log("ENV KEYS:", {
@@ -48,7 +49,12 @@ export default async function handler(req, res) {
 
   try {
     const raw = await fetchSportmonksFixturesWithRetry(date);
-    const fixtures = (raw.data || []).filter((f) => f.time?.status === "NS");
+    let fixtures = (raw.data || []).filter((f) => f.time?.status === "NS");
+
+    // optional single-fixture filter to save downstream work / API usage
+    if (fixture_id) {
+      fixtures = fixtures.filter((f) => String(f.id) === String(fixture_id));
+    }
 
     const oddsRaw = await fetchOdds(sport_key);
     const oddsMap = {};
@@ -66,7 +72,7 @@ export default async function handler(req, res) {
       const key = `${homeName}|${awayName}`;
       const o = oddsMap[key];
 
-      // placeholders for model output
+      // placeholders for model output (replace later with real model)
       const model_probs = { home: 0.45, draw: 0.25, away: 0.3 };
       const model_over25 = 0.32;
       const model_btts = 0.4;
