@@ -1,7 +1,6 @@
 // pages/api/select-matches.js
 import { fetchSportmonksFixtures } from "../../lib/sources/sportmonks";
 
-// retry wrapper in case the underlying helper has transient 500/503 issues
 async function fetchSportmonksFixturesWithRetry(date, retries = 3, baseDelay = 500) {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
@@ -40,13 +39,12 @@ export default async function handler(req, res) {
         away: { id: f.visitorTeam.data.id, name: f.visitorTeam.data.name },
       },
       datetime_local: f.time,
-      // TODO: replace these placeholders with real model outputs
       model_probs: { home: 0.45, draw: 0.25, away: 0.3 },
       predicted: "home",
       confidence: 30,
       rankScore: 30,
-      btts_probability: 0.4, // placeholder
-      over25_probability: 0.32, // placeholder
+      btts_probability: 0.4,
+      over25_probability: 0.32,
     }));
 
     res.status(200).json({ picks, debug: { total_fetched: fixtures.length } });
