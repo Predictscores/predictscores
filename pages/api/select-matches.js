@@ -12,17 +12,23 @@ let cache = {
 
 function formatLocalDatetimeFromSportMonks(fixture) {
   try {
-    // SportMonks daje: fixture.starting_at.date_time === "2025-08-04 19:00:00" (UTC)
     let utcDate;
-    if (fixture.starting_at?.date_time) {
-      // zameni razmak T i doda Z da bi bio ISO UTC
-      const iso = fixture.starting_at.date_time.replace(' ', 'T') + 'Z';
-      utcDate = new Date(iso);
-    } else if (fixture.starting_at) {
-      utcDate = new Date(fixture.starting_at);
-    } else if (fixture.date) {
-      utcDate = new Date(fixture.date);
-    } else {
+
+    if (fixture.starting_at) {
+      // Preferiraj timestamp ako postoji (najstabilnije)
+      if (fixture.starting_at.timestamp) {
+        utcDate = new Date(fixture.starting_at.timestamp * 1000);
+      } else if (fixture.starting_at.date_time) {
+        // Zameni razmak sa T i dodaj Z da bi bio ISO UTC
+        const iso = fixture.starting_at.date_time.replace(' ', 'T') + 'Z';
+        utcDate = new Date(iso);
+      } else if (fixture.starting_at.date) {
+        // fallback na date-only
+        utcDate = new Date(fixture.starting_at.date);
+      }
+    }
+
+    if (!utcDate || isNaN(utcDate.getTime())) {
       return 'Invalid Date';
     }
 
@@ -34,25 +40,22 @@ function formatLocalDatetimeFromSportMonks(fixture) {
       hour12: false,
       timeZone: 'Europe/Belgrade',
     });
-    // Example output: "04/08/2025, 21:00"
     let formatted = formatter.format(utcDate);
-    // Drop year if present: "04/08/2025, 21:00" -> "04/08, 21:00"
-    formatted = formatted.replace(/\/\d{4}/, '').trim();
+    formatted = formatted.replace(/\/\d{4}/, '').trim(); // ukloni godinu
     return formatted;
   } catch (e) {
     return 'Invalid Date';
   }
 }
 
-// Naivni model: stub funkcija da izračuna 1X2 verovatnoće, BTTS i Over25
+// Very simple placeholder model for probabilities
 function deriveSimpleProbabilities(fixture) {
-  // Ovo možeš zameniti kasnije pravim modelom.
-  // Ovde stavljamo fiksne (ili možeš dodati malo heuristike po domaćinu / gostu).
+  // Ovde možeš kasnije zameniti pravim modelom.
   const home = 0.45;
   const draw = 0.25;
-  const away = 0.30;
-  const btts_probability = 0.4; // stub
-  const over25_probability = 0.323; // stub
+  const away = 0.3;
+  const btts_probability = 0.4;
+  const over25_probability = 0.323;
 
   const predicted =
     home >= draw && home >= away
@@ -61,13 +64,12 @@ function deriveSimpleProbabilities(fixture) {
       ? 'draw'
       : 'away';
 
-  // Confidence: recimo razlika između najjače i sledeće
-  let sorted = [
+  const sorted = [
     { key: 'home', val: home },
     { key: 'draw', val: draw },
     { key: 'away', val: away },
   ].sort((a, b) => b.val - a.val);
-  const confidence = Math.round((sorted[0].val - sorted[1].val) * 100);
+  const confidence = Math.round((sorted[0].val - sorted[1].val) * 100); // razlika najboljeg i drugog
 
   return {
     model_probs: {
@@ -84,24 +86,19 @@ function deriveSimpleProbabilities(fixture) {
 
 export default async function handler(req, res) {
   try {
-    // očekuje query param date u formatu YYYY-MM-DD, default danas (UTC)
     const { date: rawDate } = req.query;
-    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const today = new Date().toISOString().slice(0, 10);
     const date = rawDate && typeof rawDate === 'string' ? rawDate : today;
 
-    // cache po datumu
     const now = Date.now();
     if (cache.date === date && now - cache.timestamp < CACHE_TTL_MS && cache.data) {
       return res.status(200).json(cache.data);
     }
 
     if (!SPORTMONKS_KEY) {
-      return res.status(500).json({
-        error: 'Missing SPORTMONKS_KEY env var',
-      });
+      return res.status(500).json({ error: 'Missing SPORTMONKS_KEY env var' });
     }
 
-    // Povuči fixture-e sa SportMonks za taj datum
     const fixturesUrl = `${SPORTMONKS_BASE}/fixtures/date/${encodeURIComponent(
       date
     )}?api_token=${encodeURIComponent(SPORTMONKS_KEY)}&include=localTeam,visitorTeam,league`;
@@ -118,7 +115,9 @@ export default async function handler(req, res) {
     const raw = await fRes.json();
     const fixtures = raw.data || [];
 
-    // Mapiraj u picks
+    // debug: log da vidiš da se pravi novi poziv
+    console.log(`select-matches: fetched ${fixtures.length} fixtures for date=${date}`);
+
     const picks = fixtures.map((fixture) => {
       const {
         model_probs,
@@ -128,7 +127,6 @@ export default async function handler(req, res) {
         over25_probability,
       } = deriveSimpleProbabilities(fixture);
 
-      // timovi
       const teams = {
         home: {
           id: fixture.localTeam?.data?.id || fixture.localteam_id || null,
@@ -156,7 +154,7 @@ export default async function handler(req, res) {
         confidence,
         btts_probability,
         over25_probability,
-        rankScore: confidence, // za sada
+        rankScore: confidence,
       };
     });
 
