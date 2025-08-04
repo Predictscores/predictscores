@@ -1,176 +1,328 @@
-// FILE: components/SignalCard.js
+// FILE: components/SignalCard.jsx
+// Complete self-contained SignalCard handling football + crypto with consensus, badges, sparkline, and embedded chart.
 
 import React from 'react';
 
-const SignalCard = ({ data, type }) => {
-  if (!data) return null;
+// consensus between trend and crossover
+const computeConsensus = (trend, crossover) => {
+  if (!trend || !crossover) return null;
+  if (trend.direction === crossover.direction) {
+    let avg = (trend.confidence + crossover.confidence) / 2;
+    if (trend.confidence >= 80 && crossover.confidence >= 80) avg += 5; // boost when both strong
+    return Math.min(100, Math.round(avg));
+  }
+  // disagreement: take smaller and dampen
+  return Math.round(Math.min(trend.confidence, crossover.confidence) * 0.7);
+};
 
-  const {
-    symbol,
-    name,
-    direction,
-    confidence,
-    expected_range,
-    stop_loss,
-    take_profit,
-    current_price,
-    odds,
-    prediction,
-    note,
-    timeframe,
-  } = data;
+const Badge = ({ children, className = '' }) => (
+  <div
+    className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-semibold ${className}`}
+  >
+    {children}
+  </div>
+);
 
-  // Determine level
-  const getConfidenceLevel = (val) => {
-    if (typeof val !== 'number') return 'unknown';
-    if (val > 90) return 'explosive';
-    if (val >= 80) return 'high';
-    if (val >= 55) return 'moderate';
-    return 'low';
+const ConfidenceBadge = ({ confidence }) => {
+  if (confidence > 90) {
+    return (
+      <Badge className="bg-gradient-to-r from-red-500 to-yellow-400 text-white">
+        🔥 Bomba {confidence}%
+      </Badge>
+    );
+  }
+  if (confidence >= 80) {
+    return <Badge className="bg-green-600 text-white">High {confidence}%</Badge>;
+  }
+  if (confidence >= 55) {
+    return <Badge className="bg-yellow-500 text-black">Moderate {confidence}%</Badge>;
+  }
+  return <Badge className="bg-gray-600 text-white">Low {confidence}%</Badge>;
+};
+
+const DirectionBadge = ({ direction }) => {
+  if (direction === 'LONG') {
+    return (
+      <div className="text-green-300 font-bold flex items-center gap-1">
+        ▲ LONG
+      </div>
+    );
+  }
+  if (direction === 'SHORT') {
+    return (
+      <div className="text-red-300 font-bold flex items-center gap-1">
+        ▼ SHORT
+      </div>
+    );
+  }
+  return (
+    <div className="text-gray-300 font-semibold flex items-center gap-1">
+      {direction}
+    </div>
+  );
+};
+
+const Sparkline = ({ history = [], width = 120, height = 32 }) => {
+  if (!history || history.length === 0) return null;
+  const slice = history.slice(-60);
+  const prices = slice.map((p) => (typeof p === 'number' ? p : p));
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
+  const span = max - min || 1;
+  const path = prices
+    .map((price, i) => {
+      const x = (i / (prices.length - 1)) * width;
+      const y = height - ((price - min) / span) * height;
+      return `${i === 0 ? 'M' : 'L'}${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(' ');
+  return (
+    <svg
+      width="100%"
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      aria-label="sparkline"
+      className="mt-1"
+    >
+      <path
+        d={path}
+        fill="none"
+        stroke="#7c3aed"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <circle
+        cx={((prices.length - 1) / (prices.length - 1)) * width}
+        cy={
+          height -
+          (((prices[prices.length - 1] - min) / span) * height || 0)
+        }
+        r="2"
+        fill="#fff"
+      />
+    </svg>
+  );
+};
+
+const FootballContent = ({ data }) => (
+  <div className="flex-1 flex flex-col justify-between">
+    <div className="flex items-center mb-2">
+      <div className="text-lg font-bold mr-2">
+        {data.name || data.predicted || 'Pick'}
+      </div>
+      {data.timeframe && (
+        <div className="text-[10px] px-2 py-1 bg-[#222741] rounded-full">
+          {data.timeframe}
+        </div>
+      )}
+      <div className="ml-auto">
+        <ConfidenceBadge confidence={data.confidence ?? 0} />
+      </div>
+    </div>
+    <div className="text-sm">
+      {data.prediction && (
+        <p>
+          <span className="font-bold">Pick:</span> {data.prediction}
+        </p>
+      )}
+      {data.odds && (
+        <p>
+          <span className="font-bold">Odds:</span> {data.odds}
+        </p>
+      )}
+      {data.note && (
+        <p className="text-xs italic text-gray-400 mt-1">{data.note}</p>
+      )}
+    </div>
+  </div>
+);
+
+const CryptoMetrics = ({ sig }) => {
+  const trend = {
+    direction: sig.direction,
+    confidence: sig.confidence,
   };
-
-  const level = getConfidenceLevel(confidence);
-
-  // Color mapping
-  const barColor = {
-    low: 'bg-yellow-400',
-    moderate: 'bg-blue-400',
-    high: 'bg-green-400',
-    explosive: 'bg-gradient-to-b from-orange-400 to-red-500',
-    unknown: 'bg-gray-500',
-  }[level];
-
-  const badgeBg = {
-    low: 'bg-yellow-400',
-    moderate: 'bg-blue-400',
-    high: 'bg-green-400',
-    explosive: 'bg-gradient-to-r from-orange-400 to-red-500',
-    unknown: 'bg-gray-500',
-  }[level];
-
-  const levelLabel = {
-    low: 'Low',
-    moderate: 'Moderate',
-    high: 'High',
-    explosive: '🔥 Explosive',
-    unknown: 'Unknown',
-  }[level];
+  const crossover = sig.crossover || null;
+  const consensus = computeConsensus(trend, crossover);
+  const showConsensus = consensus != null;
 
   return (
-    <div
-      className={`relative flex w-full rounded-2xl bg-[#1f2339] text-white shadow-md p-6 flex-col md:flex-row gap-6 signal-card-hover`}
-    >
-      {/* Vertical bar indicator */}
-      <div className="absolute left-0 top-0 bottom-0 w-1 rounded-l-2xl">
-        <div
-          className={`h-full ${barColor} ${
-            level === 'explosive' ? 'opacity-90' : ''
-          }`}
-          style={level === 'explosive' ? { boxShadow: '0 0 12px 2px rgba(255,99,0,0.8)' } : {}}
-        />
+    <div className="flex flex-col flex-1">
+      <div className="flex justify-between items-start mb-2">
+        <div className="flex gap-2 items-center">
+          <div className="text-xl font-bold">{sig.symbol}</div>
+          <div className="text-xs text-gray-400">{sig.name}</div>
+          {sig.timeframe && (
+            <div className="text-[10px] px-2 py-1 bg-[#222741] rounded-full">
+              {sig.timeframe}
+            </div>
+          )}
+        </div>
+        <div className="flex flex-col items-end gap-1">
+          <div className="flex gap-2">
+            <ConfidenceBadge confidence={sig.confidence} />
+            {crossover && crossover.confidence != null && (
+              <ConfidenceBadge confidence={crossover.confidence} />
+            )}
+          </div>
+          {showConsensus && (
+            <div>
+              <Badge className="bg-blue-600 text-white text-[10px]">
+                Consensus {consensus}%
+              </Badge>
+            </div>
+          )}
+        </div>
       </div>
 
-      {/* Info */}
-      <div className="flex-1 flex flex-col justify-between pl-3">
-        <div className="flex items-start gap-2 mb-2 flex-wrap">
-          <div className="flex-1 min-w-0">
-            <h3 className="text-lg font-bold truncate">
-              {name || symbol}{' '}
-              {timeframe && (
-                <span className="text-xs font-normal text-gray-300">
-                  [{timeframe}]
-                </span>
-              )}
-            </h3>
+      <div className="flex flex-wrap gap-4 mb-2">
+        <div className="flex gap-4 flex-1 min-w-[150px]">
+          <div className="flex flex-col">
+            <div className="text-[10px] text-gray-400">Trend</div>
+            <DirectionBadge direction={sig.direction} />
           </div>
-          {typeof confidence === 'number' && (
-            <div
-              className={`flex items-center gap-2 text-xs font-semibold px-3 py-1 rounded-full ${
-                level === 'explosive' ? 'pulse-fire' : ''
-              }`}
-              style={
-                level === 'explosive'
-                  ? {
-                      background:
-                        'linear-gradient(135deg, rgba(251,146,60,1) 0%, rgba(239,68,68,1) 100%)',
-                      color: 'white',
-                    }
-                  : {}
-              }
-            >
-              {level === 'explosive' ? (
-                <span className="mr-1">🔥</span>
-              ) : null}
-              <span>
-                {confidence}%
-                <span className="ml-1 text-gray-300">
-                  {level === 'explosive'
-                    ? ''
-                    : levelLabel[level] && ` ${levelLabel[level]}`}
-                </span>
-              </span>
+          {sig.crossover && (
+            <div className="flex flex-col">
+              <div className="text-[10px] text-gray-400">Crossover</div>
+              <DirectionBadge direction={sig.crossover.direction} />
             </div>
           )}
         </div>
 
-        {type === 'football' && (
-          <div className="flex flex-col gap-1 text-sm">
-            <div>
-              <span className="font-semibold">Pick:</span> {prediction || '—'}
-            </div>
-            {odds && (
-              <div>
-                <span className="font-semibold">Odds:</span> {odds}
-              </div>
-            )}
-            {note && (
-              <div className="text-xs italic text-gray-400 mt-1">{note}</div>
-            )}
+        <div className="flex flex-col text-right min-w-[120px]">
+          <div className="text-[10px] text-gray-400">Price</div>
+          <div className="text-lg font-semibold">
+            {sig.current_price != null
+              ? `$${Number(sig.current_price).toLocaleString(undefined, {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                })}`
+              : '—'}
           </div>
-        )}
-
-        {type === 'crypto' && (
-          <div className="flex flex-col gap-2 text-sm">
-            <div>
-              <span className="font-semibold">Signal:</span> {direction || '—'}
-            </div>
-            <div className="flex flex-wrap gap-4">
-              <div>
-                <span className="font-semibold">Range:</span>{' '}
-                {expected_range || '—'}
-              </div>
-              <div>
-                <span className="font-semibold">SL:</span>{' '}
-                {stop_loss ?? '—'}
-              </div>
-              <div>
-                <span className="font-semibold">TP:</span>{' '}
-                {take_profit ?? '—'}
-              </div>
-            </div>
-            <div>
-              <span className="font-semibold">Price:</span>{' '}
-              {current_price != null ? `$${current_price}` : '—'}
-            </div>
-          </div>
-        )}
+        </div>
       </div>
 
-      {/* Chart */}
+      <div className="w-full mb-2">
+        <Sparkline history={sig.price_history_24h} />
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 text-[11px] mb-2">
+        <div className="bg-[#222741] rounded px-2 py-1 flex flex-col">
+          <div className="font-semibold uppercase">RSI</div>
+          <div>{sig.rsi != null ? sig.rsi : '—'}</div>
+        </div>
+        <div className="bg-[#222741] rounded px-2 py-1 flex flex-col">
+          <div className="font-semibold uppercase">Δ Price</div>
+          <div>
+            {sig.priceChangePercent != null
+              ? `${sig.priceChangePercent > 0 ? '+' : ''}${sig.priceChangePercent}%`
+              : '—'}
+          </div>
+        </div>
+        <div className="bg-[#222741] rounded px-2 py-1 flex flex-col">
+          <div className="font-semibold uppercase">Volatility</div>
+          <div>{sig.volatility != null ? sig.volatility : '—'}</div>
+        </div>
+        <div className="bg-[#222741] rounded px-2 py-1 flex flex-col">
+          <div className="font-semibold uppercase">Expected</div>
+          <div>{sig.expected_range}</div>
+        </div>
+      </div>
+
+      {sig.crossover && (
+        <div className="flex gap-4 mb-1">
+          <div className="flex-1 bg-[#1f234f] rounded px-3 py-2">
+            <div className="text-[10px] uppercase font-medium mb-1">
+              Crossover Edge
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="font-bold">
+                {sig.crossover.edge != null
+                  ? `${(sig.crossover.edge * 100).toFixed(2)}%`
+                  : '—'}
+              </div>
+              <div className="text-[11px]">
+                SMA: {sig.crossover.short_ma} / {sig.crossover.long_ma}
+              </div>
+              <div className="text-[11px]">({sig.crossover.direction})</div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const SignalCard = ({ data, type }) => {
+  if (!data) return null;
+
+  const confidence = data.confidence ?? 0;
+  const trend = { direction: data.direction, confidence: data.confidence };
+  const crossover = data.crossover || null;
+  const consensus = computeConsensus(trend, crossover);
+
+  return (
+    <div className="flex flex-col h-full w-full rounded-2xl bg-[#1f234f] text-white shadow-lg p-6 items-stretch gap-6 relative overflow-hidden">
+      {/* decorative side bar based on type/confidence */}
       {type === 'crypto' && (
-        <div className="flex-shrink-0 w-full md:w-[380px]">
-          <div className="w-full rounded-xl overflow-hidden">
+        <div
+          className={`absolute left-0 top-0 bottom-0 w-1 rounded-l-xl ${
+            confidence > 90
+              ? 'bg-gradient-to-b from-red-400 to-yellow-300'
+              : confidence >= 80
+              ? 'bg-green-400'
+              : confidence >= 55
+              ? 'bg-blue-400'
+              : 'bg-yellow-500'
+          }`}
+        />
+      )}
+      {type === 'football' && (
+        <div
+          className={`absolute left-0 top-0 bottom-0 w-1 rounded-l-xl ${
+            confidence >= 85
+              ? 'bg-green-400'
+              : confidence >= 55
+              ? 'bg-blue-400'
+              : 'bg-yellow-400'
+          }`}
+        />
+      )}
+
+      {/* Content */}
+      {type === 'football' && <FootballContent data={data} />}
+      {type === 'crypto' && <CryptoMetrics sig={data} />}
+
+      {/* Chart / iframe for crypto */}
+      {type === 'crypto' && (
+        <div className="ml-auto flex-shrink-0 flex flex-col justify-between min-w-[340px] max-w-[420px]">
+          <div className="mb-2">
             <iframe
-              title="TradingView Chart"
-              src={`https://s.tradingview.com/widgetembed/?symbol=${(symbol || '')
-                .toUpperCase()
-                .replace(/[^A-Z0-9]/g, '')}USDT&interval=15&theme=dark&style=1&timezone=Etc/UTC&studies=[]&hide_side_toolbar=true&hide_legend=true&withdateranges=false&saveimage=false&hideideas=true&toolbar_bg=2c2d3e&locale=en`}
+              title={`tv-${data.symbol || 'chart'}`}
+              src={`https://s.tradingview.com/widgetembed/?symbol=${(data.symbol || '')
+                .toUpperCase()}USDT&interval=15&theme=dark&style=1&timezone=Etc/UTC&studies=[]&hide_side_toolbar=true&hide_legend=true&withdateranges=false&saveimage=false&hideideas=true&toolbar_bg=2c2d3e&locale=en`}
               width="100%"
-              height="140"
+              height="135"
               frameBorder="0"
               allowTransparency={true}
               style={{ borderRadius: 12, border: 0 }}
             />
+          </div>
+          <div className="text-[10px] text-gray-400">
+            Price updated:{' '}
+            {data.timestamp
+              ? new Date(data.timestamp).toLocaleTimeString()
+              : '—'}
+          </div>
+        </div>
+      )}
+
+      {/* strong consensus highlight */}
+      {type === 'crypto' && consensus != null && consensus > 90 && (
+        <div className="absolute top-2 right-2">
+          <div className="px-2 py-1 rounded bg-yellow-400 text-black text-[10px] font-bold flex items-center gap-1">
+            🔥 STRONG CONSENSUS
           </div>
         </div>
       )}
