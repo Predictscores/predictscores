@@ -1,241 +1,286 @@
-// FILE: pages/api/value-bets.js
+// pages/api/value-bets.js
 
-import { getTopMatches } from '../../lib/matchSelector';
+const ODDS_API_BASE = 'https://api.the-odds-api.com/v4';
+const MIN_MARKET_ODDS = 1.3; // minimalna kvota za razmatranje
+const EDGE_THRESHOLD = 0.05; // value bet cutoff
 
-const ODDS_API_KEY = process.env.ODDS_API_KEY;
-if (!ODDS_API_KEY) {
-  console.warn('Missing ODDS_API_KEY in env');
+function safePct(p) {
+  return Math.min(Math.max(p, 0), 1);
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function normalizeNoVig(probs) {
+  // probs: { outcome: impliedProbability, ... }
+  const sum = Object.values(probs).reduce((s, v) => s + v, 0);
+  if (sum <= 0) return probs;
+  const normalized = {};
+  Object.entries(probs).forEach(([k, v]) => {
+    normalized[k] = v / sum;
+  });
+  return normalized;
+}
 
-const fetchWithRetry = async (url, options = {}, retries = 2) => {
-  try {
-    const res = await fetch(url, options);
-    if (!res.ok) {
-      if (retries > 0) {
-        await sleep(500);
-        return fetchWithRetry(url, options, retries - 1);
-      }
-      const text = await res.text();
-      throw new Error(`HTTP ${res.status}: ${text}`);
+// average consensus no-vig probability across bookmakers for a given outcome
+function consensusProb(bookmakerNoVigs, outcome) {
+  if (!bookmakerNoVigs || bookmakerNoVigs.length === 0) return 0;
+  let sum = 0;
+  let count = 0;
+  bookmakerNoVigs.forEach((nv) => {
+    if (nv[outcome] != null) {
+      sum += nv[outcome];
+      count += 1;
     }
-    return res.json();
-  } catch (e) {
-    if (retries > 0) {
-      await sleep(500);
-      return fetchWithRetry(url, options, retries - 1);
-    }
-    throw e;
+  });
+  return count > 0 ? sum / count : 0;
+}
+
+async function fetchOddsBulk(sportKey = 'soccer') {
+  const apiKey = process.env.ODDS_API_KEY;
+  if (!apiKey) throw new Error('ODDS_API_KEY missing');
+  const url = new URL(`${ODDS_API_BASE}/sports/${sportKey}/odds/`);
+  url.searchParams.set('regions', 'eu'); // adjust if needed
+  url.searchParams.set('markets', 'h2h,bothteams,totals'); // 1X2, BTTS, Totals (over/under)
+  url.searchParams.set('oddsFormat', 'decimal');
+  url.searchParams.set('dateFormat', 'iso');
+  url.searchParams.set('apiKey', apiKey);
+  // Note: depending on version/naming of the Odds API, you might need to adjust "bothteams" or "totals"
+  const res = await fetch(url.toString());
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Odds API error ${res.status}: ${text}`);
   }
-};
+  return res.json(); // array of events
+}
 
-// Normalize team names: remove diacritics, non-alphanumeric, lowercase
-const normalizeName = (str) => {
-  if (!str) return '';
-  return str
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '') // strip accents
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, ''); // remove non-alphanumeric
-};
+function matchEventToPick(event, pick) {
+  // crude matching on team names (case-insensitive inclusion)
+  const home = event.home_team?.toLowerCase();
+  const away = event.away_team?.toLowerCase();
+  const pickHome = (pick.teams?.home?.name || '').toLowerCase();
+  const pickAway = (pick.teams?.away?.name || '').toLowerCase();
 
-// Remove vig for 1X2 (decimal odds)
-const removeVig = (h, d, a) => {
-  const impliedH = 1 / h;
-  const impliedD = 1 / d;
-  const impliedA = 1 / a;
-  const sum = impliedH + impliedD + impliedA;
-  return {
-    home: impliedH / sum,
-    draw: impliedD / sum,
-    away: impliedA / sum,
-  };
-};
+  // direct exact or inclusion matches
+  const homeMatches =
+    home === pickHome || home.includes(pickHome) || pickHome.includes(home);
+  const awayMatches =
+    away === pickAway || away.includes(pickAway) || pickAway.includes(away);
+  const flipHomeMatches =
+    home === pickAway || home.includes(pickAway) || pickAway.includes(home);
+  const flipAwayMatches =
+    away === pickHome || away.includes(pickHome) || pickHome.includes(away);
 
-const consensusNoVig = (books) => {
-  if (!books || books.length === 0) return null;
-  let sumHome = 0,
-    sumDraw = 0,
-    sumAway = 0;
-  books.forEach((b) => {
-    sumHome += b.home;
-    sumDraw += b.draw;
-    sumAway += b.away;
-  });
-  const avgHome = sumHome / books.length;
-  const avgDraw = sumDraw / books.length;
-  const avgAway = sumAway / books.length;
-  const total = avgHome + avgDraw + avgAway;
-  return {
-    home: avgHome / total,
-    draw: avgDraw / total,
-    away: avgAway / total,
-  };
-};
+  // allow swapped if necessary (some naming mismatches)
+  return (homeMatches && awayMatches) || (flipHomeMatches && flipAwayMatches);
+}
 
-const fetchOddsForSport = async (sportKey) => {
-  const base = `https://api.the-odds-api.com/v4/sports/${encodeURIComponent(
-    sportKey
-  )}/odds/`;
-  const params = new URLSearchParams({
-    regions: 'eu',
-    markets: 'h2h',
-    oddsFormat: 'decimal',
-    dateFormat: 'iso',
-    apiKey: ODDS_API_KEY,
-  });
-  const url = `${base}?${params.toString()}`;
-  return await fetchWithRetry(url);
-};
-
-const findMatchEvent = (events, homeName, awayName) => {
-  const normHome = normalizeName(homeName);
-  const normAway = normalizeName(awayName);
-  return events.find((ev) => {
-    const ht = normalizeName(ev.home_team || '');
-    const at = normalizeName(ev.away_team || '');
-
-    // exact or substring matching both orders
-    const match1 = ht.includes(normHome) && at.includes(normAway);
-    const match2 = ht.includes(normAway) && at.includes(normHome);
-    return match1 || match2;
-  });
-};
-
-const extractNoVigFromEvent = (matchEvent) => {
-  if (!matchEvent || !Array.isArray(matchEvent.bookmakers)) return null;
-  const books = [];
-  matchEvent.bookmakers.forEach((bm) => {
-    const h2hMarket = bm.markets?.find((m) => m.key === 'h2h');
-    if (h2hMarket && Array.isArray(h2hMarket.outcomes)) {
-      let homeO = null,
-        drawO = null,
-        awayO = null;
-      h2hMarket.outcomes.forEach((o) => {
-        const name = (o.name || '').toLowerCase();
-        if (name === (matchEvent.home_team || '').toLowerCase()) {
-          homeO = o.price;
-        } else if (name === (matchEvent.away_team || '').toLowerCase()) {
-          awayO = o.price;
-        } else if (name === 'draw' || name === 'tie') {
-          drawO = o.price;
-        }
-      });
-      if (homeO && drawO && awayO) {
-        books.push(removeVig(homeO, drawO, awayO));
-      }
-    }
-  });
-  if (books.length === 0) return null;
-  return consensusNoVig(books);
-};
+function impliedProbFromOdd(odd) {
+  if (!odd || odd <= 0) return 0;
+  return 1 / odd;
+}
 
 export default async function handler(req, res) {
   try {
-    const { sport_key } = req.query;
-    const dateParam = req.query.date || undefined;
+    const { picks, sport_key = 'soccer' } = req.method === 'GET' ? req.query : req.body || {};
 
-    const selectResult = await getTopMatches(dateParam);
-    const picks = selectResult.picks || [];
-
-    if (!picks || picks.length === 0) {
+    if (!picks || !Array.isArray(picks) || picks.length === 0) {
       return res.status(400).json({
-        error: 'No picks available from model',
-        debug: selectResult.debug,
+        error: 'no_picks',
+        message: 'You must supply picks array from /api/select-matches as body.picks',
       });
     }
 
-    if (!ODDS_API_KEY) {
-      return res.status(500).json({ error: 'Missing ODDS_API_KEY in env' });
-    }
+    // Fetch odds in bulk once per sport
+    const allOddsEvents = await fetchOddsBulk(sport_key);
 
-    // fetch all market events for transparency/debug
-    const rawOdds = await fetchOddsForSport(sport_key || 'soccer');
-
-    const valueCandidates = [];
-    const perPickDebug = [];
+    const value_bets = [];
+    const all_candidates = [];
 
     for (const pick of picks) {
-      const homeName = pick.teams.home.name || '';
-      const awayName = pick.teams.away.name || '';
-      const sportKey = sport_key || 'soccer';
+      // find matching event from odds API
+      const matchedEvents = allOddsEvents.filter((ev) => matchEventToPick(ev, pick));
 
-      // try to locate the event in rawOdds
-      const matchEvent = findMatchEvent(
-        Array.isArray(rawOdds) ? rawOdds : [],
-        homeName,
-        awayName
-      );
-
-      let marketProb = null;
-      let matchInfo = null;
-      if (matchEvent) {
-        marketProb = extractNoVigFromEvent(matchEvent);
-        matchInfo = matchEvent;
+      if (matchedEvents.length === 0) {
+        // no market data found
+        all_candidates.push({
+          fixture_id: pick.fixture_id,
+          reason: 'no matching odds event',
+          pick,
+        });
+        continue;
       }
 
-      const modelProbs = pick.model_probs || {};
+      // For simplicity take first matching event
+      const event = matchedEvents[0];
 
-      // compute edges if market data exists
-      if (marketProb) {
-        ['home', 'draw', 'away'].forEach((key) => {
-          const model_p = modelProbs[key] ?? 0;
-          const market_p = marketProb[key] ?? 0;
-          const final_prob = (model_p + market_p) / 2;
-          const edge = final_prob - market_p;
-          if (edge >= 0.05) {
-            valueCandidates.push({
-              fixture_id: pick.fixture_id,
-              league: pick.league,
-              teams: pick.teams,
-              datetime_local: pick.datetime_local,
-              pick: key,
-              model_prob: model_p,
-              market_prob: market_p,
-              edge,
-              raw_market: matchEvent,
-              predicted_model: pick.predicted,
-              model_confidence: pick.confidence,
-            });
-          }
+      // gather bookmakers that have the markets we need
+      const bookies = event.bookmakers || [];
+
+      // Prepare storage for per-market consensus
+      const marketsSummary = {};
+
+      // --- 1X2 market (h2h) ---
+      const h2hNoVigs = [];
+      bookies.forEach((bk) => {
+        const h2h = bk.markets?.find((m) => m.key === 'h2h');
+        if (!h2h || !Array.isArray(h2h.outcomes)) return;
+        // build implied probs
+        const probs = {};
+        h2h.outcomes.forEach((o) => {
+          probs[o.name.toLowerCase()] = impliedProbFromOdd(o.price);
+        });
+        const noVig = normalizeNoVig(probs); // { home:..., draw:..., away:... }
+        h2hNoVigs.push(noVig);
+      });
+
+      const model_probs = pick.model_probs || {};
+      // map predicted outcomes naming collision: we expect market outcome names like home/draw/away
+      // consensus for each of home/draw/away
+      const consensus_h2h = {
+        home: consensusProb(h2hNoVigs, 'home'),
+        draw: consensusProb(h2hNoVigs, 'draw'),
+        away: consensusProb(h2hNoVigs, 'away'),
+      };
+
+      // For each outcome, compute edge vs model
+      ['home', 'draw', 'away'].forEach((outcome) => {
+        const model_p = safePct(model_probs[outcome] ?? 0);
+        const market_p = safePct(consensus_h2h[outcome]);
+        // final blended
+        const final_p = (model_p + market_p) / 2;
+        const edge = final_p - market_p; // positive means model lifts above market
+        // implied odds from consensus (no-vig)
+        const impliedOdds = market_p > 0 ? 1 / market_p : null;
+
+        if (edge >= EDGE_THRESHOLD && impliedOdds && impliedOdds >= MIN_MARKET_ODDS) {
+          value_bets.push({
+            fixture_id: pick.fixture_id,
+            market: '1X2',
+            outcome,
+            model_probability: Number(model_p.toFixed(3)),
+            consensus_probability: Number(market_p.toFixed(3)),
+            final_probability: Number(final_p.toFixed(3)),
+            edge: Number(edge.toFixed(3)),
+            implied_odds: impliedOdds ? Number(impliedOdds.toFixed(2)) : null,
+            predicted: pick.predicted,
+          });
+        }
+
+        all_candidates.push({
+          fixture_id: pick.fixture_id,
+          market: '1X2',
+          outcome,
+          model_probability: Number(model_p.toFixed(3)),
+          consensus_probability: Number(market_p.toFixed(3)),
+          edge: Number(( (model_p + market_p)/2 - market_p ).toFixed(3)),
+          implied_odds: impliedOdds ? Number(impliedOdds.toFixed(2)) : null,
+        });
+      });
+
+      // --- BTTS ---
+      // Model probability available as btts_probability
+      const model_btts = safePct(pick.btts_probability ?? 0);
+      // try to pull BTTS market from bookmakers
+      const bttsNoVigs = [];
+      bookies.forEach((bk) => {
+        const btts = bk.markets?.find((m) => m.key === 'bothteams' || m.key === 'both_teams_to_score');
+        if (!btts || !Array.isArray(btts.outcomes)) return;
+        // Assume outcomes names like "Yes"/"No"
+        const probs = {};
+        btts.outcomes.forEach((o) => {
+          probs[o.name.toLowerCase()] = impliedProbFromOdd(o.price);
+        });
+        const noVig = normalizeNoVig(probs); // yes/no
+        bttsNoVigs.push(noVig);
+      });
+      const consensus_btts_yes = consensusProb(bttsNoVigs, 'yes');
+      const final_btts_p = (model_btts + consensus_btts_yes) / 2;
+      const edge_btts = final_btts_p - consensus_btts_yes;
+      const impliedOddsBTTS = consensus_btts_yes > 0 ? 1 / consensus_btts_yes : null;
+      if (edge_btts >= EDGE_THRESHOLD && impliedOddsBTTS && impliedOddsBTTS >= MIN_MARKET_ODDS) {
+        value_bets.push({
+          fixture_id: pick.fixture_id,
+          market: 'BTTS',
+          outcome: 'yes',
+          model_probability: Number(model_btts.toFixed(3)),
+          consensus_probability: Number(consensus_btts_yes.toFixed(3)),
+          final_probability: Number(final_btts_p.toFixed(3)),
+          edge: Number(edge_btts.toFixed(3)),
+          implied_odds: impliedOddsBTTS ? Number(impliedOddsBTTS.toFixed(2)) : null,
         });
       }
-
-      perPickDebug.push({
+      all_candidates.push({
         fixture_id: pick.fixture_id,
-        teams: pick.teams,
-        predicted: pick.predicted,
-        model_probs: modelProbs,
-        confidence: pick.confidence,
-        matched_event: matchEvent ? { home_team: matchEvent.home_team, away_team: matchEvent.away_team, id: matchEvent.id } : null,
-        market_prob: marketProb,
+        market: 'BTTS',
+        outcome: 'yes',
+        model_probability: Number(model_btts.toFixed(3)),
+        consensus_probability: Number(consensus_btts_yes.toFixed(3)),
+        edge: Number(edge_btts.toFixed(3)),
+        implied_odds: impliedOddsBTTS ? Number(impliedOddsBTTS.toFixed(2)) : null,
+      });
+
+      // --- Over/Under 2.5 ---
+      const model_over25 = safePct(pick.over25_probability ?? 0); // model probability over 2.5
+      const totalsNoVigs = [];
+      bookies.forEach((bk) => {
+        const totals = bk.markets?.find((m) => m.key === 'totals');
+        if (!totals || !Array.isArray(totals.outcomes)) return;
+        // Need to find outcome corresponding to Over 2.5 (naming varies, e.g., "Over 2.5")
+        const relevant = {};
+        totals.outcomes.forEach((o) => {
+          const nameLower = o.name.toLowerCase();
+          if (nameLower.includes('over') && nameLower.includes('2.5')) {
+            relevant['over'] = impliedProbFromOdd(o.price);
+          } else if (nameLower.includes('under') && nameLower.includes('2.5')) {
+            relevant['under'] = impliedProbFromOdd(o.price);
+          }
+        });
+        if (Object.keys(relevant).length === 0) return;
+        const noVig = normalizeNoVig(relevant); // over/under
+        totalsNoVigs.push(noVig);
+      });
+      const consensus_over = consensusProb(totalsNoVigs, 'over') || 0;
+      const final_over_p = (model_over25 + consensus_over) / 2;
+      const edge_over = final_over_p - consensus_over;
+      const impliedOddsOver = consensus_over > 0 ? 1 / consensus_over : null;
+      if (edge_over >= EDGE_THRESHOLD && impliedOddsOver && impliedOddsOver >= MIN_MARKET_ODDS) {
+        value_bets.push({
+          fixture_id: pick.fixture_id,
+          market: 'Over/Under 2.5',
+          outcome: 'over',
+          model_probability: Number(model_over25.toFixed(3)),
+          consensus_probability: Number(consensus_over.toFixed(3)),
+          final_probability: Number(final_over_p.toFixed(3)),
+          edge: Number(edge_over.toFixed(3)),
+          implied_odds: impliedOddsOver ? Number(impliedOddsOver.toFixed(2)) : null,
+        });
+      }
+      all_candidates.push({
+        fixture_id: pick.fixture_id,
+        market: 'Over/Under 2.5',
+        outcome: 'over',
+        model_probability: Number(model_over25.toFixed(3)),
+        consensus_probability: Number(consensus_over.toFixed(3)),
+        edge: Number(edge_over.toFixed(3)),
+        implied_odds: impliedOddsOver ? Number(impliedOddsOver.toFixed(2)) : null,
       });
     }
 
-    valueCandidates.sort((a, b) => b.edge - a.edge);
-    const top = valueCandidates.slice(0, 4);
+    // Sort value_bets by edge descending
+    value_bets.sort((a, b) => b.edge - a.edge);
 
     return res.status(200).json({
-      value_bets: top,
-      all_candidates: valueCandidates,
-      source_sport_key: sport_key || 'soccer',
+      value_bets,
+      all_candidates,
+      source_sport_key: sport_key,
       debug: {
-        select: selectResult.debug,
-        raw_odds_events_sample: Array.isArray(rawOdds)
-          ? rawOdds.slice(0, 5).map((ev) => ({
-              home_team: ev.home_team,
-              away_team: ev.away_team,
-              sport_key: ev.sport_key,
-              commence_time: ev.commence_time,
-              bookmakers_count: ev.bookmakers?.length || 0,
-            }))
-          : rawOdds,
-        per_pick: perPickDebug,
+        timestamp: new Date().toISOString(),
+        picks_count: picks.length,
       },
     });
   } catch (err) {
-    console.error('value-bets error', err);
-    res.status(500).json({ error: err.message || 'unknown error' });
+    console.error('value-bets error:', err);
+    return res.status(500).json({
+      error: 'internal',
+      message: err.message,
+    });
   }
 }
