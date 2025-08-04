@@ -103,7 +103,7 @@ const Sparkline = ({ history = [], width = 100, height = 24 }) => {
 };
 
 const FootballContent = ({ data }) => (
-  <div className="flex-1 flex flex-col justify-between">
+  <div className="flex-1 flex flex-col justify-between h-full">
     <div className="flex items-center mb-0">
       <div className="text-lg font-bold mr-2">{data.prediction || data.name || 'Pick'}</div>
       {data.timeframe && (
@@ -143,7 +143,7 @@ const CryptoMetrics = ({ sig }) => {
   const showConsensus = consensus != null;
 
   return (
-    <div className="flex-1 flex flex-col justify-between">
+    <div className="flex-1 flex flex-col justify-between h-full">
       <div className="flex justify-between items-start mb-1 flex-wrap gap-1">
         <div className="flex gap-2 items-center flex-wrap">
           <div className="text-xl font-bold">{sig.symbol}</div>
@@ -221,7 +221,7 @@ const SignalCard = ({ data, type }) => {
   const consensus = computeConsensus(trend, crossover);
 
   return (
-    <div className="flex flex-row w-full rounded-2xl bg-[#1f234f] text-white shadow p-4 items-stretch relative overflow-hidden">
+    <div className="flex flex-row w-full h-full rounded-2xl bg-[#1f234f] text-white shadow p-4 items-stretch relative overflow-hidden">
       {/* accent bar */}
       <div
         className={`flex-shrink-0 w-1 rounded-l-xl mr-3 ${
@@ -247,17 +247,17 @@ const SignalCard = ({ data, type }) => {
       </div>
 
       {type === 'crypto' && (
-        <div className="flex-shrink-0 w-[280px] ml-3 flex flex-col justify-between">
+        <div className="flex-shrink-0 w-[260px] ml-3 flex flex-col justify-between">
           <div className="mb-1">
             <iframe
               title={`tv-${data.symbol || 'chart'}`}
               src={`https://s.tradingview.com/widgetembed/?symbol=${(data.symbol || '')
                 .toUpperCase()}USDT&interval=15&theme=dark&style=1&timezone=Etc/UTC&studies=[]&hide_side_toolbar=true&hide_legend=true&withdateranges=false&saveimage=false&hideideas=true&toolbar_bg=2c2d3e&locale=en`}
               width="100%"
-              height="100"
+              height="90"
               frameBorder="0"
               allowTransparency={true}
-              style={{ borderRadius: 8, border: 0, minHeight: 100 }}
+              style={{ borderRadius: 8, border: 0, minHeight: 90 }}
             />
           </div>
           <div className="text-[10px] text-gray-400">
@@ -269,7 +269,6 @@ const SignalCard = ({ data, type }) => {
         </div>
       )}
 
-      {/* strong consensus highlight */}
       {type === 'crypto' && consensus != null && consensus > 90 && (
         <div className="absolute top-2 right-2">
           <div className="px-2 py-1 rounded bg-yellow-400 text-black text-[10px] font-bold flex items-center gap-1">
