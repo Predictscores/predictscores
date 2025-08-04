@@ -127,48 +127,46 @@ export default function Home() {
         </div>
       </div>
 
-      <main className="mt-8 space-y-10 px-6">
+      <main className="mt-8 space-y-6 px-6">
         {(loadingFootball || loadingCrypto) && (
           <div className="text-center text-gray-400">Učitavanje podataka...</div>
         )}
 
+        {/* Combined */}
         {activeTab === TABS.COMBINED && (
           <>
             {topFootball.length === 0 && topCrypto.length === 0 && (
-              <div className="text-center text-gray-400 mb-6">
+              <div className="text-center text-gray-400 mb-4">
                 Nema dostupnih kombinovanih predloga.
               </div>
             )}
             {combinedPairs.map((i) => (
               <div
                 key={i}
-                className="grid grid-cols-1 md:grid-cols-[4fr_8fr] gap-4 items-stretch"
+                className="flex flex-col md:flex-row gap-4"
+                style={{ alignItems: 'stretch' }}
               >
-                <div className="flex">
+                {/* Football 33% */}
+                <div className="md:w-1/3 flex">
                   {topFootball[i] ? (
-                    <div className="w-full relative flex flex-col">
-                      {i === 0 && (
-                        <div className="absolute -top-4 left-0 z-10">
-                          <div className="inline-flex px-3 py-1 rounded-full bg-gradient-to-r from-yellow-400 to-red-500 text-xs font-bold">
-                            Best Combined Pick
-                          </div>
-                        </div>
-                      )}
+                    <div className="w-full">
                       <SignalCard data={topFootball[i]} type="football" />
                     </div>
                   ) : (
-                    <div className="w-full bg-[#1f2339] p-5 rounded-2xl text-gray-400 flex items-center justify-center">
+                    <div className="w-full bg-[#1f2339] p-4 rounded-2xl text-gray-400 flex items-center justify-center">
                       Nema dostupne fudbalske prognoze
                     </div>
                   )}
                 </div>
-                <div className="flex">
+
+                {/* Crypto 67% */}
+                <div className="md:w-2/3 flex">
                   {topCrypto[i] ? (
-                    <div className="w-full flex flex-col">
+                    <div className="w-full">
                       <SignalCard data={topCrypto[i]} type="crypto" />
                     </div>
                   ) : (
-                    <div className="w-full bg-[#1f2339] p-5 rounded-2xl text-gray-400 flex items-center justify-center">
+                    <div className="w-full bg-[#1f2339] p-4 rounded-2xl text-gray-400 flex items-center justify-center">
                       Nema dostupnog kripto signala
                     </div>
                   )}
@@ -178,6 +176,7 @@ export default function Home() {
           </>
         )}
 
+        {/* Football only */}
         {activeTab === TABS.FOOTBALL && (
           <>
             <h2 className="text-2xl font-bold">Top Football Picks</h2>
@@ -200,6 +199,7 @@ export default function Home() {
           </>
         )}
 
+        {/* Crypto only */}
         {activeTab === TABS.CRYPTO && (
           <>
             <CryptoTopSignals refreshIntervalMs={10000} limit={6} />
@@ -207,13 +207,14 @@ export default function Home() {
         )}
       </main>
 
-      <footer className="mt-16 mb-8 px-6 text-center text-sm text-gray-400">
+      {/* Footer */}
+      <footer className="mt-12 mb-8 px-6 text-center text-sm text-gray-400">
         <div className="inline-flex gap-2 flex-wrap justify-center">
           <div>
             <span className="font-semibold">Confidence:</span>{' '}
           </div>
           <div className="flex gap-1">
-            <div>🟢 High (≥80% &lt;=90%)</div>
+            <div>🟢 High (80–90%)</div>
             <div>·</div>
             <div>🔵 Moderate (55–80%)</div>
             <div>·</div>
