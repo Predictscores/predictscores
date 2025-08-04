@@ -18,6 +18,14 @@ async function fetchSportmonksFixturesWithRetry(date, retries = 3, baseDelay = 5
   throw new Error("Failed to fetch SportMonks fixtures after retries");
 }
 
+function makeUniqueKey(f) {
+  const leagueId = f.league?.data?.id || "no-league";
+  const homeId = f.localTeam?.data?.id || "no-home";
+  const awayId = f.visitorTeam?.data?.id || "no-away";
+  const start = f.time?.starting_at?.date_time || "";
+  return `${leagueId}-${homeId}-${awayId}-${start}`;
+}
+
 export default async function handler(req, res) {
   const { date } = req.query;
   console.log("ENV KEYS:", {
@@ -31,7 +39,17 @@ export default async function handler(req, res) {
     const all = raw.data || [];
     const fixtures = all.filter((f) => f.time?.status === "NS");
 
-    const picks = fixtures.map((f) => ({
+    // dedupe
+    const seen = new Set();
+    const unique = [];
+    for (const f of fixtures) {
+      const key = makeUniqueKey(f);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push(f);
+    }
+
+    const picks = unique.map((f) => ({
       fixture_id: f.id,
       league: { id: f.league.data.id, name: f.league.data.name },
       teams: {
@@ -47,7 +65,7 @@ export default async function handler(req, res) {
       over25_probability: 0.32,
     }));
 
-    res.status(200).json({ picks, debug: { total_fetched: fixtures.length } });
+    res.status(200).json({ picks, debug: { total_fetched: unique.length, raw_count: fixtures.length } });
   } catch (err) {
     console.error("/api/select-matches error:", err);
     res.status(200).json({ picks: [], debug: { error: err.message } });
