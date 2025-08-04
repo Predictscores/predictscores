@@ -23,7 +23,7 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState(TABS.COMBINED);
   const [isDark, setIsDark] = useState(false);
 
-  // Dark mode persistence / init
+  // Init dark mode from localStorage or prefers-color-scheme
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const stored = localStorage.getItem('dark-mode');
@@ -105,7 +105,7 @@ export default function Home() {
           <div className="text-xl font-bold">AI Top fudbalske i Kripto Prognoze</div>
         </div>
 
-        {/* right: controls + pill timers */}
+        {/* right: controls + timers pill */}
         <div className="flex flex-col items-end gap-2">
           <div className="flex gap-3">
             <button
@@ -121,7 +121,7 @@ export default function Home() {
               {isDark ? 'Light mode' : 'Dark mode'}
             </button>
           </div>
-          <div className="flex">
+          <div>
             <div className="bg-[#1f2339] px-4 py-2 rounded-full flex flex-col sm:flex-row gap-2 text-sm text-gray-300 font-medium">
               <div className="flex gap-1 items-center">
                 <span className="text-white">Crypto next refresh:</span>
@@ -136,13 +136,13 @@ export default function Home() {
         </div>
       </header>
 
-      {/* Main content */}
+      {/* Main */}
       <main className="mt-2 space-y-4 px-6">
         {(loadingFootball || loadingCrypto) && (
           <div className="text-center text-gray-400">Učitavanje podataka...</div>
         )}
 
-        {/* Combined view */}
+        {/* Combined */}
         {activeTab === TABS.COMBINED && (
           <>
             {topFootball.length === 0 && topCrypto.length === 0 && (
