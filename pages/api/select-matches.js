@@ -1,4 +1,5 @@
-import { fetchSportmonksFixtures } from "@/lib/sources/sportmonks";
+// pages/api/select-matches.js
+import { fetchSportmonksFixtures } from "../../lib/sources/sportmonks";
 
 export default async function handler(req, res) {
   const { date } = req.query;
