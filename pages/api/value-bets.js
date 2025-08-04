@@ -8,11 +8,9 @@ export default async function handler(req, res) {
     const minEdge = parseFloat(me ?? '0.05');
     const minOdds = parseFloat(mo ?? '1.3');
 
-    // Step 1: get model picks directly
     const selectResp = await selectMatchesForDate(date);
     const picks = selectResp.picks || [];
 
-    // Normalize candidates
     const all_candidates = picks.map((p) => {
       const predicted = p.predicted;
       const model_prob =
@@ -37,7 +35,6 @@ export default async function handler(req, res) {
       };
     });
 
-    // No real market integration yet; fallback top 3 by confidence
     let value_bets = [];
     if (all_candidates.length > 0) {
       value_bets = all_candidates
