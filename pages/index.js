@@ -63,8 +63,9 @@ export default function Home() {
     <div className="min-h-screen bg-[#18191c] text-white">
       {/* Header */}
       <header className="w-full flex flex-col md:flex-row items-start md:items-center justify-between py-4 px-6 gap-4">
-        <div className="text-xl font-bold">AI Top fudbalske i Kripto Prognoze</div>
-        <div className="flex flex-wrap items-center gap-4 ml-auto">
+        {/* Left: title + tabs */}
+        <div className="flex flex-col md:flex-row items-start md:items-center gap-4">
+          <div className="text-xl font-bold">AI Top fudbalske i Kripto Prognoze</div>
           <div className="flex gap-1 bg-[#1f2339] rounded-full overflow-hidden">
             <button
               onClick={() => setActiveTab(TABS.COMBINED)}
@@ -97,6 +98,10 @@ export default function Home() {
               Crypto
             </button>
           </div>
+        </div>
+
+        {/* Right: controls + timers */}
+        <div className="flex flex-col items-end gap-2">
           <div className="flex gap-3">
             <button
               onClick={refreshAll}
@@ -111,22 +116,20 @@ export default function Home() {
               {isDark ? 'Light mode' : 'Dark mode'}
             </button>
           </div>
+          <div className="flex gap-6 text-sm text-gray-300 font-medium">
+            <div>
+              <span className="text-white">Football last generated:</span>{' '}
+              {formatTime(footballData?.generated_at)}
+            </div>
+            <div>
+              <span className="text-white">Crypto next refresh:</span>{' '}
+              {getCountdown(nextCryptoUpdate)}
+            </div>
+          </div>
         </div>
       </header>
 
-      {/* Info bar */}
-      <div className="flex flex-col md:flex-row justify-center gap-8 mt-2 px-6 text-sm text-gray-300 font-medium">
-        <div>
-          <span className="text-white">Football last generated:</span>{' '}
-          {formatTime(footballData?.generated_at)}
-        </div>
-        <div>
-          <span className="text-white">Crypto next refresh:</span>{' '}
-          {getCountdown(nextCryptoUpdate)}
-        </div>
-      </div>
-
-      <main className="mt-8 space-y-6 px-6">
+      <main className="mt-6 space-y-4 px-6">
         {(loadingFootball || loadingCrypto) && (
           <div className="text-center text-gray-400">Učitavanje podataka...</div>
         )}
@@ -142,7 +145,7 @@ export default function Home() {
             {combinedPairs.map((i) => (
               <div
                 key={i}
-                className="flex flex-col md:flex-row gap-4 md:h-[220px] items-stretch"
+                className="flex flex-col md:flex-row gap-4 md:h-[180px] items-stretch"
               >
                 {/* Football 33% */}
                 <div className="md:w-1/3 flex h-full">
@@ -151,7 +154,7 @@ export default function Home() {
                       <SignalCard data={topFootball[i]} type="football" />
                     </div>
                   ) : (
-                    <div className="w-full bg-[#1f2339] p-4 rounded-2xl text-gray-400 flex items-center justify-center">
+                    <div className="w-full bg-[#1f2339] p-3 rounded-2xl text-gray-400 flex items-center justify-center">
                       Nema dostupne fudbalske prognoze
                     </div>
                   )}
@@ -164,7 +167,7 @@ export default function Home() {
                       <SignalCard data={topCrypto[i]} type="crypto" />
                     </div>
                   ) : (
-                    <div className="w-full bg-[#1f2339] p-4 rounded-2xl text-gray-400 flex items-center justify-center">
+                    <div className="w-full bg-[#1f2339] p-3 rounded-2xl text-gray-400 flex items-center justify-center">
                       Nema dostupnog kripto signala
                     </div>
                   )}
