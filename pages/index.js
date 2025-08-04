@@ -3,14 +3,42 @@
 import { useContext, useEffect, useState } from 'react';
 import { DataContext } from '../contexts/DataContext';
 import SignalCard from '../components/SignalCard';
-import CombinedBets from '../components/CombinedBets';
-import FootballBets from '../components/FootballBets';
 
 const TABS = {
   COMBINED: 'combined',
   FOOTBALL: 'football',
   CRYPTO: 'crypto',
 };
+
+function formatPercent(x) {
+  if (x == null) return '-';
+  return `${(x * 100).toFixed(1)}%`;
+}
+
+function explainBet(bet) {
+  if (!bet) return '';
+  if (bet.type === 'MODEL+ODDS') {
+    const implied = bet.market_odds ? 1 / bet.market_odds : null;
+    return `Model: ${formatPercent(bet.model_prob)} vs Market: ${formatPercent(
+      implied
+    )} (odds ${bet.market_odds}) → edge ${formatPercent(bet.edge)}`;
+  } else {
+    return `Model-only: ${formatPercent(bet.model_prob)} (fallback)`;
+  }
+}
+
+function sortValueBets(value_bets = []) {
+  return value_bets
+    .slice()
+    .sort((a, b) => {
+      if (a.type !== b.type) return a.type === 'MODEL+ODDS' ? -1 : 1;
+      // prefer higher edge, fallback to model_prob if edge missing
+      const edgeA = a.edge != null ? a.edge : 0;
+      const edgeB = b.edge != null ? b.edge : 0;
+      if (edgeB !== edgeA) return edgeB - edgeA;
+      return (b.model_prob || 0) - (a.model_prob || 0);
+    });
+}
 
 export default function Home() {
   const {
@@ -24,6 +52,13 @@ export default function Home() {
 
   const [activeTab, setActiveTab] = useState(TABS.COMBINED);
   const [isDark, setIsDark] = useState(false);
+
+  const [valueBets, setValueBets] = useState([]);
+  const [loadingValueBets, setLoadingValueBets] = useState(true);
+  const [valueBetsError, setValueBetsError] = useState(null);
+
+  // date used for bets
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
   // Init dark mode from localStorage or prefers-color-scheme
   useEffect(() => {
@@ -58,8 +93,101 @@ export default function Home() {
     return `${m}m ${s.toString().padStart(2, '0')}s`;
   };
 
+  const topFootball = footballData?.footballTop || [];
   const topCrypto = cryptoData?.cryptoTop || [];
-  const today = new Date().toISOString().slice(0, 10); // format YYYY-MM-DD
+  const combinedPairs = [0, 1, 2];
+
+  // Fetch value bets from backend (football)
+  const fetchValueBets = async () => {
+    setLoadingValueBets(true);
+    setValueBetsError(null);
+    try {
+      const res = await fetch(
+        `/api/value-bets?sport_key=soccer&date=${encodeURIComponent(
+          today
+        )}&min_edge=0.05&min_odds=1.3`
+      );
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(`Fetch error ${res.status}: ${t}`);
+      }
+      const json = await res.json();
+      const bets = Array.isArray(json.value_bets) ? json.value_bets : [];
+      setValueBets(sortValueBets(bets));
+    } catch (e) {
+      console.error('value-bets fetch failed', e);
+      setValueBetsError('Failed to load value bets');
+      setValueBets([]);
+    } finally {
+      setLoadingValueBets(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchValueBets();
+    const interval = setInterval(fetchValueBets, 2 * 60 * 60 * 1000); // every 2h
+    return () => clearInterval(interval);
+  }, [today]);
+
+  // Derive top3 football value bets (for combined)
+  const topValueBets = valueBets.slice(0, 3);
+  // For combined slots, fallback to original topFootball if there is no corresponding value bet
+  const combinedFootballSlots = combinedPairs.map((i) => topValueBets[i] || topFootball[i]);
+
+  // For football tab: if valueBets present use those, else fallback to old ones
+  const displayFootballPicks =
+    valueBets && valueBets.length > 0
+      ? valueBets.slice(0, 10)
+      : topFootball.slice(0, 10);
+
+  // Card for a value bet (football) using existing style
+  const ValueBetCard = ({ bet }) => {
+    if (!bet) return null;
+    const {
+      fixture_id,
+      market,
+      selection,
+      type,
+      model_prob,
+      market_odds,
+      edge,
+      datetime_local,
+      teams,
+    } = bet;
+    const home = teams?.home?.name || 'Home';
+    const away = teams?.away?.name || 'Away';
+    const timeStr = datetime_local?.starting_at?.date_time || '';
+    const explanation = explainBet(bet);
+    return (
+      <div className="bg-[#1f2339] p-5 rounded-2xl shadow flex flex-col gap-2">
+        <div className="flex justify-between items-start">
+          <div className="font-semibold">
+            {home} vs {away}{' '}
+            <span className="text-sm text-gray-400">({market || '—'})</span>
+          </div>
+          <div
+            className={`text-xs px-2 py-1 rounded ${
+              type === 'MODEL+ODDS' ? 'bg-green-100 text-green-800' : 'bg-gray-800 text-gray-300'
+            }`}
+          >
+            {type === 'MODEL+ODDS' ? 'Real + Odds' : 'FALLBACK'}
+          </div>
+        </div>
+        <div className="text-sm flex flex-col gap-1">
+          <div>
+            <strong>Pick:</strong> {selection || '-'} @ {market_odds || '-'}
+          </div>
+          {edge != null && (
+            <div>
+              <strong>Edge:</strong> {formatPercent(edge)}
+            </div>
+          )}
+          <div className="text-xs text-gray-400">{explanation}</div>
+          <div className="text-xs text-gray-500">Starts at: {timeStr}</div>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="min-h-screen bg-[#18191c] text-white">
@@ -145,17 +273,73 @@ export default function Home() {
 
         {/* Combined */}
         {activeTab === TABS.COMBINED && (
-          <div className="space-y-8">
-            <CombinedBets date={today} />
-          </div>
+          <>
+            {combinedFootballSlots.every((b) => !b) && topCrypto.length === 0 && (
+              <div className="text-center text-gray-400 mb-4">
+                Nema dostupnih kombinovanih predloga.
+              </div>
+            )}
+            {combinedPairs.map((i) => (
+              <div
+                key={i}
+                className="flex flex-col md:flex-row gap-4 md:min-h-[160px] items-stretch"
+              >
+                {/* Football 33% */}
+                <div className="md:w-1/3 flex">
+                  {combinedFootballSlots[i] ? (
+                    <div className="w-full flex">
+                      <ValueBetCard bet={combinedFootballSlots[i]} />
+                    </div>
+                  ) : topFootball[i] ? (
+                    <div className="w-full flex">
+                      <SignalCard data={topFootball[i]} type="football" />
+                    </div>
+                  ) : (
+                    <div className="w-full bg-[#1f2339] p-3 rounded-2xl text-gray-400 flex items-center justify-center">
+                      Nema dostupne fudbalske prognoze
+                    </div>
+                  )}
+                </div>
+
+                {/* Crypto 67% */}
+                <div className="md:w-2/3 flex">
+                  {topCrypto[i] ? (
+                    <div className="w-full flex">
+                      <SignalCard data={topCrypto[i]} type="crypto" />
+                    </div>
+                  ) : (
+                    <div className="w-full bg-[#1f2339] p-3 rounded-2xl text-gray-400 flex items-center justify-center">
+                      Nema dostupnog kripto signala
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </>
         )}
 
         {/* Football only */}
         {activeTab === TABS.FOOTBALL && (
-          <div className="space-y-6">
+          <>
             <h2 className="text-2xl font-bold">Top Football Picks</h2>
-            <FootballBets date={today} />
-          </div>
+            <div className="grid grid-cols-1 gap-6">
+              {loadingValueBets && (
+                <div className="text-center text-gray-400">Učitavanje predloga...</div>
+              )}
+              {!loadingValueBets &&
+                (displayFootballPicks.length > 0 ? (
+                  displayFootballPicks.map((bet, idx) => (
+                    <div key={idx} className="bg-[#1f2339] p-5 rounded-2xl shadow flex">
+                      <ValueBetCard bet={bet} />
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-center text-gray-400">
+                    Nema dostupnih fudbalskih predloga.
+                  </div>
+                ))}
+            </div>
+          </>
         )}
 
         {/* Crypto only */}
@@ -176,6 +360,10 @@ export default function Home() {
               )}
             </div>
           </>
+        )}
+
+        {valueBetsError && (
+          <div className="text-red-400 text-center">{valueBetsError}</div>
         )}
       </main>
 
