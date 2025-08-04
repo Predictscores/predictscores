@@ -1,341 +1,85 @@
-// FILE: components/SignalCard.jsx
-// Updated, visually improved SignalCard with trend + crossover + consensus for crypto.
-// Usage example:
-// <SignalCard data={cryptoSignal} type="crypto" />
-// <SignalCard data={footballSignal} type="football" />
+// FILE: components/CryptoTopSignals.jsx
+import React, { useEffect, useState } from 'react';
+import SignalCard from './SignalCard';
 
-import React from 'react';
+export default function CryptoTopSignals({
+  refreshIntervalMs = 10000,
+  limit = 6,
+}) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(true);
 
-// helper to compute consensus between trend and crossover
-const computeConsensus = (trend, crossover) => {
-  if (!trend || !crossover) return null;
-  if (trend.direction === crossover.direction) {
-    let avg = (trend.confidence + crossover.confidence) / 2;
-    if (trend.confidence >= 80 && crossover.confidence >= 80) avg += 5; // boost
-    return Math.min(100, Math.round(avg));
-  }
-  // disagreement: penalize, take smaller and dampen
-  return Math.round(Math.min(trend.confidence, crossover.confidence) * 0.7);
-};
-
-const Badge = ({ children, className = '' }) => (
-  <div
-    className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-semibold ${className}`}
-  >
-    {children}
-  </div>
-);
-
-const ConfidenceBadge = ({ confidence }) => {
-  if (confidence > 90) {
-    return (
-      <Badge className="bg-gradient-to-r from-red-500 to-yellow-400 text-white">
-        🔥 Bomba {confidence}%
-      </Badge>
-    );
-  }
-  if (confidence >= 80) {
-    return (
-      <Badge className="bg-green-600 text-white">High {confidence}%</Badge>
-    );
-  }
-  if (confidence >= 55) {
-    return <Badge className="bg-yellow-500 text-black">Moderate {confidence}%</Badge>;
-  }
-  return <Badge className="bg-gray-600 text-white">Low {confidence}%</Badge>;
-};
-
-const DirectionBadge = ({ direction }) => {
-  if (direction === 'LONG') {
-    return (
-      <div className="text-green-300 font-bold flex items-center gap-1">
-        ▲ LONG
-      </div>
-    );
-  }
-  if (direction === 'SHORT') {
-    return (
-      <div className="text-red-300 font-bold flex items-center gap-1">
-        ▼ SHORT
-      </div>
-    );
-  }
-  return (
-    <div className="text-gray-300 font-semibold flex items-center gap-1">
-      {direction}
-    </div>
-  );
-};
-
-const Sparkline = ({ history = [], width = 100, height = 32 }) => {
-  if (!history || history.length === 0) return null;
-  const slice = history.slice(-60); // last N points
-  const prices = slice.map((p) => (typeof p === 'number' ? p : p));
-  const min = Math.min(...prices);
-  const max = Math.max(...prices);
-  const span = max - min || 1;
-  const path = prices
-    .map((price, i) => {
-      const x = (i / (prices.length - 1)) * width;
-      const y = height - ((price - min) / span) * height;
-      return `${i === 0 ? 'M' : 'L'}${x.toFixed(2)},${y.toFixed(2)}`;
-    })
-    .join(' ');
-  return (
-    <svg
-      width="100%"
-      height={height}
-      viewBox={`0 0 ${width} ${height}`}
-      aria-label="sparkline"
-      className="mt-1"
-    >
-      <path
-        d={path}
-        fill="none"
-        stroke="#7c3aed"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <circle
-        cx={((prices.length - 1) / (prices.length - 1)) * width}
-        cy={
-          height -
-          (((prices[prices.length - 1] - min) / span) * height || 0)
-        }
-        r="2"
-        fill="#fff"
-      />
-    </svg>
-  );
-};
-
-const CryptoMetrics = ({ sig }) => {
-  const trend = {
-    direction: sig.direction,
-    confidence: sig.confidence,
+  const fetchSignals = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch('/api/crypto');
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`HTTP ${res.status} ${text}`);
+      }
+      const json = await res.json();
+      setData(json);
+      setError(null);
+    } catch (e) {
+      setError(e.message || 'Fetch error');
+    } finally {
+      setLoading(false);
+    }
   };
-  const crossover = sig.crossover || null;
-  const consensus = computeConsensus(trend, crossover);
-  const showConsensus = consensus != null;
+
+  useEffect(() => {
+    fetchSignals();
+    const iv = setInterval(fetchSignals, refreshIntervalMs);
+    return () => clearInterval(iv);
+  }, [refreshIntervalMs]);
+
+  if (loading) {
+    return (
+      <div className="bg-[#1f2339] p-4 rounded-2xl text-center text-gray-300">
+        Učitavanje kripto signala...
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="bg-[#1f2339] p-4 rounded-2xl text-red-300">
+        Greška učitavanja kripto signala: {error}{' '}
+        <button
+          onClick={fetchSignals}
+          className="ml-2 underline font-medium text-white"
+        >
+          Pokušaj ponovo
+        </button>
+      </div>
+    );
+  }
+
+  const top = (data?.cryptoTop || []).slice(0, limit);
+
+  if (top.length === 0) {
+    return (
+      <div className="bg-[#1f2339] p-4 rounded-2xl text-center text-gray-400">
+        Nema dostupnih kripto signala.
+      </div>
+    );
+  }
 
   return (
-    <div className="flex flex-col flex-1">
-      <div className="flex justify-between items-start mb-2">
-        <div className="flex gap-2 items-center">
-          <div className="text-xl font-bold">{sig.symbol}</div>
-          <div className="text-xs text-gray-400">{sig.name}</div>
-          {sig.timeframe && (
-            <div className="text-[10px] px-2 py-1 bg-[#222741] rounded-full">
-              {sig.timeframe}
-            </div>
-          )}
-        </div>
-        <div className="flex flex-col items-end gap-1">
-          <div className="flex gap-2">
-            <ConfidenceBadge confidence={sig.confidence} />
-            {crossover && crossover.confidence != null && (
-              <ConfidenceBadge confidence={crossover.confidence} />
-            )}
+    <div className="space-y-6">
+      <h2 className="text-2xl font-bold">Top Crypto Signals</h2>
+      <div className="grid grid-cols-1 gap-6">
+        {top.map((sig, idx) => (
+          <div
+            key={idx}
+            className="bg-[#1f2339] p-5 rounded-2xl shadow flex"
+            style={{ alignItems: 'stretch' }}
+          >
+            <SignalCard data={sig} type="crypto" />
           </div>
-          {showConsensus && (
-            <div>
-              <Badge className="bg-blue-600 text-white text-[10px]">
-                Consensus {consensus}%
-              </Badge>
-            </div>
-          )}
-        </div>
+        ))}
       </div>
-
-      <div className="flex flex-wrap gap-4 mb-2">
-        {/* Directions */}
-        <div className="flex gap-4 flex-1 min-w-[150px]">
-          <div className="flex flex-col">
-            <div className="text-[10px] text-gray-400">Trend</div>
-            <DirectionBadge direction={sig.direction} />
-          </div>
-          {crossover && (
-            <div className="flex flex-col">
-              <div className="text-[10px] text-gray-400">Crossover</div>
-              <DirectionBadge direction={crossover.direction} />
-            </div>
-          )}
-        </div>
-
-        {/* Price */}
-        <div className="flex flex-col text-right min-w-[120px]">
-          <div className="text-[10px] text-gray-400">Price</div>
-          <div className="text-lg font-semibold">
-            {sig.current_price != null
-              ? `$${Number(sig.current_price).toLocaleString(undefined, {
-                  minimumFractionDigits: 2,
-                  maximumFractionDigits: 2,
-                })}`
-              : '—'}
-          </div>
-        </div>
-      </div>
-
-      {/* Sparkline */}
-      <div className="w-full mb-2">
-        <Sparkline history={sig.price_history_24h} />
-      </div>
-
-      {/* Stats row */}
-      <div className="grid grid-cols-2 gap-2 text-[11px] mb-2">
-        <div className="bg-[#222741] rounded px-2 py-1 flex flex-col">
-          <div className="font-semibold uppercase">RSI</div>
-          <div>{sig.rsi != null ? sig.rsi : '—'}</div>
-        </div>
-        <div className="bg-[#222741] rounded px-2 py-1 flex flex-col">
-          <div className="font-semibold uppercase">Δ Price</div>
-          <div>
-            {sig.priceChangePercent != null
-              ? `${sig.priceChangePercent > 0 ? '+' : ''}${sig.priceChangePercent}%`
-              : '—'}
-          </div>
-        </div>
-        <div className="bg-[#222741] rounded px-2 py-1 flex flex-col">
-          <div className="font-semibold uppercase">Volatility</div>
-          <div>{sig.volatility != null ? sig.volatility : '—'}</div>
-        </div>
-        <div className="bg-[#222741] rounded px-2 py-1 flex flex-col">
-          <div className="font-semibold uppercase">Expected</div>
-          <div>{sig.expected_range}</div>
-        </div>
-      </div>
-
-      {/* Crossover edge */}
-      {sig.crossover && (
-        <div className="flex gap-4 mb-1">
-          <div className="flex-1 bg-[#1f234f] rounded px-3 py-2">
-            <div className="text-[10px] uppercase font-medium mb-1">
-              Crossover Edge
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="font-bold">
-                {sig.crossover.edge != null
-                  ? `${(sig.crossover.edge * 100).toFixed(2)}%`
-                  : '—'}
-              </div>
-              <div className="text-[11px]">
-                SMA: {sig.crossover.short_ma} / {sig.crossover.long_ma}
-              </div>
-              <div className="text-[11px]">
-                ({sig.crossover.direction})
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
-};
-
-const FootballContent = ({ data }) => (
-  <div className="flex-1 flex flex-col justify-between">
-    <div className="flex items-center mb-2">
-      <div className="text-lg font-bold mr-2">
-        {data.name || data.predicted || 'Pick'}
-      </div>
-      <div className="text-xs text-gray-400">
-        {data.odds ? `Odds: ${data.odds}` : ''}
-      </div>
-    </div>
-    <div className="text-sm">
-      <p>
-        <span className="font-bold">Pick:</span> {data.prediction || '—'}
-      </p>
-      {data.odds && (
-        <p>
-          <span className="font-bold">Odds:</span> {data.odds}
-        </p>
-      )}
-      {data.note && (
-        <p className="text-xs italic text-gray-400 mt-1">{data.note}</p>
-      )}
-    </div>
-  </div>
-);
-
-const SignalCard = ({ data, type }) => {
-  if (!data) return null;
-
-  // Shared confidence indicator (for non-crypto fallback)
-  const confidence = data.confidence ?? 0;
-
-  return (
-    <div className="flex w-full rounded-2xl bg-[#1f234f] text-white shadow-lg p-6 min-h-[180px] items-stretch gap-6 relative overflow-hidden">
-      {/* Left info */}
-      {type === 'football' && <FootballContent data={data} />}
-
-      {type === 'crypto' && <CryptoMetrics sig={data} />}
-
-      {/* Right / chart for crypto */}
-      {type === 'crypto' && (
-        <div className="ml-auto flex-shrink-0 flex flex-col justify-between min-w-[340px] max-w-[420px]">
-          {/* TradingView iframe embedded */}
-          <div className="mb-2">
-            <iframe
-              title={`tv-${data.symbol || 'chart'}`}
-              src={`https://s.tradingview.com/widgetembed/?symbol=${(data.symbol || '')
-                .toUpperCase()}USDT&interval=15&theme=dark&style=1&timezone=Etc/UTC&studies=[]&hide_side_toolbar=true&hide_legend=true&withdateranges=false&saveimage=false&hideideas=true&toolbar_bg=2c2d3e&locale=en`}
-              width="100%"
-              height="135"
-              frameBorder="0"
-              allowTransparency={true}
-              style={{ borderRadius: 12, border: 0 }}
-            />
-          </div>
-          <div className="text-[10px] text-gray-400">
-            Price updated:{' '}
-            {data.timestamp
-              ? new Date(data.timestamp).toLocaleTimeString()
-              : '—'}
-          </div>
-        </div>
-      )}
-
-      {/* Vertical consensus / special highlight */}
-      {type === 'crypto' && computeConsensus(
-        { direction: data.direction, confidence: data.confidence },
-        data.crossover || { direction: null, confidence: 0 }
-      ) > 90 && (
-        <div className="absolute top-2 right-2">
-          <div className="px-2 py-1 rounded bg-yellow-500 text-black text-[10px] font-bold flex items-center gap-1">
-            🔥 STRONG CONSENSUS
-          </div>
-        </div>
-      )}
-
-      {/* Left decorative border for confidence */}
-      {type === 'crypto' && (
-        <div
-          className={`absolute left-0 top-0 bottom-0 w-1 rounded-l-xl ${
-            confidence > 90
-              ? 'bg-gradient-to-b from-red-400 to-yellow-300'
-              : confidence >= 80
-              ? 'bg-green-400'
-              : confidence >= 55
-              ? 'bg-blue-400'
-              : 'bg-yellow-500'
-          }`}
-        />
-      )}
-      {type === 'football' && (
-        <div
-          className={`absolute left-0 top-0 bottom-0 w-1 rounded-l-xl ${
-            confidence >= 85
-              ? 'bg-green-400'
-              : confidence >= 55
-              ? 'bg-blue-400'
-              : 'bg-yellow-400'
-          }`}
-        />
-      )}
-    </div>
-  );
-};
-
-export default SignalCard;
+}
