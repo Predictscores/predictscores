@@ -62,10 +62,9 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-[#18191c] text-white">
       {/* Header */}
-      <header className="w-full flex flex-col md:flex-row items-start md:items-center justify-between py-4 px-6 gap-4">
-        {/* Left: title + tabs */}
-        <div className="flex flex-col md:flex-row items-start md:items-center gap-4">
-          <div className="text-xl font-bold">AI Top fudbalske i Kripto Prognoze</div>
+      <header className="w-full grid grid-cols-[auto_1fr_auto] items-start gap-4 py-4 px-6">
+        {/* left: tabs */}
+        <div className="flex gap-1 items-center">
           <div className="flex gap-1 bg-[#1f2339] rounded-full overflow-hidden">
             <button
               onClick={() => setActiveTab(TABS.COMBINED)}
@@ -100,7 +99,12 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Right: controls + timers */}
+        {/* center: title */}
+        <div className="flex justify-center">
+          <div className="text-xl font-bold">AI Top fudbalske i Kripto Prognoze</div>
+        </div>
+
+        {/* right: controls + timers */}
         <div className="flex flex-col items-end gap-2">
           <div className="flex gap-3">
             <button
@@ -116,12 +120,12 @@ export default function Home() {
               {isDark ? 'Light mode' : 'Dark mode'}
             </button>
           </div>
-          <div className="flex gap-6 text-sm text-gray-300 font-medium">
+          <div className="flex flex-col text-sm text-gray-300 font-medium">
             <div>
               <span className="text-white">Football last generated:</span>{' '}
               {formatTime(footballData?.generated_at)}
             </div>
-            <div>
+            <div className="mt-1">
               <span className="text-white">Crypto next refresh:</span>{' '}
               {getCountdown(nextCryptoUpdate)}
             </div>
@@ -145,12 +149,12 @@ export default function Home() {
             {combinedPairs.map((i) => (
               <div
                 key={i}
-                className="flex flex-col md:flex-row gap-4 md:h-[180px] items-stretch"
+                className="flex flex-col md:flex-row gap-4 md:min-h-[160px] items-stretch"
               >
                 {/* Football 33% */}
-                <div className="md:w-1/3 flex h-full">
+                <div className="md:w-1/3 flex">
                   {topFootball[i] ? (
-                    <div className="w-full flex h-full">
+                    <div className="w-full flex">
                       <SignalCard data={topFootball[i]} type="football" />
                     </div>
                   ) : (
@@ -161,9 +165,9 @@ export default function Home() {
                 </div>
 
                 {/* Crypto 67% */}
-                <div className="md:w-2/3 flex h-full">
+                <div className="md:w-2/3 flex">
                   {topCrypto[i] ? (
-                    <div className="w-full flex h-full">
+                    <div className="w-full flex">
                       <SignalCard data={topCrypto[i]} type="crypto" />
                     </div>
                   ) : (
