@@ -3,6 +3,8 @@
 import { useContext, useEffect, useState } from 'react';
 import { DataContext } from '../contexts/DataContext';
 import SignalCard from '../components/SignalCard';
+import CombinedBets from '../components/CombinedBets';
+import FootballBets from '../components/FootballBets';
 
 const TABS = {
   COMBINED: 'combined',
@@ -56,9 +58,8 @@ export default function Home() {
     return `${m}m ${s.toString().padStart(2, '0')}s`;
   };
 
-  const topFootball = footballData?.footballTop || [];
   const topCrypto = cryptoData?.cryptoTop || [];
-  const combinedPairs = [0, 1, 2];
+  const today = new Date().toISOString().slice(0, 10); // format YYYY-MM-DD
 
   return (
     <div className="min-h-screen bg-[#18191c] text-white">
@@ -144,68 +145,17 @@ export default function Home() {
 
         {/* Combined */}
         {activeTab === TABS.COMBINED && (
-          <>
-            {topFootball.length === 0 && topCrypto.length === 0 && (
-              <div className="text-center text-gray-400 mb-4">
-                Nema dostupnih kombinovanih predloga.
-              </div>
-            )}
-            {combinedPairs.map((i) => (
-              <div
-                key={i}
-                className="flex flex-col md:flex-row gap-4 md:min-h-[160px] items-stretch"
-              >
-                {/* Football 33% */}
-                <div className="md:w-1/3 flex">
-                  {topFootball[i] ? (
-                    <div className="w-full flex">
-                      <SignalCard data={topFootball[i]} type="football" />
-                    </div>
-                  ) : (
-                    <div className="w-full bg-[#1f2339] p-3 rounded-2xl text-gray-400 flex items-center justify-center">
-                      Nema dostupne fudbalske prognoze
-                    </div>
-                  )}
-                </div>
-
-                {/* Crypto 67% */}
-                <div className="md:w-2/3 flex">
-                  {topCrypto[i] ? (
-                    <div className="w-full flex">
-                      <SignalCard data={topCrypto[i]} type="crypto" />
-                    </div>
-                  ) : (
-                    <div className="w-full bg-[#1f2339] p-3 rounded-2xl text-gray-400 flex items-center justify-center">
-                      Nema dostupnog kripto signala
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))}
-          </>
+          <div className="space-y-8">
+            <CombinedBets date={today} />
+          </div>
         )}
 
         {/* Football only */}
         {activeTab === TABS.FOOTBALL && (
-          <>
+          <div className="space-y-6">
             <h2 className="text-2xl font-bold">Top Football Picks</h2>
-            <div className="grid grid-cols-1 gap-6">
-              {topFootball.length > 0 ? (
-                topFootball.slice(0, 10).map((signal, idx) => (
-                  <div
-                    key={idx}
-                    className="bg-[#1f2339] p-5 rounded-2xl shadow flex"
-                  >
-                    <SignalCard data={signal} type="football" />
-                  </div>
-                ))
-              ) : (
-                <div className="text-center text-gray-400">
-                  Nema dostupnih fudbalskih predloga.
-                </div>
-              )}
-            </div>
-          </>
+            <FootballBets date={today} />
+          </div>
         )}
 
         {/* Crypto only */}
@@ -215,10 +165,7 @@ export default function Home() {
             <div className="grid grid-cols-1 gap-6">
               {topCrypto.length > 0 ? (
                 topCrypto.slice(0, 10).map((signal, idx) => (
-                  <div
-                    key={idx}
-                    className="bg-[#1f2339] p-5 rounded-2xl shadow flex"
-                  >
+                  <div key={idx} className="bg-[#1f2339] p-5 rounded-2xl shadow flex">
                     <SignalCard data={signal} type="crypto" />
                   </div>
                 ))
