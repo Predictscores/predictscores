@@ -1,5 +1,6 @@
-import { fetchSportmonksFixtures } from "@/lib/sources/sportmonks";
-import { fetchOdds } from "@/lib/sources/theOddsApi";
+// pages/api/value-bets.js
+import { fetchSportmonksFixtures } from "../../lib/sources/sportmonks";
+import { fetchOdds } from "../../lib/sources/theOddsApi";
 
 function calculateEdge(modelProb, marketProb) {
   return marketProb ? modelProb - marketProb : 0;
@@ -10,23 +11,20 @@ export default async function handler(req, res) {
   if (!date) return res.status(400).json({ error: "missing date" });
 
   try {
-    // 1) Fixtures
     const raw = await fetchSportmonksFixtures(date);
     const fixtures = (raw.data || []).filter(f => f.time?.status === "NS");
 
-    // 2) Odds
     const oddsRaw = await fetchOdds(sport_key);
     const oddsMap = {};
     oddsRaw.forEach(o => {
-      const h = o.home_team.toLowerCase();
-      const a = o.away_team.toLowerCase();
-      oddsMap[`${h}|${a}`] = o;
+      const home = o.home_team.toLowerCase();
+      const away = o.away_team.toLowerCase();
+      oddsMap[`${home}|${away}`] = o;
     });
 
-    // 3) Build value bets
     const value_bets = fixtures.map(f => {
-      const home = f.localTeam.data.name.toLowerCase();
-      const away = f.visitorTeam.data.name.toLowerCase();
+      const homeName = f.localTeam.data.name.toLowerCase();
+      const awayName = f.visitorTeam.data.name.toLowerCase();
       const base = {
         fixture_id: f.id,
         type: "MODEL_ONLY",
@@ -43,22 +41,24 @@ export default async function handler(req, res) {
         reason: "model-only",
       };
 
-      const o = oddsMap[`${home}|${away}`];
+      const o = oddsMap[`${homeName}|${awayName}`];
       if (o && Array.isArray(o.bookmakers)) {
-        let mkt = null;
+        let h2hMarket = null;
         for (const b of o.bookmakers) {
-          mkt = b.markets?.find(m => m.key === "h2h");
-          if (mkt) break;
+          h2hMarket = b.markets?.find(m => m.key === "h2h");
+          if (h2hMarket) break;
         }
-        if (mkt) {
-          const outcome = mkt.outcomes.find(o => o.name.toLowerCase() === f.localTeam.data.name.toLowerCase());
+        if (h2hMarket) {
+          const outcome = h2hMarket.outcomes.find(
+            oc => oc.name.toLowerCase() === f.localTeam.data.name.toLowerCase()
+          );
           if (outcome && outcome.price >= Number(min_odds)) {
-            const mp = 1 / outcome.price;
-            const edge = calculateEdge(base.model_prob, mp);
+            const marketProb = 1 / outcome.price;
+            const edge = calculateEdge(base.model_prob, marketProb);
             if (edge >= Number(min_edge)) {
               base.type = "MODEL+ODDS";
               base.market_odds = outcome.price;
-              base.market_prob = Number(mp.toFixed(3));
+              base.market_prob = Number(marketProb.toFixed(3));
               base.edge = Number(edge.toFixed(3));
               base.confidence = Math.min(100, Math.round(edge * 100));
               base.fallback = false;
