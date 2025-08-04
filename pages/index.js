@@ -3,7 +3,6 @@
 import { useContext, useEffect, useState } from 'react';
 import { DataContext } from '../contexts/DataContext';
 import SignalCard from '../components/SignalCard';
-import CryptoTopSignals from '../components/CryptoTopSignals';
 
 const TABS = {
   COMBINED: 'combined',
@@ -143,13 +142,12 @@ export default function Home() {
             {combinedPairs.map((i) => (
               <div
                 key={i}
-                className="flex flex-col md:flex-row gap-4"
-                style={{ alignItems: 'stretch' }}
+                className="flex flex-col md:flex-row gap-4 md:h-[220px] items-stretch"
               >
                 {/* Football 33% */}
-                <div className="md:w-1/3 flex">
+                <div className="md:w-1/3 flex h-full">
                   {topFootball[i] ? (
-                    <div className="w-full">
+                    <div className="w-full flex h-full">
                       <SignalCard data={topFootball[i]} type="football" />
                     </div>
                   ) : (
@@ -160,9 +158,9 @@ export default function Home() {
                 </div>
 
                 {/* Crypto 67% */}
-                <div className="md:w-2/3 flex">
+                <div className="md:w-2/3 flex h-full">
                   {topCrypto[i] ? (
-                    <div className="w-full">
+                    <div className="w-full flex h-full">
                       <SignalCard data={topCrypto[i]} type="crypto" />
                     </div>
                   ) : (
@@ -202,7 +200,23 @@ export default function Home() {
         {/* Crypto only */}
         {activeTab === TABS.CRYPTO && (
           <>
-            <CryptoTopSignals refreshIntervalMs={10000} limit={6} />
+            <h2 className="text-2xl font-bold">Top Crypto Signals</h2>
+            <div className="grid grid-cols-1 gap-6">
+              {topCrypto.length > 0 ? (
+                topCrypto.slice(0, 10).map((signal, idx) => (
+                  <div
+                    key={idx}
+                    className="bg-[#1f2339] p-5 rounded-2xl shadow flex"
+                  >
+                    <SignalCard data={signal} type="crypto" />
+                  </div>
+                ))
+              ) : (
+                <div className="text-center text-gray-400">
+                  Nema dostupnih kripto signala.
+                </div>
+              )}
+            </div>
           </>
         )}
       </main>
@@ -213,7 +227,7 @@ export default function Home() {
           <div>
             <span className="font-semibold">Confidence:</span>{' '}
           </div>
-          <div className="flex gap-1">
+          <div className="flex gap-1 flex-wrap justify-center">
             <div>🟢 High (80–90%)</div>
             <div>·</div>
             <div>🔵 Moderate (55–80%)</div>
