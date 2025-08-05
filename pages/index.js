@@ -168,7 +168,7 @@ export default function Home() {
                 <div className="md:w-2/3">
                   {topCrypto[i] ? (
                     <SignalCard data={topCrypto[i]} type="crypto" />
-                  ) : (
+                  ) : ( 
                     <div className="w-full bg-[#1f2339] p-3 rounded-2xl text-gray-400 flex items-center justify-center">Nema kripto signala</div>
                   )}
                 </div>
@@ -225,7 +225,7 @@ export default function Home() {
             <div>🟢 High (80–90%)</div><div>·</div>
             <div>🔵 Moderate (55–80%)</div><div>·</div>
             <div>🟡 Low (&lt;55%)</div><div>·</div>
-            <div>🔥 Bomba (>90%)</div>
+            <div>🔥 Bomba (&gt;90%)</div>
           </div>
         </div>
       </footer>
