@@ -226,8 +226,8 @@ export default function Home() {
           <div className="flex gap-1 flex-wrap justify-center">
             <div>🟢 High (80–90%)</div><div>·</div>
             <div>🔵 Moderate (55–80%)</div><div>·</div>
-            <div>🟡 Low (&lt;55%)</div><div>·</div>
-            <div>🔥 Bomba (&gt;90%)</div>
+            <div>🟡 Low (<55%)</div><div>·</div>
+            <div>🔥 Bomba (>90%)</div>
           </div>
         </div>
       </footer>
