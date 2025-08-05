@@ -41,7 +41,6 @@ export default function Home() {
 
   const today = new Date().toISOString().slice(0, 10);
 
-  // Use our new hook for football value bets
   const {
     bets: valueBets,
     loading: loadingValueBets,
@@ -71,7 +70,6 @@ export default function Home() {
   const combinedSlots = combinedPairs.map((i) => topValueBets[i] || topFootball[i]);
   const displayFootball = valueBets.length > 0 ? valueBets.slice(0, 10) : topFootball.slice(0, 10);
 
-  // Card for a value bet using same styling as SignalCard
   const ValueBetCard = ({ bet }) => {
     if (!bet) return null;
     const { market, selection, type, market_odds, edge, teams, datetime_local } = bet;
@@ -104,8 +102,8 @@ export default function Home() {
         </div>
         <div className="text-sm mt-2">
           <div><strong>Kvota:</strong> {market_odds ?? '-'}</div>
-          {edge != null && <div><strong>Edge:</strong> {(edge*100).toFixed(1)}%</div>}
-          <div className="text-xs text-gray-400 mt-1">{`Model: ${(bet.model_prob*100).toFixed(1)}%`}</div>
+          {edge != null && <div><strong>Edge:</strong> {(edge * 100).toFixed(1)}%</div>}
+          <div className="text-xs text-gray-400 mt-1">{`Model: ${(bet.model_prob * 100).toFixed(1)}%`}</div>
           <div className="text-xs text-gray-500 mt-1">Starts at: {timeStr}</div>
         </div>
       </div>
@@ -226,7 +224,7 @@ export default function Home() {
           <div className="flex gap-1 flex-wrap justify-center">
             <div>🟢 High (80–90%)</div><div>·</div>
             <div>🔵 Moderate (55–80%)</div><div>·</div>
-            <div>🟡 Low (<55%)</div><div>·</div>
+            <div>🟡 Low (&lt;55%)</div><div>·</div>
             <div>🔥 Bomba (>90%)</div>
           </div>
         </div>
