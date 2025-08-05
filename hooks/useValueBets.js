@@ -22,10 +22,27 @@ function sortValueBets(bets = []) {
 }
 
 /**
+ * Helper: fetch raw bets for a given date
+ */
+async function fetchRawBetsForDate(date) {
+  const res = await fetch(
+    `/api/value-bets?sport_key=soccer&date=${encodeURIComponent(
+      date
+    )}&min_edge=0.05&min_odds=1.3`
+  );
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`HTTP ${res.status}: ${txt}`);
+  }
+  const json = await res.json();
+  return Array.isArray(json.value_bets) ? json.value_bets : [];
+}
+
+/**
  * useValueBets hook:
  * - date: string "YYYY-MM-DD"
  * - caches results in localStorage under key `valueBets_<date>`
- * - auto-refreshes once per day (at first use for new date)
+ * - if no bets for date, falls back to date-1
  */
 export default function useValueBets(date) {
   const [bets, setBets] = useState([]);
@@ -37,55 +54,50 @@ export default function useValueBets(date) {
     const cacheKey = `valueBets_${date}`;
     let cancelled = false;
 
-    // Try reading from cache
+    // Load from cache if available
     const cached = localStorage.getItem(cacheKey);
     if (cached) {
       try {
-        const parsed = JSON.parse(cached);
-        setBets(parsed);
+        setBets(JSON.parse(cached));
         setLoading(false);
-      } catch (e) {
-        // invalid JSON, clear cache
+        return; // skip fetch on initial load
+      } catch {
         localStorage.removeItem(cacheKey);
       }
     }
 
-    // If no cached data, fetch and cache
-    if (!cached) {
-      const fetchAndCache = async () => {
-        setLoading(true);
-        setError(null);
-        try {
-          const res = await fetch(
-            `/api/value-bets?sport_key=soccer&date=${encodeURIComponent(
-              date
-            )}&min_edge=0.05&min_odds=1.3`
-          );
-          if (!res.ok) {
-            const txt = await res.text();
-            throw new Error(`HTTP ${res.status}: ${txt}`);
-          }
-          const json = await res.json();
-          const raw = Array.isArray(json.value_bets) ? json.value_bets : [];
-          const sorted = sortValueBets(raw);
-          if (!cancelled) {
-            setBets(sorted);
-            // Cache the sorted results for this date
-            localStorage.setItem(cacheKey, JSON.stringify(sorted));
-          }
-        } catch (e) {
-          console.error('useValueBets fetch error', e);
-          if (!cancelled) {
-            setError(e.message);
-            setBets([]);
-          }
-        } finally {
-          if (!cancelled) setLoading(false);
-        }
-      };
-      fetchAndCache();
-    }
+    const fetchAndCache = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        // 1) Try today
+        let raw = await fetchRawBetsForDate(date);
 
+        // 2) If empty, try yesterday
+        if (raw.length === 0) {
+          const d = new Date(date);
+          d.setDate(d.getDate() - 1);
+          const ystr = d.toISOString().slice(0, 10);
+          raw = await fetchRawBetsForDate(ystr);
+        }
+
+        const sorted = sortValueBets(raw);
+        if (!cancelled) {
+          setBets(sorted);
+          localStorage.setItem(cacheKey, JSON.stringify(sorted));
+        }
+      } catch (e) {
+        console.error('useValueBets fetch error', e);
+        if (!cancelled) {
+          setError(e.message);
+          setBets([]);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+
+    fetchAndCache();
     return () => {
       cancelled = true;
     };
