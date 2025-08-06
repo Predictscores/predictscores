@@ -12,8 +12,9 @@ const TABS = {
 
 export default function Home() {
   const {
-    cryptoData,
     footballData,
+    longSignals,
+    shortSignals,
     loadingCrypto,
     loadingFootball,
     refreshAll,
@@ -23,7 +24,7 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState(TABS.COMBINED);
   const [isDark, setIsDark] = useState(false);
 
-  // Init dark mode from localStorage or prefers-color-scheme
+  // Dark mode init
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const stored = localStorage.getItem('dark-mode');
@@ -41,9 +42,9 @@ export default function Home() {
     }
   }, [isDark]);
 
-  const formatTime = (timestamp) => {
-    if (!timestamp) return '—';
-    const d = new Date(timestamp);
+  const formatTime = (ts) => {
+    if (!ts) return '—';
+    const d = new Date(ts);
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
 
@@ -53,12 +54,11 @@ export default function Home() {
     if (diff <= 0) return 'Now';
     const m = Math.floor(diff / 60000);
     const s = Math.floor((diff % 60000) / 1000);
-    return `${m}m ${s.toString().padStart(2, '0')}s`;
+    return `${m}m ${s.toString().padStart(2,'0')}s`;
   };
 
   const topFootball = footballData?.footballTop || [];
-  const topCrypto = cryptoData?.cryptoTop || [];
-  const combinedPairs = [0, 1, 2];
+  const combinedPairs = [0,1,2];
 
   return (
     <div className="min-h-screen bg-[#18191c] text-white">
@@ -67,36 +67,19 @@ export default function Home() {
         {/* Tabs */}
         <div className="flex gap-1 items-center">
           <div className="flex gap-1 bg-[#1f2339] rounded-full overflow-hidden">
-            <button
-              onClick={() => setActiveTab(TABS.COMBINED)}
-              className={`px-5 py-2 text-sm font-semibold transition ${
-                activeTab === TABS.COMBINED
-                  ? 'bg-[#23272f] text-white'
-                  : 'text-gray-300 hover:bg-[#272c4f]'
-              }`}
-            >
-              Combined
-            </button>
-            <button
-              onClick={() => setActiveTab(TABS.FOOTBALL)}
-              className={`px-5 py-2 text-sm font-semibold transition ${
-                activeTab === TABS.FOOTBALL
-                  ? 'bg-[#23272f] text-white'
-                  : 'text-gray-300 hover:bg-[#272c4f]'
-              }`}
-            >
-              Football
-            </button>
-            <button
-              onClick={() => setActiveTab(TABS.CRYPTO)}
-              className={`px-5 py-2 text-sm font-semibold transition ${
-                activeTab === TABS.CRYPTO
-                  ? 'bg-[#23272f] text-white'
-                  : 'text-gray-300 hover:bg-[#272c4f]'
-              }`}
-            >
-              Crypto
-            </button>
+            {Object.entries(TABS).map(([key, value]) => (
+              <button
+                key={value}
+                onClick={() => setActiveTab(value)}
+                className={`px-5 py-2 text-sm font-semibold transition ${
+                  activeTab === value
+                    ? 'bg-[#23272f] text-white'
+                    : 'text-gray-300 hover:bg-[#272c4f]'
+                }`}
+              >
+                {key.charAt(0) + key.slice(1).toLowerCase()}
+              </button>
+            ))}
           </div>
         </div>
 
@@ -117,7 +100,7 @@ export default function Home() {
               Refresh all
             </button>
             <button
-              onClick={() => setIsDark((d) => !d)}
+              onClick={() => setIsDark(d => !d)}
               className="px-4 py-2 rounded-md bg-[#23272f] hover:bg-[#2f3344] transition font-medium"
             >
               {isDark ? 'Light mode' : 'Dark mode'}
@@ -127,9 +110,7 @@ export default function Home() {
             <div className="bg-[#1f2339] px-4 py-2 rounded-full flex flex-col sm:flex-row gap-2 text-sm text-gray-300 font-medium">
               <div className="flex gap-1 items-center">
                 <span className="text-white">Crypto next refresh:</span>
-                <span className="font-mono">
-                  {getCountdown(nextCryptoUpdate)}
-                </span>
+                <span className="font-mono">{getCountdown(nextCryptoUpdate)}</span>
               </div>
               <div className="flex gap-1 items-center">
                 <span className="text-white">Football last generated:</span>
@@ -148,15 +129,10 @@ export default function Home() {
           <div className="text-center text-gray-400">Učitavanje podataka...</div>
         )}
 
-        {/* Combined */}
+        {/* Combined Tab */}
         {activeTab === TABS.COMBINED && (
           <>
-            {topFootball.length === 0 && topCrypto.length === 0 && (
-              <div className="text-center text-gray-400 mb-4">
-                Nema dostupnih kombinovanih predloga.
-              </div>
-            )}
-            {combinedPairs.map((i) => (
+            {combinedPairs.map(i => (
               <div
                 key={i}
                 className="flex flex-col md:flex-row gap-4 md:min-h-[160px] items-stretch"
@@ -164,9 +140,7 @@ export default function Home() {
                 {/* Football 33% */}
                 <div className="md:w-1/3 flex">
                   {topFootball[i] ? (
-                    <div className="w-full flex">
-                      <SignalCard data={topFootball[i]} type="football" />
-                    </div>
+                    <SignalCard data={topFootball[i]} type="football" />
                   ) : (
                     <div className="w-full bg-[#1f2339] p-3 rounded-2xl text-gray-400 flex items-center justify-center">
                       Nema dostupne fudbalske prognoze
@@ -176,10 +150,8 @@ export default function Home() {
 
                 {/* Crypto 67% */}
                 <div className="md:w-2/3 flex">
-                  {topCrypto[i] ? (
-                    <div className="w-full flex">
-                      <SignalCard data={topCrypto[i]} type="crypto" />
-                    </div>
+                  {(longSignals[i] || shortSignals[i]) ? (
+                    <SignalCard data={ longSignals[i] || shortSignals[i] } type="crypto" />
                   ) : (
                     <div className="w-full bg-[#1f2339] p-3 rounded-2xl text-gray-400 flex items-center justify-center">
                       Nema dostupnog kripto signala
@@ -191,13 +163,13 @@ export default function Home() {
           </>
         )}
 
-        {/* Football only */}
+        {/* Football Tab */}
         {activeTab === TABS.FOOTBALL && (
           <>
             <h2 className="text-2xl font-bold">Top Football Picks</h2>
             <div className="grid grid-cols-1 gap-6">
               {topFootball.length > 0 ? (
-                topFootball.slice(0, 10).map((signal, idx) => (
+                topFootball.slice(0,10).map((signal, idx) => (
                   <div
                     key={idx}
                     className="bg-[#1f2339] p-5 rounded-2xl shadow flex"
@@ -214,15 +186,16 @@ export default function Home() {
           </>
         )}
 
-        {/* Crypto only */}
+        {/* Crypto Tab */}
         {activeTab === TABS.CRYPTO && (
           <>
             <h2 className="text-2xl font-bold">Top Crypto Signals</h2>
+            <h3 className="mt-4 text-lg font-semibold text-green-300">Long</h3>
             <div className="grid grid-cols-1 gap-6">
-              {topCrypto.length > 0 ? (
-                topCrypto.slice(0, 10).map((signal, idx) => (
+              {longSignals.length > 0 ? (
+                longSignals.map((signal, idx) => (
                   <div
-                    key={idx}
+                    key={`long-${idx}`}
                     className="bg-[#1f2339] p-5 rounded-2xl shadow flex"
                   >
                     <SignalCard data={signal} type="crypto" />
@@ -230,7 +203,24 @@ export default function Home() {
                 ))
               ) : (
                 <div className="text-center text-gray-400">
-                  Nema dostupnih kripto signala.
+                  Nema LONG signala.
+                </div>
+              )}
+            </div>
+            <h3 className="mt-6 text-lg font-semibold text-red-300">Short</h3>
+            <div className="grid grid-cols-1 gap-6 mb-8">
+              {shortSignals.length > 0 ? (
+                shortSignals.map((signal, idx) => (
+                  <div
+                    key={`short-${idx}`}
+                    className="bg-[#1f2339] p-5 rounded-2xl shadow flex"
+                  >
+                    <SignalCard data={signal} type="crypto" />
+                  </div>
+                ))
+              ) : (
+                <div className="text-center text-gray-400">
+                  Nema SHORT signala.
                 </div>
               )}
             </div>
@@ -241,20 +231,14 @@ export default function Home() {
       {/* Footer */}
       <footer className="mt-12 mb-8 px-6 text-center text-sm text-gray-400">
         <div className="inline-flex gap-2 flex-wrap justify-center">
-          <div>
-            <span className="font-semibold">Confidence:</span>{' '}
-          </div>
-          <div className="flex gap-1 flex-wrap justify-center">
-            <div>🟢 High (80–90%)</div>
-            <div>·</div>
-            <div>🔵 Moderate (55–80%)</div>
-            <div>·</div>
-            <div>🟡 Low (&lt;55%)</div>
-            <div>·</div>
-            <div>🔥 Bomba (&gt;90%)</div>
-          </div>
+          <span className="font-semibold">Confidence legend:</span>
+          <span>🟢 High (≥75%)</span>
+          <span>·</span>
+          <span>🔵 Moderate (50–75%)</span>
+          <span>·</span>
+          <span>🟡 Low (&lt;50%)</span>
         </div>
       </footer>
     </div>
-  );
+);
 }
