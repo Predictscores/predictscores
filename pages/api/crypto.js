@@ -4,122 +4,101 @@
 const CACHE_TTL = 10 * 60 * 1000;
 let cached = { combined: null, crypto: null, timestamp: 0 };
 
-// TF konfiguracije: aggregate (minuta) i broj štapića
 const TF_CONFIGS = [
-  { aggregate: 15, limit: 96 },  // 24h @15m
-  { aggregate: 30, limit: 48 },  // 24h @30m
-  { aggregate: 60, limit: 24 },  // 24h @1h
-  { aggregate: 240, limit: 6 },  // 24h @4h
+  { aggregate: 15, limit: 96 },
+  { aggregate: 30, limit: 48 },
+  { aggregate: 60, limit: 24 },
+  { aggregate: 240, limit: 6 },
 ];
 
-// 1) Uzmi top 50 simbola po MC sa CoinGecko
 async function fetchTopCoins() {
   const url =
     'https://api.coingecko.com/api/v3/coins/markets' +
     '?vs_currency=usd&order=market_cap_desc&per_page=50&page=1';
   const res = await fetch(url);
-  if (!res.ok) throw new Error('CoinGecko markets fetch failed');
+  if (!res.ok) throw new Error(`CoinGecko markets fetch failed: ${res.status}`);
   const data = await res.json();
-  // vraćamo samo simbole (BTC, ETH, ...)
   return data.map((c) => c.symbol.toUpperCase());
 }
 
-// 2) Za dati symbol, TF i limit vrati niz closing cena
 async function fetchOHLC(symbol, aggregate, limit) {
   const url =
     `https://min-api.cryptocompare.com/data/v2/histominute` +
     `?fsym=${symbol}&tsym=USD&limit=${limit}&aggregate=${aggregate}`;
   const res = await fetch(url);
   const json = await res.json();
-  if (json.Response !== 'Success')
-    throw new Error(`OHLC fetch failed for ${symbol}`);
-  // iz json.Data.Data uzmem samo polje .close
+  if (json.Response !== 'Success') {
+    throw new Error(`CC histominute failed: ${json.Message || json.Response}`);
+  }
   return json.Data.Data.map((d) => d.close);
 }
 
-// Glavni handler
 export default async function handler(req, res) {
+  const debug = { symbols: [], processed: 0, errors: [] };
+
   try {
-    // Ako je keš svež, samo ga vrati
+    // koristimo keš ako je svež
     if (
       cached.combined &&
       Date.now() - cached.timestamp < CACHE_TTL
     ) {
-      res.setHeader(
-        'Cache-Control',
-        's-maxage=600, stale-while-revalidate'
-      );
       return res
         .status(200)
-        .json({ combined: cached.combined, crypto: cached.crypto });
+        .setHeader('Cache-Control', 's-maxage=600, stale-while-revalidate')
+        .json({ combined: cached.combined, crypto: cached.crypto, debug: { cached: true } });
     }
 
-    // 1) Pribavi simbole
-    const symbols = await fetchTopCoins(); // npr. ['BTC','ETH',...]
+    // 1) fetch top simbola
+    let symbols;
+    try {
+      symbols = await fetchTopCoins();
+      debug.symbols = symbols;
+    } catch (e) {
+      debug.errors.push(`fetchTopCoins: ${e.message}`);
+      symbols = [];
+    }
 
     const signals = [];
-
-    // 2) Za svaki simbol izračunaj prosečnu promenu po TF
+    // 2) za svaki simbol
     await Promise.all(
       symbols.map(async (sym) => {
         try {
-          // Skupi sve TF promene
+          // 2a) skupljanje closes na svim TF
           const changes = await Promise.all(
             TF_CONFIGS.map(async (cfg) => {
-              const closes = await fetchOHLC(
-                sym,
-                cfg.aggregate,
-                cfg.limit
-              );
+              const closes = await fetchOHLC(sym, cfg.aggregate, cfg.limit);
               const last = closes.length - 1;
-              return (closes[last] - closes[last - 1]) /
-                closes[last - 1];
+              return (closes[last] - closes[last - 1]) / closes[last - 1];
             })
           );
-
-          // Prosečna promena preko svih TF
+          // 2b) prosečna promena
           const avgChange =
-            changes.reduce((sum, ch) => sum + ch, 0) /
-            changes.length;
-
-          // LONG ili SHORT po znaku avgChange
+            changes.reduce((sum, ch) => sum + ch, 0) / changes.length;
           const signal = avgChange >= 0 ? 'LONG' : 'SHORT';
-          // škaluješ confidence na 0–100 (ovde *150 da dobije lep raspon,
-          // ali slobodno prilagodiš)
-          const confidence = Math.min(
-            Math.abs(avgChange) * 100 * 1.5,
-            100
-          ).toFixed(2);
-
-          signals.push({
-            symbol: sym,
-            signal,
-            confidence: Number(confidence),
-          });
+          const confidence = Math.min(Math.abs(avgChange) * 150, 100).toFixed(2);
+          signals.push({ symbol: sym, signal, confidence: Number(confidence) });
+          debug.processed++;
         } catch (e) {
-          console.error('Signal error for', sym, e);
+          debug.errors.push(`${sym}: ${e.message}`);
         }
       })
     );
 
-    // 3) Sortiraj po confidence desc i uzmi top10 & top3
+    // 3) sortiranje i top slice
     signals.sort((a, b) => b.confidence - a.confidence);
     const top10 = signals.slice(0, 10);
     const top3 = top10.slice(0, 3);
 
-    // 4) Keširaj i vrati
-    cached = {
-      combined: top3,
-      crypto: top10,
-      timestamp: Date.now(),
-    };
-    res.setHeader(
-      'Cache-Control',
-      's-maxage=600, stale-while-revalidate'
-    );
-    res.status(200).json({ combined: top3, crypto: top10 });
+    // 4) keširanje
+    cached = { combined: top3, crypto: top10, timestamp: Date.now() };
+
+    res
+      .status(200)
+      .setHeader('Cache-Control', 's-maxage=600, stale-while-revalidate')
+      .json({ combined: top3, crypto: top10, debug });
   } catch (err) {
+    debug.errors.push(`handler: ${err.message}`);
     console.error('API /crypto error', err);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal error', debug });
   }
 }
