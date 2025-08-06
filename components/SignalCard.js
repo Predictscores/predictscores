@@ -44,7 +44,10 @@ export default function SignalCard({ data }) {
       };
 
       const encoded = encodeURIComponent(JSON.stringify(config));
-      setChartUrl(`https://quickchart.io/chart?c=${encoded}&w=300&h=160&bkg=23272f`);
+      // DODATO &version=3
+      setChartUrl(
+        `https://quickchart.io/chart?c=${encoded}&w=300&h=160&bkg=23272f&version=3`
+      );
     }
 
     buildChart();
