@@ -15,12 +15,16 @@ export default function SignalCard({ data }) {
     expectedMove = 0
   } = data;
 
+  // Izračunaj odnos rizika/nagrade
+  const riskReward =
+    entryPrice !== sl ? (tp - entryPrice) / Math.abs(entryPrice - sl) : null;
+
   const [chartUrl, setChartUrl] = useState('');
 
   useEffect(() => {
     async function buildChart() {
       try {
-        // 24h history in 15-minute bars (96 bars)
+        // 24h istorija u 15-minutnim svećama (96 tačaka)
         const res = await fetch(
           `https://min-api.cryptocompare.com/data/v2/histominute?fsym=${symbol}&tsym=USD&limit=96&aggregate=15`
         );
@@ -34,7 +38,7 @@ export default function SignalCard({ data }) {
           c: d.close
         }));
 
-        // Chart.js config with white background & TP/SL lines
+        // Chart.js konfiguracija sa belom pozadinom i TP/SL linijama
         const config = {
           type: 'candlestick',
           data: {
@@ -91,7 +95,6 @@ export default function SignalCard({ data }) {
         };
 
         const encoded = encodeURIComponent(JSON.stringify(config));
-        // bkg=ffffff for white chart background
         setChartUrl(
           `https://quickchart.io/chart?c=${encoded}&w=800&h=240&bkg=ffffff&version=3`
         );
@@ -99,12 +102,13 @@ export default function SignalCard({ data }) {
         setChartUrl(null);
       }
     }
+
     buildChart();
   }, [symbol, tp, sl]);
 
   return (
     <div className="flex h-40 bg-[#23272f] rounded-2xl shadow overflow-hidden">
-      {/* INFO (≈35%) */}
+      {/* 1) INFO (≈35%) */}
       <div className="w-1/3 p-3 flex flex-col justify-center space-y-1 break-words">
         <h3 className="text-xl font-bold">{symbol}</h3>
         <div className="text-sm">Current: ${price.toFixed(4)}</div>
@@ -126,13 +130,13 @@ export default function SignalCard({ data }) {
         </div>
       </div>
 
-      {/* EXTRA DETAILS (≈15%) */}
-      <div className="w-1/6 p-3 border-l border-gray-700 flex flex-col justify-center items-center bg-[#1f2339]">
-        <div className="text-sm">Signal TF: 15m</div>
-        <div className="text-sm">R:R: {(tp - entryPrice) / (entryPrice - sl) || '-':.2f}</div>
+      {/* 2) EXTRA DETAILS (≈15%) */}
+      <div className="w-1/6 p-3 border-l border-gray-700 flex flex-col justify-center items-center bg-[#1f2339] text-sm">
+        <div>Signal TF: 15m</div>
+        <div>R:R: {riskReward != null ? riskReward.toFixed(2) : '-'}</div>
       </div>
 
-      {/* 24h Chart (≈50%) */}
+      {/* 3) 24h Chart (≈50%) */}
       <div className="w-1/2 flex items-center justify-center bg-[#23272f]">
         {chartUrl === null ? (
           <div className="text-gray-500">No chart available</div>
