@@ -1,87 +1,84 @@
-// FILE: contexts/DataContext.js
-import { createContext, useState, useEffect, useCallback } from 'react';
+// contexts/DataContext.js
+import React, { createContext, useState, useEffect, useCallback } from 'react';
 
 export const DataContext = createContext();
 
 export function DataProvider({ children }) {
-  const [footballData, setFootballData] = useState({ picks: [], date: null, generated_at: null });
-  const [cryptoData, setCryptoData] = useState({ cryptoTop: [], generated_at: null });
-  const [loadingFootball, setLoadingFootball] = useState(false);
-  const [loadingCrypto, setLoadingCrypto] = useState(false);
-  const [selectedDate, setSelectedDate] = useState(
-    new Date().toISOString().slice(0, 10)
-  );
+  // Crypto state
+  const [cryptoData, setCryptoData] = useState({ cryptoTop: [], combined: [] });
+  const [loadingCrypto, setLoadingCrypto] = useState(true);
+  const [nextCryptoUpdate, setNextCryptoUpdate] = useState(null);
 
-  // Fallback fetch: za datum i narednih maxDays dana
-  const fetchWithFallback = useCallback(async (startDate, maxDays = 7) => {
-    for (let i = 0; i < maxDays; i++) {
-      const d = new Date(startDate);
-      d.setDate(d.getDate() + i);
-      const dateStr = d.toISOString().slice(0, 10);
-      const res = await fetch(`/api/select-matches?date=${dateStr}`);
-      const json = await res.json();
-      if (json.picks && json.picks.length > 0) {
-        return { picks: json.picks, date: dateStr };
-      }
-    }
-    return { picks: [], date: null };
-  }, []);
+  // Football state (pretpostavljam da već imaš fetching, prilagodio sam strukturu)
+  const [footballData, setFootballData] = useState({ footballTop: [], generated_at: null });
+  const [loadingFootball, setLoadingFootball] = useState(true);
 
-  const loadFootball = useCallback(async () => {
-    setLoadingFootball(true);
-    try {
-      const { picks, date } = await fetchWithFallback(selectedDate, 7);
-      setFootballData({
-        picks,
-        date,
-        generated_at: Date.now(),
-      });
-    } catch (e) {
-      console.error('Error fetching football picks:', e);
-      setFootballData({ picks: [], date: null, generated_at: Date.now() });
-    } finally {
-      setLoadingFootball(false);
-    }
-  }, [fetchWithFallback, selectedDate]);
-
-  // (Crypto loader ostaje kako je bio)
-  const loadCrypto = useCallback(async () => {
+  // Fetch crypto signals
+  const fetchCrypto = useCallback(async () => {
     setLoadingCrypto(true);
     try {
-      // ... tvoja postojeća logika za cryptoData
+      const res = await fetch('/api/crypto');
+      const json = await res.json();
       setCryptoData({
-        cryptoTop: [], // primer
-        generated_at: Date.now(),
+        cryptoTop: json.crypto,      // za Crypto tab
+        combined: json.combined      // za Combined sekciju
       });
-    } catch {
-      setCryptoData({ cryptoTop: [], generated_at: Date.now() });
+      // zakaži sledeće osveženje
+      setNextCryptoUpdate(Date.now() + 10 * 60 * 1000);
+    } catch (err) {
+      console.error('Crypto fetch error:', err);
     } finally {
       setLoadingCrypto(false);
     }
   }, []);
 
-  // Ucitaj oba na startu i kad se klikne Refresh
+  // Fetch football predictions
+  const fetchFootball = useCallback(async () => {
+    setLoadingFootball(true);
+    try {
+      const res = await fetch('/api/football');
+      const json = await res.json();
+      // Pretpostavka: API vraća { top: [...], generated_at: timestamp }
+      setFootballData({
+        footballTop: json.top || [],
+        generated_at: json.generated_at || Date.now()
+      });
+    } catch (err) {
+      console.error('Football fetch error:', err);
+    } finally {
+      setLoadingFootball(false);
+    }
+  }, []);
+
+  // Auto-refresh crypto na 10 minuta
+  useEffect(() => {
+    fetchCrypto();
+    const iv = setInterval(fetchCrypto, 10 * 60 * 1000);
+    return () => clearInterval(iv);
+  }, [fetchCrypto]);
+
+  // Auto-refresh football (po potrebi – izmeni interval ako treba)
+  useEffect(() => {
+    fetchFootball();
+    const iv2 = setInterval(fetchFootball, 10 * 60 * 1000);
+    return () => clearInterval(iv2);
+  }, [fetchFootball]);
+
+  // Ručni refresh za oba
   const refreshAll = () => {
-    loadFootball();
-    loadCrypto();
+    fetchCrypto();
+    fetchFootball();
   };
 
-  useEffect(() => {
-    refreshAll();
-  }, [selectedDate]);
-
   return (
-    <DataContext.Provider
-      value={{
-        footballData,
-        cryptoData,
-        loadingFootball,
-        loadingCrypto,
-        refreshAll,
-        selectedDate,
-        setSelectedDate,
-      }}
-    >
+    <DataContext.Provider value={{
+      cryptoData,
+      footballData,
+      loadingCrypto,
+      loadingFootball,
+      nextCryptoUpdate,
+      refreshAll
+    }}>
       {children}
     </DataContext.Provider>
   );
