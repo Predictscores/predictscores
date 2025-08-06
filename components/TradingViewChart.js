@@ -1,52 +1,87 @@
 // components/TradingViewChart.js
-
 import React, { useEffect, useRef } from 'react';
+import { Chart, registerables } from 'chart.js';
+import 'chartjs-chart-financial';
+import annotationPlugin from 'chartjs-plugin-annotation';
 
-const TradingViewChart = ({ symbol = "BTCUSDT", theme = "dark", height = 200 }) => {
-  const containerRef = useRef();
+Chart.register(...registerables, annotationPlugin);
+
+/**
+ * Candlestick grafikon za poslednjih 24h.
+ * Props:
+ *   - symbol: npr. 'BTC'
+ *   - patternMarkers: niz objekata { time: timestamp_ms, price: number, label: string }
+ */
+export default function TradingViewChart({ symbol, patternMarkers = [] }) {
+  const canvasRef = useRef(null);
+  const chartRef  = useRef(null);
 
   useEffect(() => {
-    // Clean up previous widget if re-rendered
-    if (containerRef.current) {
-      containerRef.current.innerHTML = '';
+    const ctx = canvasRef.current.getContext('2d');
+
+    async function loadData() {
+      // mapovanje simbola na CoinGecko ID
+      const idMap = {
+        BTC: 'bitcoin',
+        ETH: 'ethereum',
+        LTC: 'litecoin',
+        // po potrebi dodaj ostale
+      };
+      const id = idMap[symbol] || symbol.toLowerCase();
+
+      // povlačimo OHLC za 1 dan
+      const res = await fetch(
+        `https://api.coingecko.com/api/v3/coins/${id}/ohlc?vs_currency=usd&days=1`
+      );
+      const data = await res.json();
+      // data: [[timestamp, open, high, low, close], ...]
+      const chartData = data.map(d => ({
+        x: d[0],
+        o: d[1],
+        h: d[2],
+        l: d[3],
+        c: d[4],
+      }));
+
+      // uništi stari chart ako postoji
+      if (chartRef.current) chartRef.current.destroy();
+
+      chartRef.current = new Chart(ctx, {
+        type: 'candlestick',
+        data: {
+          datasets: [{
+            label: symbol,
+            data: chartData,
+          }]
+        },
+        options: {
+          plugins: {
+            legend: { display: false },
+            annotation: {
+              annotations: patternMarkers.map((pm, i) => ({
+                type: 'label',
+                xValue: pm.time,
+                yValue: pm.price,
+                backgroundColor: 'rgba(255,255,255,0.8)',
+                content: [pm.label],
+                font: { size: 10 },
+                position: 'center'
+              }))
+            }
+          },
+          scales: {
+            x: { type: 'time', time: { unit: 'hour' } },
+            y: { position: 'right' }
+          }
+        }
+      });
     }
-    const script = document.createElement('script');
-    script.src = 'https://s3.tradingview.com/tv.js';
-    script.async = true;
-    script.onload = () => {
-      if (window.TradingView) {
-        new window.TradingView.widget({
-          autosize: true,
-          symbol: `BINANCE:${symbol}`,
-          interval: '15',
-          timezone: 'Europe/Belgrade',
-          theme: theme,
-          style: "1", // 1 = candlestick
-          locale: "en",
-          toolbar_bg: "#222",
-          enable_publishing: false,
-          hide_top_toolbar: true,
-          hide_legend: true,
-          save_image: false,
-          container_id: containerRef.current.id,
-          height,
-        });
-      }
-    };
-    containerRef.current.appendChild(script);
-    // Cleanup function
+
+    loadData();
     return () => {
-      if (containerRef.current) containerRef.current.innerHTML = '';
+      if (chartRef.current) chartRef.current.destroy();
     };
-  }, [symbol, theme, height]);
+  }, [symbol, patternMarkers]);
 
-  return (
-    <div
-      id={`tv_chart_${symbol}_${theme}`}
-      ref={containerRef}
-      style={{ width: "100%", height: height, borderRadius: 12, overflow: "hidden", background: theme === "dark" ? "#222" : "#fff" }}
-    ></div>
-  );
-};
-
-export default TradingViewChart;
+  return <canvas ref={canvasRef} className="w-full h-24" />;
+}
