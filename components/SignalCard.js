@@ -20,7 +20,7 @@ export default function SignalCard({ data }) {
 
   useEffect(() => {
     async function buildChart() {
-      // 24h istorija @1h = 24 sveće
+      // 24h @1h = 24 bars
       const res = await fetch(
         `https://min-api.cryptocompare.com/data/v2/histohour?fsym=${symbol}&tsym=USD&limit=23`
       );
@@ -30,7 +30,7 @@ export default function SignalCard({ data }) {
         o: d.open,
         h: d.high,
         l: d.low,
-        c: d.close,
+        c: d.close
       }));
 
       const config = {
@@ -53,15 +53,16 @@ export default function SignalCard({ data }) {
       };
 
       const encoded = encodeURIComponent(JSON.stringify(config));
-      setChartUrl(`https://quickchart.io/chart?c=${encoded}&w=320&h=180&bkg=23272f&version=3`);
+      setChartUrl(
+        `https://quickchart.io/chart?c=${encoded}&w=480&h=200&bkg=23272f&version=3`
+      );
     }
-
     buildChart();
   }, [symbol]);
 
   return (
-    <div className="bg-[#23272f] rounded-2xl shadow flex h-40 overflow-hidden">
-      {/* INFO (35%) */}
+    <div className="flex h-40 bg-[#23272f] rounded-2xl shadow overflow-hidden">
+      {/* 1) Info (≈35%) */}
       <div className="w-1/3 p-3 flex flex-col justify-center space-y-1">
         <h3 className="text-xl font-bold">{symbol}</h3>
         <div className="text-sm">Current: ${price.toFixed(4)}</div>
@@ -81,20 +82,26 @@ export default function SignalCard({ data }) {
         <div className="text-xs text-gray-400">
           1h: {change1h.toFixed(2)}% • 24h: {change24h.toFixed(2)}%
         </div>
-        {patterns.length > 0 && (
-          <div className="text-xs text-gray-400">
-            Patterns: {patterns.join(', ')}
-          </div>
+      </div>
+
+      {/* 2) Pattern focus (≈15%) */}
+      <div className="w-1/6 p-3 border-l border-gray-700 flex flex-col justify-center items-center bg-[#1f2339]">
+        {patterns.length > 0 ? (
+          patterns.map((pat, i) => (
+            <div key={i} className="text-sm text-yellow-300">{pat}</div>
+          ))
+        ) : (
+          <div className="text-gray-500 italic text-center">No patterns</div>
         )}
       </div>
 
-      {/* CHART (65%) */}
-      <div className="w-2/3 flex items-center justify-center bg-[#1f2339]">
+      {/* 3) 24h Chart (≈50%) */}
+      <div className="w-1/2 flex items-center justify-center bg-[#1f2339]">
         {chartUrl ? (
           <img
             src={chartUrl}
             alt={`${symbol} 24h candlestick`}
-            className="h-full object-contain"
+            className="h-full w-full object-contain"
           />
         ) : (
           <div className="text-gray-500">Loading chart…</div>
