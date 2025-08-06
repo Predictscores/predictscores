@@ -20,9 +20,9 @@ export default function SignalCard({ data }) {
 
   useEffect(() => {
     async function buildChart() {
-      // 24h @1h = 24 bars
+      // 24h historia u 15-minutnim svećama = 96 tačaka
       const res = await fetch(
-        `https://min-api.cryptocompare.com/data/v2/histohour?fsym=${symbol}&tsym=USD&limit=23`
+        `https://min-api.cryptocompare.com/data/v2/histominute?fsym=${symbol}&tsym=USD&limit=96&aggregate=15`
       );
       const json = await res.json();
       const chartData = json.Data.Data.map(d => ({
@@ -44,7 +44,7 @@ export default function SignalCard({ data }) {
         options: {
           plugins: { legend: { display: false } },
           scales: {
-            x: { type: 'time', time: { unit: 'hour' } },
+            x: { type: 'time', time: { unit: 'hour', tooltipFormat: 'MMM D, h:mm a' } },
             y: { position: 'right' }
           },
           layout: { padding: 0 },
@@ -53,8 +53,9 @@ export default function SignalCard({ data }) {
       };
 
       const encoded = encodeURIComponent(JSON.stringify(config));
+      // width large enough; CSS will scale it to fill 65% panel
       setChartUrl(
-        `https://quickchart.io/chart?c=${encoded}&w=480&h=200&bkg=23272f&version=3`
+        `https://quickchart.io/chart?c=${encoded}&w=800&h=240&bkg=23272f&version=3`
       );
     }
     buildChart();
@@ -101,7 +102,7 @@ export default function SignalCard({ data }) {
           <img
             src={chartUrl}
             alt={`${symbol} 24h candlestick`}
-            className="h-full w-full object-contain"
+            className="w-full h-full object-contain"
           />
         ) : (
           <div className="text-gray-500">Loading chart…</div>
