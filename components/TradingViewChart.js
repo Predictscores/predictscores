@@ -1,13 +1,8 @@
 // components/TradingViewChart.js
 import React, { useEffect, useRef } from 'react';
-import { Chart, registerables } from 'chart.js';
-import 'chartjs-chart-financial';
-import annotationPlugin from 'chartjs-plugin-annotation';
-
-Chart.register(...registerables, annotationPlugin);
 
 /**
- * Candlestick grafikon za poslednjih 24h.
+ * Candlestick grafikon za poslednjih 24h, sa dinamičkim importom Chart.js.
  * Props:
  *   - symbol: npr. 'BTC'
  *   - patternMarkers: niz objekata { time: timestamp_ms, price: number, label: string }
@@ -17,10 +12,24 @@ export default function TradingViewChart({ symbol, patternMarkers = [] }) {
   const chartRef  = useRef(null);
 
   useEffect(() => {
-    const ctx = canvasRef.current.getContext('2d');
+    let isMounted = true;
 
-    async function loadData() {
-      // mapovanje simbola na CoinGecko ID
+    async function loadChart() {
+      // Dinamički importujemo Chart.js i njegove plugine
+      const chartPkg      = await import('chart.js');
+      const finPluginPkg  = await import('chartjs-chart-financial');
+      const annPluginPkg  = await import('chartjs-plugin-annotation');
+
+      const { Chart, registerables } = chartPkg;
+      const financialPlugin          = finPluginPkg.default;
+      const annotationPlugin         = annPluginPkg.default;
+
+      // Registrujemo module
+      Chart.register(...registerables);
+      Chart.register(financialPlugin);
+      Chart.register(annotationPlugin);
+
+      // Mapovanje simbola na CoinGecko ID
       const idMap = {
         BTC: 'bitcoin',
         ETH: 'ethereum',
@@ -29,21 +38,23 @@ export default function TradingViewChart({ symbol, patternMarkers = [] }) {
       };
       const id = idMap[symbol] || symbol.toLowerCase();
 
-      // povlačimo OHLC za 1 dan
+      // Povlačenje OHLC za poslednjih 24h
       const res = await fetch(
         `https://api.coingecko.com/api/v3/coins/${id}/ohlc?vs_currency=usd&days=1`
       );
-      const data = await res.json();
-      // data: [[timestamp, open, high, low, close], ...]
-      const chartData = data.map(d => ({
+      const raw = await res.json();
+      // raw: [[timestamp, open, high, low, close], ...]
+      const data = raw.map(d => ({
         x: d[0],
         o: d[1],
         h: d[2],
         l: d[3],
-        c: d[4],
+        c: d[4]
       }));
 
-      // uništi stari chart ako postoji
+      if (!isMounted) return;
+
+      const ctx = canvasRef.current.getContext('2d');
       if (chartRef.current) chartRef.current.destroy();
 
       chartRef.current = new Chart(ctx, {
@@ -51,14 +62,14 @@ export default function TradingViewChart({ symbol, patternMarkers = [] }) {
         data: {
           datasets: [{
             label: symbol,
-            data: chartData,
+            data
           }]
         },
         options: {
           plugins: {
             legend: { display: false },
             annotation: {
-              annotations: patternMarkers.map((pm, i) => ({
+              annotations: patternMarkers.map((pm, idx) => ({
                 type: 'label',
                 xValue: pm.time,
                 yValue: pm.price,
@@ -77,8 +88,12 @@ export default function TradingViewChart({ symbol, patternMarkers = [] }) {
       });
     }
 
-    loadData();
+    if (typeof window !== 'undefined') {
+      loadChart();
+    }
+
     return () => {
+      isMounted = false;
       if (chartRef.current) chartRef.current.destroy();
     };
   }, [symbol, patternMarkers]);
