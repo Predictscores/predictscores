@@ -12,8 +12,7 @@ export default function SignalCard({ data }) {
     entryPrice = 0,
     sl = 0,
     tp = 0,
-    expectedMove = 0,
-    patterns = []
+    expectedMove = 0
   } = data;
 
   const [chartUrl, setChartUrl] = useState('');
@@ -21,50 +20,50 @@ export default function SignalCard({ data }) {
   useEffect(() => {
     async function buildChart() {
       // 24h historia u 15-minutnim svećama = 96 tačaka
-      const res = await fetch(
-        `https://min-api.cryptocompare.com/data/v2/histominute?fsym=${symbol}&tsym=USD&limit=96&aggregate=15`
-      );
-      const json = await res.json();
-      const chartData = json.Data.Data.map(d => ({
-        x: d.time * 1000,
-        o: d.open,
-        h: d.high,
-        l: d.low,
-        c: d.close
-      }));
-
-      const config = {
-        type: 'candlestick',
-        data: {
-          datasets: [{
-            data: chartData,
-            color: { up: '#4ade80', down: '#f87171', unchanged: '#888' }
-          }]
-        },
-        options: {
-          plugins: { legend: { display: false } },
-          scales: {
-            x: { type: 'time', time: { unit: 'hour', tooltipFormat: 'MMM D, h:mm a' } },
-            y: { position: 'right' }
+      try {
+        const res = await fetch(
+          `https://min-api.cryptocompare.com/data/v2/histominute?fsym=${symbol}&tsym=USD&limit=96&aggregate=15`
+        );
+        const json = await res.json();
+        const raw = json.Data?.Data || [];
+        const chartData = raw.map(d => ({
+          x: d.time * 1000,
+          o: d.open,
+          h: d.high,
+          l: d.low,
+          c: d.close
+        }));
+        const config = {
+          type: 'candlestick',
+          data: {
+            datasets: [{
+              data: chartData,
+              color: { up: '#4ade80', down: '#f87171', unchanged: '#888' }
+            }]
           },
-          layout: { padding: 0 },
-          elements: { point: { radius: 0 } }
-        }
-      };
-
-      const encoded = encodeURIComponent(JSON.stringify(config));
-      // width large enough; CSS will scale it to fill 65% panel
-      setChartUrl(
-        `https://quickchart.io/chart?c=${encoded}&w=800&h=240&bkg=23272f&version=3`
-      );
+          options: {
+            plugins: { legend: { display: false } },
+            scales: {
+              x: { type: 'time', time: { unit: 'hour' } },
+              y: { position: 'right' }
+            },
+            layout: { padding: 0 },
+            elements: { point: { radius: 0 } }
+          }
+        };
+        const encoded = encodeURIComponent(JSON.stringify(config));
+        setChartUrl(`https://quickchart.io/chart?c=${encoded}&w=800&h=240&bkg=23272f&version=3`);
+      } catch {
+        setChartUrl(null); // fallback na “no chart”
+      }
     }
     buildChart();
   }, [symbol]);
 
   return (
     <div className="flex h-40 bg-[#23272f] rounded-2xl shadow overflow-hidden">
-      {/* 1) Info (≈35%) */}
-      <div className="w-1/3 p-3 flex flex-col justify-center space-y-1">
+      {/* INFO (≈35%) */}
+      <div className="w-1/3 p-3 flex flex-col justify-center space-y-1 break-words">
         <h3 className="text-xl font-bold">{symbol}</h3>
         <div className="text-sm">Current: ${price.toFixed(4)}</div>
         <div className="text-sm">
@@ -85,20 +84,11 @@ export default function SignalCard({ data }) {
         </div>
       </div>
 
-      {/* 2) Pattern focus (≈15%) */}
-      <div className="w-1/6 p-3 border-l border-gray-700 flex flex-col justify-center items-center bg-[#1f2339]">
-        {patterns.length > 0 ? (
-          patterns.map((pat, i) => (
-            <div key={i} className="text-sm text-yellow-300">{pat}</div>
-          ))
-        ) : (
-          <div className="text-gray-500 italic text-center">No patterns</div>
-        )}
-      </div>
-
-      {/* 3) 24h Chart (≈50%) */}
-      <div className="w-1/2 flex items-center justify-center bg-[#1f2339]">
-        {chartUrl ? (
+      {/* CHART (≈65%) */}
+      <div className="w-2/3 flex items-center justify-center bg-[#1f2339]">
+        {chartUrl === null ? (
+          <div className="text-gray-500">No chart available</div>
+        ) : chartUrl ? (
           <img
             src={chartUrl}
             alt={`${symbol} 24h candlestick`}
