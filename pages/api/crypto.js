@@ -1,5 +1,4 @@
 // pages/api/crypto.js
-import fetch from 'node-fetch';
 
 // Helpers for indicators
 function calcDelta(data, minutesAgo) {
@@ -12,8 +11,7 @@ function calcDelta(data, minutesAgo) {
 function sma(values, period) {
   if (values.length < period) return null;
   const slice = values.slice(-period);
-  const sum   = slice.reduce((acc, v) => acc + v, 0);
-  return sum / period;
+  return slice.reduce((acc, v) => acc + v, 0) / period;
 }
 
 function rsi(values, period = 14) {
@@ -60,20 +58,19 @@ export default async function handler(req, res) {
         const delta60m = calcDelta(bars, 60);
         const delta240m= calcDelta(bars, 240);
 
-        // 4) RSI on each TF (use bars aggregated down)
+        // 4) RSI on each TF
         const rsi15  = rsi(bars.slice(-Math.max(15, 14)));
         const rsi30  = rsi(bars.slice(-Math.max(30, 14)));
         const rsi60  = rsi(bars.slice(-Math.max(60, 14)));
         const rsi240 = rsi(bars);
 
         // 5) SMA crossover on each TF
-        // Short SMA = last 5 bars, Long SMA = last 20 bars (in that TF)
         function crossover(pts, shortLen, longLen) {
           if (pts.length < longLen) return 0;
           const closes = pts.map(d => d.close);
-          const shortSMA = sma(closes.slice(-shortLen), shortLen);
-          const longSMA  = sma(closes.slice(-longLen),  longLen);
-          return shortSMA > longSMA ? 1 : -1;
+          const s = sma(closes.slice(-shortLen), shortLen);
+          const l = sma(closes.slice(-longLen),  longLen);
+          return s > l ? 1 : -1;
         }
         const co15  = crossover(bars.slice(-15), 5, 10);
         const co30  = crossover(bars.slice(-30), 5, 20);
@@ -82,43 +79,36 @@ export default async function handler(req, res) {
 
         // 6) Aggregate signals
         let score = 0, maxScore = 0;
-        // Price deltas weight = |delta|
-        [[delta15m, 15], [delta30m,30], [delta60m,60], [delta240m,240]].forEach(
-          ([d, w]) => {
+        [[delta15m,15],[delta30m,30],[delta60m,60],[delta240m,240]].forEach(
+          ([d,w]) => {
             const sign = d >= 0 ? 1 : -1;
             score += sign * Math.abs(d) * (w/240);
             maxScore += Math.abs(d)*(w/240);
           }
         );
-        // RSI signals weight = 10 each
         [[rsi15,15],[rsi30,30],[rsi60,60],[rsi240,240]].forEach(
-          ([r,_]) => {
+          ([r]) => {
             const sign = r < 30 ? 1 : r > 70 ? -1 : 0;
-            score += sign * 10;
-            maxScore += 10;
+            score += sign * 10; maxScore += 10;
           }
         );
-        // Crossover weight = 15 each
         [co15,co30,co60,co240].forEach(sign => {
-          score += sign * 15;
-          maxScore += 15;
+          score += sign * 15; maxScore += 15;
         });
 
         const signal = score >= 0 ? 'LONG' : 'SHORT';
         const confidence = Math.min(100, Math.max(0, (Math.abs(score)/maxScore)*100));
 
-        // 7) ATR for SL/TP
-        // Compute true ranges on 1h bars:
+        // 7) ATR for SL/TP on 1h TF
         const hourly = await fetch(
           `https://min-api.cryptocompare.com/data/v2/histohour?fsym=${symbol}&tsym=USD&limit=24`
         ).then(r=>r.json()).then(j=>j.Data.Data);
         const trs = hourly.map((h,i,arr) => {
           if (i===0) return h.high - h.low;
-          const prevClose = arr[i-1].close;
-          return Math.max(h.high - h.low, Math.abs(h.high - prevClose), Math.abs(h.low - prevClose));
+          const pc = arr[i-1].close;
+          return Math.max(h.high - h.low, Math.abs(h.high - pc), Math.abs(h.low - pc));
         });
         const atr = sma(trs.slice(-14), 14) || (hourly[0].high - hourly[0].low);
-        // Set SL/TP based on ATR
         let slPrice, tpPrice;
         if (signal === 'LONG') {
           slPrice = entryPrice - atr;
@@ -138,17 +128,15 @@ export default async function handler(req, res) {
           entryPrice,
           sl: +slPrice.toFixed(4),
           tp: +tpPrice.toFixed(4),
-          expectedMove: +((Math.abs(tpPrice - entryPrice) / entryPrice)*100).toFixed(2)
+          expectedMove: +((Math.abs(tpPrice - entryPrice) / entryPrice) * 100).toFixed(2)
         };
       })
     );
 
-    // 8) Sort & slice
     results.sort((a,b)=> b.confidence - a.confidence);
     const top10 = results.slice(0,10);
     const top3  = top10.slice(0,3);
 
-    // Cache headers
     res.setHeader('Cache-Control','s-maxage=600,stale-while-revalidate');
     res.status(200).json({ combined: top3, crypto: top10 });
   } catch(err) {
