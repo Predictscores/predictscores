@@ -1,3 +1,6 @@
+// FILE: pages/index.js
+
+import dynamic from 'next/dynamic';
 import { useContext, useEffect, useState } from 'react';
 import { DataContext } from '../contexts/DataContext';
 import SignalCard from '../components/SignalCard';
@@ -8,7 +11,7 @@ const TABS = {
   CRYPTO: 'crypto',
 };
 
-export default function Home() {
+function Home() {
   const {
     footballData,
     longSignals,
@@ -34,9 +37,7 @@ export default function Home() {
   useEffect(() => {
     if (isDark) document.documentElement.classList.add('dark');
     else document.documentElement.classList.remove('dark');
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('dark-mode', isDark ? 'true' : 'false');
-    }
+    localStorage.setItem('dark-mode', isDark ? 'true' : 'false');
   }, [isDark]);
 
   const formatTime = (ts) => {
@@ -61,33 +62,24 @@ export default function Home() {
     <div className="min-h-screen bg-[#18191c] text-white">
       {/* Header */}
       <header className="w-full grid grid-cols-[auto_1fr_auto] items-start gap-4 py-4 px-6">
-        {/* Tabs */}
-        <div className="flex gap-1 items-center">
-          <div className="flex gap-1 bg-[#1f2339] rounded-full overflow-hidden">
-            {Object.entries(TABS).map(([key, value]) => (
-              <button
-                key={value}
-                onClick={() => setActiveTab(value)}
-                className={`px-5 py-2 text-sm font-semibold transition ${
-                  activeTab === value
-                    ? 'bg-[#23272f] text-white'
-                    : 'text-gray-300 hover:bg-[#272c4f]'
-                }`}
-              >
-                {key.charAt(0) + key.slice(1).toLowerCase()}
-              </button>
-            ))}
-          </div>
+        <div className="flex gap-1 bg-[#1f2339] rounded-full overflow-hidden">
+          {Object.entries(TABS).map(([key, tab]) => (
+            <button
+              key={tab}
+              onClick={() => setActiveTab(tab)}
+              className={`px-5 py-2 text-sm font-semibold transition ${
+                activeTab === tab
+                  ? 'bg-[#23272f] text-white'
+                  : 'text-gray-300 hover:bg-[#272c4f]'
+              }`}
+            >
+              {key.charAt(0) + key.slice(1).toLowerCase()}
+            </button>
+          ))}
         </div>
-
-        {/* Title */}
-        <div className="flex justify-center">
-          <div className="text-xl font-bold">
-            AI Top fudbalske i Kripto Prognoze
-          </div>
+        <div className="text-xl font-bold text-center">
+          AI Top fudbalske i Kripto Prognoze
         </div>
-
-        {/* Controls & Timers */}
         <div className="flex flex-col items-end gap-2">
           <div className="flex gap-3">
             <button
@@ -103,127 +95,69 @@ export default function Home() {
               {isDark ? 'Light mode' : 'Dark mode'}
             </button>
           </div>
-          <div>
-            <div className="bg-[#1f2339] px-4 py-2 rounded-full flex flex-col sm:flex-row gap-2 text-sm text-gray-300 font-medium">
-              <div className="flex gap-1 items-center">
-                <span className="text-white">Crypto next refresh:</span>
-                <span className="font-mono">{getCountdown(nextCryptoUpdate)}</span>
-              </div>
-              <div className="flex gap-1 items-center">
-                <span className="text-white">Football last generated:</span>
-                <span className="font-mono">
-                  {formatTime(footballData?.generated_at)}
-                </span>
-              </div>
-            </div>
+          <div className="bg-[#1f2339] px-4 py-2 rounded-full flex flex-col sm:flex-row gap-2 text-sm text-gray-300">
+            <div className="flex gap-1"><span className="text-white">Crypto next:</span> <span className="font-mono">{getCountdown(nextCryptoUpdate)}</span></div>
+            <div className="flex gap-1"><span className="text-white">Football last:</span> <span className="font-mono">{formatTime(footballData?.generated_at)}</span></div>
           </div>
         </div>
       </header>
 
       {/* Main */}
-      <main className="mt-2 space-y-4 px-6">
-        {(loadingFootball || loadingCrypto) && (
-          <div className="text-center text-gray-400">Učitavanje podataka...</div>
+      <main className="mt-4 px-6 space-y-4">
+        {(loadingFootball || loadingCrypto) && <div className="text-center text-gray-400">Učitavanje podataka...</div>}
+
+        {activeTab === TABS.COMBINED && combinedPairs.map(i => (
+          <div key={i} className="flex flex-col md:flex-row gap-4 md:min-h-[160px]">
+            <div className="md:w-1/3">
+              {topFootball[i]
+                ? <SignalCard data={topFootball[i]} type="football" />
+                : <div className="bg-[#1f2339] p-3 rounded-2xl text-gray-400 text-center">Nema fudbala</div>}
+            </div>
+            <div className="md:w-2/3">
+              {longSignals[i] || shortSignals[i]
+                ? <SignalCard data={longSignals[i] || shortSignals[i]} type="crypto" />
+                : <div className="bg-[#1f2339] p-3 rounded-2xl text-gray-400 text-center">Nema kripta</div>}
+            </div>
+          </div>
+        ))}
+
+        {activeTab === TABS.FOOTBALL && (
+          <div>
+            <h2 className="text-2xl font-bold">Top Football Picks</h2>
+            <div className="grid grid-cols-1 gap-6 mt-4">
+              {topFootball.slice(0, 10).map((f, idx) => (
+                <SignalCard key={idx} data={f} type="football" />
+              ))}
+            </div>
+          </div>
         )}
 
-        {/* Combined Tab */}
-        {activeTab === TABS.COMBINED && (
-          <>
-            {combinedPairs.map(i => (
-              <div
-                key={i}
-                className="flex flex-col md:flex-row gap-4 md:min-h-[160px] items-stretch"
-              >
-                <div className="md:w-1/3 flex">
-                  {topFootball[i] ? (
-                    <SignalCard data={topFootball[i]} type="football" />
-                  ) : (
-                    <div className="w-full bg-[#1f2339] p-3 rounded-2xl text-gray-400 flex items-center justify-center">
-                      Nema dostupne fudbalske prognoze
-                    </div>
-                  )}
-                </div>
-                <div className="md:w-2/3 flex">
-                  {longSignals[i] || shortSignals[i] ? (
-                    <SignalCard data={longSignals[i] || shortSignals[i]} type="crypto" />
-                  ) : (
-                    <div className="w-full bg-[#1f2339] p-3 rounded-2xl text-gray-400 flex items-center justify-center">
-                      Nema dostupnog kripto signala
-                    </div>
-                  )}
+        {activeTab === TABS.CRYPTO && (
+          <div>
+            <h2 className="text-2xl font-bold">Top Crypto</h2>
+            <div className="mt-4 space-y-6">
+              <div>
+                <h3 className="text-lg font-semibold text-green-300">Long</h3>
+                <div className="grid grid-cols-1 gap-6 mt-2">
+                  {longSignals.map((c, idx) => <SignalCard key={idx} data={c} type="crypto" />)}
                 </div>
               </div>
-            ))}
-          </>
-        )}
-
-        {/* Football Tab */}
-        {activeTab === TABS.FOOTBALL && (
-          <>
-            <h2 className="text-2xl font-bold">Top Football Picks</h2>
-            <div className="grid grid-cols-1 gap-6">
-              {topFootball.slice(0,10).length > 0 ? (
-                topFootball.slice(0,10).map((signal, idx) => (
-                  <div key={idx} className="bg-[#1f2339] p-5 rounded-2xl shadow flex">
-                    <SignalCard data={signal} type="football" />
-                  </div>
-                ))
-              ) : (
-                <div className="text-center text-gray-400">
-                  Nema dostupnih fudbalskih predloga.
+              <div>
+                <h3 className="text-lg font-semibold text-red-300">Short</h3>
+                <div className="grid grid-cols-1 gap-6 mt-2">
+                  {shortSignals.map((c, idx) => <SignalCard key={idx} data={c} type="crypto" />)}
                 </div>
-              )}
+              </div>
             </div>
-          </>
-        )}
-
-        {/* Crypto Tab */}
-        {activeTab === TABS.CRYPTO && (
-          <>
-            <h2 className="text-2xl font-bold">Top Crypto Signals</h2>
-            <h3 className="mt-4 text-lg font-semibold text-green-300">Long</h3>
-            <div className="grid grid-cols-1 gap-6">
-              {longSignals.length > 0 ? (
-                longSignals.map((signal, idx) => (
-                  <div key={`long-${idx}`} className="bg-[#1f2339] p-5 rounded-2xl shadow flex">
-                    <SignalCard data={signal} type="crypto" />
-                  </div>
-                ))
-              ) : (
-                <div className="text-center text-gray-400">Nema LONG signala.</div>
-              )}
-            </div>
-            <h3 className="mt-6 text-lg font-semibold text-red-300">Short</h3>
-            <div className="grid grid-cols-1 gap-6 mb-8">
-              {shortSignals.length > 0 ? (
-                shortSignals.map((signal, idx) => (
-                  <div key={`short-${idx}`} className="bg-[#1f2339] p-5 rounded-2xl shadow flex">
-                    <SignalCard data={signal} type="crypto" />
-                  </div>
-                ))
-              ) : (
-                <div className="text-center text-gray-400">Nema SHORT signala.</div>
-              )}
-            </div>
-          </>
+          </div>
         )}
       </main>
 
-      {/* Footer */}
       <footer className="mt-12 mb-8 px-6 text-center text-sm text-gray-400">
-        <div className="inline-flex gap-2 flex-wrap justify-center">
-          <span className="font-semibold">Confidence legend:</span>
-          <span>🟢 High (≥75%)</span>
-          <span>·</span>
-          <span>🔵 Moderate (50–75%)</span>
-          <span>·</span>
-          <span>🟡 Low (&lt;50%)</span>
-        </div>
+        <span className="font-semibold">Confidence legend:</span> 🟢 High · 🔵 Mod · 🟡 Low
       </footer>
     </div>
   );
 }
 
-export async function getServerSideProps() {
-  return { props: {} };
-}
+export default dynamic(() => Promise.resolve(Home), { ssr: false });
