@@ -23,7 +23,6 @@ export default function SignalCard({ data }) {
     expectedMove = 0,
   } = data;
 
-  // Risk:Reward
   const rr =
     entryPrice !== sl
       ? ((tp - entryPrice) / Math.abs(entryPrice - sl)).toFixed(2)
@@ -35,7 +34,6 @@ export default function SignalCard({ data }) {
   useEffect(() => {
     async function buildChart() {
       try {
-        // 24h u 15m barovima
         const res = await fetch(
           `https://min-api.cryptocompare.com/data/v2/histominute?fsym=${symbol}&tsym=USD&limit=96&aggregate=15`
         );
@@ -63,7 +61,6 @@ export default function SignalCard({ data }) {
           c: d.close,
         }));
 
-        // priprema za ATR
         let hourlyData = [];
         try {
           const hr = await fetch(
@@ -72,30 +69,30 @@ export default function SignalCard({ data }) {
           hourlyData = hr.Data?.Data || [];
         } catch {}
 
-        // fallback za ATR ako nema dovoljno satnih barova
         if (hourlyData.length < 5) {
           const cgOhlc = await fetch(
             `https://api.coingecko.com/api/v3/coins/${symbol.toLowerCase()}/ohlc?vs_currency=usd&days=1`
           ).then((r) => r.json());
-          // uzimamo samo high/low/close da izračunamo ATR
-          hourlyData = cgOhlc.map(([t, o, h, l, c]) => ({ high: h, low: l, close: c }));
+          hourlyData = cgOhlc.map(([t, o, h, l, c]) => ({
+            high: h,
+            low: l,
+            close: c,
+          }));
         }
 
-        // ATR(14)
         const trueRanges = hourlyData.map((h, i, arr) => {
           if (i === 0) return h.high - h.low;
-          const prevClose = arr[i - 1].close;
+          const prev = arr[i - 1].close;
           return Math.max(
             h.high - h.low,
-            Math.abs(h.high - prevClose),
-            Math.abs(h.low - prevClose)
+            Math.abs(h.high - prev),
+            Math.abs(h.low - prev)
           );
         });
         const atr =
           sma(trueRanges.slice(-14), 14) ??
           (hourlyData.length ? hourlyData[0].high - hourlyData[0].low : 0);
 
-        // grafikon sa TP/SL linijama i belom pozadinom
         const config = {
           type: 'candlestick',
           data: {
@@ -163,8 +160,8 @@ export default function SignalCard({ data }) {
   }, [symbol, tp, sl]);
 
   return (
-    <div className="grid grid-cols-[35%_15%_50%] h-40 bg-[#23272f] rounded-2xl shadow overflow-hidden">
-      {/* 1) INFO */}
+    <div className="grid grid-cols-[40%_60%] h-40 bg-[#23272f] rounded-2xl shadow overflow-hidden">
+      {/* TEKST (40%) */}
       <div className="p-3 flex flex-col justify-center overflow-hidden break-words">
         <h3 className="text-xl font-bold truncate">{symbol}</h3>
         <div className="text-lg truncate">Current: ${price.toFixed(4)}</div>
@@ -189,22 +186,20 @@ export default function SignalCard({ data }) {
         <div className="text-xs text-gray-400 mt-1 truncate">
           1h: {change1h.toFixed(2)}% • 24h: {change24h.toFixed(2)}%
         </div>
+        <div className="text-sm mt-1 truncate">R:R: {rr}</div>
+        <div className="text-xs text-gray-500 mt-1 truncate">
+          TF: 15m,30m,1h,4h
+        </div>
       </div>
 
-      {/* 2) DETAILS */}
-      <div className="p-3 border-l border-gray-700 flex flex-col justify-center items-center bg-[#1f2339] text-sm truncate">
-        <div>Signal TF: 15m,30m,1h,4h</div>
-        <div>R:R: {rr}</div>
-      </div>
-
-      {/* 3) CHART */}
+      {/* GRAFIKON (60%) */}
       <div className="flex items-center justify-center bg-[#23272f] p-2 overflow-hidden">
         {loadingChart ? (
-          <div className="w-full h-full animate-pulse bg-gray-700 rounded"></div>
+          <div className="w-full h-full animate-pulse bg-gray-700 rounded" />
         ) : chartUrl ? (
           <img
             src={chartUrl}
-            alt={`${symbol} 24h candlestick`}
+            alt={`${symbol} 24h chart`}
             className="w-full h-full object-contain rounded-lg"
           />
         ) : (
