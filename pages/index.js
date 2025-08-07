@@ -12,9 +12,9 @@ const TABS = {
 
 export default function Home() {
   const {
-    footballData,
-    longSignals,
-    shortSignals,
+    footballData = {},
+    longSignals = [],
+    shortSignals = [],
     loadingCrypto,
     loadingFootball,
     refreshAll,
@@ -40,69 +40,91 @@ export default function Home() {
     localStorage.setItem('dark-mode', isDark ? 'true' : 'false');
   }, [isDark]);
 
-  const formatTime = (ts) =>
-    ts ? new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
+  const fmtTime = (ts) =>
+    ts
+      ? new Date(ts).toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+        })
+      : '—';
 
-  const getCountdown = (t) => {
+  const fmtCountdown = (t) => {
     if (!t) return '—';
-    const diff = t - Date.now();
-    if (diff <= 0) return 'Now';
-    const m = Math.floor(diff / 60000);
-    const s = Math.floor((diff % 60000) / 1000);
-    return `${m}m ${s.toString().padStart(2,'0')}s`;
+    const d = t - Date.now();
+    if (d <= 0) return 'Now';
+    const m = Math.floor(d / 60000),
+      s = Math.floor((d % 60000) / 1000);
+    return `${m}m ${s.toString().padStart(2, '0')}s`;
   };
 
-  const topFootball = footballData?.footballTop || [];
+  const topFootball = footballData.footballTop || [];
   const pairs = [0, 1, 2];
 
   return (
     <div className="min-h-screen bg-[#18191c] text-white">
-      {/* Header */}
-      <header className="w-full grid grid-cols-[auto_1fr_auto] items-start gap-4 py-4 px-6">
-        <div className="flex gap-1 bg-[#1f2339] rounded-full overflow-hidden">
-          {Object.entries(TABS).map(([key, tab]) => (
+      {/* HEADER */}
+      <header className="w-full grid grid-cols-[auto_1fr_auto] items-start py-4 px-6 gap-4">
+        <div className="flex bg-[#1f2339] rounded-full overflow-hidden">
+          {Object.entries(TABS).map(([k, v]) => (
             <button
-              key={tab}
-              onClick={() => setActiveTab(tab)}
+              key={v}
+              onClick={() => setActiveTab(v)}
               className={`px-5 py-2 text-sm font-semibold transition ${
-                activeTab === tab ? 'bg-[#23272f] text-white' : 'text-gray-300 hover:bg-[#272c4f]'
+                activeTab === v
+                  ? 'bg-[#23272f] text-white'
+                  : 'text-gray-300 hover:bg-[#272c4f]'
               }`}
             >
-              {key.charAt(0) + key.slice(1).toLowerCase()}
+              {k[0] + k.slice(1).toLowerCase()}
             </button>
           ))}
         </div>
-        <div className="text-xl font-bold text-center">AI Top fudbalske i Kripto Prognoze</div>
+        <div className="text-xl font-bold text-center">
+          AI Top fudbalske i Kripto Prognoze
+        </div>
         <div className="flex flex-col items-end gap-2">
           <div className="flex gap-3">
-            <button onClick={refreshAll} className="px-4 py-2 rounded-md bg-[#23272f] hover:bg-[#2f3344] transition font-medium">
+            <button
+              onClick={refreshAll}
+              className="px-4 py-2 rounded-md bg-[#23272f] hover:bg-[#2f3344] font-medium"
+            >
               Refresh all
             </button>
-            <button onClick={() => setIsDark(d => !d)} className="px-4 py-2 rounded-md bg-[#23272f] hover:bg-[#2f3344] transition font-medium">
-              {isDark ? 'Light mode' : 'Dark mode'}
+            <button
+              onClick={() => setIsDark((d) => !d)}
+              className="px-4 py-2 rounded-md bg-[#23272f] hover:bg-[#2f3344] font-medium"
+            >
+              {isDark ? 'Light' : 'Dark'}
             </button>
           </div>
           <div className="bg-[#1f2339] px-4 py-2 rounded-full flex flex-col sm:flex-row gap-2 text-sm text-gray-300">
             <div className="flex gap-1">
-              <span className="text-white">Crypto next:</span> <span className="font-mono">{getCountdown(nextCryptoUpdate)}</span>
+              <span className="text-white">Crypto next:</span>{' '}
+              <span className="font-mono">{fmtCountdown(nextCryptoUpdate)}</span>
             </div>
             <div className="flex gap-1">
-              <span className="text-white">Football last:</span> <span className="font-mono">{formatTime(footballData?.generated_at)}</span>
+              <span className="text-white">Football last:</span>{' '}
+              <span className="font-mono">{fmtTime(footballData.generated_at)}</span>
             </div>
           </div>
         </div>
       </header>
 
-      {/* Main */}
+      {/* MAIN */}
       <main className="mt-4 px-6 space-y-4">
         {(loadingFootball || loadingCrypto) && (
-          <div className="text-center text-gray-400">Učitavanje podataka...</div>
+          <div className="text-center text-gray-400">
+            Učitavanje podataka...
+          </div>
         )}
 
-        {/* Combined */}
+        {/* COMBINED */}
         {activeTab === TABS.COMBINED &&
-          pairs.map(i => (
-            <div key={i} className="flex flex-col md:flex-row gap-4 md:min-h-[160px]">
+          pairs.map((i) => (
+            <div
+              key={i}
+              className="flex flex-col md:flex-row gap-4 md:min-h-[160px]"
+            >
               <div className="md:w-1/3">
                 {topFootball[i] ? (
                   <SignalCard data={topFootball[i]} type="football" />
@@ -114,7 +136,10 @@ export default function Home() {
               </div>
               <div className="md:w-2/3">
                 {(longSignals[i] || shortSignals[i]) ? (
-                  <SignalCard data={longSignals[i] || shortSignals[i]} type="crypto" />
+                  <SignalCard
+                    data={longSignals[i] || shortSignals[i]}
+                    type="crypto"
+                  />
                 ) : (
                   <div className="bg-[#1f2339] p-3 rounded-2xl text-gray-400 text-center">
                     Nema kripto signala
@@ -124,7 +149,7 @@ export default function Home() {
             </div>
           ))}
 
-        {/* Football */}
+        {/* FOOTBALL */}
         {activeTab === TABS.FOOTBALL && (
           <>
             <h2 className="text-2xl font-bold">Top Football Picks</h2>
@@ -136,7 +161,7 @@ export default function Home() {
           </>
         )}
 
-        {/* Crypto */}
+        {/* CRYPTO */}
         {activeTab === TABS.CRYPTO && (
           <>
             <h2 className="text-2xl font-bold">Top Crypto</h2>
@@ -162,14 +187,10 @@ export default function Home() {
         )}
       </main>
 
+      {/* FOOTER */}
       <footer className="mt-12 mb-8 px-6 text-center text-sm text-gray-400">
         <span className="font-semibold">Confidence legend:</span> 🟢 High · 🔵 Mod · 🟡 Low
       </footer>
     </div>
   );
-}
-
-// Ovo onemogućava SSG i izbegava "collect page data" grešku
-export async function getServerSideProps() {
-  return { props: {} };
 }
