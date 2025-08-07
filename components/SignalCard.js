@@ -23,6 +23,7 @@ export default function SignalCard({ data }) {
     expectedMove = 0,
   } = data;
 
+  // Risk:Reward
   const rr =
     entryPrice !== sl
       ? ((tp - entryPrice) / Math.abs(entryPrice - sl)).toFixed(2)
@@ -34,6 +35,7 @@ export default function SignalCard({ data }) {
   useEffect(() => {
     async function buildChart() {
       try {
+        // 24h in 15m bars
         const res = await fetch(
           `https://min-api.cryptocompare.com/data/v2/histominute?fsym=${symbol}&tsym=USD&limit=96&aggregate=15`
         );
@@ -61,6 +63,7 @@ export default function SignalCard({ data }) {
           c: d.close,
         }));
 
+        // hourly data for ATR
         let hourlyData = [];
         try {
           const hr = await fetch(
@@ -93,6 +96,7 @@ export default function SignalCard({ data }) {
           sma(trueRanges.slice(-14), 14) ??
           (hourlyData.length ? hourlyData[0].high - hourlyData[0].low : 0);
 
+        // QuickChart config
         const config = {
           type: 'candlestick',
           data: {
@@ -149,7 +153,9 @@ export default function SignalCard({ data }) {
         };
 
         const encoded = encodeURIComponent(JSON.stringify(config));
-        setChartUrl(`https://quickchart.io/chart?c=${encoded}&w=800&h=240&bkg=ffffff&version=3`);
+        setChartUrl(
+          `https://quickchart.io/chart?c=${encoded}&w=800&h=240&bkg=ffffff&version=3`
+        );
       } catch {
         setChartUrl(null);
       } finally {
@@ -161,38 +167,44 @@ export default function SignalCard({ data }) {
 
   return (
     <div className="grid grid-cols-[40%_60%] h-40 bg-[#23272f] rounded-2xl shadow overflow-hidden">
-      {/* TEKST (40%) */}
-      <div className="p-3 flex flex-col justify-center overflow-hidden break-words">
-        <h3 className="text-xl font-bold truncate">{symbol}</h3>
-        <div className="text-lg truncate">Current: ${price.toFixed(4)}</div>
-        <div className="text-base truncate">
+      {/* 40% TEXT SECTION */}
+      <div className="p-3 flex flex-col justify-center h-full w-full overflow-hidden break-words">
+        <h3 className="text-xl font-bold truncate whitespace-normal break-words">
+          {symbol}
+        </h3>
+        <div className="text-lg truncate whitespace-normal break-words">
+          Current: ${price.toFixed(4)}
+        </div>
+        <div className="text-base truncate whitespace-normal break-words">
           Entry: ${entryPrice.toFixed(4)}{' '}
           <span className={signal === 'LONG' ? 'text-green-400' : 'text-red-400'}>
             {signal === 'LONG' ? '⇧' : '⇩'}
           </span>
         </div>
         <div className="flex gap-2 flex-wrap mt-1">
-          <span className="px-2 py-1 bg-green-600 rounded-full truncate">
+          <span className="px-2 py-1 bg-green-600 rounded-full truncate max-w-full break-words">
             TP: ${tp.toFixed(4)}
           </span>
-          <span className="px-2 py-1 bg-red-600 rounded-full truncate">
+          <span className="px-2 py-1 bg-red-600 rounded-full truncate max-w-full break-words">
             SL: ${sl.toFixed(4)}
           </span>
         </div>
-        <div className="text-sm mt-1 truncate">
+        <div className="text-sm mt-1 truncate whitespace-normal break-words">
           Expected: {expectedMove.toFixed(2)}%{' '}
           <span>{confidence > 75 ? '🟢' : confidence > 50 ? '🔵' : '🟡'}</span>
         </div>
-        <div className="text-xs text-gray-400 mt-1 truncate">
+        <div className="text-xs text-gray-400 mt-1 truncate whitespace-normal break-words">
           1h: {change1h.toFixed(2)}% • 24h: {change24h.toFixed(2)}%
         </div>
-        <div className="text-sm mt-1 truncate">R:R: {rr}</div>
-        <div className="text-xs text-gray-500 mt-1 truncate">
+        <div className="text-sm mt-1 truncate whitespace-normal break-words">
+          R:R: {rr}
+        </div>
+        <div className="text-xs text-gray-500 mt-1 truncate whitespace-normal break-words">
           TF: 15m,30m,1h,4h
         </div>
       </div>
 
-      {/* GRAFIKON (60%) */}
+      {/* 60% CHART SECTION */}
       <div className="flex items-center justify-center bg-[#23272f] p-2 overflow-hidden">
         {loadingChart ? (
           <div className="w-full h-full animate-pulse bg-gray-700 rounded" />
