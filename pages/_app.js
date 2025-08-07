@@ -1,13 +1,12 @@
-// pages/_app.js
+// FILE: pages/_app.js
+
 import '../styles/globals.css';
 import { DataProvider } from '../contexts/DataContext';
 
-function MyApp({ Component, pageProps }) {
+export default function App({ Component, pageProps }) {
   return (
     <DataProvider>
       <Component {...pageProps} />
     </DataProvider>
   );
 }
-
-export default MyApp;
