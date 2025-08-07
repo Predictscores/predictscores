@@ -1,5 +1,3 @@
-// FILE: pages/index.js
-
 import { useContext, useEffect, useState } from 'react';
 import { DataContext } from '../contexts/DataContext';
 import SignalCard from '../components/SignalCard';
@@ -24,7 +22,6 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState(TABS.COMBINED);
   const [isDark, setIsDark] = useState(false);
 
-  // Dark mode init
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const stored = localStorage.getItem('dark-mode');
@@ -137,7 +134,6 @@ export default function Home() {
                 key={i}
                 className="flex flex-col md:flex-row gap-4 md:min-h-[160px] items-stretch"
               >
-                {/* Football 33% */}
                 <div className="md:w-1/3 flex">
                   {topFootball[i] ? (
                     <SignalCard data={topFootball[i]} type="football" />
@@ -147,11 +143,9 @@ export default function Home() {
                     </div>
                   )}
                 </div>
-
-                {/* Crypto 67% */}
                 <div className="md:w-2/3 flex">
-                  {(longSignals[i] || shortSignals[i]) ? (
-                    <SignalCard data={ longSignals[i] || shortSignals[i] } type="crypto" />
+                  {longSignals[i] || shortSignals[i] ? (
+                    <SignalCard data={longSignals[i] || shortSignals[i]} type="crypto" />
                   ) : (
                     <div className="w-full bg-[#1f2339] p-3 rounded-2xl text-gray-400 flex items-center justify-center">
                       Nema dostupnog kripto signala
@@ -168,12 +162,9 @@ export default function Home() {
           <>
             <h2 className="text-2xl font-bold">Top Football Picks</h2>
             <div className="grid grid-cols-1 gap-6">
-              {topFootball.length > 0 ? (
+              {topFootball.slice(0,10).length > 0 ? (
                 topFootball.slice(0,10).map((signal, idx) => (
-                  <div
-                    key={idx}
-                    className="bg-[#1f2339] p-5 rounded-2xl shadow flex"
-                  >
+                  <div key={idx} className="bg-[#1f2339] p-5 rounded-2xl shadow flex">
                     <SignalCard data={signal} type="football" />
                   </div>
                 ))
@@ -194,34 +185,24 @@ export default function Home() {
             <div className="grid grid-cols-1 gap-6">
               {longSignals.length > 0 ? (
                 longSignals.map((signal, idx) => (
-                  <div
-                    key={`long-${idx}`}
-                    className="bg-[#1f2339] p-5 rounded-2xl shadow flex"
-                  >
+                  <div key={`long-${idx}`} className="bg-[#1f2339] p-5 rounded-2xl shadow flex">
                     <SignalCard data={signal} type="crypto" />
                   </div>
                 ))
               ) : (
-                <div className="text-center text-gray-400">
-                  Nema LONG signala.
-                </div>
+                <div className="text-center text-gray-400">Nema LONG signala.</div>
               )}
             </div>
             <h3 className="mt-6 text-lg font-semibold text-red-300">Short</h3>
             <div className="grid grid-cols-1 gap-6 mb-8">
               {shortSignals.length > 0 ? (
                 shortSignals.map((signal, idx) => (
-                  <div
-                    key={`short-${idx}`}
-                    className="bg-[#1f2339] p-5 rounded-2xl shadow flex"
-                  >
+                  <div key={`short-${idx}`} className="bg-[#1f2339] p-5 rounded-2xl shadow flex">
                     <SignalCard data={signal} type="crypto" />
                   </div>
                 ))
               ) : (
-                <div className="text-center text-gray-400">
-                  Nema SHORT signala.
-                </div>
+                <div className="text-center text-gray-400">Nema SHORT signala.</div>
               )}
             </div>
           </>
@@ -240,5 +221,9 @@ export default function Home() {
         </div>
       </footer>
     </div>
-);
+  );
+}
+
+export async function getServerSideProps() {
+  return { props: {} };
 }
