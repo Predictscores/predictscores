@@ -3,7 +3,8 @@
 import React from 'react';
 import TradingViewChart from './TradingViewChart';
 
-export default function SignalCard({ data, type }) {
+export default function SignalCard({ data = {}, type }) {
+  // data je objekat sa svim vrednostima iz API-ja
   const {
     symbol,
     price,
@@ -15,18 +16,16 @@ export default function SignalCard({ data, type }) {
     change1h,
     change24h,
     signal,
-    // pretpostavljamo da incoming `data` može imati i `patterns` i `bars`
     patterns = [],
     bars = [],
-  } = data || {};
+  } = data;
 
-  // Format helper
-  const fmt = (num, dp = 4) =>
-    typeof num === 'number' ? num.toFixed(dp) : '—';
+  const fmt = (n, d = 4) =>
+    typeof n === 'number' ? n.toFixed(d) : '—';
 
   return (
     <div className="w-full bg-[#1f2339] p-5 rounded-2xl shadow flex">
-      {/* ----- LEVI DEO: INFO (35%) ----- */}
+      {/* LEVI 35% */}
       <div className="w-[35%] pr-4 flex flex-col justify-between">
         <h3 className="text-2xl font-bold">{symbol}</h3>
         <div className="text-sm">
@@ -38,8 +37,7 @@ export default function SignalCard({ data, type }) {
                 signal === 'LONG' ? 'text-green-400' : 'text-red-400'
               }
             >
-              ${fmt(entryPrice)}{' '}
-              {signal === 'LONG' ? '↑' : '↓'}
+              ${fmt(entryPrice)} {signal === 'LONG' ? '↑' : '↓'}
             </span>
           </div>
           <div className="mt-2 flex gap-2">
@@ -70,7 +68,7 @@ export default function SignalCard({ data, type }) {
         </div>
       </div>
 
-      {/* ----- SREDNJI DEO: PATTERNS (Optional) ----- */}
+      {/* SREDNJI 15% */}
       <div className="w-[15%] px-4 flex flex-col justify-center items-center border-l border-gray-700">
         {patterns.length > 0 ? (
           patterns.map((p, i) => (
@@ -83,9 +81,9 @@ export default function SignalCard({ data, type }) {
         )}
       </div>
 
-      {/* ----- DESNI DEO: CHART (50%) ----- */}
+      {/* DESNI 50% */}
       <div className="w-[50%] pl-4 flex items-center justify-center">
-        {Array.isArray(bars) && bars.length > 0 ? (
+        {bars.length > 0 ? (
           <TradingViewChart
             bars={bars}
             entry={entryPrice}
@@ -93,9 +91,7 @@ export default function SignalCard({ data, type }) {
             tp={tp}
           />
         ) : (
-          <div className="text-gray-500 text-sm">
-            Loading chart…
-          </div>
+          <div className="text-gray-500 text-sm">Loading chart…</div>
         )}
       </div>
     </div>
