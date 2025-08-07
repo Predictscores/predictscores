@@ -35,7 +35,7 @@ export default function SignalCard({ data }) {
   useEffect(() => {
     async function buildChart() {
       try {
-        // 24h in 15m bars
+        // 24h in 15m bars from CryptoCompare
         const res = await fetch(
           `https://min-api.cryptocompare.com/data/v2/histominute?fsym=${symbol}&tsym=USD&limit=96&aggregate=15`
         );
@@ -166,46 +166,46 @@ export default function SignalCard({ data }) {
   }, [symbol, tp, sl]);
 
   return (
-    <div className="grid grid-cols-[40%_60%] h-40 bg-[#23272f] rounded-2xl shadow overflow-hidden">
-      {/* 40% TEXT SECTION */}
-      <div className="p-3 flex flex-col justify-center h-full w-full overflow-hidden break-words">
-        <h3 className="text-xl font-bold truncate whitespace-normal break-words">
-          {symbol}
-        </h3>
-        <div className="text-lg truncate whitespace-normal break-words">
+    <div className="flex h-40 bg-[#23272f] rounded-2xl shadow overflow-hidden">
+      {/* LEFT: TEXT (40%) */}
+      <div className="w-2/5 h-full p-3 flex flex-col justify-center overflow-hidden">
+        <h3 className="text-xl font-bold whitespace-nowrap truncate">{symbol}</h3>
+        <div className="text-lg whitespace-nowrap truncate">
           Current: ${price.toFixed(4)}
         </div>
-        <div className="text-base truncate whitespace-normal break-words">
+        <div className="text-base whitespace-nowrap truncate">
           Entry: ${entryPrice.toFixed(4)}{' '}
           <span className={signal === 'LONG' ? 'text-green-400' : 'text-red-400'}>
             {signal === 'LONG' ? '⇧' : '⇩'}
           </span>
         </div>
+
         <div className="flex gap-2 flex-wrap mt-1">
-          <span className="px-2 py-1 bg-green-600 rounded-full truncate max-w-full break-words">
+          <span className="px-2 py-1 bg-green-600 rounded-full whitespace-nowrap truncate">
             TP: ${tp.toFixed(4)}
           </span>
-          <span className="px-2 py-1 bg-red-600 rounded-full truncate max-w-full break-words">
+          <span className="px-2 py-1 bg-red-600 rounded-full whitespace-nowrap truncate">
             SL: ${sl.toFixed(4)}
           </span>
         </div>
-        <div className="text-sm mt-1 truncate whitespace-normal break-words">
+
+        <div className="text-sm mt-1 whitespace-nowrap truncate">
           Expected: {expectedMove.toFixed(2)}%{' '}
           <span>{confidence > 75 ? '🟢' : confidence > 50 ? '🔵' : '🟡'}</span>
         </div>
-        <div className="text-xs text-gray-400 mt-1 truncate whitespace-normal break-words">
+
+        <div className="text-xs text-gray-400 mt-1 whitespace-nowrap truncate">
           1h: {change1h.toFixed(2)}% • 24h: {change24h.toFixed(2)}%
         </div>
-        <div className="text-sm mt-1 truncate whitespace-normal break-words">
-          R:R: {rr}
-        </div>
-        <div className="text-xs text-gray-500 mt-1 truncate whitespace-normal break-words">
+
+        <div className="text-sm mt-1 whitespace-nowrap truncate">R:R: {rr}</div>
+        <div className="text-xs text-gray-500 mt-1 whitespace-nowrap truncate">
           TF: 15m,30m,1h,4h
         </div>
       </div>
 
-      {/* 60% CHART SECTION */}
-      <div className="flex items-center justify-center bg-[#23272f] p-2 overflow-hidden">
+      {/* RIGHT: CHART (60%) */}
+      <div className="w-3/5 h-full p-2 flex items-center justify-center overflow-hidden">
         {loadingChart ? (
           <div className="w-full h-full animate-pulse bg-gray-700 rounded" />
         ) : chartUrl ? (
