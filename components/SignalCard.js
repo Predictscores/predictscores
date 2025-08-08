@@ -2,15 +2,15 @@
 import React from 'react';
 import TradingViewChart from './TradingViewChart';
 
-// helper: safe format brojeva
+// format brojeva
 function fmt(n, d = 4) {
   return typeof n === 'number' && Number.isFinite(n) ? n.toFixed(d) : '—';
 }
 
-// helper: normalizuj i cap-uj confidence na [5..95]
+// normalizuj/cap-uj confidence na [5..95] za prikaz
 function normalizeConfidence(conf) {
   const raw = typeof conf === 'number' ? conf : 0;
-  const pct = raw > 1 ? raw : raw * 100; // ako dođe u 0..1, pretvori u %
+  const pct = raw > 1 ? raw : raw * 100; // ako stigne u [0..1], prebaci u %
   const capped = Math.min(95, Math.max(5, Math.round(pct)));
   return capped;
 }
@@ -31,28 +31,33 @@ export default function SignalCard({ data = {}, type }) {
     bars = [],
   } = data;
 
-  // prikazni confidence (cap ≤ 95)
   const confDisplay = normalizeConfidence(confidence);
 
-  // boja indikatora po bucketima
+  // bucket i boja tačkice uz "Expected"
+  let bucketText = 'Low';
   let confDot = 'text-amber-300';
-  if (confDisplay >= 90) confDot = 'text-orange-400';
-  else if (confDisplay >= 75) confDot = 'text-green-400';
-  else if (confDisplay >= 50) confDot = 'text-sky-400';
+  if (confDisplay >= 90) {
+    bucketText = 'Top Pick';
+    confDot = 'text-orange-400';
+  } else if (confDisplay >= 75) {
+    bucketText = 'High';
+    confDot = 'text-green-400';
+  } else if (confDisplay >= 50) {
+    bucketText = 'Moderate';
+    confDot = 'text-sky-400';
+  }
 
   return (
     <div className="w-full bg-[#1f2339] p-5 rounded-2xl shadow flex">
       {/* LEVO ~35% */}
-      <div className="w-[35%] pr-4 flex flex-col justify-between">
+      <div className="w-[35%] pr-4 flex flex-col">
         <h3 className="text-2xl font-bold">{symbol}</h3>
 
-        <div className="text-sm">
+        <div className="mt-2 text-sm">
           <div>Current: ${fmt(price)}</div>
           <div>
             Entry:{' '}
-            <span
-              className={signal === 'LONG' ? 'text-green-400' : 'text-red-400'}
-            >
+            <span className={signal === 'LONG' ? 'text-green-400' : 'text-red-400'}>
               ${fmt(entryPrice)} {signal === 'LONG' ? '↑' : '↓'}
             </span>
           </div>
@@ -67,14 +72,28 @@ export default function SignalCard({ data = {}, type }) {
           </div>
         </div>
 
-        {/* Očekivani pomak + confidence indikator (capovan) */}
-        <div className="text-sm mt-2 flex items-center gap-2">
+        {/* Expected + bucket */}
+        <div className="text-sm mt-3 flex items-center gap-2">
           <span>Expected: {fmt(expectedMove, 2)}%</span>
-          <span className={`${confDot}`}>●</span>
-          <span className="text-xs text-gray-400">{confDisplay}%</span>
+          <span className={confDot}>●</span>
+          <span className="text-gray-200">{bucketText}</span>
         </div>
 
-        <div className="text-xs text-gray-400 mt-1">
+        {/* Confidence progress bar (kao na tvom screenshotu) */}
+        <div className="mt-2">
+          <div className="text-xs text-gray-400 mb-1">Confidence</div>
+          <div className="flex items-center gap-2">
+            <div className="flex-1 h-2 rounded-full bg-white/10 overflow-hidden">
+              <div
+                className="h-2 rounded-full bg-gradient-to-r from-emerald-500 to-emerald-400"
+                style={{ width: `${Math.max(0, Math.min(100, confDisplay))}%` }}
+              />
+            </div>
+            <span className="text-xs text-gray-300">{confDisplay}%</span>
+          </div>
+        </div>
+
+        <div className="text-xs text-gray-400 mt-2">
           1h: {fmt(change1h, 2)}% · 24h: {fmt(change24h, 2)}%
         </div>
       </div>
