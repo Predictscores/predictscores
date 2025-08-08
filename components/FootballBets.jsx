@@ -2,52 +2,35 @@
 import { useState, useEffect } from "react";
 
 /**
- * FootballBets
+ * FootballBets: prikazuje value betove.
  * Props:
- *  - date: YYYY-MM-DD (obavezno)
- *  - limit?: broj kartica za prikaz (npr. 3)
- *  - compact?: true za manji, tamni stil (za Combined levu kolonu)
+ *   - date: string YYYY-MM-DD
+ *   - limit?: broj kartica (npr. 3 u Combined, 10 u Football tabu)
+ *   - compact?: true za Combined (malo manja tipografija)
  */
-export default function FootballBets({ date, limit, compact = false }) {
+export default function FootballBets({ date, limit = 10, compact = false }) {
   const [bets, setBets] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  const formatPercent = (x) => (x == null ? "-" : `${(x * 100).toFixed(1)}%`);
-
-  const sortBets = (value_bets = []) =>
-    value_bets
-      .slice()
-      .sort((a, b) => {
-        if (a.type !== b.type) return a.type === "MODEL+ODDS" ? -1 : 1;
-        return (b.edge || 0) - (a.edge || 0);
-      });
-
-  const explainBet = (bet) => {
-    const fmt = (x) => (x != null ? `${(x * 100).toFixed(1)}%` : "-");
-    if (bet.type === "MODEL+ODDS") {
-      const implied = bet.market_odds ? 1 / bet.market_odds : null;
-      return `Model: ${fmt(bet.model_prob)} vs Market: ${fmt(implied)} (odds ${bet.market_odds}) → edge ${fmt(
-        bet.edge
-      )}`;
-    }
-    return `Model-only: ${fmt(bet.model_prob)} (fallback)`;
-  };
-
-  async function fetchBets() {
+  const fetchBets = async () => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(
-        `/api/value-bets?sport_key=soccer&date=${encodeURIComponent(
-          date
-        )}&min_edge=0.05&min_odds=1.3`,
-        { headers: { accept: "application/json" } }
-      );
+      const url = new URL("/api/value-bets", window.location.origin);
+      url.searchParams.set("sport_key", "soccer");
+      url.searchParams.set("date", date);
+      url.searchParams.set("min_edge", "0.05");
+      url.searchParams.set("min_odds", "1.3");
+      url.searchParams.set("fallback_min_prob", "0.52");
+      const res = await fetch(url.toString());
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       const all = Array.isArray(json.value_bets) ? json.value_bets : [];
-      setBets(sortBets(all));
+
+      // Ako želimo da Combined uvek popuni 3: uzmi top N bez obzira na bucket.
+      const picked = limit ? all.slice(0, limit) : all;
+      setBets(picked);
     } catch (e) {
       console.error("FootballBets fetch error", e);
       setError("Failed to load predictions.");
@@ -55,115 +38,54 @@ export default function FootballBets({ date, limit, compact = false }) {
     } finally {
       setLoading(false);
     }
-  }
+  };
 
   useEffect(() => {
     if (!date) return;
     fetchBets();
-    const interval = setInterval(fetchBets, 2 * 60 * 60 * 1000); // every 2h
-    return () => clearInterval(interval);
+    const iv = setInterval(fetchBets, 2 * 60 * 60 * 1000); // every 2h
+    return () => clearInterval(iv);
   }, [date]);
 
-  const shown = typeof limit === "number" ? bets.slice(0, limit) : bets;
-
-  // kompaktne tamne kartice za Combined
-  if (compact) {
+  if (loading) {
     return (
-      <div className="space-y-3">
-        {loading && (
-          <div className="p-4 rounded-2xl bg-[#1f2339] text-slate-300 shadow">
-            Loading predictions…
-          </div>
-        )}
-        {error && (
-          <div className="p-4 rounded-2xl bg-rose-500/10 text-rose-300 ring-1 ring-rose-500/30 shadow">
-            {error}
-          </div>
-        )}
-        {!loading && !error && shown.length === 0 && (
-          <div className="p-4 rounded-2xl bg-[#1f2339] text-slate-300 shadow">
-            Nema dostupne fudbalske prognoze
-          </div>
-        )}
-        {shown.map((bet) => {
-          const {
-            fixture_id,
-            market,
-            selection,
-            type,
-            model_prob,
-            market_odds,
-            edge,
-            datetime_local,
-            teams,
-          } = bet;
-          const home = teams?.home?.name || "Home";
-          const away = teams?.away?.name || "Away";
-          const timeStr = datetime_local?.starting_at?.date_time || "";
-          return (
-            <div
-              key={`${fixture_id}|${market}|${selection}`}
-              className="p-4 rounded-2xl bg-[#1f2339] text-slate-100 shadow border border-white/5"
-            >
-              <div className="flex justify-between items-start">
-                <div className="font-semibold">
-                  {home} vs {away}{" "}
-                  <span className="text-xs text-slate-400">({market})</span>
-                </div>
-                <div
-                  className={
-                    "text-[10px] px-2 py-0.5 rounded-full " +
-                    (type === "MODEL+ODDS"
-                      ? "bg-blue-500/15 text-blue-300 ring-1 ring-blue-500/30"
-                      : "bg-slate-500/15 text-slate-300 ring-1 ring-white/10")
-                  }
-                >
-                  {type === "MODEL+ODDS" ? "MODEL+ODDS" : "FALLBACK"}
-                </div>
-              </div>
-              <div className="text-sm mt-1">
-                <div className="flex items-center gap-2">
-                  <strong>Pick:</strong> {selection}
-                  <span className="px-2 py-0.5 text-[11px] rounded-full bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/30">
-                    {market_odds || "-"}
-                  </span>
-                </div>
-                {edge != null && (
-                  <div className="text-[12px] text-slate-300 mt-1">
-                    Edge: <span className="font-medium">{formatPercent(edge)}</span>
-                  </div>
-                )}
-                <div className="text-[11px] text-slate-400">{explainBet(bet)}</div>
-                <div className="text-[11px] text-slate-500 mt-1">Starts at: {timeStr}</div>
-              </div>
-            </div>
-          );
-        })}
+      <div className="space-y-4">
+        <h2 className={`font-semibold ${compact ? "text-lg" : "text-xl"}`}>All Suggestions</h2>
+        <div className="p-4 rounded-2xl bg-[#1f2339] text-gray-300">Loading predictions...</div>
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div className="space-y-4">
+        <h2 className={`font-semibold ${compact ? "text-lg" : "text-xl"}`}>All Suggestions</h2>
+        <div className="p-4 rounded-2xl bg-red-50 text-red-700">{error}</div>
+      </div>
+    );
+  }
+  if (bets.length === 0) {
+    return (
+      <div className="space-y-4">
+        <h2 className={`font-semibold ${compact ? "text-lg" : "text-xl"}`}>All Suggestions</h2>
+        <div className="p-4 rounded-2xl bg-yellow-50 text-yellow-800">No suggestions available.</div>
       </div>
     );
   }
 
-  // default (ne-compact) – kao i ranije
+  const badgeByBucket = (b) => {
+    if (b === "TOP") return "bg-orange-500 text-white";
+    if (b === "High") return "bg-emerald-600 text-white";
+    if (b === "Moderate") return "bg-sky-600 text-white";
+    return "bg-amber-500 text-black";
+  };
+
+  const fmtOdds = (o) => (o ? `@${Number(o).toFixed(2)}` : "—");
+
   return (
     <div className="space-y-4">
-      <h2 className="text-xl font-semibold">All Suggestions</h2>
-      {loading && (
-        <div className="p-4 bg-white rounded shadow text-gray-800">
-          <div>Loading predictions...</div>
-        </div>
-      )}
-      {error && (
-        <div className="p-4 bg-red-50 rounded shadow">
-          <div className="text-red-600">{error}</div>
-        </div>
-      )}
-      {!loading && !error && shown.length === 0 && (
-        <div className="p-4 border rounded bg-yellow-50 text-gray-800">
-          <div>No suggestions available.</div>
-        </div>
-      )}
+      {!compact && <h2 className="text-xl font-semibold">All Suggestions</h2>}
       <div className="space-y-4">
-        {shown.map((bet) => {
+        {bets.map((bet) => {
           const {
             fixture_id,
             market,
@@ -171,44 +93,73 @@ export default function FootballBets({ date, limit, compact = false }) {
             type,
             model_prob,
             market_odds,
-            edge,
             datetime_local,
             teams,
+            league,
+            confidence_pct,
+            confidence_bucket,
           } = bet;
+
           const home = teams?.home?.name || "Home";
           const away = teams?.away?.name || "Away";
           const timeStr = datetime_local?.starting_at?.date_time || "";
+          const leagueName = league?.name || "League";
+
           return (
             <div
               key={`${fixture_id}|${market}|${selection}`}
-              className="p-4 border rounded shadow-sm flex flex-col gap-2 bg-white text-gray-900"
+              className={`rounded-2xl bg-[#1f2339] text-white shadow p-4 flex flex-col gap-3 min-h-[260px]`}
             >
-              <div className="flex justify-between items-start">
-                <div className="font-semibold">
-                  {home} vs {away} <span className="text-sm text-gray-500">({market})</span>
+              {/* Match & League */}
+              <div className="flex items-center justify-between">
+                <div className={`font-semibold ${compact ? "text-base" : "text-lg"}`}>
+                  {home} <span className="text-gray-400">vs</span> {away}{" "}
+                  <span className="text-xs text-gray-400">({market})</span>
+                </div>
+                <div className="text-xs px-2 py-1 rounded-full bg-indigo-600/20 border border-indigo-500/50 text-indigo-200">
+                  {leagueName}
+                </div>
+              </div>
+
+              {/* Pick + odds + type */}
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="text-sm">
+                  <span className="font-semibold">Pick:</span>{" "}
+                  <span className="inline-flex items-center gap-2">
+                    <span className="px-2 py-0.5 rounded bg-white/10">{selection}</span>
+                    <span className="text-gray-300">({market})</span>
+                    <span className="px-2 py-0.5 rounded bg-emerald-600/20 border border-emerald-500/40 text-emerald-200">
+                      {fmtOdds(market_odds)}
+                    </span>
+                  </span>
                 </div>
                 <div
-                  className={`text-xs px-2 py-1 rounded ${
+                  className={`text-[10px] px-2 py-0.5 rounded-full ${
                     type === "MODEL+ODDS"
-                      ? "bg-blue-100 text-blue-800"
-                      : "bg-gray-100 text-gray-700"
+                      ? "bg-blue-600/20 border border-blue-500/40 text-blue-200"
+                      : "bg-gray-600/20 border border-gray-500/40 text-gray-300"
                   }`}
                 >
-                  {type === "MODEL+ODDS" ? "MODEL+ODDS" : "FALLBACK"}
+                  {type}
                 </div>
               </div>
-              <div className="text-sm flex flex-col gap-1">
-                <div>
-                  <strong>Pick:</strong> {selection} @ {market_odds || "-"}
+
+              {/* Confidence bar */}
+              <div className="flex items-center gap-2">
+                <span className={`text-[11px] px-2 py-0.5 rounded-full ${badgeByBucket(confidence_bucket)}`}>
+                  {confidence_bucket}
+                </span>
+                <div className="flex-1 h-2 rounded bg-white/10 overflow-hidden">
+                  <div
+                    className="h-2 bg-emerald-500"
+                    style={{ width: `${Math.min(100, Math.max(0, confidence_pct))}%` }}
+                  />
                 </div>
-                {edge != null && (
-                  <div>
-                    <strong>Edge:</strong> {formatPercent(edge)}
-                  </div>
-                )}
-                <div className="text-xs text-gray-600">{explainBet(bet)}</div>
-                <div className="text-xs text-gray-500">Starts at: {timeStr}</div>
+                <span className="text-xs text-gray-300">{Math.round(confidence_pct)}%</span>
               </div>
+
+              {/* Starts at */}
+              <div className="text-xs text-gray-400">Starts at: {timeStr}</div>
             </div>
           );
         })}
