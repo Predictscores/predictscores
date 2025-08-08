@@ -15,6 +15,6 @@ export default function useCryptoSignals(limit) {
   return {
     crypto,
     loading: loadingCrypto,
-    error: cryptoError,
+    error: cryptoError
   };
 }
