@@ -1,9 +1,9 @@
 // FILE: components/TradingViewChart.js
-
 import React, { useRef, useEffect } from 'react';
 import { Chart, registerables } from 'chart.js';
 import 'chartjs-chart-financial';
 import annotationPlugin from 'chartjs-plugin-annotation';
+import 'chartjs-adapter-date-fns';
 
 Chart.register(...registerables, annotationPlugin);
 
@@ -15,7 +15,7 @@ export default function TradingViewChart({ bars, entry, sl, tp }) {
     if (!Array.isArray(bars) || bars.length === 0) return;
     const ctx = canvasRef.current.getContext('2d');
 
-    // Destroy previous chart instance
+    // Uništi prethodni chart instance ako postoji
     if (chartRef.current) {
       chartRef.current.destroy();
     }
@@ -34,9 +34,9 @@ export default function TradingViewChart({ bars, entry, sl, tp }) {
               c: b.close,
             })),
             borderColor: '#888',
-            borderWidth: 1,
-          },
-        ],
+            borderWidth: 1
+          }
+        ]
       },
       options: {
         responsive: true,
@@ -44,48 +44,48 @@ export default function TradingViewChart({ bars, entry, sl, tp }) {
           legend: { display: false },
           annotation: {
             annotations: {
-              entryLine: {
+              entryLine: entry != null ? {
                 type: 'line',
                 yMin: entry,
                 yMax: entry,
-                borderColor: '#fff',
-                borderDash: [5, 5],
-              },
-              slLine: {
+                borderColor: '#ffffff',
+                borderDash: [5, 5]
+              } : undefined,
+              slLine: sl != null ? {
                 type: 'line',
                 yMin: sl,
                 yMax: sl,
-                borderColor: 'red',
-              },
-              tpLine: {
+                borderColor: 'red'
+              } : undefined,
+              tpLine: tp != null ? {
                 type: 'line',
                 yMin: tp,
                 yMax: tp,
-                borderColor: 'green',
-              },
-            },
-          },
+                borderColor: 'green'
+              } : undefined
+            }
+          }
         },
         scales: {
           x: {
             type: 'time',
             time: { unit: 'hour', tooltipFormat: 'MMM d, h:mm a' },
             ticks: { color: '#aaa' },
-            grid: { display: false },
+            grid: { display: false }
           },
           y: {
             ticks: { color: '#aaa' },
-            grid: { color: 'rgba(255,255,255,0.1)' },
-          },
-        },
-      },
+            grid: { color: 'rgba(255,255,255,0.1)' }
+          }
+        }
+      }
     });
   }, [bars, entry, sl, tp]);
 
   return (
     <canvas
       ref={canvasRef}
-      className="w-full h-28" // visina ~ same as existing card
+      className="w-full h-28"
     />
   );
 }
