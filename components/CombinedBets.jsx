@@ -1,5 +1,5 @@
 // FILE: components/CombinedBets.jsx
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo } from 'react';
 import Tabs from './Tabs';
 import FootballBets from './FootballBets';
 import CryptoTopSignals from './CryptoTopSignals';
@@ -10,43 +10,23 @@ export default function CombinedBets() {
     const y = d.getFullYear();
     const m = String(d.getMonth() + 1).padStart(2, '0');
     const day = String(d.getDate()).padStart(2, '0');
-    return y + '-' + m + '-' + day;
+    return `${y}-${m}-${day}`;
   }, []);
-
-  // Proveri da li uopšte ima fudbalskih tipova za danas; ako nema → Crypto neka bude 100% širine
-  const [hasFootball, setHasFootball] = useState(true);
-  useEffect(() => {
-    let cancelled = false;
-    async function checkFootball() {
-      try {
-        const url = '/api/value-bets?sport_key=soccer&date=' + encodeURIComponent(today) + '&min_edge=0.05&min_odds=1.3';
-        const res = await fetch(url, { headers: { accept: 'application/json' } });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const json = await res.json();
-        const list = Array.isArray(json && json.value_bets) ? json.value_bets : [];
-        if (!cancelled) setHasFootball(list.length > 0);
-      } catch (e) {
-        if (!cancelled) setHasFootball(false);
-      }
-    }
-    checkFootball();
-    return function () { cancelled = true; };
-  }, [today]);
 
   return (
     <Tabs>
       <div label="Combined">
-        {/* Ako nema fudbala, Crypto zauzima celu širinu */}
-        {hasFootball ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <FootballBets date={today} />
+        {/* 1/3 : 2/3 raspored i na desktopu */}
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
+          <div className="md:col-span-4">
+            {/* Top 3 football, kompaktan tamni stil */}
+            <FootballBets date={today} limit={3} compact />
+          </div>
+          <div className="md:col-span-8">
+            {/* Top 3 crypto (već sortirano po score DESC) */}
             <CryptoTopSignals limit={3} />
           </div>
-        ) : (
-          <div className="grid grid-cols-1 gap-4">
-            <CryptoTopSignals limit={10} />
-          </div>
-        )}
+        </div>
       </div>
 
       <div label="Football">
