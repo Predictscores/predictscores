@@ -1,5 +1,5 @@
 // FILE: components/SignalCard.js
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import TradingViewChart from './TradingViewChart';
 
 export default function SignalCard({ data = {}, type }) {
@@ -56,61 +56,72 @@ export default function SignalCard({ data = {}, type }) {
   }, [symbol]);
 
   const fmt = (n, d = 4) => (typeof n === 'number' ? n.toFixed(d) : '—');
+  const pct = (n, d = 2) =>
+    typeof n === 'number' ? `${(Math.abs(n)).toFixed(d)}%` : '—';
+  const arrow = (n) => (typeof n === 'number' ? (n > 0 ? '▲' : n < 0 ? '▼' : '•') : '•');
+  const signClass = (n) =>
+    typeof n === 'number'
+      ? n > 0
+        ? 'bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/30'
+        : n < 0
+        ? 'bg-rose-500/15 text-rose-300 ring-1 ring-rose-500/30'
+        : 'bg-slate-500/15 text-slate-300 ring-1 ring-white/10'
+      : 'bg-slate-500/15 text-slate-300 ring-1 ring-white/10';
+
+  const conf = useMemo(() => {
+    const x = Number(confidence ?? 0);
+    return Math.max(0, Math.min(100, isNaN(x) ? 0 : x));
+  }, [confidence]);
+
+  const confBarClass =
+    conf >= 75 ? 'bg-emerald-500' : conf >= 50 ? 'bg-sky-500' : 'bg-amber-400';
+
+  const dirBadgeClass =
+    signal === 'SHORT'
+      ? 'from-rose-500 to-rose-400 text-rose-950'
+      : 'from-emerald-500 to-emerald-400 text-emerald-950';
 
   return (
     <div className="w-full bg-[#1f2339] p-5 rounded-2xl shadow flex flex-col md:flex-row">
-      {/* LEVI BLOK (info) */}
-      <div className="md:w-[40%] md:pr-6 flex flex-col justify-between">
-        <h3 className="text-2xl font-bold">{symbol}</h3>
+      {/* INFO BLOK (≈40%) */}
+      <div className="md:w-[40%] md:pr-6 flex flex-col gap-3">
+        {/* Naslov + smer */}
+        <div className="flex items-center gap-3">
+          <h3 className="text-3xl font-extrabold tracking-wide text-transparent bg-clip-text bg-gradient-to-r from-white to-slate-300">
+            {symbol}
+          </h3>
+          <span
+            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-extrabold uppercase bg-gradient-to-b ${dirBadgeClass} shadow`}
+            title={signal}
+          >
+            {signal} {signal === 'SHORT' ? '↓' : '↑'}
+          </span>
+        </div>
 
-        <div className="text-sm mt-1">
-          <div>Current: ${fmt(price)}</div>
-          <div>
-            Entry{' '}
-            <span className={signal === 'LONG' ? 'text-green-400' : 'text-red-400'}>
+        {/* Cene + TP/SL */}
+        <div className="text-sm space-y-2">
+          <div className="flex items-baseline gap-2">
+            <span className="text-slate-300">Current:</span>
+            <span className="font-semibold">${fmt(price)}</span>
+          </div>
+
+          <div className="flex items-baseline gap-2">
+            <span className="text-slate-300">Entry</span>
+            <span className={signal === 'LONG' ? 'text-emerald-400' : 'text-rose-400'}>
               ${fmt(entryPrice)} {signal === 'LONG' ? '↑' : '↓'}
             </span>
           </div>
 
-          <div className="mt-2 flex gap-2">
-            <span className="bg-green-500/90 px-3 py-1 rounded-full text-sm">
+          <div className="flex gap-2 pt-1">
+            <span className="px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/90 text-emerald-50 shadow">
               TP: ${fmt(tp)}
             </span>
-            <span className="bg-red-500/90 px-3 py-1 rounded-full text-sm">
+            <span className="px-3 py-1 rounded-full text-xs font-semibold bg-rose-500/90 text-rose-50 shadow">
               SL: ${fmt(sl)}
             </span>
           </div>
         </div>
 
-        <div className="text-sm mt-2">
-          Expected: {fmt(expectedMove, 2)}%{' '}
-          <span
-            className={
-              confidence >= 75 ? 'text-green-400' :
-              confidence >= 50 ? 'text-blue-400' : 'text-yellow-300'
-            }
-          >
-            ●
-          </span>
-        </div>
-
-        <div className="text-xs text-gray-400 mt-1">
-          1h: {fmt(change1h, 2)}% · 24h: {fmt(change24h, 2)}%
-        </div>
-      </div>
-
-      {/* DESNI BLOK (graf) */}
-      <div className="md:w-[60%] md:pl-6 mt-4 md:mt-0 border-t md:border-t-0 md:border-l border-gray-700 flex items-center justify-center">
-        {barsLoading ? (
-          <div className="text-gray-500 text-sm">Loading chart…</div>
-        ) : barsError ? (
-          <div className="text-red-400 text-sm">Chart error</div>
-        ) : bars.length > 0 ? (
-          <TradingViewChart bars={bars} entry={entryPrice} sl={sl} tp={tp} />
-        ) : (
-          <div className="text-gray-500 text-sm">No data</div>
-        )}
-      </div>
-    </div>
-  );
-}
+        {/* 1h / 24h promene */}
+        <div className="flex gap-2 text-xs">
+          <span className={`inline-flex
