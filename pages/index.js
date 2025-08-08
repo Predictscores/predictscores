@@ -1,9 +1,122 @@
 // FILE: pages/index.js
 import Head from 'next/head';
+import { useContext, useEffect, useMemo, useState } from 'react';
 import dynamic from 'next/dynamic';
+import { DataContext } from '../contexts/DataContext';
 
-// Isključi SSR za sadržaj početne strane (stabilno za live podatke)
+// CombinedBets renderujemo bez SSR-a (stabilno za live podatke)
 const CombinedBets = dynamic(() => import('../components/CombinedBets'), { ssr: false });
+
+function useDarkMode() {
+  const [dark, setDark] = useState(true);
+  useEffect(() => {
+    // init iz localStorage ili default dark
+    const saved = typeof window !== 'undefined' ? localStorage.getItem('theme') : null;
+    const isDark = saved ? saved === 'dark' : true;
+    setDark(isDark);
+    if (isDark) document.documentElement.classList.add('dark');
+    else document.documentElement.classList.remove('dark');
+  }, []);
+  const toggle = () => {
+    setDark((d) => {
+      const next = !d;
+      if (next) document.documentElement.classList.add('dark');
+      else document.documentElement.classList.remove('dark');
+      if (typeof window !== 'undefined') localStorage.setItem('theme', next ? 'dark' : 'light');
+      return next;
+    });
+  };
+  return { dark, toggle };
+}
+
+function HeaderBar() {
+  const { nextCryptoUpdate, refreshAll } = useContext(DataContext);
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const timeLeft = useMemo(() => {
+    if (!nextCryptoUpdate) return null;
+    const ms = Math.max(0, nextCryptoUpdate - now);
+    const m = Math.floor(ms / 60000);
+    const s = Math.floor((ms % 60000) / 1000);
+    return { m, s };
+  }, [nextCryptoUpdate, now]);
+
+  const { toggle } = useDarkMode();
+
+  return (
+    <div className="flex items-center justify-between">
+      <h1 className="text-2xl md:text-3xl font-extrabold text-white">
+        AI Top fudbalske i Kripto Prognoze
+      </h1>
+      <div className="flex items-center gap-3">
+        <button
+          onClick={refreshAll}
+          className="px-4 py-2 rounded-xl bg-[#202542] text-white font-semibold"
+          type="button"
+        >
+          Refresh all
+        </button>
+        <button
+          onClick={toggle}
+          className="px-4 py-2 rounded-xl bg-[#202542] text-white font-semibold"
+          type="button"
+        >
+          Light mode
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function InfoBar() {
+  const { nextCryptoUpdate } = useContext(DataContext);
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  let text = 'Crypto next refresh: --';
+  if (nextCryptoUpdate) {
+    const ms = Math.max(0, nextCryptoUpdate - now);
+    const m = Math.floor(ms / 60000);
+    const s = Math.floor((ms % 60000) / 1000);
+    text = `Crypto next refresh: ${m}m ${String(s).padStart(2, '0')}s`;
+  }
+
+  return (
+    <div className="mt-4 px-4 py-2 rounded-full bg-[#202542] text-white inline-flex items-center gap-6">
+      <span>{text}</span>
+      <span>Football last generated: —</span>
+    </div>
+  );
+}
+
+function Legend() {
+  return (
+    <div className="mt-4 text-sm text-slate-300 flex items-center gap-3">
+      <span>Confidence legend:</span>
+      <span className="inline-flex items-center gap-1">
+        <span className="inline-block w-3 h-3 rounded-full bg-emerald-400" /> High (≥75%)
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span className="inline-block w-3 h-3 rounded-full bg-sky-400" /> Moderate (50–75%)
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span className="inline-block w-3 h-3 rounded-full bg-amber-400" /> Low (&lt;50%)
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span>🔥</span> Top Pick (≥90%)
+      </span>
+    </div>
+  );
+}
 
 function HomePage() {
   return (
@@ -13,12 +126,21 @@ function HomePage() {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </Head>
 
-      <main className="max-w-7xl mx-auto p-4 md:p-6 space-y-6">
-        <CombinedBets />
+      <main className="min-h-screen bg-[#0f1116] text-white">
+        <div className="max-w-7xl mx-auto p-4 md:p-6">
+          <HeaderBar />
+          <InfoBar />
+          <Legend />
+          <div className="mt-6">
+            <CombinedBets />
+          </div>
+        </div>
       </main>
     </>
   );
 }
 
-// Dodatno osiguranje: i samu stranicu izvozimo bez SSR-a
-export default dynamic(() => Promise.resolve(HomePage), { ssr: false });
+// Izvoz bez SSR-a (stabilno za dash)
+export default function Index() {
+  return <HomePage />;
+}
