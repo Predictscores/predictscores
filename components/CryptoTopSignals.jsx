@@ -3,14 +3,15 @@ import React from 'react';
 import useCryptoSignals from '../hooks/useCryptoSignals';
 import SignalCard from './SignalCard';
 
-// helper: normalizuj i cap-uj confidence na [5..95]
+// Normalizacija i cap confidence-a na [5..95]
 function normalizeConfidence(conf) {
   const raw = typeof conf === 'number' ? conf : 0;
-  const pct = raw > 1 ? raw : raw * 100; // ako dođe u 0..1, pretvori u %
+  const pct = raw > 1 ? raw : raw * 100; // ako stigne u [0..1], prikaži u %
   const capped = Math.min(95, Math.max(5, Math.round(pct)));
   return capped;
 }
 
+// Ne prikazujemo stable coine
 const STABLES = new Set([
   'USDT','USDC','USDE','DAI','TUSD','FDUSD','USDP','EURS','EURT','USTC'
 ]);
@@ -21,31 +22,31 @@ export default function CryptoTopSignals({ limit = 10 }) {
   if (loading) return <div>Loading crypto signals...</div>;
   if (error) return <div>Error loading crypto signals</div>;
 
-  // 1) map: cap-uj confidence (ne menjamo backend, samo prikaz i sort)
-  const withConf = crypto.map(s => ({
+  // 1) cap-uj confidence (samo za prikaz/sort)
+  const withConf = crypto.map((s) => ({
     ...s,
     confidence: normalizeConfidence(s.confidence),
   }));
 
-  // 2) no-trade filter: izbaci stabilne i male pokrete (expectedMove < 0.8%)
-  let filtered = withConf.filter(s => {
+  // 2) no-trade filter: stable OUT + expectedMove < 0.8% OUT
+  let filtered = withConf.filter((s) => {
     const sym = String(s.symbol || '').toUpperCase();
     if (STABLES.has(sym)) return false;
     const move = typeof s.expectedMove === 'number' ? s.expectedMove : 0;
     return move >= 0.8;
   });
 
-  // ako posle filtra nema dovoljno, malo olabavi move prag da barem nešto prikažemo
+  // Fallback da ne ostane prazno (olabavi na 0.3%)
   if (filtered.length < Math.min(3, limit)) {
-    filtered = withConf.filter(s => {
+    filtered = withConf.filter((s) => {
       const sym = String(s.symbol || '').toUpperCase();
       if (STABLES.has(sym)) return false;
       const move = typeof s.expectedMove === 'number' ? s.expectedMove : 0;
-      return move >= 0.3; // fallback prag da ne ostane prazno
+      return move >= 0.3;
     });
   }
 
-  // 3) sortiraj po snazi (confidence pa expectedMove kao tie-breaker)
+  // 3) najjači prvi (confidence, pa expectedMove kao tie-breaker)
   filtered.sort((a, b) => {
     const c = (b.confidence || 0) - (a.confidence || 0);
     if (c !== 0) return c;
@@ -56,8 +57,9 @@ export default function CryptoTopSignals({ limit = 10 }) {
 
   const top = filtered.slice(0, limit);
 
+  // VIZUELNO: vratili smo na “stari” izgled — jedna široka kartica po redu
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-4">
+    <div className="space-y-4">
       {top.map((signal) => (
         <SignalCard key={signal.symbol} data={signal} type="crypto" />
       ))}
