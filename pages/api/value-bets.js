@@ -5,17 +5,17 @@
 // - The Odds API: kvote (1x na ~2h; keš 2h; hard guard da ne pređe 12/dan)
 // - Ako kvote nisu dostupne: "FALLBACK" predlozi (MODEL-only) bez rušenja.
 //
+// OVA VERZIJA: opušten fallback prag, da dobijemo rezultate i kad nema kvota.
+//   - Query param:  ?fallback_min_prob=0.54   (default 0.54; možeš promeniti u env FALLBACK_MIN_PROB)
+//
 // Kompatibilno sa components/FootballBets.jsx (očekivana polja).
 //
 // ENV varijable (Vercel > Settings > Environment Variables):
-// - SPORTMONKS_KEY        (obavezno za fixtures)
-// - ODDS_API_KEY          (opciono; ako nedostaje ili pukne, radimo FALLBACK)
-// - ODDS_MAX_CALLS_PER_DAY= "12" (opciono; default 12)
-// - TZ_DISPLAY            = "Europe/Belgrade" (opciono; default Europe/Belgrade)
-//
-// Napomena: The Odds endpoint ovde je pozvan "najbezbednije" i potpuno
-// try/catch-ovano. Ako endpoint/ključ/limit nisu ok — API i dalje radi
-// (samo bez "MODEL+ODDS" edge-a), da ne potrošimo deploy-e na greške.
+// - SPORTMONKS_KEY
+// - ODDS_API_KEY                (opciono; ako nema/limit → radimo FALLBACK)
+// - ODDS_MAX_CALLS_PER_DAY      (default "12")
+// - TZ_DISPLAY                  (default "Europe/Belgrade")
+// - FALLBACK_MIN_PROB           (default "0.54")
 
 export const config = {
   api: {
@@ -27,6 +27,7 @@ const SPORTMONKS_KEY = process.env.SPORTMONKS_KEY || "";
 const ODDS_API_KEY = process.env.ODDS_API_KEY || "";
 const ODDS_MAX_CALLS_PER_DAY = Number(process.env.ODDS_MAX_CALLS_PER_DAY || "12");
 const TZ_DISPLAY = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const FALLBACK_MIN_PROB_ENV = Number(process.env.FALLBACK_MIN_PROB || "0.54");
 
 // --- u-memorijski keš (serverless "warm" instanca) ---
 let _fixturesCache = {
@@ -100,8 +101,6 @@ function pickBestOddsForH2H(bookmakers = []) {
     const m = (b.markets || []).find(x => x.key === 'h2h');
     if (!m) continue;
     const out = m.outcomes || [];
-    // pokušaj naći HOME/DRAW/AWAY po redosledu i/ili "name"
-    // Ne oslanjamo se na imena timova (mapiramo po poziciji: 0=home,1=away; draw poseban).
     const home = out.find(o => o.name?.toLowerCase() === 'home') || out[0];
     const away = out.find(o => o.name?.toLowerCase() === 'away') || out[1];
     const draw = out.find(o => (o.name || '').toLowerCase() === 'draw') || out.find(o => (o.name || '').toLowerCase() === 'tie');
@@ -114,16 +113,13 @@ function pickBestOddsForH2H(bookmakers = []) {
 }
 
 function baseModel1X2Prob(fix) {
-  // Grubi model iz pozicija (ako postoje) + home advantage (ligom-agnostički).
-  // Ovo je "štedljiva" varijanta bez dodatnih poziva; u sledećem koraku
-  // može se zameniti API-Football Poissonom za top-k.
+  // Grubi model iz pozicija (ako postoje) + home advantage.
   const posH = toNumber(fix?.standings?.localteam_position, 0);
   const posA = toNumber(fix?.standings?.visitorteam_position, 0);
   const homeAdv = 0.08; // 8% absolutni boost za home
   let posAdj = 0;
 
   if (posH > 0 && posA > 0) {
-    // niža pozicija = jači tim; ograniči uticaj u +/-10pp na ravnoteži
     const diff = (posA - posH); // ako je home bolji, diff > 0
     posAdj = clamp(diff / 20, -0.10, 0.10);
   }
@@ -132,7 +128,6 @@ function baseModel1X2Prob(fix) {
   let pAway = 0.33 - homeAdv - posAdj;
   let pDraw = 1 - (pHome + pAway);
 
-  // osiguraj realne opsege i renormalizuj
   pHome = clamp(pHome, 0.10, 0.75);
   pAway = clamp(pAway, 0.10, 0.75);
   pDraw = clamp(pDraw, 0.10, 0.40);
@@ -141,7 +136,6 @@ function baseModel1X2Prob(fix) {
 }
 
 function scoreFromEdge(edge, movement = 0, bookies = 0, hoursToKO = 24) {
-  // edge u [−1, 1]; movement u [−1, 1] (pozitivno u našem smeru); bookies ~ [0..N]
   const edgePct = clamp(edge, -1, 1);
   const mov = clamp(movement, -1, 1);
   const bk = clamp(bookies / 10, 0, 1); // 10 bukija ~ max
@@ -149,9 +143,8 @@ function scoreFromEdge(edge, movement = 0, bookies = 0, hoursToKO = 24) {
   if (hoursToKO >= 6) t = 0.6;
   else if (hoursToKO >= 3) t = 0.5;
   else t = 0.3;
-  // ponderi
   const score = 0.55 * edgePct + 0.20 * mov + 0.15 * bk + 0.10 * (1 - Math.abs(t - 0.45));
-  return clamp((score + 1) / 2 * 100, 0, 100); // u [0..100]
+  return clamp((score + 1) / 2 * 100, 0, 100);
 }
 
 function hoursUntil(startIsoUTC) {
@@ -161,9 +154,7 @@ function hoursUntil(startIsoUTC) {
   } catch { return 999; }
 }
 
-// Detekcija dnevnog ključa (za limitiranje The Odds poziva)
 function currentDayKey() {
-  // ključ po Srbiji (tvoj lokalni dan)
   return todayYMD(TZ_DISPLAY);
 }
 
@@ -189,23 +180,18 @@ async function fetchFixturesForDate(dateYMD) {
   }
 }
 
-// The Odds API: široki snapshot (h2h, btts, totals). Sve u try/catch.
-// Ako bilo šta pođe po zlu, vraćamo null i NE rušimo API.
 async function fetchOddsSnapshotGuarded() {
   const dayKey = currentDayKey();
 
-  // dnevni limit poziva
   if (_oddsCache.dayKey !== dayKey) {
     _oddsCache.dayKey = dayKey;
     _oddsCache.lastCallTimestamps = [];
   }
 
-  // Ako imamo svež snapshot (<2h), vrati ga
   if (_oddsCache.data && Date.now() - _oddsCache.fetchedAt < 2 * 3600_000) {
     return { data: _oddsCache.data, previous: _oddsCache.previousData };
   }
 
-  // Ako smo već pogodili dnevni limit, vrati poslednji snapshot (možda null)
   if (_oddsCache.lastCallTimestamps.length >= ODDS_MAX_CALLS_PER_DAY) {
     return { data: _oddsCache.data, previous: _oddsCache.previousData };
   }
@@ -215,24 +201,16 @@ async function fetchOddsSnapshotGuarded() {
   }
 
   try {
-    // PAŽNJA: The Odds API ima više varijanti endpointa po ligi/sportu.
-    // Ovde biramo "širok" pristup; ako endpoint ne odgovara tvom planu,
-    // funkcija će se ponašati kao da kvote nema (fallback).
-    //
-    // region EU, markets h2h/btts/totals, decimal
     const params = new URLSearchParams({
       regions: "eu",
       markets: "h2h,btts,totals",
       oddsFormat: "decimal",
       apiKey: ODDS_API_KEY,
     });
-
-    // Pokušaj "upcoming" soccer endpoint-a (v4).
     const url = `https://api.the-odds-api.com/v4/sports/soccer/odds?${params.toString()}`;
 
     const res = await fetch(url, { headers: { accept: 'application/json' } });
     if (!res.ok) {
-      // ako dobiješ 404/401/429 — ne rušimo: fallback
       console.warn("TheOdds HTTP", res.status);
       return { data: null, previous: _oddsCache.previousData };
     }
@@ -250,20 +228,15 @@ async function fetchOddsSnapshotGuarded() {
   }
 }
 
-// Izračun "movement"-a u poslednjem intervalu (ako imamo prethodni snapshot).
 function computeMovementForMatch(key, currentOddsObj, previousOddsObj) {
-  // Ovo je skroman prox: uporedi implied(home) iz bestOdds sada vs ranije.
-  // Vraća broj u [-1..+1] (pozitivno ako ide u smer većeg edge-a kad biramo selekciju).
   try {
     if (!currentOddsObj || !previousOddsObj) return 0;
     const cur = impliedFromBestOdds(currentOddsObj.best);
     const prev = impliedFromBestOdds(previousOddsObj.best);
     if (!Number.isFinite(cur.home) || !Number.isFinite(prev.home)) return 0;
-    // promene u procentnim poenima
     const dh = cur.home - prev.home;
     const dd = cur.draw - prev.draw;
     const da = cur.away - prev.away;
-    // normalizuj u [-1..1] po max apsolutnoj promeni 0.1 (10pp)
     const norm = 0.1;
     const ch = clamp(dh / norm, -1, 1);
     const cd = clamp(dd / norm, -1, 1);
@@ -284,18 +257,18 @@ export default async function handler(req, res) {
     const minEdge = toNumber(url.searchParams.get('min_edge'), 0.05); // 5%
     const minOdds = toNumber(url.searchParams.get('min_odds'), 1.3);
     const sportKey = url.searchParams.get('sport_key') || 'soccer';
+    const fallbackMinProb = toNumber(url.searchParams.get('fallback_min_prob'), FALLBACK_MIN_PROB_ENV); // <-- NOVO
 
     // 1) fixtures (SportMonks)
     const fixturesJson = await fetchFixturesForDate(date);
     const fixtures = Array.isArray(fixturesJson?.data) ? fixturesJson.data : [];
 
-    // pripremi mapu mečeva po "normalized key"
     const fixtureRows = fixtures.map((f) => {
       const homeName = f?.localTeam?.data?.name || f?.localTeam?.data?.short_code || 'Home';
       const awayName = f?.visitorTeam?.data?.name || f?.visitorTeam?.data?.short_code || 'Away';
       const key = normalizeTeamName(homeName) + " vs " + normalizeTeamName(awayName);
 
-      const utcStart = f?.time?.starting_at?.date_time?.replace(' ', 'T') + 'Z'; // "YYYY-MM-DDTHH:mm:ssZ"
+      const utcStart = f?.time?.starting_at?.date_time?.replace(' ', 'T') + 'Z';
       const beograd = formatBelgradeDateTime(f?.time?.starting_at?.date_time?.replace(' ', 'T'));
 
       return {
@@ -323,12 +296,10 @@ export default async function handler(req, res) {
 
     function buildOddsKey(evt) {
       try {
-        // v4 obično ima teams: ["Home Team","Away Team"] ili outcomes sa name.
-        const t1 = normalizeTeamName(evt?.home_team || (evt?.teams && evt.teams[0]) || evt?.commence_time || "");
-        const tA = normalizeTeamName(evt?.away_team || (evt?.teams && evt.teams[1]) || "");
-        if (!t1 || !tA) return null;
-        return normalizeTeamName(evt?.home_team || evt?.teams?.[0] || "") + " vs " +
-               normalizeTeamName(evt?.away_team || evt?.teams?.[1] || "");
+        const home = normalizeTeamName(evt?.home_team || (evt?.teams && evt.teams[0]) || "");
+        const away = normalizeTeamName(evt?.away_team || (evt?.teams && evt.teams[1]) || "");
+        if (!home || !away) return null;
+        return home + " vs " + away;
       } catch {
         return null;
       }
@@ -338,7 +309,6 @@ export default async function handler(req, res) {
       for (const evt of oddsData) {
         const key = buildOddsKey(evt);
         if (!key) continue;
-        // uzmi best H2H i broj bukija
         const { best, bookmakerCount } = pickBestOddsForH2H(evt.bookmakers || []);
         oddsMap.set(key, { best, bookmakerCount, event: evt });
       }
@@ -382,7 +352,6 @@ export default async function handler(req, res) {
         away: model.away - implied.away,
       };
 
-      // Ako nemamo kvote → implied = 0 → favorizovaćemo high P model; zato kasnije filter edge/min_odds
       let sel = 'home';
       let selProb = model.home;
       let selOdds = marketOdds?.home || null;
@@ -395,15 +364,14 @@ export default async function handler(req, res) {
         sel = 'away'; selProb = model.away; selOdds = marketOdds?.away || null; selEdge = edges.away;
       }
 
-      // validacija minimalnih uslova
       const hours = hoursUntil(row.utcStart);
-      if (hours < 0.33) continue; // <20 min do starta, preskoči
+      if (hours < 0.33) continue; // <20 min do starta
 
-      // ako imamo kvote → primeni pragove; ako nemamo → dozvoli samo kad je model baš ubedljiv
+      // *** KLJUČNA PROMENA: fallback uslov opušten (default 0.54), možeš menjati kroz query/env
       const hasOdds = type === "MODEL+ODDS";
-      const passEdge = hasOdds ? (selEdge >= minEdge) : (selProb >= 0.65); // fallback stroži
-      const passOdds = hasOdds ? (toNumber(selOdds, 0) >= minOdds) : true;
-      const passBookies = hasOdds ? (bookies >= 4) : true; // tražimo makar 4 bukija
+      const passEdge = hasOdds ? (selEdge >= toNumber(minEdge, 0.05)) : (selProb >= fallbackMinProb);
+      const passOdds = hasOdds ? (toNumber(selOdds, 0) >= toNumber(minOdds, 1.3)) : true;
+      const passBookies = hasOdds ? (bookies >= 4) : true;
 
       if (!passEdge || !passOdds || !passBookies) continue;
 
@@ -419,7 +387,6 @@ export default async function handler(req, res) {
       }
 
       const score = scoreFromEdge(selEdge, movementScore, bookies, hours);
-
       const selectionLabel = sel === 'home' ? '1' : sel === 'draw' ? 'X' : '2';
 
       candidates.push({
@@ -445,23 +412,18 @@ export default async function handler(req, res) {
           implied_draw: implied.draw,
           implied_away: implied.away,
           hours_to_kickoff: hours,
-          // debug: row.key
         },
-        // skoring za sortiranje
         _score: score,
       });
     }
 
-    // Sortiraj po score opa, uzmi top 10
     candidates.sort((a, b) => (toNumber(b._score, 0) - toNumber(a._score, 0)));
     const top = candidates.slice(0, 10).map(({ _score, meta, ...rest }) => rest);
 
-    // Keš kontrola za CDN/Edge
     res.setHeader('Cache-Control', 's-maxage=3600, stale-while-revalidate=1800');
     return res.status(200).json({ value_bets: top, generated_at: new Date().toISOString() });
   } catch (e) {
     console.error("value-bets fatal", e?.message || e);
-    // Nemoj rušiti UI — vrati prazan niz, sa napomenom
     res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=300');
     return res.status(200).json({ value_bets: [], note: 'error, returned empty' });
   }
