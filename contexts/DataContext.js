@@ -21,18 +21,23 @@ export function DataProvider({ children }) {
       }
       const json = await res.json();
 
-      // Normalizacija: podrži i {long, short} i {signals}
-      const long = Array.isArray(json.long)
-        ? json.long
-        : Array.isArray(json.signals)
-        ? json.signals.filter((s) => s.signal === 'LONG')
-        : [];
+      // Normalizacija izlaza — podržava više formata:
+      // 1) { long:[], short:[] }
+      // 2) { signals:[...] }  sa signal === 'LONG'/'SHORT'
+      // 3) { crypto:[...] }   (trenutni tvoj API)
+      let long = [];
+      let short = [];
 
-      const short = Array.isArray(json.short)
-        ? json.short
-        : Array.isArray(json.signals)
-        ? json.signals.filter((s) => s.signal === 'SHORT')
-        : [];
+      if (Array.isArray(json.long) || Array.isArray(json.short)) {
+        long = Array.isArray(json.long) ? json.long : [];
+        short = Array.isArray(json.short) ? json.short : [];
+      } else if (Array.isArray(json.signals)) {
+        long = json.signals.filter((s) => s.signal === 'LONG');
+        short = json.signals.filter((s) => s.signal === 'SHORT');
+      } else if (Array.isArray(json.crypto)) {
+        long = json.crypto.filter((s) => s.signal === 'LONG');
+        short = json.crypto.filter((s) => s.signal === 'SHORT');
+      }
 
       setLongSignals(long);
       setShortSignals(short);
@@ -53,7 +58,7 @@ export function DataProvider({ children }) {
     return () => clearInterval(iv);
   }, [fetchCrypto]);
 
-  // Spajanje u jedan niz, sort po confidence desc
+  // Spajanje i sortiranje po confidence DESC
   const crypto = useMemo(() => {
     const L = (longSignals || []).map((s) => ({ ...s, side: 'LONG' }));
     const S = (shortSignals || []).map((s) => ({ ...s, side: 'SHORT' }));
@@ -61,27 +66,19 @@ export function DataProvider({ children }) {
   }, [longSignals, shortSignals]);
 
   const refreshCrypto = useCallback(() => fetchCrypto(), [fetchCrypto]);
-
-  const refreshAll = useCallback(() => {
-    fetchCrypto();
-    // ovde ćemo dodati football refresh kad pređemo na fudbal
-  }, [fetchCrypto]);
+  const refreshAll = useCallback(() => { fetchCrypto(); }, [fetchCrypto]);
 
   return (
     <DataContext.Provider
       value={{
-        // raw
         longSignals,
         shortSignals,
-        // combined
         crypto,
-        // state
         loadingCrypto,
         cryptoError,
         nextCryptoUpdate,
-        // actions
         refreshCrypto,
-        refreshAll,
+        refreshAll
       }}
     >
       {children}
