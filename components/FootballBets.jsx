@@ -4,7 +4,7 @@ import { useState, useEffect } from "react";
 /**
  * FootballBets: prikazuje value betove.
  * Props:
- *   - date: string YYYY-MM-DD
+ *   - date?: string YYYY-MM-DD (ako izostane, koristi se današnji iz API-ja)
  *   - limit?: broj kartica (npr. 3 u Combined, 10 u Football tabu)
  *   - compact?: true za Combined (malo manja tipografija)
  */
@@ -19,16 +19,18 @@ export default function FootballBets({ date, limit = 10, compact = false }) {
     try {
       const url = new URL("/api/value-bets", window.location.origin);
       url.searchParams.set("sport_key", "soccer");
-      url.searchParams.set("date", date);
+      if (date) {
+        // >>> KLJUČNO: šaljemo date SAMO ako je prosleđen
+        url.searchParams.set("date", date);
+      }
       url.searchParams.set("min_edge", "0.05");
       url.searchParams.set("min_odds", "1.3");
       url.searchParams.set("fallback_min_prob", "0.52");
+
       const res = await fetch(url.toString());
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       const all = Array.isArray(json.value_bets) ? json.value_bets : [];
-
-      // Ako želimo da Combined uvek popuni 3: uzmi top N bez obzira na bucket.
       const picked = limit ? all.slice(0, limit) : all;
       setBets(picked);
     } catch (e) {
@@ -41,7 +43,7 @@ export default function FootballBets({ date, limit = 10, compact = false }) {
   };
 
   useEffect(() => {
-    if (!date) return;
+    // više ne blokiramo ako date nije prosleđen; API koristi današnji dan
     fetchBets();
     const iv = setInterval(fetchBets, 2 * 60 * 60 * 1000); // every 2h
     return () => clearInterval(iv);
@@ -78,7 +80,6 @@ export default function FootballBets({ date, limit = 10, compact = false }) {
     if (b === "Moderate") return "bg-sky-600 text-white";
     return "bg-amber-500 text-black";
   };
-
   const fmtOdds = (o) => (o ? `@${Number(o).toFixed(2)}` : "—");
 
   return (
@@ -91,7 +92,6 @@ export default function FootballBets({ date, limit = 10, compact = false }) {
             market,
             selection,
             type,
-            model_prob,
             market_odds,
             datetime_local,
             teams,
@@ -108,7 +108,7 @@ export default function FootballBets({ date, limit = 10, compact = false }) {
           return (
             <div
               key={`${fixture_id}|${market}|${selection}`}
-              className={`rounded-2xl bg-[#1f2339] text-white shadow p-4 flex flex-col gap-3 min-h-[260px]`}
+              className="rounded-2xl bg-[#1f2339] text-white shadow p-4 flex flex-col gap-3 min-h-[260px]"
             >
               {/* Match & League */}
               <div className="flex items-center justify-between">
