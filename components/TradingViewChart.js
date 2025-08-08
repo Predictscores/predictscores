@@ -4,24 +4,12 @@ import { Chart, registerables } from 'chart.js';
 import 'chartjs-adapter-date-fns';
 import annotationPlugin from 'chartjs-plugin-annotation';
 
-// VAŽNO: koristimo SCOPED paket za finansijske chartove
-import {
-  CandlestickController,
-  CandlestickElement,
-  OhlcController,
-  OhlcElement
-} from '@sgratzl/chartjs-chart-financial';
+Chart.register(...registerables, annotationPlugin);
 
-// Registracija svih potrebnih kontrolera/elemenata i plugina
-Chart.register(
-  ...registerables,
-  CandlestickController,
-  CandlestickElement,
-  OhlcController,
-  OhlcElement,
-  annotationPlugin
-);
-
+/**
+ * bars: [{ time: <unix sec>, open, high, low, close }, ...]
+ * entry/sl/tp: brojevi (opcioni)
+ */
 export default function TradingViewChart({ bars, entry, sl, tp }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
@@ -30,31 +18,31 @@ export default function TradingViewChart({ bars, entry, sl, tp }) {
     if (!Array.isArray(bars) || bars.length === 0) return;
     const ctx = canvasRef.current.getContext('2d');
 
-    // Uništi prethodni chart instance ako postoji
     if (chartRef.current) {
       chartRef.current.destroy();
     }
 
+    // Umesto candlestick-a, crtamo line chart od close vrednosti
+    const dataPoints = bars.map((b) => ({
+      x: new Date(b.time * 1000),
+      y: b.close
+    }));
+
     chartRef.current = new Chart(ctx, {
-      type: 'candlestick',
+      type: 'line',
       data: {
         datasets: [
           {
-            label: 'Price',
-            data: bars.map((b) => ({
-              x: new Date(b.time * 1000),
-              o: b.open,
-              h: b.high,
-              l: b.low,
-              c: b.close
-            })),
-            borderColor: '#888',
-            borderWidth: 1
+            label: 'Price (close)',
+            data: dataPoints,
+            borderWidth: 2,
+            pointRadius: 0
           }
         ]
       },
       options: {
         responsive: true,
+        interaction: { mode: 'nearest', intersect: false },
         plugins: {
           legend: { display: false },
           annotation: {
@@ -65,7 +53,8 @@ export default function TradingViewChart({ bars, entry, sl, tp }) {
                   yMin: entry,
                   yMax: entry,
                   borderColor: '#ffffff',
-                  borderDash: [5, 5]
+                  borderDash: [5, 5],
+                  borderWidth: 1
                 }
               }),
               ...(sl != null && {
@@ -73,7 +62,8 @@ export default function TradingViewChart({ bars, entry, sl, tp }) {
                   type: 'line',
                   yMin: sl,
                   yMax: sl,
-                  borderColor: 'red'
+                  borderColor: 'red',
+                  borderWidth: 1
                 }
               }),
               ...(tp != null && {
@@ -81,7 +71,8 @@ export default function TradingViewChart({ bars, entry, sl, tp }) {
                   type: 'line',
                   yMin: tp,
                   yMax: tp,
-                  borderColor: 'green'
+                  borderColor: 'green',
+                  borderWidth: 1
                 }
               })
             }
