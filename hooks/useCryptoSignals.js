@@ -1,30 +1,20 @@
-// hooks/useCryptoSignals.js
-import { useState, useEffect } from 'react';
+// FILE: hooks/useCryptoSignals.js
+import { useContext, useMemo } from 'react';
+import { DataContext } from '../contexts/DataContext';
 
-export default function useCryptoSignals() {
-  const [crypto, setCrypto] = useState([]);
-  const [combined, setCombined] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+export default function useCryptoSignals(limit) {
+  const { longSignals, shortSignals, loadingCrypto, cryptoError } = useContext(DataContext);
 
-  async function fetchData() {
-    try {
-      const res = await fetch('/api/crypto');
-      const json = await res.json();
-      setCombined(json.combined || []);
-      setCrypto(json.crypto || []);
-    } catch (e) {
-      setError(e);
-    } finally {
-      setLoading(false);
-    }
-  }
+  const crypto = useMemo(() => {
+    const L = (longSignals || []).map((s) => ({ ...s, side: 'LONG' }));
+    const S = (shortSignals || []).map((s) => ({ ...s, side: 'SHORT' }));
+    const all = [...L, ...S].sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+    return typeof limit === 'number' ? all.slice(0, limit) : all;
+  }, [longSignals, shortSignals, limit]);
 
-  useEffect(() => {
-    fetchData();
-    const iv = setInterval(fetchData, 10 * 60 * 1000); // 10 min
-    return () => clearInterval(iv);
-  }, []);
-
-  return { combined, crypto, loading, error };
+  return {
+    crypto,
+    loading: loadingCrypto,
+    error: cryptoError,
+  };
 }
