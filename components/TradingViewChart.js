@@ -1,11 +1,26 @@
 // FILE: components/TradingViewChart.js
 import React, { useRef, useEffect } from 'react';
 import { Chart, registerables } from 'chart.js';
-import 'chartjs-chart-financial';
-import annotationPlugin from 'chartjs-plugin-annotation';
 import 'chartjs-adapter-date-fns';
+import annotationPlugin from 'chartjs-plugin-annotation';
 
-Chart.register(...registerables, annotationPlugin);
+// VAŽNO: koristimo SCOPED paket za finansijske chartove
+import {
+  CandlestickController,
+  CandlestickElement,
+  OhlcController,
+  OhlcElement
+} from '@sgratzl/chartjs-chart-financial';
+
+// Registracija svih potrebnih kontrolera/elemenata i plugina
+Chart.register(
+  ...registerables,
+  CandlestickController,
+  CandlestickElement,
+  OhlcController,
+  OhlcElement,
+  annotationPlugin
+);
 
 export default function TradingViewChart({ bars, entry, sl, tp }) {
   const canvasRef = useRef(null);
@@ -31,7 +46,7 @@ export default function TradingViewChart({ bars, entry, sl, tp }) {
               o: b.open,
               h: b.high,
               l: b.low,
-              c: b.close,
+              c: b.close
             })),
             borderColor: '#888',
             borderWidth: 1
@@ -44,25 +59,31 @@ export default function TradingViewChart({ bars, entry, sl, tp }) {
           legend: { display: false },
           annotation: {
             annotations: {
-              entryLine: entry != null ? {
-                type: 'line',
-                yMin: entry,
-                yMax: entry,
-                borderColor: '#ffffff',
-                borderDash: [5, 5]
-              } : undefined,
-              slLine: sl != null ? {
-                type: 'line',
-                yMin: sl,
-                yMax: sl,
-                borderColor: 'red'
-              } : undefined,
-              tpLine: tp != null ? {
-                type: 'line',
-                yMin: tp,
-                yMax: tp,
-                borderColor: 'green'
-              } : undefined
+              ...(entry != null && {
+                entryLine: {
+                  type: 'line',
+                  yMin: entry,
+                  yMax: entry,
+                  borderColor: '#ffffff',
+                  borderDash: [5, 5]
+                }
+              }),
+              ...(sl != null && {
+                slLine: {
+                  type: 'line',
+                  yMin: sl,
+                  yMax: sl,
+                  borderColor: 'red'
+                }
+              }),
+              ...(tp != null && {
+                tpLine: {
+                  type: 'line',
+                  yMin: tp,
+                  yMax: tp,
+                  borderColor: 'green'
+                }
+              })
             }
           }
         },
@@ -82,10 +103,5 @@ export default function TradingViewChart({ bars, entry, sl, tp }) {
     });
   }, [bars, entry, sl, tp]);
 
-  return (
-    <canvas
-      ref={canvasRef}
-      className="w-full h-28"
-    />
-  );
+  return <canvas ref={canvasRef} className="w-full h-28" />;
 }
