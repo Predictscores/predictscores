@@ -1,8 +1,7 @@
 // FILE: pages/api/ohlc.js
 // OHLC feed za grafikon: Binance klines (30m, poslednja 24h)
-// Upotreba: /api/ohlc?symbol=LINK (opciono &interval=30m&limit=48)
-// Vraća: { bars: [{time, open, high, low, close}], symbol }
-
+// /api/ohlc?symbol=LINK  (opciono &interval=30m&limit=48)
+// Vraća: { bars: [{time,open,high,low,close}], symbol }
 export default async function handler(req, res) {
   try {
     if (req.method !== 'GET') {
@@ -12,45 +11,66 @@ export default async function handler(req, res) {
 
     const { symbol = '', interval = '30m', limit = '48' } = req.query;
     let s = String(symbol || '').trim().toUpperCase();
-
     if (!s) return res.status(400).json({ error: 'Missing symbol' });
 
-    // Ako već ima sufiks, koristi ga; inače dodaj USDT
     const hasQuote = /(USDT|USDC|USD)$/.test(s);
     const pair = hasQuote ? s : `${s}USDT`;
 
-    const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(
-      pair
-    )}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`;
+    const hosts = [
+      'https://api.binance.com',
+      'https://data-api.binance.vision',
+      'https://www.binance.com'
+    ];
 
-    const r = await fetch(url, { headers: { 'accept': 'application/json' } });
+    const params = new URLSearchParams({
+      symbol: pair,
+      interval: String(interval || '30m'),
+      limit: String(limit || '48')
+    });
 
-    if (!r.ok) {
-      const text = await r.text();
-      return res
-        .status(r.status)
-        .json({ error: 'Upstream error', status: r.status, body: text.slice(0, 200) });
-    }
+    const headers = {
+      accept: 'application/json',
+      'user-agent': 'predictscores/1.0 (+vercel)'
+    };
 
-    const klines = await r.json();
-    // Mapiramo u (sekunde) i brojčane vrednosti
-    const bars = Array.isArray(klines)
-      ? klines.map((k) => ({
-          time: Math.floor(k[0] / 1000),    // open time (sec)
+    let lastErr = null;
+    for (const host of hosts) {
+      try {
+        const url = `${host}/api/v3/klines?${params.toString()}`;
+        const r = await fetch(url, { headers, cache: 'no-store' });
+
+        if (!r.ok) {
+          const body = await r.text();
+          lastErr = { host, status: r.status, body: body.slice(0, 200) };
+          continue; // probaj sledeći host
+        }
+
+        const klines = await r.json();
+        if (!Array.isArray(klines) || klines.length === 0) {
+          lastErr = { host, status: 502, body: 'Empty klines' };
+          continue;
+        }
+
+        const bars = klines.map((k) => ({
+          time: Math.floor(k[0] / 1000),
           open: Number(k[1]),
           high: Number(k[2]),
           low: Number(k[3]),
           close: Number(k[4])
-        }))
-      : [];
+        }));
 
-    // 24h = 48 sveća po 30m → već pokriveno default "limit"
-    res.setHeader('Content-Type', 'application/json');
-    // Keš za edge razumnu (2 min), pa SWR
-    res.setHeader('Cache-Control', 's-maxage=120, stale-while-revalidate=600');
-    return res.status(200).json({ symbol: pair, bars });
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 's-maxage=120, stale-while-revalidate=600');
+        return res.status(200).json({ symbol: pair, bars });
+      } catch (e) {
+        lastErr = { host, status: 500, body: String(e?.message || e) };
+        continue;
+      }
+    }
+
+    return res.status(502).json({ error: 'Upstream failed', detail: lastErr });
   } catch (e) {
-    console.error('OHLC API error', e);
+    console.error('OHLC API fatal', e);
     return res.status(500).json({ error: 'Internal error' });
   }
 }
