@@ -14,15 +14,14 @@ export default function SignalCard({ data = {}, type }) {
     change1h,
     change24h,
     signal,
-    patterns = [],
-    bars: initialBars = []   // ako API već pošalje bars – koristimo
+    bars: initialBars = [] // ako API već pošalje bars – koristimo
   } = data;
 
   const [bars, setBars] = useState(Array.isArray(initialBars) ? initialBars : []);
   const [barsLoading, setBarsLoading] = useState(false);
   const [barsError, setBarsError] = useState(null);
 
-  // Ako bars nisu došli kroz data → povuci ih sa našeg API-ja
+  // Ako bars nisu došli kroz data → povuci ih sa našeg API-ja (30m, 24h)
   useEffect(() => {
     let cancelled = false;
 
@@ -34,7 +33,6 @@ export default function SignalCard({ data = {}, type }) {
         setBarsLoading(true);
         setBarsError(null);
 
-        // npr. LINK -> LINKUSDT, BTC -> BTCUSDT; ako već sadrži USDT/USDC/USD, ostaje
         const q = encodeURIComponent(symbol);
         const res = await fetch(`/api/ohlc?symbol=${q}&interval=30m&limit=48`, {
           headers: { accept: 'application/json' }
@@ -55,16 +53,17 @@ export default function SignalCard({ data = {}, type }) {
     loadBars();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol]); // refetch kad se promeni simbol
+  }, [symbol]);
 
   const fmt = (n, d = 4) => (typeof n === 'number' ? n.toFixed(d) : '—');
 
   return (
-    <div className="w-full bg-[#1f2339] p-5 rounded-2xl shadow flex">
-      {/* LEVI 35% */}
-      <div className="w-[35%] pr-4 flex flex-col justify-between">
+    <div className="w-full bg-[#1f2339] p-5 rounded-2xl shadow flex flex-col md:flex-row">
+      {/* LEVI BLOK (info) */}
+      <div className="md:w-[40%] md:pr-6 flex flex-col justify-between">
         <h3 className="text-2xl font-bold">{symbol}</h3>
-        <div className="text-sm">
+
+        <div className="text-sm mt-1">
           <div>Current: ${fmt(price)}</div>
           <div>
             Entry{' '}
@@ -72,6 +71,7 @@ export default function SignalCard({ data = {}, type }) {
               ${fmt(entryPrice)} {signal === 'LONG' ? '↑' : '↓'}
             </span>
           </div>
+
           <div className="mt-2 flex gap-2">
             <span className="bg-green-500/90 px-3 py-1 rounded-full text-sm">
               TP: ${fmt(tp)}
@@ -81,36 +81,26 @@ export default function SignalCard({ data = {}, type }) {
             </span>
           </div>
         </div>
+
         <div className="text-sm mt-2">
           Expected: {fmt(expectedMove, 2)}%{' '}
           <span
             className={
-              confidence >= 75 ? 'text-green-400' : confidence >= 50 ? 'text-blue-400' : 'text-yellow-300'
+              confidence >= 75 ? 'text-green-400' :
+              confidence >= 50 ? 'text-blue-400' : 'text-yellow-300'
             }
           >
             ●
           </span>
         </div>
+
         <div className="text-xs text-gray-400 mt-1">
           1h: {fmt(change1h, 2)}% · 24h: {fmt(change24h, 2)}%
         </div>
       </div>
 
-      {/* SREDNJI 15% */}
-      <div className="w-[15%] px-4 flex flex-col justify-center items-center border-l border-gray-700">
-        {patterns.length > 0 ? (
-          patterns.map((p, i) => (
-            <div key={i} className="text-xs mb-1">
-              {p.name || p}
-            </div>
-          ))
-        ) : (
-          <div className="text-xs text-gray-500">No patterns</div>
-        )}
-      </div>
-
-      {/* DESNI 50% */}
-      <div className="w-[50%] pl-4 flex items-center justify-center">
+      {/* DESNI BLOK (graf) */}
+      <div className="md:w-[60%] md:pl-6 mt-4 md:mt-0 border-t md:border-t-0 md:border-l border-gray-700 flex items-center justify-center">
         {barsLoading ? (
           <div className="text-gray-500 text-sm">Loading chart…</div>
         ) : barsError ? (
