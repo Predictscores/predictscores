@@ -1,43 +1,87 @@
 // FILE: pages/index.js
-import Head from 'next/head';
-import dynamic from 'next/dynamic';
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useContext, useEffect, useMemo, useState } from "react";
+import Head from "next/head";
+import dynamic from "next/dynamic";
+import { DataContext } from "../contexts/DataContext";
 
-// Klijent-only import sa fallbackom (sprečava SSR i “ćutljivi” pad)
-const CombinedBets = dynamic(() => import('../components/CombinedBets'), {
+// ---- lazy import Combined sa isključenim SSR-om + jednostavan loading
+const CombinedBetsLazy = dynamic(() => import("../components/CombinedBets"), {
   ssr: false,
-  loading: () => <div className="text-slate-400">Loading picks…</div>,
+  loading: () => (
+    <div className="mt-6 text-slate-400 text-sm">Loading suggestions…</div>
+  ),
 });
 
-// Mali ErrorBoundary da ne proguta celu sekciju ako neki child baci grešku
-class SafeBoundary extends React.Component {
-  constructor(props) {
-    super(props);
-    this.state = { hasError: false };
+// ---- vrlo jednostavan error boundary (samo za klijent)
+function ErrorBoundary({ children }) {
+  const [err, setErr] = useState(null);
+  if (err) {
+    return (
+      <div className="mt-6 p-4 rounded-xl bg-[#1a1f36] text-rose-300 text-sm">
+        Something went wrong while rendering the list. Try Refresh all.
+      </div>
+    );
   }
-  static getDerivedStateFromError() { return { hasError: true }; }
-  componentDidCatch(err) { console.error('Combined section error:', err); }
-  render() {
-    if (this.state.hasError) {
-      return <div className="text-rose-400">Couldn’t render picks. Refresh and try again.</div>;
-    }
-    return this.props.children;
-  }
+  return (
+    <React.Suspense
+      fallback={<div className="mt-6 text-slate-400 text-sm">Loading…</div>}
+    >
+      {React.cloneElement(children, { onError: setErr })}
+    </React.Suspense>
+  );
 }
 
-function useCountdown(targetTs) {
+// ---- Dark mode toggle (samo klijent)
+function useDarkMode() {
+  const [dark, setDark] = useState(true);
+  useEffect(() => {
+    const saved =
+      typeof window !== "undefined" ? localStorage.getItem("theme") : null;
+    const isDark = saved ? saved === "dark" : true;
+    setDark(isDark);
+    document.documentElement.classList.toggle("dark", isDark);
+  }, []);
+  const toggle = () => {
+    setDark((d) => {
+      const next = !d;
+      document.documentElement.classList.toggle("dark", next);
+      if (typeof window !== "undefined") {
+        localStorage.setItem("theme", next ? "dark" : "light");
+      }
+      return next;
+    });
+  };
+  return { toggle };
+}
+
+// ---- Header sa tajmerima
+function HeaderBar() {
+  const { refreshAll, nextCryptoUpdate, nextKickoffAt } =
+    useContext(DataContext) || {};
+  const { toggle } = useDarkMode();
   const [now, setNow] = useState(Date.now());
+
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
-  const ms = targetTs ? Math.max(0, targetTs - now) : null;
-  const m = ms != null ? Math.floor(ms / 60000) : null;
-  const s = ms != null ? Math.floor((ms % 60000) / 1000) : null;
-  return { m, s, ms };
-}
 
-function HeaderBar({ cryptoCd, kickoffCd }) {
+  const cryptoTL = useMemo(() => {
+    if (!nextCryptoUpdate) return null;
+    const ms = Math.max(0, nextCryptoUpdate - now);
+    const m = Math.floor(ms / 60000);
+    const s = Math.floor((ms % 60000) / 1000);
+    return `${m}m ${String(s).padStart(2, "0")}s`;
+  }, [nextCryptoUpdate, now]);
+
+  const kickoffTL = useMemo(() => {
+    if (!nextKickoffAt) return null;
+    const ms = Math.max(0, new Date(nextKickoffAt).getTime() - now);
+    const m = Math.floor(ms / 60000);
+    const s = Math.floor((ms % 60000) / 1000);
+    return `${m}m ${String(s).padStart(2, "0")}s`;
+  }, [nextKickoffAt, now]);
+
   return (
     <div className="flex items-start justify-between gap-4">
       <h1 className="text-3xl md:text-4xl font-extrabold text-white">
@@ -47,21 +91,14 @@ function HeaderBar({ cryptoCd, kickoffCd }) {
       <div className="flex flex-col items-end gap-2">
         <div className="flex items-center gap-3">
           <button
-            onClick={() => (typeof window !== 'undefined') && window.location.reload()}
+            onClick={refreshAll}
             className="px-4 py-2 rounded-xl bg-[#202542] text-white font-semibold"
             type="button"
           >
             Refresh all
           </button>
           <button
-            onClick={() => {
-              const el = document.documentElement;
-              const nextDark = !el.classList.contains('dark');
-              el.classList.toggle('dark', nextDark);
-              if (typeof window !== 'undefined') {
-                localStorage.setItem('theme', nextDark ? 'dark' : 'light');
-              }
-            }}
+            onClick={toggle}
             className="px-4 py-2 rounded-xl bg-[#202542] text-white font-semibold"
             type="button"
           >
@@ -71,75 +108,37 @@ function HeaderBar({ cryptoCd, kickoffCd }) {
 
         <div className="px-4 py-2 rounded-full bg-[#202542] text-white text-sm inline-flex items-center gap-6">
           <span>
-            {cryptoCd?.m != null
-              ? `Crypto next refresh: ${cryptoCd.m}m ${String(cryptoCd.s).padStart(2,'0')}s`
-              : 'Crypto next refresh: —'}
+            Crypto next refresh: {cryptoTL ? cryptoTL : "—"}
           </span>
-          <span>
-            {kickoffCd?.m != null
-              ? `Next kickoff: ${kickoffCd.m}m ${String(kickoffCd.s).padStart(2,'0')}s`
-              : 'Next kickoff: —'}
-          </span>
+          <span>Next kickoff: {kickoffTL ? kickoffTL : "—"}</span>
         </div>
       </div>
     </div>
   );
 }
 
-export default function Index() {
-  // Tema – inicijalizacija tek posle mount-a (da ne “puca” na SSR/hydration)
-  useEffect(() => {
-    const saved = typeof window !== 'undefined' ? localStorage.getItem('theme') : null;
-    const wantDark = saved ? saved === 'dark' : true;
-    document.documentElement.classList.toggle('dark', wantDark);
-  }, []);
-
-  // 10-min ciklični crypto timer (lokalno, stabilno)
-  const [cycleBase, setCycleBase] = useState(null);
-  useEffect(() => { setCycleBase(Date.now()); }, []);
-  const cryptoNextTs = useMemo(
-    () => (cycleBase ? cycleBase + 10 * 60 * 1000 : null),
-    [cycleBase]
+// ---- Legenda (ostaje ista)
+function Legend() {
+  return (
+    <div className="mt-10 text-sm text-slate-300 flex flex-wrap items-center gap-4">
+      <span>Confidence legend:</span>
+      <span className="inline-flex items-center gap-1">
+        <span className="inline-block w-3 h-3 rounded-full bg-emerald-400" /> High (≥75%)
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span className="inline-block w-3 h-3 rounded-full bg-sky-400" /> Moderate (50–75%)
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span className="inline-block w-3 h-3 rounded-full bg-amber-400" /> Low (&lt;50%)
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span>🔥</span> Top Pick (≥90%)
+      </span>
+    </div>
   );
-  const cryptoCd = useCountdown(cryptoNextTs);
-  useEffect(() => {
-    if (!cryptoNextTs) return;
-    const t = setInterval(() => {
-      if (Date.now() >= cryptoNextTs) setCycleBase(Date.now());
-    }, 1000);
-    return () => clearInterval(t);
-  }, [cryptoNextTs]);
+}
 
-  // Next kickoff iz API-ja (poll 60s)
-  const [kickTs, setKickTs] = useState(null);
-  useEffect(() => {
-    let alive = true;
-    async function load() {
-      try {
-        const res = await fetch('/api/value-bets', { cache: 'no-store' });
-        const json = await res.json();
-        const list = Array.isArray(json?.value_bets) ? json.value_bets : [];
-        const ts = list
-          .map(v => v?.datetime_local?.starting_at?.date_time)
-          .filter(Boolean)
-          .map(s => new Date(s.replace(' ', 'T')).getTime())
-          .filter(t => Number.isFinite(t) && t > Date.now());
-        const next = ts.length ? Math.min(...ts) : null;
-        if (alive) setKickTs(next);
-      } catch (e) {
-        console.warn('kickoff fetch failed', e);
-      }
-    }
-    load();
-    const timer = setInterval(load, 60_000);
-    return () => { alive = false; clearInterval(timer); };
-  }, []);
-  const kickoffCd = useCountdown(kickTs);
-
-  // Client-only mount gate (ako nešto u Combined zavisi od window/ctx)
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
-
+function HomePage() {
   return (
     <>
       <Head>
@@ -149,35 +148,23 @@ export default function Index() {
 
       <main className="min-h-screen bg-[#0f1116] text-white">
         <div className="max-w-7xl mx-auto p-4 md:p-6">
-          <HeaderBar cryptoCd={cryptoCd} kickoffCd={kickoffCd} />
+          <HeaderBar />
 
+          {/* >>> OVO VRAĆA TABOVE (Combined/Football/Crypto) <<< */}
           <div className="mt-6">
-            {mounted ? (
-              <SafeBoundary>
-                <CombinedBets />
-              </SafeBoundary>
-            ) : (
-              <div className="text-slate-400">Loading picks…</div>
-            )}
+            <ErrorBoundary>
+              <CombinedBetsLazy />
+            </ErrorBoundary>
           </div>
 
-          <div className="mt-8 text-sm text-slate-300 flex flex-wrap items-center gap-3">
-            <span>Confidence legend:</span>
-            <span className="inline-flex items-center gap-1">
-              <span className="inline-block w-3 h-3 rounded-full bg-emerald-400" /> High (≥75%)
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <span className="inline-block w-3 h-3 rounded-full bg-sky-400" /> Moderate (50–75%)
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <span className="inline-block w-3 h-3 rounded-full bg-amber-400" /> Low (&lt;50%)
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <span>🔥</span> Top Pick (≥90%)
-            </span>
-          </div>
+          {/* legenda na dnu */}
+          <Legend />
         </div>
       </main>
     </>
   );
+}
+
+export default function Index() {
+  return <HomePage />;
 }
