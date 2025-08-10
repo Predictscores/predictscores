@@ -2,23 +2,16 @@
 import { useContext, useMemo } from 'react';
 import { DataContext } from '../contexts/DataContext';
 
-/**
- * Vraća kripto signale iz DataContext-a.
- * - Koristi SPOJENI i već SORTIRANI niz `crypto` (score DESC).
- * - Fallback: ako `crypto` nije niz, vraća prazan niz.
- * - Opcioni `limit` da preseče broj kartica.
- */
-export default function useCryptoSignals(limit) {
-  const { crypto, loadingCrypto, cryptoError } = useContext(DataContext);
-
-  const result = useMemo(() => {
-    const arr = Array.isArray(crypto) ? crypto : [];
-    return typeof limit === 'number' ? arr.slice(0, limit) : arr;
-  }, [crypto, limit]);
-
+export default function useCryptoSignals(limit = 10) {
+  const ctx = useContext(DataContext) || {};
+  const list = Array.isArray(ctx.crypto) ? ctx.crypto : [];
+  const top = useMemo(
+    () => list.slice().sort((a, b) => (b?.confidence ?? 0) - (a?.confidence ?? 0)).slice(0, limit),
+    [list, limit]
+  );
   return {
-    crypto: result,
-    loading: !!loadingCrypto,
-    error: cryptoError || null,
+    loading: !!ctx.loadingCrypto,
+    nextRefreshAt: ctx.cryptoNextRefreshAt || null,
+    data: top,
   };
 }
