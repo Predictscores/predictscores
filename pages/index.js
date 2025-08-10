@@ -1,37 +1,17 @@
 // FILE: pages/index.js
-import React, { useContext, useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import Head from "next/head";
 import dynamic from "next/dynamic";
-import { DataContext } from "../contexts/DataContext";
 
-// ---- lazy import Combined sa isključenim SSR-om + jednostavan loading
-const CombinedBetsLazy = dynamic(() => import("../components/CombinedBets"), {
+// CombinedBets samo na klijentu (bez SSR) + jednostavan loader
+const CombinedBets = dynamic(() => import("../components/CombinedBets"), {
   ssr: false,
   loading: () => (
     <div className="mt-6 text-slate-400 text-sm">Loading suggestions…</div>
   ),
 });
 
-// ---- vrlo jednostavan error boundary (samo za klijent)
-function ErrorBoundary({ children }) {
-  const [err, setErr] = useState(null);
-  if (err) {
-    return (
-      <div className="mt-6 p-4 rounded-xl bg-[#1a1f36] text-rose-300 text-sm">
-        Something went wrong while rendering the list. Try Refresh all.
-      </div>
-    );
-  }
-  return (
-    <React.Suspense
-      fallback={<div className="mt-6 text-slate-400 text-sm">Loading…</div>}
-    >
-      {React.cloneElement(children, { onError: setErr })}
-    </React.Suspense>
-  );
-}
-
-// ---- Dark mode toggle (samo klijent)
+// --------- Dark mode toggle (lokalno)
 function useDarkMode() {
   const [dark, setDark] = useState(true);
   useEffect(() => {
@@ -54,33 +34,100 @@ function useDarkMode() {
   return { toggle };
 }
 
-// ---- Header sa tajmerima
-function HeaderBar() {
-  const { refreshAll, nextCryptoUpdate, nextKickoffAt } =
-    useContext(DataContext) || {};
-  const { toggle } = useDarkMode();
-  const [now, setNow] = useState(Date.now());
+// --------- helperi
+async function safeJson(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} -> ${res.status}`);
+  return res.json();
+}
+function parseStartISO(item) {
+  try {
+    const dt =
+      item?.datetime_local?.starting_at?.date_time ||
+      item?.datetime_local?.date_time ||
+      item?.time?.starting_at?.date_time ||
+      null;
+    if (!dt) return null;
+    // "YYYY-MM-DD HH:mm:ss" -> "YYYY-MM-DDTHH:mm:ss"
+    return dt.replace(" ", "T");
+  } catch {
+    return null;
+  }
+}
+function nearestFutureKickoff(items = []) {
+  const now = Date.now();
+  let best = null;
+  for (const it of items) {
+    const iso = parseStartISO(it);
+    if (!iso) continue;
+    const t = new Date(iso).getTime();
+    if (Number.isFinite(t) && t > now) {
+      if (!best || t < best) best = t;
+    }
+  }
+  return best ? new Date(best).toISOString() : null;
+}
+function fmtCountdown(ms) {
+  const m = Math.floor(ms / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  return `${m}m ${String(s).padStart(2, "0")}s`;
+}
 
+// --------- Header (bez DataContext-a)
+function HeaderBar() {
+  const { toggle } = useDarkMode();
+
+  const [now, setNow] = useState(Date.now());
+  const [nextKickoffAt, setNextKickoffAt] = useState(null); // ISO string
+  const [cryptoNextAt, setCryptoNextAt] = useState(null); // timestamp (ms)
+
+  // tikanje tajmera
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
 
+  // inicijalno pokupi podatke za tajmere (ne zavisi od context-a)
+  useEffect(() => {
+    (async () => {
+      try {
+        const [fb, cr] = await Promise.allSettled([
+          safeJson("/api/value-bets"),
+          safeJson("/api/crypto"),
+        ]);
+        if (fb.status === "fulfilled") {
+          const list = Array.isArray(fb.value?.value_bets)
+            ? fb.value.value_bets
+            : [];
+          setNextKickoffAt(nearestFutureKickoff(list));
+        }
+        if (cr.status === "fulfilled") {
+          // sledeći refresh ~10 min posle uspešnog poziva
+          setCryptoNextAt(Date.now() + 10 * 60 * 1000);
+        }
+      } catch {
+        // ne ruši UI
+      }
+    })();
+  }, []);
+
+  // countdown-ovi
   const cryptoTL = useMemo(() => {
-    if (!nextCryptoUpdate) return null;
-    const ms = Math.max(0, nextCryptoUpdate - now);
-    const m = Math.floor(ms / 60000);
-    const s = Math.floor((ms % 60000) / 1000);
-    return `${m}m ${String(s).padStart(2, "0")}s`;
-  }, [nextCryptoUpdate, now]);
+    if (!cryptoNextAt) return null;
+    const ms = Math.max(0, cryptoNextAt - now);
+    return fmtCountdown(ms);
+  }, [cryptoNextAt, now]);
 
   const kickoffTL = useMemo(() => {
     if (!nextKickoffAt) return null;
     const ms = Math.max(0, new Date(nextKickoffAt).getTime() - now);
-    const m = Math.floor(ms / 60000);
-    const s = Math.floor((ms % 60000) / 1000);
-    return `${m}m ${String(s).padStart(2, "0")}s`;
+    return fmtCountdown(ms);
   }, [nextKickoffAt, now]);
+
+  // ručni refresh: za stabilnost samo reload (da povuče sve iz nove sesije)
+  const hardRefresh = () => {
+    if (typeof window !== "undefined") window.location.reload();
+  };
 
   return (
     <div className="flex items-start justify-between gap-4">
@@ -91,7 +138,7 @@ function HeaderBar() {
       <div className="flex flex-col items-end gap-2">
         <div className="flex items-center gap-3">
           <button
-            onClick={refreshAll}
+            onClick={hardRefresh}
             className="px-4 py-2 rounded-xl bg-[#202542] text-white font-semibold"
             type="button"
           >
@@ -107,17 +154,15 @@ function HeaderBar() {
         </div>
 
         <div className="px-4 py-2 rounded-full bg-[#202542] text-white text-sm inline-flex items-center gap-6">
-          <span>
-            Crypto next refresh: {cryptoTL ? cryptoTL : "—"}
-          </span>
-          <span>Next kickoff: {kickoffTL ? kickoffTL : "—"}</span>
+          <span>Crypto next refresh: {cryptoTL || "—"}</span>
+          <span>Next kickoff: {kickoffTL || "—"}</span>
         </div>
       </div>
     </div>
   );
 }
 
-// ---- Legenda (ostaje ista)
+// --------- Legenda
 function Legend() {
   return (
     <div className="mt-10 text-sm text-slate-300 flex flex-wrap items-center gap-4">
@@ -138,7 +183,11 @@ function Legend() {
   );
 }
 
-function HomePage() {
+export default function Index() {
+  // kartice prikazujemo tek nakon mount-a (da izbegnemo SSR trzavice)
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
   return (
     <>
       <Head>
@@ -150,21 +199,17 @@ function HomePage() {
         <div className="max-w-7xl mx-auto p-4 md:p-6">
           <HeaderBar />
 
-          {/* >>> OVO VRAĆA TABOVE (Combined/Football/Crypto) <<< */}
           <div className="mt-6">
-            <ErrorBoundary>
-              <CombinedBetsLazy />
-            </ErrorBoundary>
+            {mounted ? (
+              <CombinedBets />
+            ) : (
+              <div className="text-slate-400 text-sm">Loading…</div>
+            )}
           </div>
 
-          {/* legenda na dnu */}
           <Legend />
         </div>
       </main>
     </>
   );
-}
-
-export default function Index() {
-  return <HomePage />;
 }
