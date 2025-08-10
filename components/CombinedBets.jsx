@@ -1,27 +1,34 @@
+// FILE: components/CombinedBets.jsx
 import React from "react";
 import Tabs from "./Tabs";
 import FootballBets from "./FootballBets";
 import CryptoTopSignals from "./CryptoTopSignals";
 
+/**
+ * Raspored:
+ * - Combined: grid sa 3 kolone (md+). Levo: Football (Top 3) -> 1 kolona (≈33%).
+ *             Desno: Crypto (Top 3) -> span 2 kolone (≈66%).
+ * - Football tab: Top 10
+ * - Crypto tab: Top 10
+ */
 const CombinedBets = () => (
   <Tabs>
     <div label="Combined">
-      {/* 33% / 66% raspored */}
-      <div className="grid grid-cols-1 lg:grid-cols-[1fr_2fr] gap-4 items-stretch">
-        {/* Leva kolona – fudbal (top 3) */}
-        <div className="flex flex-col gap-4">
-          <FootballBets limit={3} tall />
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-stretch">
+        {/* Levo: Football Top 3, u "combined" layoutu, kartice iste visine */}
+        <div className="md:col-span-1">
+          <FootballBets limit={3} layout="combined" />
         </div>
-        {/* Desna kolona – kripto (top 3) */}
-        <div className="flex flex-col gap-4">
+
+        {/* Desno: Crypto Top 3, širi prostor */}
+        <div className="md:col-span-2">
           <CryptoTopSignals limit={3} />
         </div>
       </div>
     </div>
 
     <div label="Football">
-      {/* Ovde puni spisak, bez limit-a */}
-      <FootballBets tall />
+      <FootballBets limit={10} layout="full" />
     </div>
 
     <div label="Crypto">
