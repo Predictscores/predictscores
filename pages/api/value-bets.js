@@ -1,186 +1,175 @@
 // FILE: pages/api/value-bets.js
-// Minimal, stable pipeline (API-FOOTBALL fixtures only) so you ALWAYS get picks.
-// Next step (after you confirm this works): add odds-based edges via API-FOOTBALL /odds.
 
 export const config = { api: { bodyParser: false } };
 
-const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY || "";
-const TZ_DISPLAY = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const AF_BASE = 'https://v3.football.api-sports.io';
+const AF_KEY  = process.env.API_FOOTBALL_KEY || '';
+const TZ_DISPLAY = process.env.TZ_DISPLAY || 'Europe/Belgrade';
 
-// how many picks to return
-const DESIRED_PICKS = 10;
+// --- simple in-memory caches (resetuju se na cold start) ---
+const fixturesCache = { key: null, at: 0, data: null };        // key = YYYY-MM-DD
+const h2hCache = new Map();                                     // key = `${homeId}-${awayId}`, val: {at, data}
 
-// lower fallback threshold so we always have suggestions (you asked to allow weaker ones)
-const FALLBACK_MIN_PROB = Number(process.env.FALLBACK_MIN_PROB || "0.36");
-
-// in-memory cache (reduce API calls)
-let _cache = { day: null, data: null, fetchedAt: 0 };
-
-function todayYMD(tz = "UTC") {
+function todayYMD(tz = TZ_DISPLAY) {
   const d = new Date();
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
   });
   const [{ value: y }, , { value: m }, , { value: dd }] = fmt.formatToParts(d);
   return `${y}-${m}-${dd}`;
 }
 
-function toNumber(x, def = 0) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : def;
-}
-function clamp(x, a, b) {
-  return Math.max(a, Math.min(b, x));
-}
-
-function belgradeFromIso(isoUtc) {
-  try {
-    const d = new Date(isoUtc);
-    const fmtD = new Intl.DateTimeFormat("en-CA", {
-      timeZone: TZ_DISPLAY,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    });
-    const fmtT = new Intl.DateTimeFormat("en-GB", {
-      timeZone: TZ_DISPLAY,
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: false,
-    });
-    const [{ value: y }, , { value: m }, , { value: da }] = fmtD.formatToParts(d);
-    return `${y}-${m}-${da} ${fmtT.format(d)}`;
-  } catch {
-    return isoUtc;
-  }
-}
-
-// very simple model: home baseline + tiny draw; safe, deterministic
-function simple1x2Model() {
-  // baseline that produces a pick without being absurd
-  const pHome = 0.46;
-  const pDraw = 0.27;
-  const pAway = 0.27;
-  // confidence from gap between top2
-  const arr = [
-    { k: "home", v: pHome },
-    { k: "draw", v: pDraw },
-    { k: "away", v: pAway },
-  ].sort((a, b) => b.v - a.v);
-  const gap = arr[0].v - arr[1].v;
-  const confidencePct = clamp(Math.round((gap / 0.5) * 100), 0, 100);
-  return { probs: { home: pHome, draw: pDraw, away: pAway }, top: arr[0].k, confidencePct };
-}
-
-function confidenceBucket(p) {
-  if (p >= 0.90) return "TOP";
-  if (p >= 0.75) return "High";
-  if (p >= 0.50) return "Moderate";
-  return "Low";
-}
-
-// score to rank fallback picks (uses prob & time-to-KO)
-function rankScore(prob, kickoffIso) {
-  let tHrs = 24;
-  try {
-    tHrs = (new Date(kickoffIso).getTime() - Date.now()) / 3600000;
-  } catch {}
-  const tFactor = clamp(1 - Math.abs(tHrs - 6) / 24, 0, 1); // mild preference for matches within ~6–12h
-  return Math.round((prob * 0.8 + tFactor * 0.2) * 100); // 0–100
-}
-
-async function fetchFixturesAF(dateYMD) {
-  // cache per day to minimize calls
-  if (_cache.day === dateYMD && _cache.data && Date.now() - _cache.fetchedAt < 30 * 60 * 1000) {
-    return _cache.data;
-  }
-  if (!API_FOOTBALL_KEY) {
-    throw new Error("Missing API_FOOTBALL_KEY env");
-  }
-
-  const url = `https://v3.football.api-sports.io/fixtures?date=${encodeURIComponent(
-    dateYMD
-  )}`;
-  const res = await fetch(url, {
-    headers: {
-      "x-apisports-key": API_FOOTBALL_KEY,
-      accept: "application/json",
-    },
+function toBelgrade(dateIso) {
+  if (!dateIso) return '';
+  const d = new Date(dateIso);
+  const fmtDate = new Intl.DateTimeFormat('en-CA', {
+    timeZone: TZ_DISPLAY, year: 'numeric', month: '2-digit', day: '2-digit'
   });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`API-FOOTBALL fixtures HTTP ${res.status} – ${txt.slice(0, 200)}`);
-  }
+  const fmtTime = new Intl.DateTimeFormat('en-GB', {
+    timeZone: TZ_DISPLAY, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+  });
+  const [{ value: y }, , { value: m }, , { value: da }] = fmtDate.formatToParts(d);
+  return `${y}-${m}-${da} ${fmtTime.format(d)}`;
+}
+
+async function afFetch(path, params = {}) {
+  const qs = new URLSearchParams(params);
+  const url = `${AF_BASE}${path}${qs.toString() ? `?${qs.toString()}` : ''}`;
+  const res = await fetch(url, { headers: { 'x-apisports-key': AF_KEY } });
+  if (!res.ok) throw new Error(`API-FOOTBALL ${res.status}`);
   const json = await res.json();
-  _cache = { day: dateYMD, data: json, fetchedAt: Date.now() };
   return json;
+}
+
+// jednostavan 1X2 model (placeholder): home 45%, draw 25%, away 30%,
+// + mala korekcija za "domacinstvo"
+function simpleModel() {
+  const home = 0.45, draw = 0.25, away = 0.30;
+  let selection = 'home', prob = home;
+  if (away > home && away > draw) { selection = 'away'; prob = away; }
+  else if (draw > home && draw > away) { selection = 'draw'; prob = draw; }
+  return { probs: { home, draw, away }, selection, prob };
+}
+
+function bucket(p) {
+  if (p >= 0.90) return 'TOP';
+  if (p >= 0.75) return 'High';
+  if (p >= 0.50) return 'Moderate';
+  return 'Low';
+}
+
+// H2H (poslednjih 5) keširano ~3h
+async function getH2H(homeId, awayId) {
+  if (!homeId || !awayId) return null;
+  const key = `${homeId}-${awayId}`;
+  const now = Date.now();
+  const cached = h2hCache.get(key);
+  if (cached && now - cached.at < 3 * 3600_000) return cached.data;
+
+  try {
+    const json = await afFetch('/fixtures/headtohead', { h2h: key, last: 5 });
+    const list = Array.isArray(json?.response) ? json.response : [];
+    let H = 0, D = 0, A = 0, gH = 0, gA = 0;
+    const last5 = list.slice(0, 5).map(r => {
+      const hs = r.goals?.home ?? 0;
+      const as = r.goals?.away ?? 0;
+      gH += hs; gA += as;
+      if (hs > as) H++; else if (hs < as) A++; else D++;
+      return {
+        date: r.fixture?.date || null,
+        home: r.teams?.home?.name || 'Home',
+        away: r.teams?.away?.name || 'Away',
+        hs, as
+      };
+    });
+    const data = { H, D, A, gH, gA, last5 };
+    h2hCache.set(key, { at: now, data });
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+// Dohvati dnevne mečeve (keš ~1h)
+async function getFixtures(date) {
+  const key = date;
+  const now = Date.now();
+  if (fixturesCache.key === key && fixturesCache.data && now - fixturesCache.at < 3600_000) {
+    return fixturesCache.data;
+  }
+  const json = await afFetch('/fixtures', { date });
+  const list = Array.isArray(json?.response) ? json.response : [];
+  fixturesCache.key = key;
+  fixturesCache.data = list;
+  fixturesCache.at = now;
+  return list;
+}
+
+function selectTop(list) {
+  // sortiramo kroz jednostavan “score” (confidence), pokupimo do 10
+  const rows = list.map(f => {
+    const m = simpleModel();
+    const confPct = Math.round(m.prob * 100);
+    // minimalno rangiranje: viša liga prioritet + kasnije filtriranje lako menjaš
+    const score = confPct;
+    return { f, m, confPct, score };
+  }).sort((a, b) => b.score - a.score);
+  return rows.slice(0, 10);
 }
 
 export default async function handler(req, res) {
   try {
-    const url = new URL(req.url, "http://localhost");
-    const dateParam = url.searchParams.get("date"); // allow ?date=YYYY-MM-DD
-    const dateYMD = dateParam || todayYMD(TZ_DISPLAY);
+    const url = new URL(req.url, 'http://localhost');
+    const date = url.searchParams.get('date') || todayYMD();
 
-    const fixturesJson = await fetchFixturesAF(dateYMD);
-    const list = Array.isArray(fixturesJson?.response) ? fixturesJson.response : [];
+    const fixtures = await getFixtures(date);
+    const top = selectTop(fixtures);
 
-    // map fixtures → fallback picks (no odds yet)
-    const rawPicks = list.map((f) => {
-      const fx = f?.fixture || {};
-      const lg = f?.league || {};
-      const tm = f?.teams || {};
-      const iso = fx?.date || null; // ISO string
-      const belgrade = iso ? belgradeFromIso(iso) : "";
+    // paralelno pokupi H2H za top parove
+    const enriched = await Promise.all(top.map(async row => {
+      const f = row.f;
+      const home = f.teams?.home?.name || 'Home';
+      const away = f.teams?.away?.name || 'Away';
+      const homeId = f.teams?.home?.id;
+      const awayId = f.teams?.away?.id;
 
-      const model = simple1x2Model();
-      const sel = model.top; // "home" | "draw" | "away"
-      const prob = model.probs[sel];
+      const h2h = await getH2H(homeId, awayId); // može biti null
 
-      // to 1/X/2 label
-      const label = sel === "home" ? "1" : sel === "draw" ? "X" : "2";
+      const sel = row.m.selection === 'home' ? '1' : row.m.selection === 'away' ? '2' : 'X';
 
-      const pick = {
-        fixture_id: fx?.id ?? null,
-        market: "1X2",
-        selection: label,
-        type: "FALLBACK", // for now (no odds yet)
-        model_prob: prob,
+      return {
+        fixture_id: f.fixture?.id ?? null,
+        market: '1X2',
+        selection: sel,
+        type: 'FALLBACK',            // nemamo “market_odds” u ovoj varijanti
+        model_prob: row.m.prob,
         market_odds: null,
         edge: null,
-        datetime_local: { starting_at: { date_time: belgrade } },
+        datetime_local: {
+          starting_at: { date_time: toBelgrade(f.fixture?.date) }
+        },
         teams: {
-          home: { id: tm?.home?.id ?? null, name: tm?.home?.name ?? "Home" },
-          away: { id: tm?.away?.id ?? null, name: tm?.away?.name ?? "Away" },
+          home: { id: homeId ?? null, name: home },
+          away: { id: awayId ?? null, name: away }
         },
         league: {
-          id: lg?.id ?? null,
-          name: lg?.name ?? "League",
-          country: lg?.country ?? null,
+          id: f.league?.id ?? null,
+          name: f.league?.name ?? 'League',
+          country: f.league?.country ?? null
         },
-        confidence_pct: Math.round(prob * 100),
-        confidence_bucket: confidenceBucket(prob),
-        _score: rankScore(prob, iso),
+        confidence_pct: row.confPct,
+        confidence_bucket: bucket(row.m.prob),
+        _score: row.score,
+        // NOVO:
+        h2h // {H,D,A,gH,gA,last5:[...]} ili null
       };
-      return pick;
-    });
+    }));
 
-    // filter by min prob (low threshold so we always have items)
-    const eligible = rawPicks.filter((p) => toNumber(p.model_prob, 0) >= FALLBACK_MIN_PROB);
-
-    // sort by score and keep top N
-    eligible.sort((a, b) => toNumber(b._score, 0) - toNumber(a._score, 0));
-    const out = eligible.slice(0, DESIRED_PICKS);
-
-    res.setHeader("Cache-Control", "s-maxage=900, stale-while-revalidate=900");
-    return res.status(200).json({ value_bets: out, generated_at: new Date().toISOString() });
+    res.setHeader('Cache-Control', 's-maxage=1800, stale-while-revalidate=1800');
+    return res.status(200).json({ value_bets: enriched, generated_at: new Date().toISOString() });
   } catch (e) {
-    console.error("value-bets error:", e?.message || e);
-    res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=300");
-    return res.status(200).json({ value_bets: [], note: "error, returned empty" });
+    console.error('value-bets error:', e?.message || e);
+    res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=300');
+    return res.status(200).json({ value_bets: [], note: 'error, returned empty' });
   }
 }
