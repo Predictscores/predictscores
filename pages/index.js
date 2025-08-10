@@ -1,9 +1,9 @@
 // FILE: pages/index.js
 import Head from 'next/head';
 import dynamic from 'next/dynamic';
-import { useContext, useEffect, useMemo, useState } from 'react';
-import { DataContext } from '../contexts/DataContext';
+import { useEffect, useState } from 'react';
 
+// CombinedBets bez SSR-a (stabilno za live podatke)
 const CombinedBets = dynamic(() => import('../components/CombinedBets'), { ssr: false });
 
 function useDarkMode() {
@@ -28,37 +28,8 @@ function useDarkMode() {
 }
 
 function HeaderBar() {
-  // ⬇⬇⬇ NEKA JE UVEK DEFENSIVE – ako nema Providera, neće pući
-  const ctx = useContext(DataContext) || {};
-  const nextCryptoUpdate = ctx.cryptoNextRefreshAt || null;
-  const refreshAll = ctx.refreshAll || (() => {});
-  const nextKickoffTs = ctx.nextKickoffTs || null;
-
-  const [now, setNow] = useState(Date.now());
   const { toggle } = useDarkMode();
-
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
-
-  const timeLeft = useMemo(() => {
-    if (!nextCryptoUpdate) return null;
-    const ms = Math.max(0, nextCryptoUpdate - now);
-    const m = Math.floor(ms / 60000);
-    const s = Math.floor((ms % 60000) / 1000);
-    return { m, s };
-  }, [nextCryptoUpdate, now]);
-
-  const nextKick = useMemo(() => {
-    if (!nextKickoffTs) return '—';
-    const dt = new Date(nextKickoffTs);
-    // Prikaži lokalno vreme (Srbija će ionako biti lokalna u browseru)
-    const hh = String(dt.getHours()).padStart(2,'0');
-    const mm = String(dt.getMinutes()).padStart(2,'0');
-    return `${hh}:${mm}`;
-  }, [nextKickoffTs]);
-
+  // Minimalna varijanta (bez context-a) – info pil ostaje, bez tajmera
   return (
     <div className="flex items-start justify-between gap-4">
       <h1 className="text-3xl md:text-4xl font-extrabold text-white">
@@ -67,21 +38,25 @@ function HeaderBar() {
 
       <div className="flex flex-col items-end gap-2">
         <div className="flex items-center gap-3">
-          <button onClick={refreshAll} className="px-4 py-2 rounded-xl bg-[#202542] text-white font-semibold" type="button">
+          <button
+            onClick={() => { if (typeof window !== 'undefined') window.location.reload(); }}
+            className="px-4 py-2 rounded-xl bg-[#202542] text-white font-semibold"
+            type="button"
+          >
             Refresh all
           </button>
-          <button onClick={toggle} className="px-4 py-2 rounded-xl bg-[#202542] text-white font-semibold" type="button">
+          <button
+            onClick={toggle}
+            className="px-4 py-2 rounded-xl bg-[#202542] text-white font-semibold"
+            type="button"
+          >
             Light mode
           </button>
         </div>
 
         <div className="px-4 py-2 rounded-full bg-[#202542] text-white text-sm inline-flex items-center gap-6">
-          <span>
-            {timeLeft
-              ? `Crypto next refresh: ${timeLeft.m}m ${String(timeLeft.s).padStart(2,'0')}s`
-              : 'Crypto next refresh: —'}
-          </span>
-          <span>Next kickoff: {nextKick}</span>
+          <span>Crypto next refresh: —</span>
+          <span>Football last generated: —</span>
         </div>
       </div>
     </div>
