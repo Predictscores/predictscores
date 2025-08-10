@@ -1,121 +1,169 @@
-// FILE: pages/api/value-bets.js
+// pages/api/value-bets.js
+// Jednostavan, štedljiv endpoint sa keširanjem i "pauza" prekidačem.
+// Koristi API-FOOTBALL (v3) samo 1 poziv po danu, pravi max 10 pickova.
+// Env promenljive:
+//  API_FOOTBALL_KEY
+//  FOOTBALL_PAUSE=0|1
+//  FOOTBALL_TTL_SECONDS=900
+//  MAX_APIFOOTBALL_CALLS=200
 export const config = { api: { bodyParser: false } };
 
-const API_BASE = 'https://v3.football.api-sports.io';
-const API_KEY = process.env.API_FOOTBALL_KEY || '';
-const TZ = 'Europe/Belgrade';
+const API_BASE = "https://v3.football.api-sports.io";
+const API_KEY = process.env.API_FOOTBALL_KEY || "";
 
-function yn(x) { return Number.isFinite(+x) ? +x : 0; }
-function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
-function bucket(p) { if (p >= 0.9) return 'TOP'; if (p >= 0.75) return 'High'; if (p >= 0.5) return 'Moderate'; return 'Low'; }
+const FOOTBALL_PAUSE = process.env.FOOTBALL_PAUSE === "1";
+const FOOTBALL_TTL_SECONDS = Number(process.env.FOOTBALL_TTL_SECONDS || "900");
 
-function safeISO(dt) {
-  try { return new Date(dt).toISOString(); } catch { return null; }
+let _cache = {
+  dayKey: null,
+  payload: null,
+  ts: 0,
+};
+
+let _budget = {
+  dayKey: null,
+  used: 0,
+  max: Number(process.env.MAX_APIFOOTBALL_CALLS || "200"),
+};
+
+function todayUTC() {
+  const d = new Date();
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
 }
 
-function baseModel(f) {
-  // vrlo lagan model da se UI ne isprazni: koristi league rank (ako postoji) + home adv
-  const home = 0.45, draw = 0.25, away = 0.30;
-  let pick = '1', p = home;
-  if (away > home && away > draw) { pick = '2'; p = away; }
-  else if (draw > home && draw > away) { pick = 'X'; p = draw; }
-  return { pick, prob: p };
+function toISOZ(s) {
+  if (!s) return null;
+  const x = String(s);
+  if (x.endsWith("Z")) return x;
+  if (x.includes("T")) return x + "Z";
+  return x.replace(" ", "T") + "Z";
 }
 
-async function apiGet(path, params = {}) {
-  const qs = new URLSearchParams(params).toString();
-  const url = `${API_BASE}${path}${qs ? `?${qs}` : ''}`;
-  const res = await fetch(url, {
-    headers: { 'x-apisports-key': API_KEY },
-  });
-  const text = await res.text();
-  let json = null;
-  try { json = JSON.parse(text); } catch { /* ignore */ }
-  return { ok: res.ok, status: res.status, json, raw: text };
+function basicModelPick(fix) {
+  // Jeftin model: home bias + "U19" slabije poverenje
+  let pHome = 0.56;
+  let pDraw = 0.22;
+  let pAway = 0.22;
+
+  const ln = String(fix?.league?.name || "").toLowerCase();
+  if (ln.includes("u19") || ln.includes("youth")) {
+    pHome -= 0.06;
+    pDraw += 0.03;
+    pAway += 0.03;
+  }
+
+  let pick = "1";
+  let prob = pHome;
+  if (pDraw > prob) {
+    pick = "X";
+    prob = pDraw;
+  }
+  if (pAway > prob) {
+    pick = "2";
+    prob = pAway;
+  }
+  const bucket = prob >= 0.9 ? "TOP" : prob >= 0.75 ? "High" : prob >= 0.5 ? "Moderate" : "Low";
+  const score = Math.round(prob * 100 * 1.25); // rangiranje
+
+  return { pick, prob, bucket, score };
+}
+
+async function afetch(path) {
+  const dayKey = todayUTC();
+  if (_budget.dayKey !== dayKey) _budget = { dayKey, used: 0, max: _budget.max };
+  if (_budget.used >= _budget.max) {
+    return { ok: false, status: 429, json: null, reason: "budget-exhausted" };
+  }
+  const headers = { "x-apisports-key": API_KEY };
+  const res = await fetch(`${API_BASE}${path}`, { headers });
+  _budget.used += 1;
+  try {
+    const json = await res.json();
+    return { ok: res.ok, status: res.status, json };
+  } catch {
+    return { ok: false, status: res.status, json: null };
+  }
 }
 
 export default async function handler(req, res) {
-  const debug = req.url.includes('debug=1');
-  const now = new Date();
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, '0');
-  const d = String(now.getDate()).padStart(2, '0');
-  const today = `${y}-${m}-${d}`;
-
-  const debugLog = { date: today, attempts: [] };
-
-  let fixtures = [];
-  // Primarni pokušaj: svi mečevi sa današnjim datumom (API-Football)
-  const r1 = await apiGet('/fixtures', { date: today, timezone: TZ });
-  debugLog.attempts.push({ step: 'fixtures?date', status: r1.status, ok: r1.ok, count: r1.json?.response?.length ?? 0 });
-
-  if (r1.ok && Array.isArray(r1.json?.response)) {
-    fixtures = r1.json.response;
-  }
-
-  // Ako i dalje prazno, probaj from-to raspon unutar dana
-  if (!fixtures.length) {
-    const from = `${today}`;
-    const to = `${today}`;
-    const r2 = await apiGet('/fixtures', { from, to, timezone: TZ });
-    debugLog.attempts.push({ step: 'fixtures?from-to', status: r2.status, ok: r2.ok, count: r2.json?.response?.length ?? 0 });
-    if (r2.ok && Array.isArray(r2.json?.response)) fixtures = r2.json.response;
-  }
-
-  // Ako baš ništa — isporuči prazan set, ali sa debugom
-  if (!fixtures.length) {
-    if (debug) {
-      return res.status(200).json({ value_bets: [], generated_at: new Date().toISOString(), debug: debugLog });
+  try {
+    if (FOOTBALL_PAUSE) {
+      return res.status(200).json({
+        value_bets: [],
+        generated_at: new Date().toISOString(),
+        note: "paused",
+      });
     }
-    return res.status(200).json({ value_bets: [], generated_at: new Date().toISOString() });
-  }
 
-  // Pretvori u naš format
-  const picks = fixtures.map(f => {
-    const homeName = f?.teams?.home?.name || 'Home';
-    const awayName = f?.teams?.away?.name || 'Away';
-    const leagueName = f?.league?.name || 'League';
-    const fixtureTime = f?.fixture?.date || null;
+    const dayKey = todayUTC();
+    const now = Date.now();
 
-    const mdl = baseModel(f);
-    const confPct = Math.round(clamp(mdl.prob, 0, 1) * 100);
+    // TTL keš
+    if (_cache.dayKey === dayKey && _cache.payload && now - _cache.ts < FOOTBALL_TTL_SECONDS * 1000) {
+      res.setHeader("Cache-Control", `s-maxage=${FOOTBALL_TTL_SECONDS}, stale-while-revalidate=${FOOTBALL_TTL_SECONDS}`);
+      return res.status(200).json(_cache.payload);
+    }
 
-    return {
-      fixture_id: f?.fixture?.id ?? null,
-      market: '1X2',
-      selection: mdl.pick,
-      type: 'FALLBACK',            // dok ne spojimo market odds
-      model_prob: mdl.prob,
-      market_odds: null,
-      edge: null,
-      datetime_local: {
-        starting_at: {
-          date_time: fixtureTime, // ISO (provider vraća ISO)
-        }
-      },
-      teams: {
-        home: { id: f?.teams?.home?.id ?? null, name: homeName },
-        away: { id: f?.teams?.away?.id ?? null, name: awayName },
-      },
-      league: {
-        id: f?.league?.id ?? null,
-        name: leagueName,
-      },
-      confidence_pct: confPct,
-      confidence_bucket: bucket(mdl.prob),
-      _score: confPct, // najjednostavnije rangiranje
-    };
-  });
+    if (!API_KEY) {
+      const empty = { value_bets: [], generated_at: new Date().toISOString(), note: "no api key" };
+      _cache = { dayKey, payload: empty, ts: now };
+      res.setHeader("Cache-Control", `s-maxage=${FOOTBALL_TTL_SECONDS}`);
+      return res.status(200).json(empty);
+    }
 
-  // Rangiraj i skrati (top 10)
-  const out = picks.sort((a, b) => (b?._score ?? 0) - (a?._score ?? 0)).slice(0, 10);
+    // 1 poziv: današnji mečevi
+    const resp = await afetch(`/fixtures?date=${encodeURIComponent(dayKey)}`);
+    const arr = Array.isArray(resp?.json?.response) ? resp.json.response : [];
 
-  if (debug) {
-    return res.status(200).json({
-      value_bets: out,
-      generated_at: new Date().toISOString(),
-      debug: debugLog
+    const mapped = arr.map((f) => {
+      const model = basicModelPick(f);
+      return {
+        fixture_id: f?.fixture?.id ?? null,
+        market: "1X2",
+        selection: model.pick,
+        type: "FALLBACK",
+        model_prob: model.prob,
+        market_odds: null,
+        edge: null,
+
+        datetime_local: {
+          starting_at: {
+            date_time: toISOZ(f?.fixture?.date) || null,
+          },
+        },
+
+        teams: {
+          home: { id: f?.teams?.home?.id ?? null, name: f?.teams?.home?.name ?? null },
+          away: { id: f?.teams?.away?.id ?? null, name: f?.teams?.away?.name ?? null },
+        },
+
+        league: {
+          id: f?.league?.id ?? null,
+          name: f?.league?.name ?? null,
+          country: f?.league?.country ?? null,
+          season: f?.league?.season ?? null,
+        },
+
+        confidence_pct: Math.round(model.prob * 100),
+        confidence_bucket: model.bucket,
+        _score: model.score,
+      };
     });
+
+    // sortiraj po našem _score
+    mapped.sort((a, b) => (b?._score ?? 0) - (a?._score ?? 0));
+
+    const top = mapped.slice(0, 10);
+    const payload = { value_bets: top, generated_at: new Date().toISOString() };
+
+    _cache = { dayKey, payload, ts: now };
+    res.setHeader("Cache-Control", `s-maxage=${FOOTBALL_TTL_SECONDS}, stale-while-revalidate=${FOOTBALL_TTL_SECONDS}`);
+    return res.status(200).json(payload);
+  } catch (e) {
+    const fallback = { value_bets: [], generated_at: new Date().toISOString(), error: String(e?.message || e) };
+    return res.status(200).json(fallback);
   }
-  return res.status(200).json({ value_bets: out, generated_at: new Date().toISOString() });
 }
