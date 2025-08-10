@@ -1,4 +1,3 @@
-// FILE: components/CryptoTopSignals.jsx
 import React from 'react';
 import useCryptoSignals from '../hooks/useCryptoSignals';
 import SignalCard from './SignalCard';
@@ -17,13 +16,13 @@ const STABLES = new Set([
 ]);
 
 export default function CryptoTopSignals({ limit = 10 }) {
-  const { crypto = [], loading, error } = useCryptoSignals();
+  // ⬇⬇⬇ KOREKCIJA: hook vraća { data, loading }, ne { crypto, ... }
+  const { data = [], loading } = useCryptoSignals(limit);
 
   if (loading) return <div>Loading crypto signals...</div>;
-  if (error) return <div>Error loading crypto signals</div>;
 
   // 1) cap-uj confidence (samo za prikaz/sort)
-  const withConf = crypto.map((s) => ({
+  const withConf = data.map((s) => ({
     ...s,
     confidence: normalizeConfidence(s.confidence),
   }));
@@ -57,7 +56,6 @@ export default function CryptoTopSignals({ limit = 10 }) {
 
   const top = filtered.slice(0, limit);
 
-  // VIZUELNO: vratili smo na “stari” izgled — jedna široka kartica po redu
   return (
     <div className="space-y-4">
       {top.map((signal) => (
