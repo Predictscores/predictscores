@@ -1,152 +1,254 @@
-// FILE: contexts/DataContext.js
-import { createContext, useState, useEffect, useCallback, useMemo } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 
-export const DataContext = createContext();
+const DataContext = createContext(null);
+export const useData = () => useContext(DataContext);
 
-function percentileRank(arr, v) {
-  if (!Array.isArray(arr) || arr.length === 0) return 50;
-  let c = 0;
-  for (let i = 0; i < arr.length; i++) if (arr[i] <= v) c++;
-  return (c / arr.length) * 100;
+// helpers
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const toNum = (x, d = 0) => {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : d;
+};
+const pct = (x) => clamp(Math.round(x * 100), 0, 100);
+const fmtRel = (ms) => {
+  if (!Number.isFinite(ms)) return "—";
+  if (ms <= 0) return "now";
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  if (h > 0) return `${h}h ${m % 60}m`;
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+};
+const toUTCDate = (s) => {
+  if (!s) return null;
+  // accepts "YYYY-MM-DD hh:mm:ss" or ISO
+  const iso = s.includes("T") ? s : s.replace(" ", "T");
+  const d = new Date(iso.endsWith("Z") ? iso : iso + "Z");
+  return isNaN(d) ? null : d;
+};
+
+function confidenceBucket(p) {
+  if (p >= 90) return "Top";
+  if (p >= 75) return "High";
+  if (p >= 50) return "Moderate";
+  return "Low";
 }
-function clamp01(x) {
-  if (Number.isNaN(x)) return 0;
-  return Math.max(0, Math.min(1, x));
-}
-function computeRR(item) {
-  const e = Number(item.entryPrice ?? 0);
-  const tp = Number(item.tp ?? 0);
-  const sl = Number(item.sl ?? 0);
-  const eps = 1e-9;
-  if (item.signal === 'SHORT') {
-    const risk = Math.max(sl - e, eps);
-    const reward = Math.max(e - tp, 0);
-    return reward / risk;
-  }
-  const risk = Math.max(e - sl, eps);
-  const reward = Math.max(tp - e, 0);
-  return reward / risk;
-}
-function scoreAndTier(items) {
-  const feats = items.map((s) => {
-    const sign = s.signal === 'SHORT' ? -1 : 1;
-    const m1 = sign * Number(s.change1h ?? 0);
-    const m24 = sign * Number(s.change24h ?? 0);
-    const em = Math.abs(Number(s.expectedMove ?? 0));
-    const rr = computeRR(s);
-    return { m1, m24, em, rr };
-  });
 
-  const a1 = feats.map((f) => f.m1);
-  const a24 = feats.map((f) => f.m24);
-  const aem = feats.map((f) => f.em);
-  const arr = feats.map((f) => f.rr);
-
-  return items.map((s, idx) => {
-    const f = feats[idx];
-    const p1 = percentileRank(a1, f.m1);
-    const p24 = percentileRank(a24, f.m24);
-    const pem = percentileRank(aem, f.em);
-    const prr = percentileRank(arr, f.rr);
-
-    // ponderisano: 0–100
-    let score = 0.35 * p24 + 0.25 * p1 + 0.25 * pem + 0.15 * prr;
-    score = Math.max(0, Math.min(100, score));
-
-    let tier = 'low';
-    if (score >= 90) tier = 'top';
-    else if (score >= 75) tier = 'high';
-    else if (score >= 50) tier = 'moderate';
-
-    return {
-      ...s,
-      confidence: score, // koristimo score kao confidence 0–100
-      score,
-      tier,
-    };
-  });
+// crude country -> emoji (koristi ako league.country postoji)
+const flag = (countryName) => {
+  if (!countryName) return "";
+  const map = {
+    Japan: "🇯🇵",
+    Germany: "🇩🇪",
+    "South Korea": "🇰🇷",
+    USA: "🇺🇸",
+    England: "🏴",
+    Scotland: "🏴",
+    Spain: "🇪🇸",
+    Italy: "🇮🇹",
+    France: "🇫🇷",
+    Norway: "🇳🇴",
+    Sweden: "🇸🇪",
+    Denmark: "🇩🇰",
+    "Faroe-Islands": "🇫🇴",
+    Iceland: "🇮🇸",
+    Poland: "🇵🇱",
+    Hungary: "🇭🇺",
+    Estonia: "🇪🇪",
+  };
+  return map[countryName] || "";
 }
 
 export function DataProvider({ children }) {
-  const [rawLong, setRawLong] = useState([]);
-  const [rawShort, setRawShort] = useState([]);
-  const [loadingCrypto, setLoadingCrypto] = useState(false);
-  const [cryptoError, setCryptoError] = useState(null);
-  const [nextCryptoUpdate, setNextCryptoUpdate] = useState(null);
+  const [crypto, setCrypto] = useState([]);
+  const [football, setFootball] = useState([]);
+  const [loading, setLoading] = useState({ crypto: false, football: false });
+  const [errors, setErrors] = useState({ crypto: null, football: null });
 
-  const fetchCrypto = useCallback(async () => {
-    setLoadingCrypto(true);
-    setCryptoError(null);
+  // header timers
+  const [cryptoNextRefreshAt, setCryptoNextRefreshAt] = useState(null);
+  const [footballLastGeneratedAt, setFootballLastGeneratedAt] = useState(null);
+  const [footballNextKickoffAt, setFootballNextKickoffAt] = useState(null);
+  const tick = useRef(0);
+
+  // ====== FETCH CRYPTO ======
+  async function fetchCrypto() {
     try {
-      const res = await fetch('/api/crypto', { headers: { accept: 'application/json' } });
-      const ct = res.headers.get('content-type') || '';
-      if (!res.ok || !ct.includes('application/json')) {
-        throw new Error('Crypto API bad response');
-      }
-      const json = await res.json();
+      setLoading((s) => ({ ...s, crypto: true }));
+      setErrors((e) => ({ ...e, crypto: null }));
+      const r = await fetch("/api/crypto", { cache: "no-store" });
+      const j = await r.json();
 
-      // podrži više formata: {long,short} ili {signals} ili {crypto}
-      let L = [];
-      let S = [];
-      if (Array.isArray(json.long) || Array.isArray(json.short)) {
-        L = Array.isArray(json.long) ? json.long : [];
-        S = Array.isArray(json.short) ? json.short : [];
-      } else if (Array.isArray(json.signals)) {
-        L = json.signals.filter((x) => x.signal === 'LONG');
-        S = json.signals.filter((x) => x.signal === 'SHORT');
-      } else if (Array.isArray(json.crypto)) {
-        const both = json.crypto;
-        L = both.filter((x) => x.signal === 'LONG');
-        S = both.filter((x) => x.signal === 'SHORT');
-        // ako nema SHORT-ova, ostaje samo LONG – to je ok
-      }
+      const list = Array.isArray(j?.crypto) ? j.crypto : [];
 
-      setRawLong(L);
-      setRawShort(S);
-      setNextCryptoUpdate(Date.now() + 10 * 60 * 1000);
+      // API ti trenutno vraća "confidence" kao mali broj (deluje kao % promene, npr 6.25),
+      // pa ovde gradimo normalizovan confidencePct koji UI očekuje (0–100),
+      // i uklanjamo bilo kakav “gate” – uvek vraćamo top N.
+      const mapped = list.map((x) => {
+        const em = toNum(x.expectedMove, 0); // ~1–3%
+        const rawC = toNum(x.confidence, 0);
+        // heuristika: ako je već 0–100 koristi ga, ako je 0–1 pomnoži sa 100,
+        // inače iz expectedMove napravimo “signal” oko 50–90
+        let confidencePct =
+          rawC <= 1 ? Math.round(rawC * 100)
+          : rawC <= 100 ? Math.round(rawC)
+          : Math.round(50 + em * 20);
+
+        confidencePct = clamp(confidencePct, 1, 99);
+
+        return {
+          symbol: x.symbol,
+          price: toNum(x.price, 0),
+          entryPrice: toNum(x.entryPrice, x.price),
+          sl: toNum(x.sl, null),
+          tp: toNum(x.tp, null),
+          expectedMove: em,
+          change1h: toNum(x.change1h, 0),
+          change24h: toNum(x.change24h, 0),
+          signal: x.signal || "LONG",
+          confidencePct,
+          confidenceBucket: confidenceBucket(confidencePct),
+        };
+      });
+
+      // sortiraj po “snazi”: očekivani pomeraj i zatim confidence
+      mapped.sort((a, b) => (b.expectedMove - a.expectedMove) || (b.confidencePct - a.confidencePct));
+
+      setCrypto(mapped);
+      // kripto se osvežava svakih ~10min (po tvom headeru) – postavi “sledeće”
+      setCryptoNextRefreshAt(Date.now() + 10 * 60 * 1000);
     } catch (e) {
-      console.error('fetchCrypto error', e);
-      setRawLong([]);
-      setRawShort([]);
-      setCryptoError(e.message || 'Error');
+      setErrors((er) => ({ ...er, crypto: e?.message || String(e) }));
     } finally {
-      setLoadingCrypto(false);
+      setLoading((s) => ({ ...s, crypto: false }));
     }
-  }, []);
+  }
 
+  // ====== FETCH FOOTBALL ======
+  async function fetchFootball() {
+    try {
+      setLoading((s) => ({ ...s, football: true }));
+      setErrors((e) => ({ ...e, football: null }));
+
+      const r = await fetch("/api/value-bets", { cache: "no-store" });
+      const j = await r.json();
+      const vb = Array.isArray(j?.value_bets) ? j.value_bets : [];
+
+      const mapped = vb.map((p) => {
+        const confPct = toNum(p.confidence_pct, NaN);
+        const modelPct = pct(toNum(p.model_prob, 0));
+        const confidencePct = Number.isNaN(confPct) ? modelPct : clamp(Math.round(confPct), 0, 100);
+
+        const startStr = p?.datetime_local?.starting_at?.date_time || p?.datetime_local?.date_time || null;
+        const startUtc = toUTCDate(startStr);
+        return {
+          id: p.fixture_id,
+          market: p.market || "1X2",
+          selection: String(p.selection || "").toUpperCase(), // '1','X','2',...
+          type: p.type || "MODEL",
+          modelPct,
+          confidencePct,
+          confidenceBucket: confidenceBucket(confidencePct),
+          marketOdds: toNum(p.market_odds, null),
+          league: {
+            id: p?.league?.id ?? null,
+            name: p?.league?.name ?? "",
+            country: p?.league?.country ?? null,
+          },
+          teams: {
+            home: { name: p?.teams?.home?.name || "" },
+            away: { name: p?.teams?.away?.name || "" },
+          },
+          startUtc,
+          startIso: startStr || "",
+          _score: toNum(p?._score, confidencePct), // zadrži tvoj skor za sortiranje
+          // (opciono) malo meta što ti treba u kartici
+          _flag: flag(p?.league?.country),
+        };
+      });
+
+      // UVEK popuni: sort po _score i uzmi sve (UI će iseći na top 3 za Combined)
+      mapped.sort((a, b) => b._score - a._score);
+      setFootball(mapped);
+
+      setFootballLastGeneratedAt(Date.now());
+
+      // nađi sledeći kikof
+      const now = Date.now();
+      const next = mapped
+        .map((x) => x.startUtc?.getTime())
+        .filter((t) => Number.isFinite(t) && t > now)
+        .sort((a, b) => a - b)[0];
+
+      setFootballNextKickoffAt(next || null);
+    } catch (e) {
+      setErrors((er) => ({ ...er, football: e?.message || String(e) }));
+      setFootball([]);
+    } finally {
+      setLoading((s) => ({ ...s, football: false }));
+    }
+  }
+
+  // initial + intervals
   useEffect(() => {
     fetchCrypto();
-    const iv = setInterval(fetchCrypto, 10 * 60 * 1000);
-    return () => clearInterval(iv);
-  }, [fetchCrypto]);
+    fetchFootball();
 
-  // SPOJENO + SCORE + SORT — bez deljenja na LONG/SHORT
-  const crypto = useMemo(() => {
-    const L = (rawLong || []).map((x) => ({ ...x, side: 'LONG' }));
-    const S = (rawShort || []).map((x) => ({ ...x, side: 'SHORT' }));
-    const all = [...L, ...S];
-    if (all.length === 0) return [];
+    const t = setInterval(() => {
+      tick.current = Date.now();
+    }, 1000);
+    const cryptoInt = setInterval(fetchCrypto, 10 * 60 * 1000); // 10m
+    const footInt = setInterval(fetchFootball, 15 * 60 * 1000); // 15m (sada kad imaš 7500/day možemo češće)
 
-    const withScores = scoreAndTier(all);
-    withScores.sort((a, b) => (b.score || 0) - (a.score || 0));
-    return withScores;
-  }, [rawLong, rawShort]);
+    return () => {
+      clearInterval(t);
+      clearInterval(cryptoInt);
+      clearInterval(footInt);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  const refreshCrypto = useCallback(() => fetchCrypto(), [fetchCrypto]);
-  const refreshAll = useCallback(() => { fetchCrypto(); }, [fetchCrypto]);
+  // header labeli
+  const cryptoNextRefreshLabel = useMemo(() => {
+    if (!cryptoNextRefreshAt) return "—";
+    return fmtRel(cryptoNextRefreshAt - Date.now());
+  }, [tick.current, cryptoNextRefreshAt]);
 
-  return (
-    <DataContext.Provider
-      value={{
-        crypto,            // već SORITIRANO po score DESC
-        loadingCrypto,
-        cryptoError,
-        nextCryptoUpdate,
-        refreshCrypto,
-        refreshAll,
-      }}
-    >
-      {children}
-    </DataContext.Provider>
-  );
+  const footballLastGeneratedLabel = useMemo(() => {
+    if (!footballLastGeneratedAt) return "—";
+    const delta = Date.now() - footballLastGeneratedAt;
+    const m = Math.floor(delta / 60000);
+    return m <= 0 ? "just now" : `${m}m ago`;
+  }, [tick.current, footballLastGeneratedAt]);
+
+  const footballNextKickoffLabel = useMemo(() => {
+    if (!footballNextKickoffAt) return "—";
+    return fmtRel(footballNextKickoffAt - Date.now());
+  }, [tick.current, footballNextKickoffAt]);
+
+  // top liste za Combined
+  const top3Football = useMemo(() => football.slice(0, 3), [football]);
+  const topCrypto = useMemo(() => crypto.slice(0, 10), [crypto]);
+
+  const value = {
+    // data
+    crypto,
+    football,
+    top3Football,
+    topCrypto,
+    // states
+    loading,
+    errors,
+    // timers/labels for header
+    cryptoNextRefreshLabel,
+    footballLastGeneratedLabel, // ostavljeno zbog postojećeg UI-a
+    footballNextKickoffLabel,   // koristi gde želiš countdown
+    // actions
+    refreshAll: async () => {
+      await Promise.all([fetchCrypto(), fetchFootball()]);
+    },
+  };
+
+  return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
 }
