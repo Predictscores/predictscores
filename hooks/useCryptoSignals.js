@@ -1,4 +1,3 @@
-// FILE: hooks/useCryptoSignals.js
 import { useContext, useMemo } from 'react';
 import { DataContext } from '../contexts/DataContext';
 
@@ -12,6 +11,6 @@ export default function useCryptoSignals(limit = 10) {
   return {
     loading: !!ctx.loadingCrypto,
     nextRefreshAt: ctx.cryptoNextRefreshAt || null,
-    data: top,
+    data: top, // 👈 ovo komponente treba da koriste
   };
 }
