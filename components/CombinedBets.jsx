@@ -6,21 +6,25 @@ import CryptoTopSignals from "./CryptoTopSignals";
 const CombinedBets = () => (
   <Tabs>
     <div label="Combined">
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {/* Levo: top 3 football */}
-        <FootballBets limit={3} />
-        {/* Desno: top 3 crypto */}
-        <CryptoTopSignals limit={3} />
+      {/* 33% / 66% raspored */}
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_2fr] gap-4 items-stretch">
+        {/* Leva kolona – fudbal (top 3) */}
+        <div className="flex flex-col gap-4">
+          <FootballBets limit={3} tall />
+        </div>
+        {/* Desna kolona – kripto (top 3) */}
+        <div className="flex flex-col gap-4">
+          <CryptoTopSignals limit={3} />
+        </div>
       </div>
     </div>
 
     <div label="Football">
-      {/* Top 10 football (ili koliko god vrati – bez ograničenja ovde) */}
-      <FootballBets />
+      {/* Ovde puni spisak, bez limit-a */}
+      <FootballBets tall />
     </div>
 
     <div label="Crypto">
-      {/* Top 10 crypto */}
       <CryptoTopSignals limit={10} />
     </div>
   </Tabs>
