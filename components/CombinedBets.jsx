@@ -1,38 +1,33 @@
 // FILE: components/CombinedBets.jsx
-import React, { useMemo } from 'react';
+import React from 'react';
 import Tabs from './Tabs';
 import FootballBets from './FootballBets';
 import CryptoTopSignals from './CryptoTopSignals';
 
 export default function CombinedBets() {
-  const today = useMemo(() => {
-    const d = new Date();
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    return `${y}-${m}-${day}`;
-  }, []);
-
   return (
     <Tabs>
+      {/* COMBINED: 1/3 football (top 3) + 2/3 crypto (top 3) */}
       <div label="Combined">
-        {/* 1/3 : 2/3 raspored i na desktopu */}
-        <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
-          <div className="md:col-span-4">
-            {/* Top 3 football, kompaktan tamni stil */}
-            <FootballBets date={today} limit={3} compact />
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          {/* Leva kolona (1/3): tri fudbalske kartice, jedna ispod druge */}
+          <div className="lg:col-span-1 space-y-4">
+            <FootballBets limit={3} />
           </div>
-          <div className="md:col-span-8">
-            {/* Top 3 crypto (već sortirano po score DESC) */}
+
+          {/* Desna kolona (2/3): tri kripto kartice u gridu */}
+          <div className="lg:col-span-2">
             <CryptoTopSignals limit={3} />
           </div>
         </div>
       </div>
 
+      {/* FOOTBALL tab: prikaži sve (ili top 10, po tvom izboru) */}
       <div label="Football">
-        <FootballBets date={today} />
+        <FootballBets limit={10} />
       </div>
 
+      {/* CRYPTO tab: po želji top 10 */}
       <div label="Crypto">
         <CryptoTopSignals limit={10} />
       </div>
