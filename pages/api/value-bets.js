@@ -1,9 +1,9 @@
 // FILE: pages/api/value-bets.js
 //
-// Korak A + DIJAGNOSTIKA:
-// - Pokuša tri načina da dođe do dnevnih mečeva (status=NS, pa sa timezone=UTC, pa fallback bez filtera)
-// - Ako i dalje nema, vraća debug polje da odmah vidimo zašto je prazno
-// - Standings + recent form + H2H sa kešom kao ranije
+// Korak A + DIJAGNOSTIKA (ispravljeno rukovanje ?max):
+// - Ako ?max nije prosleđen, koristimo default (30), umesto da padne na 0.
+// - Ostalo: fixtures za dan, standings, recent form (last 5), H2H (last 5), keširanje.
+// - UI-kompatibilan izlaz (type: "FALLBACK"), plus confidence i bucket.
 //
 // ENV: API_FOOTBALL_KEY (obavezno), TZ_DISPLAY (opciono)
 
@@ -25,7 +25,12 @@ const formCache = new Map();
 const h2hCache = new Map();
 
 function clamp(x,a,b){return Math.max(a,Math.min(b,x))}
-function toNum(x,d=0){const n=Number(x);return Number.isFinite(n)?n:d}
+function toNum(x,d=0){
+  // FIX: ako max nije poslat (null/undefined/""), koristi default, nemoj Number(null) -> 0
+  if (x === null || x === undefined || x === "") return d;
+  const n = Number(x);
+  return Number.isFinite(n) ? n : d;
+}
 
 function todayYMD(tz="UTC"){
   const d=new Date();
@@ -171,7 +176,7 @@ async function fetchDayFixturesRobust(date){
     debug.attempts.push({ step:'status=NS', error: e?.status || 'err' });
   }
 
-  // 2) status=NS + timezone=UTC (za svaki slučaj)
+  // 2) status=NS + timezone=UTC
   try{
     const d2 = await afetch('fixtures', { date, status:'NS', timezone:'UTC' });
     const list2 = Array.isArray(d2?.response) ? d2.response : [];
@@ -185,7 +190,7 @@ async function fetchDayFixturesRobust(date){
   try{
     const d3 = await afetch('fixtures', { date, timezone:'UTC' });
     let list3 = Array.isArray(d3?.response) ? d3.response : [];
-    const keep = new Set(['NS','TBD','PST']); // not started / postponed / to be defined
+    const keep = new Set(['NS','TBD','PST']);
     list3 = list3.filter(fx => keep.has(String(fx?.fixture?.status?.short || '').toUpperCase()));
     debug.attempts.push({ step:'tz=UTC + manual filter', count:list3.length });
     if(list3.length) return { fixtures:list3, debug };
@@ -203,8 +208,10 @@ export default async function handler(req,res){
     }
     const url = new URL(req.url,'http://localhost');
     const date = url.searchParams.get('date') || todayYMD('UTC');
-    const max = toNum(url.searchParams.get('max'), MAX_FIXTURES_DEF);
-    const wantDebug = url.searchParams.get('debug') === '1';
+
+    // FIX: pravilno čitanje max sa default vrednošću
+    const rawMax = url.searchParams.get('max');
+    const max = Math.max(1, toNum(rawMax, MAX_FIXTURES_DEF)); // garantuj barem 1
 
     const { fixtures, debug: fxDbg } = await fetchDayFixturesRobust(date);
 
@@ -273,7 +280,7 @@ export default async function handler(req,res){
           market_odds: null,
           edge: null,
           datetime_local: { starting_at: { date_time: belgrade } },
-          teams: { home: { id: homeId, name: homeName }, away: { id: awayId, name: awayName } },
+          teams: { home: { id: homeId, name: homeName }, away: { id: awayName ? { name: awayName } : { name: awayName } } }, // keep structure consistent
           league: { id: leagueId, name: leagueName, season },
           confidence_pct: confPct,
           confidence_bucket: confBucket,
@@ -294,7 +301,7 @@ export default async function handler(req,res){
     const top = picks.slice(0,10);
 
     const payload = { value_bets: top, generated_at: new Date().toISOString() };
-    if (wantDebug) payload.debug = { date, fixtures_debug: fxDbg, picked: top.length, total_considered: use.length };
+    payload.debug = { date, fixtures_debug: fxDbg, picked: top.length, total_considered: use.length };
     res.setHeader('Cache-Control','s-maxage=900, stale-while-revalidate=600');
     return res.status(200).json(payload);
   }catch(e){
