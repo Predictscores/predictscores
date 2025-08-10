@@ -1,182 +1,155 @@
-// contexts/DataContext.js
-import React, {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+// FILE: contexts/DataContext.js
+import React, { createContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-/**
- * Public context shape
- */
-export const DataContext = createContext({
-  // crypto
+const initialState = {
   crypto: [],
-  loadingCrypto: false,
-  nextCryptoUpdate: null,
-
-  // football
   football: [],
+  loadingCrypto: false,
   loadingFootball: false,
-  footballLastGenerated: null,
-  nextKickoffTs: null,
-
-  // actions
+  nextCryptoUpdate: null,     // timestamp (ms)
+  nextKickoffAt: null,        // ISO string
+  footballLastGeneratedAt: null,
+  cryptoLastGeneratedAt: null,
   refreshAll: () => {},
-});
+};
 
-/**
- * Hook za lak pristup kontekstu
- */
-export function useData() {
-  return useContext(DataContext) || {};
+export const DataContext = createContext(initialState);
+
+// --- helpers
+async function fetchJson(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} -> ${res.status}`);
+  return res.json();
 }
 
-/* Helpers */
-function nowTs() {
-  return Date.now();
-}
-function tsFromISO(v) {
+function parseFootballStartISO(item) {
+  // pokušaj nekoliko oblika koje smo viđali
   try {
-    const s = String(v || "");
-    const iso = s.includes("T") ? s : s.replace(" ", "T") + (s.endsWith("Z") ? "" : "Z");
-    const t = new Date(iso).getTime();
-    return Number.isFinite(t) ? t : null;
-  } catch {
-    return null;
-  }
+    const a = item?.datetime_local;
+    if (a?.starting_at?.date_time) {
+      // "2025-08-10 16:00:00" (lokalno) -> tretiramo kao lokalni string bez Z
+      return a.starting_at.date_time.replace(" ", "T");
+    }
+    if (a?.date_time) return a.date_time.replace(" ", "T");
+    const b = item?.time?.starting_at?.date_time;
+    if (b) return b.replace(" ", "T");
+  } catch (_) {}
+  return null;
 }
 
-/**
- * Provider
- */
-export function DataProvider({ children }) {
-  // === CRYPTO ===
-  const [crypto, setCrypto] = useState([]);
-  const [loadingCrypto, setLoadingCrypto] = useState(false);
-  const [nextCryptoUpdate, setNextCryptoUpdate] = useState(null);
-
-  // === FOOTBALL ===
-  const [football, setFootball] = useState([]);
-  const [loadingFootball, setLoadingFootball] = useState(false);
-  const [footballLastGenerated, setFootballLastGenerated] = useState(null);
-  const [nextKickoffTs, setNextKickoffTs] = useState(null);
-
-  // anti-spam cooldown (da ne rušimo deploy budžet)
-  const lastCryptoFetch = useRef(0);
-  const lastFootballFetch = useRef(0);
-
-  // Robustno parsiranje crypto endpointa (podržava i stari i novi oblik)
-  const parseCryptoPayload = (json) => {
-    if (Array.isArray(json?.crypto)) {
-      return json.crypto;
+function computeNextKickoffISO(valueBets = []) {
+  const now = Date.now();
+  let best = null;
+  for (const v of valueBets) {
+    const iso = parseFootballStartISO(v);
+    if (!iso) continue;
+    const t = new Date(iso).getTime();
+    if (Number.isFinite(t) && t - now > 0) {
+      if (!best || t < best) best = t;
     }
-    const long = Array.isArray(json?.long) ? json.long : [];
-    const short = Array.isArray(json?.short) ? json.short : [];
-    const merged = [...long, ...short];
-    // Sortiraj po confidence ako postoji
-    merged.sort((a, b) => (Number(b?.confidence) || 0) - (Number(a?.confidence) || 0));
-    return merged;
-  };
+  }
+  return best ? new Date(best).toISOString() : null;
+}
 
-  const fetchCrypto = useCallback(async (force = false) => {
-    const now = nowTs();
-    if (!force && now - lastCryptoFetch.current < 12_000) return; // 12s guard
-    lastCryptoFetch.current = now;
+function msFromNow(minutes) {
+  return Date.now() + minutes * 60_000;
+}
 
+export function DataProvider({ children }) {
+  const [crypto, setCrypto] = useState([]);
+  const [football, setFootball] = useState([]);
+  const [loadingCrypto, setLoadingCrypto] = useState(false);
+  const [loadingFootball, setLoadingFootball] = useState(false);
+
+  const [nextCryptoUpdate, setNextCryptoUpdate] = useState(null); // ms
+  const [nextKickoffAt, setNextKickoffAt] = useState(null);       // ISO
+  const [footballLastGeneratedAt, setFootballLastGeneratedAt] = useState(null);
+  const [cryptoLastGeneratedAt, setCryptoLastGeneratedAt] = useState(null);
+
+  // anti–spam throttle za "Refresh all"
+  const lastRefreshRef = useRef(0);
+
+  const loadCrypto = useCallback(async () => {
     setLoadingCrypto(true);
     try {
-      const res = await fetch("/api/crypto");
-      const json = await res.json();
-      const list = parseCryptoPayload(json);
-      setCrypto(Array.isArray(list) ? list : []);
-      // Sledeći refresh za ~10 min (frontend countdown)
-      setNextCryptoUpdate(nowTs() + 10 * 60_000);
-    } catch {
-      // leave previous data
+      const data = await fetchJson("/api/crypto");
+      const list = Array.isArray(data?.crypto) ? data.crypto : [];
+      setCrypto(list);
+      setCryptoLastGeneratedAt(new Date().toISOString());
+      // sledeći refresh za ~10 minuta (možeš da promeniš interval)
+      setNextCryptoUpdate(msFromNow(10));
+    } catch (e) {
+      // ne ruši UI
+      console.warn("loadCrypto error:", e?.message || e);
     } finally {
       setLoadingCrypto(false);
     }
   }, []);
 
-  const fetchFootball = useCallback(async (force = false) => {
-    const now = nowTs();
-    if (!force && now - lastFootballFetch.current < 12_000) return; // 12s guard
-    lastFootballFetch.current = now;
-
+  const loadFootball = useCallback(async () => {
     setLoadingFootball(true);
     try {
-      const res = await fetch("/api/value-bets");
-      const json = await res.json();
-      const list = Array.isArray(json?.value_bets) ? json.value_bets : [];
-      setFootball(list);
-      setFootballLastGenerated(json?.generated_at || null);
-
-      // Izračunaj najbliži budući kickoff
-      let minTs = null;
-      for (const it of list) {
-        const dtx =
-          it?.datetime_local?.starting_at?.date_time ||
-          it?.datetime_local?.date_time ||
-          it?.starting_at?.date_time ||
-          null;
-        const ts = tsFromISO(dtx);
-        if (ts && ts > nowTs() && (minTs === null || ts < minTs)) minTs = ts;
-      }
-      setNextKickoffTs(minTs);
-    } catch {
-      // leave previous data
+      const data = await fetchJson("/api/value-bets");
+      const bets = Array.isArray(data?.value_bets) ? data.value_bets : [];
+      setFootball(bets);
+      setFootballLastGeneratedAt(
+        data?.generated_at ? new Date(data.generated_at).toISOString() : new Date().toISOString()
+      );
+      setNextKickoffAt(computeNextKickoffISO(bets));
+    } catch (e) {
+      console.warn("loadFootball error:", e?.message || e);
     } finally {
       setLoadingFootball(false);
     }
   }, []);
 
-  const refreshAll = useCallback(() => {
-    fetchCrypto(true);
-    fetchFootball(true);
-  }, [fetchCrypto, fetchFootball]);
+  const refreshAll = useCallback(async () => {
+    const now = Date.now();
+    if (now - lastRefreshRef.current < 5_000) return; // 5s throttle
+    lastRefreshRef.current = now;
+    await Promise.allSettled([loadCrypto(), loadFootball()]);
+  }, [loadCrypto, loadFootball]);
 
-  // Init + periodično osvežavanje
+  // prvi load na klijentu
   useEffect(() => {
-    // prvi load posle mount-a (SSR safe)
-    fetchCrypto(false);
-    fetchFootball(false);
+    // samo na klijentu (Next SSR zaštita)
+    if (typeof window === "undefined") return;
+    refreshAll();
+  }, [refreshAll]);
 
-    // blago pozadinsko osvežavanje (ne prečesto)
-    const iv = setInterval(() => {
-      fetchCrypto(false);
-      fetchFootball(false);
-    }, 60_000); // svake 1 min
-    return () => clearInterval(iv);
-  }, [fetchCrypto, fetchFootball]);
+  // jeftin "tajmer" da se crypto auto osveži kada istekne nextCryptoUpdate
+  useEffect(() => {
+    if (!nextCryptoUpdate) return;
+    const id = setInterval(() => {
+      const now = Date.now();
+      if (now >= nextCryptoUpdate) {
+        loadCrypto(); // osveži i postavi sledeći
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [nextCryptoUpdate, loadCrypto]);
 
   const value = useMemo(
     () => ({
-      // crypto
       crypto,
-      loadingCrypto,
-      nextCryptoUpdate,
-
-      // football
       football,
+      loadingCrypto,
       loadingFootball,
-      footballLastGenerated,
-      nextKickoffTs,
-
-      // actions
+      nextCryptoUpdate,
+      nextKickoffAt,
+      footballLastGeneratedAt,
+      cryptoLastGeneratedAt,
       refreshAll,
     }),
     [
       crypto,
-      loadingCrypto,
-      nextCryptoUpdate,
       football,
+      loadingCrypto,
       loadingFootball,
-      footballLastGenerated,
-      nextKickoffTs,
+      nextCryptoUpdate,
+      nextKickoffAt,
+      footballLastGeneratedAt,
+      cryptoLastGeneratedAt,
       refreshAll,
     ]
   );
@@ -184,7 +157,11 @@ export function DataProvider({ children }) {
   return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
 }
 
-/**
- * Za kompatibilnost sa import DataProvider default:
- */
+// kompatibilnost: i default i named export-i
 export default DataProvider;
+
+// user friendly hook (zbog starog koda koji ga očekuje)
+export function useData() {
+  const ctx = React.useContext(DataContext);
+  return ctx || initialState;
+}
