@@ -3,70 +3,108 @@ import React, { useEffect, useMemo, useState } from "react";
 
 /**
  * FootballBets
- * - Čita /api/value-bets
- * - Prikazuje Top N (po server-sidu rangirane)
- * - Ima "last generated" tajmer (živ), i kompaktan prikaz za Combined
+ * - čita /api/value-bets
+ * - Combined: header = "Next kickoff in …" (Europe/Belgrade)
+ * - Kartice: 🇩🇪 Liga • 19:00  | velika značka tipa + kvota | mini "Top tips" pilovi | confidence pri dnu
  *
  * Props:
- *  - limit: broj kartica (default 10)
- *  - layout: "combined" | "full"  (combined = tanje kartice + bez velikog naslova)
+ *  - limit: broj prikazanih kartica (default 10)
+ *  - layout: "combined" | "full"
  */
+
 export default function FootballBets({ limit = 10, layout = "full" }) {
   const [bets, setBets] = useState([]);
-  const [generatedAt, setGeneratedAt] = useState(null);
+  const [allTimes, setAllTimes] = useState([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState(null);
   const [now, setNow] = useState(Date.now());
 
-  const fetchBets = async () => {
-    setLoading(true);
-    setErr(null);
+  // --- helpers ---------------------------------------------------------------
+
+  const flagFor = (country) => {
+    if (!country) return "🌍";
+    const c = String(country).toLowerCase();
+    const map = {
+      germany: "🇩🇪",
+      deutschland: "🇩🇪",
+      serbia: "🇷🇸",
+      srbija: "🇷🇸",
+      england: "🇬🇧",
+      "united kingdom": "🇬🇧",
+      spain: "🇪🇸",
+      france: "🇫🇷",
+      italy: "🇮🇹",
+      netherlands: "🇳🇱",
+      belgium: "🇧🇪",
+      portugal: "🇵🇹",
+      denmark: "🇩🇰",
+      sweden: "🇸🇪",
+      norway: "🇳🇴",
+      iceland: "🇮🇸",
+      "faroe-islands": "🇫🇴",
+      "faroe islands": "🇫🇴",
+      poland: "🇵🇱",
+      czechia: "🇨🇿",
+      "czech republic": "🇨🇿",
+      croatia: "🇭🇷",
+      slovenia: "🇸🇮",
+      switzerland: "🇨🇭",
+      austria: "🇦🇹",
+      romania: "🇷🇴",
+      bulgaria: "🇧🇬",
+      greece: "🇬🇷",
+      turkey: "🇹🇷",
+      scotland: "🏴",
+    };
+    return map[c] || "🌍";
+  };
+
+  // zadrži ime lige (bez zemlje)
+  const shortLeague = (/* country, */ _leagueName) => {
+    return _leagueName || "League";
+  };
+
+  const toUTCms = (s) => {
+    if (!s) return null;
+    const iso = s.includes("T") ? s : s.replace(" ", "T");
+    const withZ = iso.endsWith("Z") ? iso : iso + "Z";
+    const t = Date.parse(withZ);
+    return Number.isFinite(t) ? t : null;
+  };
+
+  const fmtKickLocal = (s) => {
+    const t = toUTCms(s);
+    if (!t) return "—";
     try {
-      // uzmi malo veći pool, server će rangirati, a ovde sečemo na limit
-      const res = await fetch(`/api/value-bets?max=60`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json();
-      const all = Array.isArray(json.value_bets) ? json.value_bets : [];
-      setBets(all.slice(0, limit));
-      setGeneratedAt(json.generated_at || null);
-    } catch (e) {
-      console.error("FootballBets fetch error", e);
-      setErr("Failed to load predictions.");
-      setBets([]);
-    } finally {
-      setLoading(false);
+      return new Intl.DateTimeFormat("sr-RS", {
+        timeZone: "Europe/Belgrade",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      }).format(new Date(t));
+    } catch {
+      return "—";
     }
   };
 
-  useEffect(() => {
-    fetchBets();
-    const iv = setInterval(fetchBets, 2 * 60 * 60 * 1000); // refresh na 2h
-    return () => clearInterval(iv);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [limit]);
+  const countdownToNext = useMemo(() => {
+    const future = allTimes
+      .map(toUTCms)
+      .filter((ms) => ms && ms > now)
+      .sort((a, b) => a - b);
+    if (!future.length) return null;
+    const diff = future[0] - now;
+    if (diff <= 0) return "0m 00s";
+    const sec = Math.floor(diff / 1000);
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    if (m >= 60) {
+      const h = Math.floor(m / 60);
+      return `${h}h ${m % 60}m`;
+    }
+    return `${m}m ${String(s).padStart(2, "0")}s`;
+  }, [allTimes, now]);
 
-  // živi "ago" tajmer
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 30 * 1000);
-    return () => clearInterval(t);
-  }, []);
-
-  const lastGeneratedAgo = useMemo(() => {
-    if (!generatedAt) return null;
-    const t = new Date(generatedAt).getTime();
-    if (!Number.isFinite(t)) return null;
-    const diffMs = now - t;
-    if (diffMs < 0) return "just now";
-    const s = Math.floor(diffMs / 1000);
-    if (s < 60) return `${s}s ago`;
-    const m = Math.floor(s / 60);
-    if (m < 60) return `${m}m ago`;
-    const h = Math.floor(m / 60);
-    return `${h}h ${m % 60}m ago`;
-  }, [generatedAt, now]);
-
-  const formatPct = (x) => (x == null ? "—" : `${(x * 100).toFixed(1)}%`);
-  const formatPct0 = (x) => (x == null ? "—" : `${x.toFixed(0)}%`);
   const confColor = (bucket) =>
     bucket === "TOP"
       ? "bg-emerald-500"
@@ -76,51 +114,118 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
       ? "bg-blue-500"
       : "bg-yellow-400";
 
-  const wrapperClasses =
-    layout === "combined"
-      ? "space-y-3"
-      : "space-y-4";
+  // --- “top tips” iz dostupnih verovatnoća -------------------------------
 
-  const titleBlock =
-    layout === "combined" ? null : (
-      <div className="flex items-end justify-between">
-        <h2 className="text-xl font-semibold">Football — All Suggestions</h2>
-        <div className="text-xs text-gray-400">
-          {generatedAt ? (
-            <>
-              <span className="font-medium text-gray-300">Last generated:</span>{" "}
-              {new Date(generatedAt).toLocaleString("en-GB", {
-                hour12: false,
-              })}{" "}
-              <span className="opacity-75">({lastGeneratedAgo})</span>
-            </>
-          ) : (
-            <span>—</span>
-          )}
-        </div>
-      </div>
-    );
+  function buildTopTips(bet) {
+    const tips = [];
+
+    // 1X2 iz model_probs (ako postoji)
+    const mp = bet?.model_probs || bet?.meta?.model_probs || null;
+    if (mp && typeof mp === "object") {
+      const map = [
+        { k: "home", lbl: "1", p: Number(mp.home) || 0 },
+        { k: "draw", lbl: "X", p: Number(mp.draw) || 0 },
+        { k: "away", lbl: "2", p: Number(mp.away) || 0 },
+      ];
+      map.sort((a, b) => b.p - a.p);
+      if (map[0].p > 0.5) {
+        tips.push({ label: map[0].lbl, pct: Math.round(map[0].p * 100) });
+      }
+      // eventualno drugi ako je blizu i > 0.48
+      if (map[1].p > 0.58 && tips.length < 2) {
+        tips.push({ label: map[1].lbl, pct: Math.round(map[1].p * 100) });
+      }
+    }
+
+    // BTTS
+    const btts =
+      bet?.btts_probability ??
+      bet?.meta?.btts_prob ??
+      bet?.meta?.btts_probability ??
+      null;
+    if (typeof btts === "number") {
+      if (btts >= 0.58 && tips.length < 2) {
+        tips.push({ label: "BTTS", pct: Math.round(btts * 100) });
+      } else if (btts <= 0.42 && tips.length < 2) {
+        tips.push({ label: "NO BTTS", pct: Math.round((1 - btts) * 100) });
+      }
+    }
+
+    // Over/Under 2.5
+    const o25 =
+      bet?.over25_probability ??
+      bet?.meta?.over25_prob ??
+      bet?.meta?.over25_probability ??
+      null;
+    if (typeof o25 === "number" && tips.length < 2) {
+      if (o25 >= 0.58) {
+        tips.push({ label: "O2.5", pct: Math.round(o25 * 100) });
+      } else if (o25 <= 0.42) {
+        tips.push({ label: "U2.5", pct: Math.round((1 - o25) * 100) });
+      }
+    }
+
+    return tips.slice(0, 2);
+  }
+
+  // --- data fetch ------------------------------------------------------------
+
+  const fetchBets = async () => {
+    setLoading(true);
+    setErr(null);
+    try {
+      const res = await fetch(`/api/value-bets?max=80`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      const arr = Array.isArray(json.value_bets) ? json.value_bets : [];
+      setBets(arr.slice(0, limit));
+      const times = arr
+        .map((b) => b?.datetime_local?.starting_at?.date_time)
+        .filter(Boolean);
+      setAllTimes(times);
+    } catch (e) {
+      console.error("FootballBets fetch error", e);
+      setErr("Failed to load predictions.");
+      setBets([]);
+      setAllTimes([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchBets();
+    const refIv = setInterval(fetchBets, 2 * 60 * 60 * 1000);
+    return () => clearInterval(refIv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [limit]);
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const wrapperClasses =
+    layout === "combined" ? "space-y-3" : "space-y-4";
 
   return (
     <div className={wrapperClasses}>
-      {/* Header for combined: mali, poravnat desno ispod top dugmića */}
-      {layout === "combined" && (
-        <div className="flex items-center justify-between">
-          <h3 className="text-base font-semibold">Top {limit} Football Picks</h3>
-          <div className="text-[11px] text-gray-400">
-            {generatedAt ? (
-              <>
-                <span className="font-medium text-gray-300">Football last generated:</span>{" "}
-                {lastGeneratedAgo}
-              </>
-            ) : (
-              <span>—</span>
-            )}
-          </div>
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <h3 className="text-base md:text-lg font-semibold">
+          {layout === "combined" ? `Top ${limit} Football Picks` : "Football — All Suggestions"}
+        </h3>
+        <div className="text-[11px] text-gray-400">
+          {countdownToNext ? (
+            <>
+              <span className="font-medium text-gray-300">Next kickoff in:</span>{" "}
+              {countdownToNext}
+            </>
+          ) : (
+            <span>Next kickoff: —</span>
+          )}
         </div>
-      )}
-
-      {layout !== "combined" && titleBlock}
+      </div>
 
       {loading && (
         <div className="p-4 bg-[#1f2339] rounded-2xl shadow">
@@ -138,118 +243,117 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
         </div>
       )}
 
+      {/* Cards */}
       <div className="grid grid-cols-1 gap-3">
         {bets.map((bet) => {
           const {
             fixture_id,
             market,
-            selection,
-            type,
+            selection,           // "1" | "X" | "2" | "BTTS" | "O2.5" ...
+            market_odds,         // broj (decimal) ili null
             model_prob,
-            market_odds,
             confidence_pct,
             confidence_bucket,
             datetime_local,
             teams,
             league,
+            meta,
           } = bet;
 
           const home = teams?.home?.name || "Home";
           const away = teams?.away?.name || "Away";
-          const leagueName = league?.name || "League";
-          const timeStr =
-            datetime_local?.starting_at?.date_time ||
-            "";
+          const leagueName = shortLeague(league?.country, league?.name);
+          const leagueFlag = flagFor(league?.country);
+          const kickoffRaw = datetime_local?.starting_at?.date_time;
+          const kickoffLocal = fmtKickLocal(kickoffRaw);
+
+          const confPct =
+            typeof confidence_pct === "number"
+              ? Math.max(0, Math.min(100, confidence_pct))
+              : Math.round((model_prob || 0) * 100);
+
+          const topTips = buildTopTips(bet);
 
           return (
             <div
               key={`${fixture_id}|${market}|${selection}`}
-              className="bg-[#1f2339] rounded-2xl shadow p-4 flex flex-col gap-3 h-full min-h-48"
+              className="bg-[#1f2339] rounded-2xl shadow p-4 flex flex-col gap-3 h-full min-h-[220px]"
             >
-              {/* Header row: timovi + liga + kickoff */}
-              <div className="flex items-start justify-between gap-4">
-                <div>
-                  <div className="font-semibold text-lg leading-tight">
+              {/* Top row: liga + vreme + tip + kvota */}
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="font-semibold text-lg leading-tight truncate">
                     {home} <span className="text-gray-400">vs</span> {away}
                   </div>
-                  <div className="text-xs text-gray-400 mt-0.5">
-                    {leagueName} • {timeStr}
+
+                  <div className="text-xs text-gray-300 mt-1 flex items-center gap-2">
+                    <span className="text-lg leading-none">{leagueFlag}</span>
+                    <span className="truncate">{leagueName}</span>
+                    <span>•</span>
+                    <span>{kickoffLocal}</span>
                   </div>
+
+                  {/* mini Top tips pilovi (ako imamo podatke) */}
+                  {topTips.length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {topTips.map((t, i) => (
+                        <span
+                          key={i}
+                          className="px-2 py-0.5 text-[11px] rounded-full bg-white/10 border border-white/15 text-gray-100"
+                          title="Najjače procene"
+                        >
+                          {t.label} · {t.pct}%
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
-                <div className="flex items-center gap-2">
-                  {/* selection pill */}
-                  <div className="text-[11px] px-2 py-1 rounded-full bg-indigo-500/20 border border-indigo-500/40 text-indigo-200">
-                    {market}: <span className="font-semibold">{selection}</span>
-                    {market_odds ? ` @ ${market_odds}` : ""}
-                  </div>
-                  {/* type badge */}
-                  <div
-                    className={`text-[10px] px-2 py-0.5 rounded-full border ${
-                      type === "MODEL+ODDS"
-                        ? "border-green-500 text-green-300"
-                        : "border-gray-500 text-gray-300"
-                    }`}
-                  >
-                    {type}
+                {/* velika značka + kvota */}
+                <div className="shrink-0 text-right">
+                  <div className="flex items-center gap-2 justify-end">
+                    <div className="w-12 h-12 rounded-full bg-indigo-500/20 border border-indigo-400/50 text-indigo-100 grid place-items-center text-lg font-bold">
+                      {selection || "—"}
+                    </div>
+                    <div className="text-xs text-gray-300">
+                      <div className="text-[10px] uppercase tracking-wide text-gray-400">
+                        {market || "Pick"}
+                      </div>
+                      <div className="font-semibold">
+                        @{market_odds ? Number(market_odds).toFixed(2) : "—"}
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
 
-              {/* Sadržaj: dva stuba – levo objašnjenje, desno confidence bar */}
-              <div className="flex items-end gap-4">
-                <div className="text-xs text-gray-300 flex-1">
-                  {/* kratko objašnjenje bez zauzimanja mnogo prostora */}
-                  Model: {formatPct(model_prob)}{" "}
-                  {market_odds ? (
-                    <>
-                      • EV target ≥ 3% • bookies ≥ 6
-                    </>
-                  ) : (
-                    <>• Fallback (no market)</>
-                  )}
-                </div>
+              {/* Info linija (model %) */}
+              <div className="text-xs text-gray-300">
+                Model: {(Number(model_prob || 0) * 100).toFixed(1)}%
+              </div>
 
-                {/* Confidence bar */}
-                <div className="flex-1">
-                  <div className="flex items-center justify-between text-[11px] text-gray-400 mb-1">
-                    <span>Confidence</span>
-                    <span className="text-gray-300 font-medium">
-                      {formatPct0(confidence_pct || 0)}{" "}
-                      <span className="text-gray-400">
-                        ({confidence_bucket || "—"})
-                      </span>
+              {/* Confidence pri dnu */}
+              <div className="mt-auto">
+                <div className="flex items-center justify-between text-[11px] text-gray-400 mb-1">
+                  <span>Confidence</span>
+                  <span className="text-gray-300 font-medium">
+                    {confPct}%{" "}
+                    <span className="text-gray-400">
+                      ({confidence_bucket || "—"})
                     </span>
-                  </div>
-                  <div className="h-2 rounded-full bg-white/10 overflow-hidden">
-                    <div
-                      className={`h-2 ${confColor(confidence_bucket)} transition-all`}
-                      style={{ width: `${confidence_pct || 0}%` }}
-                    />
-                  </div>
+                  </span>
+                </div>
+                <div className="h-2 rounded-full bg-white/10 overflow-hidden">
+                  <div
+                    className={`h-2 ${confColor(confidence_bucket)} transition-all`}
+                    style={{ width: `${confPct}%` }}
+                  />
                 </div>
               </div>
             </div>
           );
         })}
       </div>
-
-      {/* Footer last generated (za full layout dole) */}
-      {layout !== "combined" && (
-        <div className="flex justify-end">
-          <div className="text-xs text-gray-400">
-            {generatedAt ? (
-              <>
-                <span className="font-medium text-gray-300">Last generated:</span>{" "}
-                {new Date(generatedAt).toLocaleString("en-GB", { hour12: false })}{" "}
-                <span className="opacity-75">({lastGeneratedAgo})</span>
-              </>
-            ) : (
-              <span>—</span>
-            )}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
