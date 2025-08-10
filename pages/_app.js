@@ -1,4 +1,3 @@
-// FILE: pages/_app.js
 import DataProvider from '../contexts/DataContext';
 
 export default function App({ Component, pageProps }) {
