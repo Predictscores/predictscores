@@ -1,113 +1,98 @@
 // FILE: contexts/DataContext.js
-import React, { createContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-export const DataContext = createContext({
-  crypto: [],
-  footballTop: [],
-  footballAll: [],
-  loadingCrypto: false,
-  loadingFootball: false,
-  footballNextKickoff: null,      // ISO string u Europe/Belgrade
-  footballLastGenerated: null,    // ISO UTC
-  cryptoNextRefreshAt: null,      // Date.now() + 10min
-  refreshAll: () => {},
-});
+export const DataContext = createContext({});
 
-export function DataProvider({ children }) {
+async function fetchJSON(url) {
+  try {
+    const res = await fetch(url, { headers: { 'cache-control': 'no-cache' } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch (e) {
+    console.error('[DataContext] fetch failed:', url, e?.message || e);
+    return null;
+  }
+}
+
+export default function DataProvider({ children }) {
+  // ---- KRIPTO ----
   const [crypto, setCrypto] = useState([]);
-  const [loadingCrypto, setLoadingCrypto] = useState(false);
+  const [loadingCrypto, setLoadingCrypto] = useState(true);
   const [cryptoNextRefreshAt, setCryptoNextRefreshAt] = useState(null);
+  const cryptoTimer = useRef(null);
 
-  const [footballAll, setFootballAll] = useState([]);
-  const [footballTop, setFootballTop] = useState([]);
-  const [loadingFootball, setLoadingFootball] = useState(false);
-  const [footballLastGenerated, setFootballLastGenerated] = useState(null);
-  const [footballNextKickoff, setFootballNextKickoff] = useState(null);
+  const loadCrypto = useCallback(async () => {
+    setLoadingCrypto(true);
+    const json = await fetchJSON('/api/crypto');
+    // format koji si pokazao: { crypto: [...] }
+    const list = Array.isArray(json?.crypto) ? json.crypto : [];
+    setCrypto(list);
+    setLoadingCrypto(false);
 
-  const mounted = useRef(true);
-  useEffect(() => () => { mounted.current = false; }, []);
-
-  async function fetchCrypto() {
-    try {
-      setLoadingCrypto(true);
-      const r = await fetch('/api/crypto');
-      const j = await r.json().catch(() => ({}));
-      const list = Array.isArray(j?.crypto) ? j.crypto : [];
-      if (!mounted.current) return;
-      setCrypto(list);
-      // 10 min do sledećeg refresh-a
-      setCryptoNextRefreshAt(Date.now() + 10 * 60 * 1000);
-    } catch {
-      if (!mounted.current) return;
-      setCrypto([]);
-      setCryptoNextRefreshAt(Date.now() + 10 * 60 * 1000);
-    } finally {
-      if (mounted.current) setLoadingCrypto(false);
-    }
-  }
-
-  async function fetchFootball() {
-    try {
-      setLoadingFootball(true);
-      const r = await fetch('/api/value-bets'); // bez debug param
-      const j = await r.json().catch(() => ({}));
-      const vb = Array.isArray(j?.value_bets) ? j.value_bets : [];
-      if (!mounted.current) return;
-
-      // sortiraj po našem _score ako postoji
-      const sorted = [...vb].sort((a, b) => (b?._score ?? 0) - (a?._score ?? 0));
-      setFootballAll(sorted);
-      setFootballTop(sorted.slice(0, 3));
-      setFootballLastGenerated(j?.generated_at || new Date().toISOString());
-
-      // izračunaj najbliži kickoff u Europe/Belgrade iz payload-a
-      const starts = sorted
-        .map(x => x?.datetime_local?.starting_at?.date_time)
-        .filter(Boolean)
-        .map(dt => new Date(dt.replace(' ', 'T') + 'Z').getTime())
-        .filter(t => t > Date.now())
-        .sort((a, b) => a - b);
-      setFootballNextKickoff(starts[0] ? new Date(starts[0]).toISOString() : null);
-    } catch {
-      if (!mounted.current) return;
-      setFootballAll([]);
-      setFootballTop([]);
-      setFootballLastGenerated(new Date().toISOString());
-      setFootballNextKickoff(null);
-    } finally {
-      if (mounted.current) setLoadingFootball(false);
-    }
-  }
-
-  async function refreshAll() {
-    await Promise.allSettled([fetchCrypto(), fetchFootball()]);
-  }
-
-  useEffect(() => {
-    refreshAll();
-    // lagani auto-refresh crypto na 10 min
-    const id = setInterval(() => fetchCrypto(), 10 * 60 * 1000);
-    return () => clearInterval(id);
+    // sledeći refresh – za ~10 min
+    const next = Date.now() + 10 * 60 * 1000;
+    setCryptoNextRefreshAt(next);
   }, []);
 
+  // inicijalno učitavanje + interval
+  useEffect(() => {
+    loadCrypto();
+    cryptoTimer.current && clearInterval(cryptoTimer.current);
+    cryptoTimer.current = setInterval(loadCrypto, 10 * 60 * 1000);
+    return () => cryptoTimer.current && clearInterval(cryptoTimer.current);
+  }, [loadCrypto]);
+
+  // ---- FOOTBALL (opciono – samo timestamp zadnjeg generisanja) ----
+  const [footballLastGenerated, setFootballLastGenerated] = useState(null);
+  const [nextKickoffTs, setNextKickoffTs] = useState(null);
+
+  const loadFootballMeta = useCallback(async () => {
+    const json = await fetchJSON('/api/value-bets');
+    if (json) {
+      setFootballLastGenerated(Date.now());
+      // probaj da izvučeš najraniji kickoff ako postoji
+      try {
+        const picks = Array.isArray(json.value_bets) ? json.value_bets : [];
+        const times = picks
+          .map(p => p?.datetime_local?.starting_at?.date_time)
+          .filter(Boolean)
+          .map(s => new Date(s.replace(' ', 'T')).getTime())
+          .filter(t => Number.isFinite(t) && t > Date.now());
+        if (times.length) setNextKickoffTs(Math.min(...times));
+        else setNextKickoffTs(null);
+      } catch { /* no-op */ }
+    }
+  }, []);
+
+  // Nemoj preterano – učitaj jednom na mount, FootballBets radi svoje
+  useEffect(() => {
+    loadFootballMeta();
+  }, [loadFootballMeta]);
+
+  // ---- PUBLIC API ----
+  const refreshAll = useCallback(() => {
+    loadCrypto();
+    loadFootballMeta();
+  }, [loadCrypto, loadFootballMeta]);
+
   const value = useMemo(() => ({
+    // crypto
     crypto,
-    footballTop,
-    footballAll,
     loadingCrypto,
-    loadingFootball,
-    footballNextKickoff,
-    footballLastGenerated,
     cryptoNextRefreshAt,
+    // football meta
+    footballLastGenerated,
+    nextKickoffTs,
+    // actions
     refreshAll,
   }), [
-    crypto, footballTop, footballAll,
-    loadingCrypto, loadingFootball,
-    footballNextKickoff, footballLastGenerated,
+    crypto,
+    loadingCrypto,
     cryptoNextRefreshAt,
+    footballLastGenerated,
+    nextKickoffTs,
+    refreshAll,
   ]);
 
   return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
 }
-
-export default DataProvider;
