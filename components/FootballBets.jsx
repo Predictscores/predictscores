@@ -2,7 +2,7 @@
 import React, { useContext, useMemo } from "react";
 import { DataContext } from "../contexts/DataContext";
 
-// ---------- helpers (lokalne, da ništa ne fali) ----------
+// ---------- helpers ----------
 function ccToFlag(cc) {
   const code = String(cc || "").toUpperCase();
   if (!/^[A-Z]{2}$/.test(code)) return "";
@@ -11,9 +11,7 @@ function ccToFlag(cc) {
   );
 }
 
-// dopunjeno mapiranje (zemlje + heuristike po ligama)
 const NAME_TO_CC = {
-  // countries
   usa: "US",
   "united states": "US",
   america: "US",
@@ -47,7 +45,6 @@ const NAME_TO_CC = {
   albania: "AL",
   mexico: "MX",
   nicaragua: "NI",
-  // leagues / heuristics
   bund: "DE",
   laliga: "ES",
   seriea: "IT",
@@ -78,16 +75,10 @@ function guessFlag(league = {}) {
 
 function sanitizeIso(s) {
   if (!s || typeof s !== "string") return null;
-  let iso = s.trim();
-  // tipičan problem iz API-ja: "...+00:00Z" (dupla zona) → skini višak
+  let iso = s.trim().replace(" ", "T");
   iso = iso.replace("+00:00Z", "Z").replace("Z+00:00", "Z");
-  // ako je slučajno "YYYY-MM-DD HH:mm:ss", prebaci u ISO
-  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:?\d{0,2}$/.test(iso)) {
-    iso = iso.replace(" ", "T") + "Z";
-  }
   return iso;
 }
-
 function extractKickoffISO(v) {
   const dt =
     v?.datetime_local?.starting_at?.date_time ||
@@ -97,7 +88,6 @@ function extractKickoffISO(v) {
     null;
   return sanitizeIso(dt);
 }
-
 function toBelgradeHM(iso) {
   try {
     const d = new Date(iso);
@@ -114,7 +104,6 @@ function toBelgradeHM(iso) {
     return "—";
   }
 }
-
 function fmtOdds(x) {
   return typeof x === "number" && isFinite(x) ? x.toFixed(2) : "—";
 }
@@ -122,14 +111,12 @@ function fmtPct(x) {
   const n = typeof x === "number" ? x : 0;
   return `${Math.round(n)}%`;
 }
-
 function pickLabel(sel, home, away) {
   if (sel === "1") return `${home} (1)`;
   if (sel === "2") return `${away} (2)`;
   if (sel?.toUpperCase() === "X") return "Draw (X)";
   return String(sel || "—");
 }
-
 function sortValueBets(bets = []) {
   return bets
     .slice()
@@ -143,7 +130,6 @@ function sortValueBets(bets = []) {
       return (b.model_prob ?? 0) - (a.model_prob ?? 0);
     });
 }
-
 function bucket(conf) {
   const c = typeof conf === "number" ? conf : 0;
   if (c >= 90) return { text: "Top Pick", cls: "text-orange-400" };
@@ -163,12 +149,14 @@ function FootballCard({ v, layout = "full" }) {
   const confPct =
     typeof v?.confidence_pct === "number" ? Math.max(0, Math.min(100, v.confidence_pct)) : 0;
   const b = bucket(confPct);
-
   const odds =
     v?.market_odds && typeof v.market_odds === "number" ? v.market_odds : null;
 
+  // >>> ključno za Combined poravnanje visine <<<
+  const minH = layout === "combined" ? "min-h-[260px] md:min-h-[280px]" : "min-h-[180px]";
+
   return (
-    <div className="w-full bg-[#1f2339] p-5 rounded-2xl shadow flex flex-col min-h-[180px]">
+    <div className={`w-full bg-[#1f2339] p-5 rounded-2xl shadow flex flex-col ${minH}`}>
       {/* Header liga + vreme */}
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2">
@@ -210,7 +198,7 @@ function FootballCard({ v, layout = "full" }) {
         </div>
       </div>
 
-      {/* Micro red (edge / model), samo informativno */}
+      {/* Micro red (edge / model) */}
       <div className="mt-1 text-[11px] text-slate-400">
         {typeof v?.edge === "number"
           ? `Edge: ${(v.edge * 100).toFixed(1)}%`
@@ -243,12 +231,15 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
     );
   }
 
-  // layout: combined → grid=1 kolona; full → lista
   if (layout === "combined") {
     return (
       <div className="grid grid-cols-1 gap-4 items-stretch">
         {list.map((v) => (
-          <FootballCard key={v?.fixture_id || `${v?.league?.id}-${v?.teams?.home?.name}-${v?.teams?.away?.name}`} v={v} layout="combined" />
+          <FootballCard
+            key={v?.fixture_id || `${v?.league?.id}-${v?.teams?.home?.name}-${v?.teams?.away?.name}`}
+            v={v}
+            layout="combined"
+          />
         ))}
       </div>
     );
