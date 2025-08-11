@@ -10,8 +10,6 @@ function sanitizeIso(s){ if(!s||typeof s!=="string") return null; let iso=s.trim
 function extractKickoffISO(v){ const dt=v?.datetime_local?.starting_at?.date_time||v?.datetime_local?.date_time||v?.time?.starting_at?.date_time||v?.kickoff||null; return sanitizeIso(dt); }
 function toBelgradeHM(iso){ try{ const d=new Date(iso); if(isNaN(d)) return "—"; return d.toLocaleString("sr-RS",{timeZone:"Europe/Belgrade",hour12:false,hour:"2-digit",minute:"2-digit",day:"2-digit",month:"2-digit"});}catch{return "—";} }
 function fmtOdds(x){ return typeof x==="number"&&isFinite(x)?x.toFixed(2):"—"; }
-function pickLabel(sel,home,away){ if(sel==="1") return `${home} (1)`; if(sel==="2") return `${away} (2)`; if(sel?.toUpperCase()==="X") return "Draw (X)"; return String(sel||"—"); }
-function sortValueBets(bets=[]){ return bets.slice().sort((a,b)=>{ if(a.type!==b.type) return a.type==="MODEL+ODDS"?-1:1; if((b._score??0)!==(a._score??0)) return (b._score??0)-(a._score??0); const eA=a.edge??-1, eB=b.edge??-1; return eB-eA; }); }
 function bucket(conf){ const c=typeof conf==="number"?conf:0; if(c>=90) return {text:"Top Pick",cls:"text-orange-400"}; if(c>=75) return {text:"High",cls:"text-emerald-400"}; if(c>=50) return {text:"Moderate",cls:"text-sky-400"}; return {text:"Low",cls:"text-amber-400"}; }
 function Badge({children,className=""}){ return <span className={`px-2 py-1 rounded-full border border-white/10 text-xs text-slate-300 ${className}`}>{children}</span>; }
 
@@ -25,6 +23,21 @@ function InfoDot({ text }) {
       </div>
     </div>
   );
+}
+
+function MarketAndSelection({ v, home, away }){
+  const label = v?.market_label || v?.market || "—";
+  const sel = String(v?.selection || "—");
+  // Prijateljski prikaz za 1X2
+  if ((v?.market||"").toUpperCase() === "1X2") {
+    let pick = sel;
+    if (sel === "1") pick = `${home} (1)`;
+    else if (sel === "2") pick = `${away} (2)`;
+    else if (sel.toUpperCase() === "X") pick = "Draw (X)";
+    return (<><span className="text-white font-bold">{pick}</span> <span className="text-slate-400">[{label}]</span></>);
+  }
+  // ostala tržišta (BTTS, OU)
+  return (<><span className="text-white font-bold">{label}: {sel}</span></>);
 }
 
 // ---------- Card ----------
@@ -42,9 +55,8 @@ function FootballCard({ v, layout="full" }){
 
   const minH = layout==="combined" ? "min-h-[220px] md:min-h-[240px]" : "min-h-[180px]";
   const [open,setOpen]=useState(false);
-  const explain=v?.explain||{};
-  const bullets=Array.isArray(explain?.bullets)?explain.bullets:[];
-  const summary=explain?.summary||"";
+  const summary=v?.explain?.summary||"";
+  const bullets=Array.isArray(v?.explain?.bullets)?v.explain.bullets:[];
 
   const formText = (v?.form_text && v.form_text.trim() && v.form_text.trim() !== "vs") ? v.form_text : "";
 
@@ -73,12 +85,10 @@ function FootballCard({ v, layout="full" }){
 
       {/* Predlog / kvota / edge / move */}
       <div className="mt-2 text-sm flex flex-wrap items-center gap-3">
-        <div>Pick: <span className="text-white font-bold">{pickLabel(v?.selection,home,away)}</span> <span className="text-slate-400">[{v?.market||"—"}]</span></div>
+        <div>Pick: <MarketAndSelection v={v} home={home} away={away} /></div>
         <div className="text-slate-300">Odds: <span className="font-semibold">{fmtOdds(odds)}</span></div>
-        {Number.isFinite(v?.edge) && <div className="text-slate-300">Edge: <span className={v.edge>=0?"text-emerald-300":"text-rose-300"}>{(v.edge*100).toFixed(1)}pp</span></div>}
+        {Number.isFinite(v?.edge_pp) && <div className="text-slate-300">Edge: <span className={v.edge_pp>=0?"text-emerald-300":"text-rose-300"}>{v.edge_pp.toFixed(1)}pp</span></div>}
         {Number.isFinite(v?.movement_pct)&&v.movement_pct!==0 && <div className="text-slate-300">Move: <span className={v.movement_pct>=0?"text-emerald-300":"text-rose-300"}>{v.movement_pct>0?"↑":"↓"} {Math.abs(v.movement_pct).toFixed(2)}pp</span></div>}
-
-        {/* Mini tooltip u Combined (jedna rečenica) */}
         {layout==="combined" && summary && <InfoDot text={summary} />}
       </div>
 
@@ -98,7 +108,7 @@ function FootballCard({ v, layout="full" }){
         </div>
       </div>
 
-      {/* H2H samo ako postoji */}
+      {/* H2H */}
       {v?.h2h_summary && v.h2h_summary.trim() && (
         <div className="mt-2 text-[11px] text-slate-400">H2H: {v.h2h_summary}</div>
       )}
@@ -121,9 +131,23 @@ function FootballCard({ v, layout="full" }){
   );
 }
 
+function sortValueBets(bets=[]){
+  return bets.slice().sort((a,b)=>{
+    if(a.type!==b.type) return a.type==="MODEL+ODDS"?-1:1;
+    if((b._score??0)!==(a._score??0)) return (b._score??0)-(a._score??0);
+    const eA = Number.isFinite(a.edge_pp) ? a.edge_pp : -999;
+    const eB = Number.isFinite(b.edge_pp) ? b.edge_pp : -999;
+    return eB - eA;
+  });
+}
+
 export default function FootballBets({ limit=10, layout="full" }){
   const { football=[], loadingFootball } = useContext(DataContext) || {};
-  const list = useMemo(()=>{ const base=Array.isArray(football)?football:[]; const sorted=sortValueBets(base); return typeof limit==="number"?sorted.slice(0,limit):sorted; },[football,limit]);
+  const list = useMemo(()=>{
+    const base=Array.isArray(football)?football:[];
+    const sorted=sortValueBets(base);
+    return typeof limit==="number"?sorted.slice(0,limit):sorted;
+  },[football,limit]);
 
   if(loadingFootball) return <div className="text-slate-400 text-sm">Loading football picks…</div>;
   if(!list.length) return <div className="text-slate-400 text-sm">No football suggestions at the moment.</div>;
