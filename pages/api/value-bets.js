@@ -1,9 +1,10 @@
 // FILE: pages/api/value-bets.js
 /**
- * Value Bets pipeline (API-Football canonical ID flow)
- * - Fixtures: API-Football (primary) -> SportMonks / Football-Data (fallback)
- * - Signals: predictions + odds (median) + edge + market move + form (last5) + H2H + lineups + injuries
- * - Server-side cache per layer + soft daily budget
+ * Value Bets pipeline (API-Football canonical + rolling 24h)
+ * - Rolling window: [now-12h, now+12h] u Europe/Belgrade
+ * - Signals: predictions + odds (median) + edge + move + form (last5) + H2H (last=10) + lineups + injuries
+ * - Dynamic confidence weights (sa/bez kvota)
+ * - Server-side keš per sloj + soft dnevni budžet
  */
 
 const AF = {
@@ -12,6 +13,8 @@ const AF = {
   DEEP_TOP: num(process.env.AF_DEEP_TOP, 30),
   SNAPSHOT_INTERVAL_MIN: num(process.env.AF_SNAPSHOT_INTERVAL_MIN, 60),
   ODDS_MAX_CALLS_PER_DAY: num(process.env.ODDS_MAX_CALLS_PER_DAY, 12),
+  ROLLING_WINDOW_HOURS: num(process.env.AF_ROLLING_WINDOW_HOURS, 24), // 24h
+  H2H_LAST: num(process.env.AF_H2H_LAST, 10),
 };
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
@@ -27,7 +30,7 @@ const g = globalThis;
 if (!g.__VB_CACHE__) {
   g.__VB_CACHE__ = {
     byKey: new Map(),
-    oddsSnapshots: new Map(),
+    oddsSnapshots: new Map(), // fixtureId -> { ts, priceMap }
     counters: { day: new Date().toISOString().slice(0,10), apiFootball: 0, sportMonks: 0, footballData: 0, theOdds: 0 },
   };
 }
@@ -40,9 +43,12 @@ function withinBudget(incr=1){ const today=new Date().toISOString().slice(0,10);
 // ---------- helpers ----------
 function sanitizeIso(s){ if(!s||typeof s!=="string") return null; let iso=s.trim().replace(" ","T"); iso=iso.replace("+00:00Z","Z").replace("Z+00:00","Z"); return iso; }
 function impliedFromDecimal(o){ const x=Number(o); return Number.isFinite(x)&&x>1.01?1/x:null; }
-function toPct(x){ const n=Number(x); return Number.isFinite(n)?Math.max(0,Math.min(100,Math.round(n*100))):0; }
 function bucketFromPct(p){ if(p>=90) return "TOP"; if(p>=75) return "High"; if(p>=50) return "Moderate"; return "Low"; }
 function sum(a){ return a.reduce((x,y)=>x+y,0); }
+function toLocalYMD(date, tz) {
+  return new Intl.DateTimeFormat('sv-SE', { timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit' })
+    .format(date); // YYYY-MM-DD
+}
 
 // ---------- HTTP wrappers ----------
 async function afFetch(path,{ttl=0}={}) {
@@ -67,54 +73,85 @@ async function fdFetch(path,{ttl=0}={}) {
 }
 
 // ---------- data fetchers ----------
-async function fetchFixturesForDate(isoDate){
-  // 1) API-Football is canonical (has correct fixture/team IDs for all downstream calls)
-  try{
-    const af=await afFetch(`/fixtures?date=${isoDate}`,{ttl:15*60});
-    const list=(af?.response||[]).map(f=>({
-      source:"AF",
-      fixture_id:f?.fixture?.id,
-      league:{ id:f?.league?.id, name:f?.league?.name, country:f?.league?.country, season:f?.league?.season },
-      teams:{ home:{ id:f?.teams?.home?.id, name:f?.teams?.home?.name }, away:{ id:f?.teams?.away?.id, name:f?.teams?.away?.name } },
-      datetime_local:{ starting_at:{ date_time:sanitizeIso(f?.fixture?.date) } },
-    })).filter(x=>x.teams?.home?.id && x.teams?.away?.id);
-    if(list.length) return list;
-  }catch(_){}
+async function fetchAFByDate(ymd){
+  const af=await afFetch(`/fixtures?date=${ymd}`,{ttl:15*60});
+  return (af?.response||[]).map(f=>({
+    source:"AF",
+    fixture_id:f?.fixture?.id,
+    league:{ id:f?.league?.id, name:f?.league?.name, country:f?.league?.country, season:f?.league?.season },
+    teams:{ home:{ id:f?.teams?.home?.id, name:f?.teams?.home?.name }, away:{ id:f?.teams?.away?.id, name:f?.teams?.away?.name } },
+    datetime_local:{ starting_at:{ date_time:sanitizeIso(f?.fixture?.date) } },
+  })).filter(x=>x.teams?.home?.id && x.teams?.away?.id);
+}
 
-  // 2) SportMonks fallback (IDs nisu kompatibilni sa AF; biće Fallback-only)
-  if(SM_KEY){
-    try{
-      const url=`https://api.sportmonks.com/v3/football/fixtures/date/${isoDate}?api_token=${SM_KEY}&include=participants;league;season`;
-      const sm=await smFetch(url,{ttl:15*60});
-      if(sm?.data?.length){
-        return sm.data.map(f=>{
-          const home=f?.participants?.find?.(p=>p.meta?.location==="home");
-          const away=f?.participants?.find?.(p=>p.meta?.location==="away");
-          return {
-            source:"SM",
-            fixture_id:f.id,
-            league:{ id:f?.league?.id, name:f?.league?.name||"", country:f?.league?.country?.name||f?.league?.country||"", season:f?.season?.name||"" },
-            teams:{ home:{ id:home?.id, name:home?.name }, away:{ id:away?.id, name:away?.name } },
-            datetime_local:{ starting_at:{ date_time:sanitizeIso(f?.starting_at) } },
-          };
-        });
-      }
-    }catch(_){}
+async function fetchFixturesRolling(nowUTC = new Date()){
+  // rolling ± window/2 u Europe/Belgrade → pokrivamo juče/danas/sutra po lokalnom datumu
+  const half = Math.max(1, Math.round(AF.ROLLING_WINDOW_HOURS/2));
+  const startMs = nowUTC.getTime() - half*3600*1000;
+  const endMs   = nowUTC.getTime() + half*3600*1000;
+
+  // lokalni YMD za juče/danas/sutra
+  const tz = TZ;
+  const dNow = new Date(nowUTC);
+  const dPrev = new Date(nowUTC); dPrev.setDate(dPrev.getDate()-1);
+  const dNext = new Date(nowUTC); dNext.setDate(dNext.getDate()+1);
+  const days = [toLocalYMD(dPrev,tz), toLocalYMD(dNow,tz), toLocalYMD(dNext,tz)];
+
+  // API-Football je kanonski
+  let afFixtures = [];
+  for (const ymd of days) {
+    try {
+      const list = await fetchAFByDate(ymd);
+      afFixtures = afFixtures.concat(list);
+    } catch (_) {}
   }
 
-  // 3) Football-Data fallback
-  if(FD_KEY){
-    try{
-      const fd=await fdFetch(`/matches?dateFrom=${isoDate}&dateTo=${isoDate}`,{ttl:15*60});
-      return (fd?.matches||[]).map(m=>({
+  // Filtriraj po rolling prozoru
+  const inWindow = afFixtures.filter(f => {
+    const iso = sanitizeIso(f?.datetime_local?.starting_at?.date_time);
+    if(!iso) return false;
+    const t = new Date(iso).getTime();
+    return Number.isFinite(t) && t >= startMs && t <= endMs;
+  });
+
+  if (inWindow.length) return inWindow;
+
+  // Fallback (retko): SportMonks / Football-Data ako baš nema AF (IDs nisu kanonski)
+  // Ovo vraćamo samo da UI ne bude prazan (biće FALLBACK bez AF detalja)
+  try {
+    if (SM_KEY) {
+      const ymd = toLocalYMD(dNow, tz);
+      const url=`https://api.sportmonks.com/v3/football/fixtures/date/${ymd}?api_token=${SM_KEY}&include=participants;league;season`;
+      const sm=await smFetch(url,{ttl:15*60});
+      const list=(sm?.data||[]).map(f=>{
+        const home=f?.participants?.find?.(p=>p.meta?.location==="home");
+        const away=f?.participants?.find?.(p=>p.meta?.location==="away");
+        return {
+          source:"SM",
+          fixture_id:f.id,
+          league:{ id:f?.league?.id, name:f?.league?.name||"", country:f?.league?.country?.name||f?.league?.country||"", season:f?.season?.name||"" },
+          teams:{ home:{ id:home?.id, name:home?.name }, away:{ id:away?.id, name:away?.name } },
+          datetime_local:{ starting_at:{ date_time:sanitizeIso(f?.starting_at) } },
+        };
+      });
+      if(list.length) return list;
+    }
+  } catch(_) {}
+
+  try {
+    if (FD_KEY) {
+      const ymd = toLocalYMD(dNow, tz);
+      const fd=await fdFetch(`/matches?dateFrom=${ymd}&dateTo=${ymd}`,{ttl:15*60});
+      const list=(fd?.matches||[]).map(m=>({
         source:"FD",
         fixture_id:m?.id,
         league:{ id:m?.competition?.id, name:m?.competition?.name, country:"", season:m?.season?.startDate?.slice(0,4) },
         teams:{ home:{ id:m?.homeTeam?.id, name:m?.homeTeam?.name }, away:{ id:m?.awayTeam?.id, name:m?.awayTeam?.name } },
         datetime_local:{ starting_at:{ date_time:sanitizeIso(m?.utcDate) } },
       }));
-    }catch(_){}
-  }
+      if(list.length) return list;
+    }
+  } catch(_) {}
 
   return [];
 }
@@ -163,7 +200,7 @@ async function fetchTeamStats(leagueId,season,teamId){
   return null;
 }
 
-async function fetchH2H(homeId,awayId,last=5){
+async function fetchH2H(homeId,awayId,last){
   try{
     const j=await afFetch(`/fixtures/headtohead?h2h=${homeId}-${awayId}&last=${last}`,{ttl:24*3600});
     const games=j?.response||[];
@@ -196,16 +233,16 @@ async function fetchLineups(fixtureId){
 function pickFromPredictions(preds){ const map={ "1":preds?.p1||0, X:preds?.px||0, "2":preds?.p2||0 }; const sel=Object.keys(map).sort((a,b)=>map[b]-map[a])[0]||"1"; return { selection:sel, model_prob: map[sel]||0 }; }
 function edgeFromOdds(sel, modelProb, odds){ const price=sel&&odds?odds[sel]:null; const implied=impliedFromDecimal(price); if(!Number.isFinite(implied)) return { market_odds:null, implied_prob:null, edge:null }; return { market_odds:price, implied_prob:implied, edge: modelProb - implied }; }
 function movementForFixture(fxId, oddsObj){
-  const now=Date.now(); const prev=CACHE.oddsSnapshots.get(fxId);
+  const prev=CACHE.oddsSnapshots.get(fxId);
   const map={ "1":oddsObj?.["1"], X:oddsObj?.X, "2":oddsObj?.["2"] };
-  CACHE.oddsSnapshots.set(fxId,{ ts:now, priceMap:map });
+  CACHE.oddsSnapshots.set(fxId,{ ts:Date.now(), priceMap:map });
   if(!prev||!prev.priceMap) return 0;
   const keys=["1","X","2"];
   const prevImp=keys.map(k=>impliedFromDecimal(prev.priceMap[k])).filter(Number.isFinite);
   const nowImp=keys.map(k=>impliedFromDecimal(map[k])).filter(Number.isFinite);
   if(!prevImp.length||!nowImp.length) return 0;
   const prevAvg=sum(prevImp)/prevImp.length, nowAvg=sum(nowImp)/nowImp.length;
-  return Math.round((nowAvg-prevAvg)*10000)/100; // pp
+  return Math.round((nowAvg-prevAvg)*10000)/100; // percentage points
 }
 
 function computeFormScore(statsHome,statsAway){
@@ -233,24 +270,33 @@ function explainBlock(v){
 }
 
 function overallConfidence(v){
+  const hasOdds = Number.isFinite(v.market_odds) && Number.isFinite(v.implied_prob);
   const pPred=v.model_prob||0;
   const edge=Number.isFinite(v.edge)?Math.max(-0.15,Math.min(0.15,v.edge)):0;
   const form=v.form_score||0;
-  const h2h=v.h2h_score||0; // (trenutno 0 – možeš dodati ponder kasnije)
+  const h2h=v.h2h_score||0; // zadržano za buduće fino-štimovanje
   const lineups=v.lineups_status==="confirmed"?1:(v.lineups_status==="expected"?0.6:0.4);
   const injuries=Math.max(0,1-Math.min(1,(v.injuries_count||0)/5));
   const move=Math.max(0,1+(v.movement_pct||0)/10);
-  const base=0.30*pPred + 0.20*(0.5+edge) + 0.15*form + 0.10*h2h + 0.10*(lineups/1.1) + 0.10*injuries + 0.05*Math.min(1.2,move);
-  return Math.max(0,Math.min(1,base));
+
+  // Dinamičke težine: sa kvotama edge/move teže više; bez kvota blag penalti
+  const W = hasOdds
+    ? { pred:0.30, edge:0.22, form:0.15, h2h:0.10, lineups:0.10, inj:0.08, move:0.05 }
+    : { pred:0.38, edge:0.06, form:0.20, h2h:0.12, lineups:0.12, inj:0.10, move:0.02 };
+
+  const base = W.pred*pPred + W.edge*(0.5+edge) + W.form*form + W.h2h*h2h + W.lineups*(lineups/1.1) + W.inj*injuries + W.move*Math.min(1.2,move);
+
+  // Blagi clamp i penalti kad baš nema ničega
+  const score = Math.max(0, Math.min(1, base));
+  return hasOdds ? score : Math.max(0, score - 0.03);
 }
 
 export default async function handler(req,res){
-  const dateParam=(req.query.date || new Date().toISOString().slice(0,10));
   const debug=req.query.debug==="1"||req.query.debug==="true";
   const t0=Date.now();
 
   let fixtures=[];
-  try{ fixtures=await fetchFixturesForDate(dateParam); }catch(_){}
+  try{ fixtures=await fetchFixturesRolling(new Date()); }catch(_){}
 
   const out=[];
   for(const f of fixtures){
@@ -262,7 +308,7 @@ export default async function handler(req,res){
     if(preds){ const pick=pickFromPredictions(preds); model_prob=pick.model_prob; selection=pick.selection; }
     else { model_prob=num(process.env.FALLBACK_MIN_PROB,0.52); selection="1"; }
 
-    // Form (cheap) + H2H
+    // Form + H2H (last=AF.H2H_LAST)
     let statsHome=null, statsAway=null;
     if(withinBudget(2) && f.source==="AF" && leagueId && season){
       [statsHome,statsAway]=await Promise.all([
@@ -273,7 +319,7 @@ export default async function handler(req,res){
     const { score:form_score, text:form_text } = computeFormScore(statsHome,statsAway);
 
     const h2h = (withinBudget(1) && f.source==="AF")
-      ? await fetchH2H(homeId,awayId,5).catch(()=>({summary:"",count:0}))
+      ? await fetchH2H(homeId,awayId,AF.H2H_LAST).catch(()=>({summary:"",count:0}))
       : { summary:"", count:0 };
 
     // Odds
@@ -310,6 +356,7 @@ export default async function handler(req,res){
       form_score, form_text,
       h2h_summary: h2h.summary || "", h2h_count: h2h.count || 0,
       lineups_status, injuries_count,
+      bookmakers_count: Number.isFinite(bookmakers_count)?bookmakers_count:0,
     };
 
     const conf=overallConfidence(base);
@@ -335,7 +382,12 @@ export default async function handler(req,res){
     generated_at:new Date().toISOString(),
     tz_display:TZ,
     value_bets:top,
-    _meta: debug ? { total_fixtures:fixtures.length, counters:CACHE.counters, took_ms:Date.now()-t0 } : undefined,
+    _meta: debug ? {
+      total_candidates: fixtures.length,
+      counters: CACHE.counters,
+      window_hours: AF.ROLLING_WINDOW_HOURS,
+      took_ms: Date.now()-t0,
+    } : undefined,
   };
 
   res.setHeader("Cache-Control","s-maxage=60, stale-while-revalidate=60");
