@@ -40,20 +40,27 @@ async function safeJson(url) {
   if (!res.ok) throw new Error(`${url} -> ${res.status}`);
   return res.json();
 }
+
+// ISO sanitizer: popravlja "YYYY-MM-DD HH:mm:ss" i duplu zonu tipa "+00:00Z"
 function parseStartISO(item) {
   try {
-    const dt =
+    const raw =
       item?.datetime_local?.starting_at?.date_time ||
       item?.datetime_local?.date_time ||
       item?.time?.starting_at?.date_time ||
       null;
-    if (!dt) return null;
+    if (!raw) return null;
+
     // "YYYY-MM-DD HH:mm:ss" -> "YYYY-MM-DDTHH:mm:ss"
-    return dt.replace(" ", "T");
+    let iso = String(raw).replace(" ", "T");
+    // ukloni duplu zonu (npr. "+00:00Z" ili "Z+00:00")
+    iso = iso.replace("+00:00Z", "Z").replace("Z+00:00", "Z");
+    return iso;
   } catch {
     return null;
   }
 }
+
 function nearestFutureKickoff(items = []) {
   const now = Date.now();
   let best = null;
@@ -67,6 +74,7 @@ function nearestFutureKickoff(items = []) {
   }
   return best ? new Date(best).toISOString() : null;
 }
+
 function fmtCountdown(ms) {
   const m = Math.floor(ms / 60000);
   const s = Math.floor((ms % 60000) / 1000);
