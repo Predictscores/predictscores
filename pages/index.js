@@ -1,8 +1,7 @@
 // FILE: pages/index.js
-import React, { useContext, useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import Head from "next/head";
 import dynamic from "next/dynamic";
-import { DataContext } from "../contexts/DataContext";
 
 // CombinedBets samo na klijentu (bez SSR) + jednostavan loader
 const CombinedBets = dynamic(() => import("../components/CombinedBets"), {
@@ -11,43 +10,6 @@ const CombinedBets = dynamic(() => import("../components/CombinedBets"), {
     <div className="mt-6 text-slate-400 text-sm">Loading suggestions…</div>
   ),
 });
-
-// --------- Klijentski Error Boundary (da UI ne ostane na "Loading")
-class ClientErrorBoundary extends React.Component {
-  constructor(props) {
-    super(props);
-    this.state = { err: null };
-  }
-  static getDerivedStateFromError(error) {
-    return { err: error };
-  }
-  componentDidCatch(error, info) {
-    if (process.env.NODE_ENV !== "production") {
-      // eslint-disable-next-line no-console
-      console.warn("ClientErrorBoundary:", error, info);
-    }
-  }
-  render() {
-    if (this.state.err) {
-      return (
-        <div className="mt-6 p-4 rounded-xl bg-[#1a1f36] text-rose-300">
-          <div className="font-semibold mb-1">Component error</div>
-          <div className="text-sm opacity-80">
-            Something went wrong while rendering the cards.
-          </div>
-          <button
-            onClick={() => (typeof window !== "undefined" ? window.location.reload() : null)}
-            className="mt-3 px-3 py-2 rounded-lg bg-[#202542] text-white text-sm"
-            type="button"
-          >
-            Reload
-          </button>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
-}
 
 // --------- Dark mode toggle (lokalno)
 function useDarkMode() {
@@ -69,26 +31,25 @@ function useDarkMode() {
       return next;
     });
   };
-  return { toggle, dark };
+  return { toggle };
 }
 
 // --------- helperi
-function sanitizeIso(s) {
-  if (!s) return null;
-  let iso = String(s).replace(" ", "T");
-  iso = iso.replace("+00:00Z", "Z").replace("Z+00:00", "Z");
-  return iso;
+async function safeJson(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url} -> ${res.status}`);
+  return res.json();
 }
 function parseStartISO(item) {
   try {
-    const raw =
+    const dt =
       item?.datetime_local?.starting_at?.date_time ||
       item?.datetime_local?.date_time ||
       item?.time?.starting_at?.date_time ||
-      item?.kickoff ||
       null;
-    if (!raw) return null;
-    return sanitizeIso(raw);
+    if (!dt) return null;
+    // "YYYY-MM-DD HH:mm:ss" -> "YYYY-MM-DDTHH:mm:ss"
+    return dt.replace(" ", "T");
   } catch {
     return null;
   }
@@ -106,38 +67,19 @@ function nearestFutureKickoff(items = []) {
   }
   return best ? new Date(best).toISOString() : null;
 }
-function toBelgradeHM(iso) {
-  try {
-    const d = new Date(iso);
-    if (isNaN(d)) return null;
-    return d.toLocaleString("sr-RS", {
-      timeZone: "Europe/Belgrade",
-      hour12: false,
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return null;
-  }
-}
 function fmtCountdown(ms) {
   const m = Math.floor(ms / 60000);
   const s = Math.floor((ms % 60000) / 1000);
   return `${m}m ${String(s).padStart(2, "0")}s`;
 }
 
-// --------- Header (sada koristi DataContext umesto zasebnog fetcha)
+// --------- Header (bez DataContext-a)
 function HeaderBar() {
-  const { toggle, dark } = useDarkMode();
-  const {
-    football = [],
-    nextCryptoUpdate,
-    footballLastGeneratedAt,
-  } = useContext(DataContext) || {};
+  const { toggle } = useDarkMode();
 
   const [now, setNow] = useState(Date.now());
-  const [nextKickoffAt, setNextKickoffAt] = useState(null); // ISO
-  const [cryptoNextAt, setCryptoNextAt] = useState(null);   // ms
+  const [nextKickoffAt, setNextKickoffAt] = useState(null); // ISO string
+  const [cryptoNextAt, setCryptoNextAt] = useState(null); // timestamp (ms)
 
   // tikanje tajmera
   useEffect(() => {
@@ -145,18 +87,29 @@ function HeaderBar() {
     return () => clearInterval(t);
   }, []);
 
-  // preračunaj next kickoff kad stigne/izmeni se football lista
+  // inicijalno pokupi podatke za tajmere (ne zavisi od context-a)
   useEffect(() => {
-    if (!Array.isArray(football) || football.length === 0) return;
-    setNextKickoffAt(nearestFutureKickoff(football));
-  }, [football]);
-
-  // preuzmi sledeći crypto refresh iz konteksta
-  useEffect(() => {
-    if (typeof nextCryptoUpdate === "number") {
-      setCryptoNextAt(nextCryptoUpdate);
-    }
-  }, [nextCryptoUpdate]);
+    (async () => {
+      try {
+        const [fb, cr] = await Promise.allSettled([
+          safeJson("/api/value-bets"),
+          safeJson("/api/crypto"),
+        ]);
+        if (fb.status === "fulfilled") {
+          const list = Array.isArray(fb.value?.value_bets)
+            ? fb.value.value_bets
+            : [];
+          setNextKickoffAt(nearestFutureKickoff(list));
+        }
+        if (cr.status === "fulfilled") {
+          // sledeći refresh ~10 min posle uspešnog poziva
+          setCryptoNextAt(Date.now() + 10 * 60 * 1000);
+        }
+      } catch {
+        // ne ruši UI
+      }
+    })();
+  }, []);
 
   // countdown-ovi
   const cryptoTL = useMemo(() => {
@@ -171,21 +124,9 @@ function HeaderBar() {
     return fmtCountdown(ms);
   }, [nextKickoffAt, now]);
 
-  const footballGenText = useMemo(() => {
-    const iso = sanitizeIso(footballLastGeneratedAt);
-    return iso ? toBelgradeHM(iso) : null;
-  }, [footballLastGeneratedAt]);
-
-  // ručni refresh: očisti lake lokalne keševe pa reload
+  // ručni refresh: za stabilnost samo reload (da povuče sve iz nove sesije)
   const hardRefresh = () => {
-    if (typeof window !== "undefined") {
-      try {
-        Object.keys(localStorage || {}).forEach((k) => {
-          if (k && k.startsWith("valueBets_")) localStorage.removeItem(k);
-        });
-      } catch {}
-      window.location.reload();
-    }
+    if (typeof window !== "undefined") window.location.reload();
   };
 
   return (
@@ -208,14 +149,14 @@ function HeaderBar() {
             className="px-4 py-2 rounded-xl bg-[#202542] text-white font-semibold"
             type="button"
           >
-            {dark ? "Light mode" : "Dark mode"}
+            Light mode
           </button>
         </div>
 
+        {/* Info chipovi: SAMO dva komada */}
         <div className="px-4 py-2 rounded-full bg-[#202542] text-white text-sm inline-flex items-center gap-6">
           <span>Crypto next refresh: {cryptoTL || "—"}</span>
           <span>Next kickoff: {kickoffTL || "—"}</span>
-          <span>Football last generated: {footballGenText || "—"}</span>
         </div>
       </div>
     </div>
@@ -244,6 +185,7 @@ function Legend() {
 }
 
 export default function Index() {
+  // kartice prikazujemo tek nakon mount-a (da izbegnemo SSR trzavice)
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
@@ -260,9 +202,7 @@ export default function Index() {
 
           <div className="mt-6">
             {mounted ? (
-              <ClientErrorBoundary>
-                <CombinedBets />
-              </ClientErrorBoundary>
+              <CombinedBets />
             ) : (
               <div className="text-slate-400 text-sm">Loading…</div>
             )}
