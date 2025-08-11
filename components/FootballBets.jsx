@@ -2,7 +2,7 @@
 import React, { useContext, useMemo, useState } from "react";
 import { DataContext } from "../contexts/DataContext";
 
-// --- helpers (kao ranije) ---
+// ---------- helpers ----------
 function ccToFlag(cc){ const code=String(cc||"").toUpperCase(); if(!/^[A-Z]{2}$/.test(code)) return ""; return String.fromCodePoint(...[...code].map(c=>0x1f1e6+(c.charCodeAt(0)-65))); }
 const NAME_TO_CC={ usa:"US","united states":"US",america:"US", iceland:"IS",japan:"JP",germany:"DE",england:"GB",scotland:"GB",wales:"GB","faroe-islands":"FO",denmark:"DK",sweden:"SE",norway:"NO",finland:"FI",portugal:"PT",spain:"ES",italy:"IT",france:"FR",netherlands:"NL",belgium:"BE",austria:"AT",switzerland:"CH",turkey:"TR",greece:"GR",serbia:"RS",croatia:"HR",slovenia:"SI",bosnia:"BA",montenegro:"ME","north macedonia":"MK",albania:"AL",mexico:"MX",nicaragua:"NI", bund:"DE",laliga:"ES",seriea:"IT",ligue:"FR",eredivisie:"NL",primeira:"PT",j1:"JP",urvalsdeild:"IS",meistaradeildin:"FO",usl:"US",mls:"US","mls next pro":"US",championship:"GB" };
 function guessFlag(league={}){ const c=String(league.country||"").toLowerCase(); const n=String(league.name||"").toLowerCase(); for(const k of Object.keys(NAME_TO_CC)) if(c.includes(k)) return ccToFlag(NAME_TO_CC[k]); for(const k of Object.keys(NAME_TO_CC)) if(n.includes(k)) return ccToFlag(NAME_TO_CC[k]); return ""; }
@@ -15,6 +15,19 @@ function sortValueBets(bets=[]){ return bets.slice().sort((a,b)=>{ if(a.type!==b
 function bucket(conf){ const c=typeof conf==="number"?conf:0; if(c>=90) return {text:"Top Pick",cls:"text-orange-400"}; if(c>=75) return {text:"High",cls:"text-emerald-400"}; if(c>=50) return {text:"Moderate",cls:"text-sky-400"}; return {text:"Low",cls:"text-amber-400"}; }
 function Badge({children,className=""}){ return <span className={`px-2 py-1 rounded-full border border-white/10 text-xs text-slate-300 ${className}`}>{children}</span>; }
 
+function InfoDot({ text }) {
+  if (!text) return null;
+  return (
+    <div className="relative group inline-flex items-center">
+      <span className="ml-2 w-4 h-4 rounded-full bg-white/10 text-xs leading-4 text-slate-200 inline-flex items-center justify-center select-none">i</span>
+      <div className="absolute z-10 hidden group-hover:block top-5 right-0 w-64 bg-[#1f2339] text-slate-200 text-xs p-3 rounded-xl border border-white/10 shadow">
+        {text}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Card ----------
 function FootballCard({ v, layout="full" }){
   const league=v?.league||{};
   const home=v?.teams?.home?.name||"Home";
@@ -33,7 +46,6 @@ function FootballCard({ v, layout="full" }){
   const bullets=Array.isArray(explain?.bullets)?explain.bullets:[];
   const summary=explain?.summary||"";
 
-  // prikaz forme: izbegni prazno " · vs"
   const formText = (v?.form_text && v.form_text.trim() && v.form_text.trim() !== "vs") ? v.form_text : "";
 
   return (
@@ -65,6 +77,9 @@ function FootballCard({ v, layout="full" }){
         <div className="text-slate-300">Odds: <span className="font-semibold">{fmtOdds(odds)}</span></div>
         {Number.isFinite(v?.edge) && <div className="text-slate-300">Edge: <span className={v.edge>=0?"text-emerald-300":"text-rose-300"}>{(v.edge*100).toFixed(1)}pp</span></div>}
         {Number.isFinite(v?.movement_pct)&&v.movement_pct!==0 && <div className="text-slate-300">Move: <span className={v.movement_pct>=0?"text-emerald-300":"text-rose-300"}>{v.movement_pct>0?"↑":"↓"} {Math.abs(v.movement_pct).toFixed(2)}pp</span></div>}
+
+        {/* Mini tooltip u Combined (jedna rečenica) */}
+        {layout==="combined" && summary && <InfoDot text={summary} />}
       </div>
 
       {/* Confidence */}
@@ -88,7 +103,7 @@ function FootballCard({ v, layout="full" }){
         <div className="mt-2 text-[11px] text-slate-400">H2H: {v.h2h_summary}</div>
       )}
 
-      {/* Why this pick (only full) */}
+      {/* Why this pick (samo u Football tabu) */}
       {layout==="full" && (summary || bullets.length>0) && (
         <div className="mt-3">
           <button onClick={()=>setOpen(x=>!x)} className="text-xs text-slate-300 underline underline-offset-2" type="button">
