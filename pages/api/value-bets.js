@@ -1,89 +1,105 @@
 // FILE: pages/api/value-bets.js
 /**
- * Value Bets (multi-market): 1X2 / BTTS / Over2.5
- * - Rolling window: [now-12h, now+12h] u Europe/Belgrade (više mečeva kroz dan)
- * - Markets:
- *    • 1X2 -> AF predictions kao model (p1,px,p2)
- *    • BTTS (Yes/No) -> Poisson iz team stats (λh, λa)
- *    • Over 2.5 -> Poisson iz λsum (CDF)
- * - Odds: median preko AF /odds?fixture= (isti response, bez novih poziva)
- * - Izbor najboljeg marketa po EV, sa edge/EV/odds u izlazu
- * - Confidence: težine jače kad postoje kvote; blagi penalti kad ne postoje
- * - H2H last=10, lineups/injuries u <90min prozoru
- * - Server-side cache (in-memory) i dnevni soft budžet
+ * Value Bets (multi-market, throttled)
+ * - Rolling 24h (Europe/Belgrade)
+ * - Markets: 1X2 (AF preds), BTTS (Poisson), Over 2.5 (Poisson)
+ * - TWO-PASS:
+ *    Pass1 (cheap): AF /predictions for all AF fixtures -> shortlist by model_prob
+ *    Pass2 (deep): for Top K -> AF /odds + /teams/statistics (home+away) + /h2h + (near kickoff) lineups/injuries
+ * - In-flight dedup & short-term in-memory payload cache (60s) + CDN cache 300s
+ * - Hard cap on AF calls per run to avoid budget spikes
  */
-
-const AF = {
-  BUDGET_DAILY: num(process.env.AF_BUDGET_DAILY, 5000),
-  NEAR_WINDOW_MIN: num(process.env.AF_NEAR_WINDOW_MIN, 90),
-  ROLLING_WINDOW_HOURS: num(process.env.AF_ROLLING_WINDOW_HOURS, 24),
-  H2H_LAST: num(process.env.AF_H2H_LAST, 10),
-};
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const AF_KEY = process.env.API_FOOTBALL_KEY;
 const SM_KEY = process.env.SPORTMONKS_KEY || "";
 const FD_KEY = process.env.FOOTBALL_DATA_KEY || "";
 
+const CFG = {
+  BUDGET_DAILY: num(process.env.AF_BUDGET_DAILY, 5000),
+  ROLLING_WINDOW_HOURS: num(process.env.AF_ROLLING_WINDOW_HOURS, 24),
+  H2H_LAST: num(process.env.AF_H2H_LAST, 10),
+  NEAR_WINDOW_MIN: num(process.env.AF_NEAR_WINDOW_MIN, 60), // smanjeno sa 90 -> 60
+  DEEP_TOP: num(process.env.AF_DEEP_TOP, 20),               // Top K za deep sloj
+  RUN_HARDCAP: num(process.env.AF_RUN_MAX_CALLS, 150),      // max AF poziva u jednom run-u
+  PAYLOAD_MEMO_MS: 60 * 1000,                               // 60s payload memo (nezavisno od query stringa)
+};
+
 function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; }
 
-// ---------- in-memory cache ----------
+// ---------- global caches ----------
 const g = globalThis;
 if (!g.__VB_CACHE__) {
   g.__VB_CACHE__ = {
     byKey: new Map(),
-    oddsSnapshots: new Map(), // key: `${fxId}|${market}|${sel}` -> { ts, implied }
-    counters: { day: new Date().toISOString().slice(0,10), apiFootball: 0, sportMonks: 0, footballData: 0 },
+    counters: { day: todayYMD(), apiFootball: 0, sportMonks: 0, footballData: 0 },
+    snapshots: new Map(), // odds movement snapshots
+    // run dedup
+    inflight: null,                 // Promise
+    inflightAt: 0,
+    lastPayload: null,              // { ts, data }
   };
 }
 const CACHE = g.__VB_CACHE__;
+function todayYMD(){ return new Date().toISOString().slice(0,10); }
+function resetCountersIfNewDay(){
+  const d = todayYMD();
+  if (CACHE.counters.day !== d) {
+    CACHE.counters = { day: d, apiFootball: 0, sportMonks: 0, footballData: 0 };
+  }
+}
+function inc(name){ resetCountersIfNewDay(); CACHE.counters[name] = (CACHE.counters[name] || 0) + 1; }
+function withinDailyBudget(incr=1){ resetCountersIfNewDay(); return CACHE.counters.apiFootball + incr <= CFG.BUDGET_DAILY; }
 function setCache(k, data, ttlSec=60){ CACHE.byKey.set(k,{data,exp:Date.now()+ttlSec*1000}); return data; }
 function getCache(k){ const it=CACHE.byKey.get(k); if(!it) return null; if(Date.now()>it.exp){ CACHE.byKey.delete(k); return null; } return it.data; }
-function inc(name){ const today=new Date().toISOString().slice(0,10); if(CACHE.counters.day!==today) CACHE.counters={day:today,apiFootball:0,sportMonks:0,footballData:0}; CACHE.counters[name]=(CACHE.counters[name]||0)+1; }
-function withinBudget(incr=1){ const today=new Date().toISOString().slice(0,10); if(CACHE.counters.day!==today) CACHE.counters={day:today,apiFootball:0,sportMonks:0,footballData:0}; return CACHE.counters.apiFootball+incr<=AF.BUDGET_DAILY; }
+
+// --- per-run hardcap ---
+let RUN_CALLS = 0;
+function canCallAF(qty=1){ return RUN_CALLS + qty <= CFG.RUN_HARDCAP; }
+function noteAF(qty=1){ RUN_CALLS += qty; }
 
 // ---------- helpers ----------
 function sanitizeIso(s){ if(!s||typeof s!=="string") return null; let iso=s.trim().replace(" ","T"); iso=iso.replace("+00:00Z","Z").replace("Z+00:00","Z"); return iso; }
 function impliedFromDecimal(o){ const x=Number(o); return Number.isFinite(x)&&x>1.01?1/x:null; }
-function toLocalYMD(d, tz){ return new Intl.DateTimeFormat("sv-SE",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit"}).format(d); }
 function bucketFromPct(p){ if(p>=90) return "TOP"; if(p>=75) return "High"; if(p>=50) return "Moderate"; return "Low"; }
+function toLocalYMD(d, tz){ return new Intl.DateTimeFormat("sv-SE",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit"}).format(d); }
 function sum(a){ return a.reduce((x,y)=>x+y,0); }
 function evFrom(p, o){ const odds=Number(o); if(!Number.isFinite(odds)||odds<=1.01) return null; return p*(odds-1) - (1-p); }
 
-// Poisson helpers
-function expm1(x){ return Math.exp(x)-1; }
-function poissonPMF(k, lambda){ if(lambda<=0) return k===0?1:0; // robust
-  // use log form to avoid overflow
-  let logP = -lambda; for(let i=1;i<=k;i++) logP += Math.log(lambda) - Math.log(i);
-  return Math.exp(logP);
-}
-function poissonCDF(k, lambda){ // P(X <= k)
-  let acc=0; for(let i=0;i<=k;i++) acc+=poissonPMF(i,lambda); return acc;
-}
+// --- Poisson ---
+function poissonPMF(k, lambda){ if(lambda<=0) return k===0?1:0; let logP = -lambda; for(let i=1;i<=k;i++) logP += Math.log(lambda) - Math.log(i); return Math.exp(logP); }
+function poissonCDF(k, lambda){ let acc=0; for(let i=0;i<=k;i++) acc+=poissonPMF(i,lambda); return acc; }
 
 // ---------- HTTP wrappers ----------
-async function afFetch(path,{ttl=0}={}) {
+async function afFetch(path,{ttl=0}={}){
   if(!AF_KEY) throw new Error("API_FOOTBALL_KEY missing");
   const url=`https://v3.football.api-sports.io${path}`;
-  const ck=`AF:${url}`; if(ttl){ const c=getCache(ck); if(c) return c; }
-  if(!withinBudget()) throw new Error("AF budget exhausted");
+  const ck=`AF:${url}`;
+  if(ttl){ const c=getCache(ck); if(c) return c; }
+  if(!withinDailyBudget()) throw new Error("AF budget exhausted");
+  if(!canCallAF()) throw new Error("AF run hardcap reached");
   const res=await fetch(url,{headers:{ "x-apisports-key":AF_KEY }});
-  inc("apiFootball"); if(!res.ok) throw new Error(`AF ${path} -> ${res.status}`);
+  noteAF(); inc("apiFootball");
+  if(!res.ok) throw new Error(`AF ${path} -> ${res.status}`);
   const j=await res.json(); if(ttl) setCache(ck,j,ttl); return j;
 }
-async function smFetch(url,{ttl=0}={}) {
-  const ck=`SM:${url}`; if(ttl){ const c=getCache(ck); if(c) return c; }
-  const res=await fetch(url); inc("sportMonks"); if(!res.ok) throw new Error(`SM ${url} -> ${res.status}`);
+async function smFetch(url,{ttl=0}={}){
+  const ck=`SM:${url}`;
+  if(ttl){ const c=getCache(ck); if(c) return c; }
+  const res=await fetch(url);
+  inc("sportMonks"); if(!res.ok) throw new Error(`SM ${url} -> ${res.status}`);
   const j=await res.json(); if(ttl) setCache(ck,j,ttl); return j;
 }
-async function fdFetch(path,{ttl=0}={}) {
+async function fdFetch(path,{ttl=0}={}){
   const url=`https://api.football-data.org/v4${path}`;
-  const ck=`FD:${url}`; if(ttl){ const c=getCache(ck); if(c) return c; }
-  const res=await fetch(url,{headers:{ "X-Auth-Token":FD_KEY }}); inc("footballData"); if(!res.ok) throw new Error(`FD ${path} -> ${res.status}`);
+  const ck=`FD:${url}`;
+  if(ttl){ const c=getCache(ck); if(c) return c; }
+  const res=await fetch(url,{headers:{ "X-Auth-Token":FD_KEY }});
+  inc("footballData"); if(!res.ok) throw new Error(`FD ${path} -> ${res.status}`);
   const j=await res.json(); if(ttl) setCache(ck,j,ttl); return j;
 }
 
-// ---------- data fetchers ----------
+// ---------- fetchers ----------
 async function fetchAFByDate(ymd){
   const af=await afFetch(`/fixtures?date=${ymd}`,{ttl:15*60});
   return (af?.response||[]).map(f=>({
@@ -96,7 +112,7 @@ async function fetchAFByDate(ymd){
 }
 
 async function fetchFixturesRolling(nowUTC=new Date()){
-  const half = Math.max(1, Math.round(AF.ROLLING_WINDOW_HOURS/2));
+  const half = Math.max(1, Math.round(CFG.ROLLING_WINDOW_HOURS/2));
   const startMs = nowUTC.getTime() - half*3600*1000;
   const endMs   = nowUTC.getTime() + half*3600*1000;
 
@@ -105,7 +121,7 @@ async function fetchFixturesRolling(nowUTC=new Date()){
   const dPrev=new Date(nowUTC); dPrev.setDate(dPrev.getDate()-1);
   const dNext=new Date(nowUTC); dNext.setDate(dNext.getDate()+1);
 
-  const days=[toLocalYMD(dPrev,tz),toLocalYMD(dNow,tz),toLocalYMD(dNext,tz)];
+  const days=[toLocalYMD(dPrev,tz), toLocalYMD(dNow,tz), toLocalYMD(dNext,tz)];
   let list=[];
   for(const ymd of days){ try{ list=list.concat(await fetchAFByDate(ymd)); }catch(_){} }
 
@@ -118,26 +134,26 @@ async function fetchFixturesRolling(nowUTC=new Date()){
 
   if(inWindow.length) return inWindow;
 
-  // fallback da UI ne bude prazan (IDs nisu kompatibilni za AF detalje)
-  if(SM_KEY){ try{
-    const ymd=toLocalYMD(dNow,tz);
-    const url=`https://api.sportmonks.com/v3/football/fixtures/date/${ymd}?api_token=${SM_KEY}&include=participants;league;season`;
-    const sm=await smFetch(url,{ttl:15*60});
-    if(sm?.data?.length){
-      return sm.data.map(f=>{
-        const home=f?.participants?.find?.(p=>p.meta?.location==="home");
-        const away=f?.participants?.find?.(p=>p.meta?.location==="away");
-        return {
-          source:"SM",
-          fixture_id:f.id,
-          league:{ id:f?.league?.id, name:f?.league?.name||"", country:f?.league?.country?.name||f?.league?.country||"", season:f?.season?.name||"" },
-          teams:{ home:{ id:home?.id, name:home?.name }, away:{ id:away?.id, name:away?.name } },
-          datetime_local:{ starting_at:{ date_time:sanitizeIso(f?.starting_at) } },
-        };
-      });
-    }
-  }catch(_){}} else if(FD_KEY){
-    try{
+  // fallback (samo da UI ne bude prazan)
+  try{
+    if(SM_KEY){
+      const ymd=toLocalYMD(dNow,tz);
+      const url=`https://api.sportmonks.com/v3/football/fixtures/date/${ymd}?api_token=${SM_KEY}&include=participants;league;season`;
+      const sm=await smFetch(url,{ttl:15*60});
+      if(sm?.data?.length){
+        return sm.data.map(f=>{
+          const home=f?.participants?.find?.(p=>p.meta?.location==="home");
+          const away=f?.participants?.find?.(p=>p.meta?.location==="away");
+          return {
+            source:"SM",
+            fixture_id:f.id,
+            league:{ id:f?.league?.id, name:f?.league?.name||"", country:f?.league?.country?.name||f?.league?.country||"", season:f?.season?.name||"" },
+            teams:{ home:{ id:home?.id, name:home?.name }, away:{ id:away?.id, name:away?.name } },
+            datetime_local:{ starting_at:{ date_time:sanitizeIso(f?.starting_at) } },
+          };
+        });
+      }
+    } else if(FD_KEY){
       const ymd=toLocalYMD(dNow,tz);
       const fd=await fdFetch(`/matches?dateFrom=${ymd}&dateTo=${ymd}`,{ttl:15*60});
       return (fd?.matches||[]).map(m=>({
@@ -147,122 +163,100 @@ async function fetchFixturesRolling(nowUTC=new Date()){
         teams:{ home:{ id:m?.homeTeam?.id, name:m?.homeTeam?.name }, away:{ id:m?.awayTeam?.id, name:m?.awayTeam?.name } },
         datetime_local:{ starting_at:{ date_time:sanitizeIso(m?.utcDate) } },
       }));
-    }catch(_){}
-  }
+    }
+  }catch(_){}
 
   return [];
 }
 
 async function fetchPredictions(fx){
-  try{
-    const j=await afFetch(`/predictions?fixture=${fx}`,{ttl:30*60});
-    const r=j?.response?.[0]; const preds=r?.predictions||r;
-    let p1=preds?.percent?.home, px=preds?.percent?.draw, p2=preds?.percent?.away;
-    const clean=v=>typeof v==="string"?parseFloat(v)/100:Number(v);
-    p1=clean(p1); px=clean(px); p2=clean(p2);
-    const t=[p1,px,p2].filter(Number.isFinite).reduce((a,b)=>a+b,0);
-    if(t>0){ p1=(p1||0)/t; px=(px||0)/t; p2=(p2||0)/t; return {p1,px,p2}; }
-  }catch(_){}
+  const j=await afFetch(`/predictions?fixture=${fx}`,{ttl:30*60});
+  const r=j?.response?.[0]; const preds=r?.predictions||r;
+  let p1=preds?.percent?.home, px=preds?.percent?.draw, p2=preds?.percent?.away;
+  const clean=v=>typeof v==="string"?parseFloat(v)/100:Number(v);
+  p1=clean(p1); px=clean(px); p2=clean(p2);
+  const t=[p1,px,p2].filter(Number.isFinite).reduce((a,b)=>a+b,0);
+  if(t>0){ p1=(p1||0)/t; px=(px||0)/t; p2=(p2||0)/t; return {p1,px,p2}; }
   return null;
 }
 
 async function fetchOdds(fx){
-  try{
-    const j=await afFetch(`/odds?fixture=${fx}`,{ttl:10*60});
-    const resp=j?.response||[];
-    // Normalize markets we care about
-    const acc = { '1X2':{ "1":[], "X":[], "2":[] }, 'BTTS':{ Yes:[], No:[] }, 'OU':{} }; // OU by line: { '2.5': { Over:[], Under:[] } }
-    for(const row of resp){
-      const bets=row?.bookmakers?.[0]?.bets||[];
-      for(const m of bets){
-        const name=(m?.name||"").toLowerCase();
-
-        // 1X2
-        if(name.includes("match winner")||name.includes("1x2")){
-          for(const v of m.values||[]){
-            const lbl=(v?.value||"").toUpperCase();
-            const odd=Number(v?.odd);
-            if(!Number.isFinite(odd)) continue;
-            if(lbl==="HOME"||lbl==="1") acc['1X2']["1"].push(odd);
-            if(lbl==="DRAW"||lbl==="X") acc['1X2']["X"].push(odd);
-            if(lbl==="AWAY"||lbl==="2") acc['1X2']["2"].push(odd);
-          }
+  const j=await afFetch(`/odds?fixture=${fx}`,{ttl:10*60});
+  const resp=j?.response||[];
+  const acc = { '1X2':{ "1":[], "X":[], "2":[] }, 'BTTS':{ Yes:[], No:[] }, 'OU':{} };
+  for(const row of resp){
+    const bets=row?.bookmakers?.[0]?.bets||[];
+    for(const m of bets){
+      const name=(m?.name||"").toLowerCase();
+      // 1X2
+      if(name.includes("match winner")||name.includes("1x2")){
+        for(const v of m.values||[]){
+          const lbl=(v?.value||"").toUpperCase();
+          const odd=Number(v?.odd); if(!Number.isFinite(odd)) continue;
+          if(lbl==="HOME"||lbl==="1") acc['1X2']["1"].push(odd);
+          if(lbl==="DRAW"||lbl==="X") acc['1X2']["X"].push(odd);
+          if(lbl==="AWAY"||lbl==="2") acc['1X2']["2"].push(odd);
         }
-
-        // BTTS
-        if(name.includes("both teams to score") || name.includes("btts")){
-          for(const v of m.values||[]){
-            const lbl=(v?.value||"").toLowerCase();
-            const odd=Number(v?.odd);
-            if(!Number.isFinite(odd)) continue;
-            if(lbl.includes("yes")) acc['BTTS'].Yes.push(odd);
-            if(lbl.includes("no"))  acc['BTTS'].No.push(odd);
-          }
+      }
+      // BTTS
+      if(name.includes("both teams to score") || name.includes("btts")){
+        for(const v of m.values||[]){
+          const lbl=(v?.value||"").toLowerCase();
+          const odd=Number(v?.odd); if(!Number.isFinite(odd)) continue;
+          if(lbl.includes("yes")) acc['BTTS'].Yes.push(odd);
+          if(lbl.includes("no"))  acc['BTTS'].No.push(odd);
         }
-
-        // Totals (Over/Under)
-        if(name.includes("over/under") || name.includes("goals over/under") || name.includes("totals")){
-          for(const v of m.values||[]){
-            const lbl=(v?.value||"").toLowerCase(); // e.g., "Over 2.5"
-            const odd=Number(v?.odd);
-            if(!Number.isFinite(odd)) continue;
-            const parts=lbl.split(" ");
-            const side=parts[0]; // "over"|"under"
-            const lineStr=parts[1] || "";
-            if(!lineStr) continue;
-            const line=parseFloat(lineStr);
-            if(!Number.isFinite(line)) continue;
-            const key=line.toFixed(1);
-            if(!acc['OU'][key]) acc['OU'][key]={ Over:[], Under:[] };
-            if(side.startsWith("over"))  acc['OU'][key].Over.push(odd);
-            if(side.startsWith("under")) acc['OU'][key].Under.push(odd);
-          }
+      }
+      // Totals (Over/Under)
+      if(name.includes("over/under") || name.includes("goals over/under") || name.includes("totals")){
+        for(const v of m.values||[]){
+          const lbl=(v?.value||"").toLowerCase(); // “Over 2.5”
+          const odd=Number(v?.odd); if(!Number.isFinite(odd)) continue;
+          const parts=lbl.split(" ");
+          const side=parts[0]; const lineStr=parts[1]||""; const line=parseFloat(lineStr);
+          if(!lineStr||!Number.isFinite(line)) continue;
+          const key=line.toFixed(1);
+          if(!acc['OU'][key]) acc['OU'][key]={ Over:[], Under:[] };
+          if(side.startsWith("over"))  acc['OU'][key].Over.push(odd);
+          if(side.startsWith("under")) acc['OU'][key].Under.push(odd);
         }
       }
     }
-
-    const median=arr=>arr.length? (arr.slice().sort((a,b)=>a-b)[Math.floor(arr.length/2)]) : null;
-
-    const odds = {
-      "1X2": { "1": median(acc['1X2']["1"]), "X": median(acc['1X2']["X"]), "2": median(acc['1X2']["2"]) },
-      "BTTS": { "Yes": median(acc['BTTS'].Yes), "No": median(acc['BTTS'].No) },
-      "OU": {}
-    };
-    for(const line of Object.keys(acc['OU'])){
-      odds["OU"][line] = { "Over": median(acc['OU'][line].Over), "Under": median(acc['OU'][line].Under) };
-    }
-
-    return { odds, bookmakers_count: resp.length||0 };
-  }catch(_){}
-  return null;
+  }
+  const median=arr=>arr.length? (arr.slice().sort((a,b)=>a-b)[Math.floor(arr.length/2)]) : null;
+  const odds = {
+    "1X2": { "1": median(acc['1X2']["1"]), "X": median(acc['1X2']["X"]), "2": median(acc['1X2']["2"]) },
+    "BTTS": { "Yes": median(acc['BTTS'].Yes), "No": median(acc['BTTS'].No) },
+    "OU": {}
+  };
+  for(const line of Object.keys(acc['OU'])){
+    odds["OU"][line] = { "Over": median(acc['OU'][line].Over), "Under": median(acc['OU'][line].Under) };
+  }
+  return { odds, bookmakers_count: resp.length||0 };
 }
 
 async function fetchTeamStats(leagueId,season,teamId){
-  try{ const j=await afFetch(`/teams/statistics?league=${leagueId}&season=${season}&team=${teamId}`,{ttl:12*3600}); return j?.response||null; }catch(_){}
-  return null;
+  const j=await afFetch(`/teams/statistics?league=${leagueId}&season=${season}&team=${teamId}`,{ttl:12*3600});
+  return j?.response||null;
 }
 async function fetchH2H(homeId,awayId,last){
-  try{
-    const j=await afFetch(`/fixtures/headtohead?h2h=${homeId}-${awayId}&last=${last}`,{ttl:24*3600});
-    const games=j?.response||[];
-    let w=0,d=0,l=0,gs=0,ga=0;
-    for(const g of games){
-      const hs=g?.goals?.home ?? g?.score?.fulltime?.home;
-      const as=g?.goals?.away ?? g?.score?.fulltime?.away;
-      if(Number.isFinite(hs)&&Number.isFinite(as)){ gs+=hs; ga+=as; if(hs>as) w++; else if(hs===as) d++; else l++; }
-    }
-    const summary=games.length?`W${w} D${d} L${l} · ${gs}:${ga}`:"";
-    return { summary, count: games.length };
-  }catch(_){}
-  return { summary:"", count:0 };
+  const j=await afFetch(`/fixtures/headtohead?h2h=${homeId}-${awayId}&last=${last}`,{ttl:24*3600});
+  const games=j?.response||[];
+  let w=0,d=0,l=0,gs=0,ga=0;
+  for(const g of games){
+    const hs=g?.goals?.home ?? g?.score?.fulltime?.home;
+    const as=g?.goals?.away ?? g?.score?.fulltime?.away;
+    if(Number.isFinite(hs)&&Number.isFinite(as)){ gs+=hs; ga+=as; if(hs>as) w++; else if(hs===as) d++; else l++; }
+  }
+  const summary=games.length?`W${w} D${d} L${l} · ${gs}:${ga}`:"";
+  return { summary, count: games.length };
 }
-async function fetchInjuries(fx){ try{ const j=await afFetch(`/injuries?fixture=${fx}`,{ttl:10*60}); return { count:(j?.response||[]).length||0 }; }catch(_){return {count:0}} }
-async function fetchLineups(fx){ try{ const j=await afFetch(`/fixtures/lineups?fixture=${fx}`,{ttl:5*60}); const ln=j?.response||[]; const confirmed=ln.some(x=>Array.isArray(x?.startXI)&&x.startXI.length>0); return { status: confirmed ? "confirmed" : (ln.length ? "expected" : "unknown") }; }catch(_){return {status:"unknown"}} }
+async function fetchInjuries(fx){ try{ const j=await afFetch(`/injuries?fixture=${fx}`,{ttl:10*60}); return { count:(j?.response||[]).length||0 }; }catch(_){ return {count:0}; } }
+async function fetchLineups(fx){ try{ const j=await afFetch(`/fixtures/lineups?fixture=${fx}`,{ttl:5*60}); const ln=j?.response||[]; const confirmed=ln.some(x=>Array.isArray(x?.startXI)&&x.startXI.length>0); return { status: confirmed ? "confirmed" : (ln.length ? "expected" : "unknown") }; }catch(_){ return {status:"unknown"}; } }
 
-// --- model pieces ---
+// --- models ---
 function pickFromPreds(preds){ const map={ "1":preds?.p1||0, "X":preds?.px||0, "2":preds?.p2||0 }; const sel=Object.keys(map).sort((a,b)=>map[b]-map[a])[0]||"1"; return { selection:sel, prob: map[sel]||0 }; }
 function poissonLambdas(statsHome, statsAway){
-  // pokušaj home/away proseka; fallback na overall ili razuman default
   const get = (s, path) => path.split(".").reduce((o,k)=>o?.[k], s);
   let λh = Number(get(statsHome,"goals.for.average.home")) || Number(get(statsHome,"goals.for.average.total")) || 1.4;
   let λa = Number(get(statsAway,"goals.for.average.away")) || Number(get(statsAway,"goals.for.average.total")) || 1.2;
@@ -284,18 +278,34 @@ function modelOver25(λh, λa){
   return { Over: over, Under: 1 - over, line: 2.5 };
 }
 
-// movement snapshot (per market+selection)
 function movementPP(fxId, market, sel, oddsVal){
   const implied = impliedFromDecimal(oddsVal);
   if(!Number.isFinite(implied)) return 0;
   const key = `${fxId}|${market}|${sel}`;
-  const prev = CACHE.oddsSnapshots.get(key);
-  CACHE.oddsSnapshots.set(key, { ts: Date.now(), implied });
+  const prev = CACHE.snapshots.get(key);
+  CACHE.snapshots.set(key, { ts: Date.now(), implied });
   if(!prev || !Number.isFinite(prev.implied)) return 0;
-  const pp = (implied - prev.implied) * 100; // percentage points
+  const pp = (implied - prev.implied) * 100;
   return Math.round(pp * 100) / 100;
 }
 
+function overallConfidence(v){
+  const hasOdds = Number.isFinite(v.odds_dec) && Number.isFinite(v.implied_prob);
+  const pPred=v.model_prob||0;
+  const edge=Number.isFinite(v.edge_pp)? Math.max(-15, Math.min(15, v.edge_pp)) / 100 : 0;
+  const form=v.form_score||0;
+  const lineups=v.lineups_status==="confirmed"?1:(v.lineups_status==="expected"?0.6:0.4);
+  const injuries=Math.max(0,1-Math.min(1,(v.injuries_count||0)/5));
+  const move=Math.max(0,1+(v.movement_pct||0)/10);
+
+  const W = hasOdds
+    ? { pred:0.30, edge:0.22, form:0.15, h2h:0.08, lineups:0.10, inj:0.08, move:0.07 }
+    : { pred:0.38, edge:0.06, form:0.20, h2h:0.12, lineups:0.12, inj:0.10, move:0.02 };
+
+  const base = W.pred*pPred + W.edge*(0.5+edge) + W.form*form + W.h2h*(v.h2h_score||0) + W.lineups*(lineups/1.1) + W.inj*injuries + W.move*Math.min(1.2,move);
+  const score = Math.max(0, Math.min(1, hasOdds ? base : base - 0.03));
+  return score;
+}
 function explainBlock(v){
   const bits=[];
   if(v.form_text) bits.push(`Forma: ${v.form_text}`);
@@ -311,39 +321,19 @@ function explainBlock(v){
   return { summary, bullets: bits };
 }
 
-function overallConfidence(v){
-  const hasOdds = Number.isFinite(v.odds_dec) && Number.isFinite(v.implied_prob);
-  const pPred=v.model_prob||0;
-  const edge=Number.isFinite(v.edge_pp)? Math.max(-15, Math.min(15, v.edge_pp)) / 100 : 0; // pp -> fraction
-  const form=v.form_score||0;
-  const lineups=v.lineups_status==="confirmed"?1:(v.lineups_status==="expected"?0.6:0.4);
-  const injuries=Math.max(0,1-Math.min(1,(v.injuries_count||0)/5));
-  const move=Math.max(0,1+(v.movement_pct||0)/10);
-
-  const W = hasOdds
-    ? { pred:0.30, edge:0.22, form:0.15, h2h:0.08, lineups:0.10, inj:0.08, move:0.07 }
-    : { pred:0.38, edge:0.06, form:0.20, h2h:0.12, lineups:0.12, inj:0.10, move:0.02 };
-
-  const base = W.pred*pPred + W.edge*(0.5+edge) + W.form*form + W.h2h*(v.h2h_score||0) + W.lineups*(lineups/1.1) + W.inj*injuries + W.move*Math.min(1.2,move);
-  const score = Math.max(0, Math.min(1, hasOdds ? base : base - 0.03));
-  return score;
-}
-
-function formatPickForUI(base, pick){
-  // pick = { market, selection, model_prob, odds_dec, implied_prob, edge_pp, ev, movement_pct, market_label }
+function formatPick(base, pick){
   const conf = overallConfidence({ ...base, ...pick });
   const confidence_pct = Math.round(conf * 100);
   return {
     fixture_id: base.fx, teams: base.teams, league: base.league,
     datetime_local: { starting_at: { date_time: base.kickoffISO } },
-    market: pick.market,
-    market_label: pick.market_label,
+    market: pick.market, market_label: pick.market_label,
     selection: pick.selection,
     type: Number.isFinite(pick.odds_dec) ? "MODEL+ODDS" : "FALLBACK",
     model_prob: pick.model_prob ?? null,
     market_odds: Number.isFinite(pick.odds_dec) ? pick.odds_dec : null,
     implied_prob: Number.isFinite(pick.implied_prob) ? pick.implied_prob : null,
-    edge: Number.isFinite(pick.edge_pp) ? pick.edge_pp/100 : null, // keep edge (fraction) for legacy UI bits
+    edge: Number.isFinite(pick.edge_pp) ? pick.edge_pp/100 : null,
     edge_pp: Number.isFinite(pick.edge_pp) ? pick.edge_pp : null,
     ev: Number.isFinite(pick.ev) ? pick.ev : null,
     movement_pct: Number.isFinite(pick.movement_pct) ? pick.movement_pct : 0,
@@ -360,76 +350,85 @@ function formatPickForUI(base, pick){
   };
 }
 
-export default async function handler(req, res){
-  const debug = req.query.debug === "1" || req.query.debug === "true";
+// ---------- main compute (two-pass with caps) ----------
+async function computePayload(){
+  RUN_CALLS = 0; // reset hardcap counter for this run
   const t0 = Date.now();
 
-  // 1) fixtures u rolling 24h
-  let fixtures=[]; try{ fixtures=await fetchFixturesRolling(new Date()); }catch(_){}
-  const out=[];
+  // 0) Fixtures
+  const fixtures = await fetchFixturesRolling(new Date());
+  const afFixtures = fixtures.filter(f => f.source === "AF");
+  const nonAf = fixtures.filter(f => f.source !== "AF");
 
-  for(const f of fixtures){
-    const fx=f.fixture_id, leagueId=f.league?.id, season=f.league?.season, homeId=f.teams?.home?.id, awayId=f.teams?.away?.id;
-    if(f.source!=="AF"){ // fallback bez AF ID-jeva -> samo minimal (da ne zatrpamo)
-      const fallback = {
-        fx, teams:f.teams, league:f.league,
-        kickoffISO: sanitizeIso(f?.datetime_local?.starting_at?.date_time),
-        form_score: 0.5, form_text: "", h2h_summary: "",
-        lineups_status: "unknown", injuries_count: 0, bookmakers_count: 0,
-      };
-      const p = num(process.env.FALLBACK_MIN_PROB, 0.52);
-      const pick = { market:"1X2", selection:"1", model_prob:p, odds_dec:null, implied_prob:null, edge_pp:null, ev:null, movement_pct:0, market_label:"1X2" };
-      out.push(formatPickForUI(fallback, pick));
-      continue;
-    }
+  // 1) PASS 1: predictions for AF fixtures (cheap layer)
+  const pass1 = [];
+  for (const f of afFixtures) {
+    if (!canCallAF()) break;
+    const preds = await fetchPredictions(f.fixture_id).catch(()=>null);
+    let selection="1", model_prob = num(process.env.FALLBACK_MIN_PROB,0.52);
+    if (preds) { const p = pickFromPreds(preds); selection=p.selection; model_prob=p.prob; }
+    pass1.push({
+      fx: f.fixture_id, league: f.league, teams: f.teams,
+      kickoffISO: sanitizeIso(f?.datetime_local?.starting_at?.date_time),
+      selection, model_prob,
+      // placeholders for deep layer:
+      form_score: 0.5, form_text: "", h2h_summary: "",
+      lineups_status: "unknown", injuries_count: 0, bookmakers_count: 0,
+    });
+  }
 
-    // 2) stats + preds + odds
-    let preds=null; if(withinBudget(1)) preds=await fetchPredictions(fx).catch(()=>null);
-    let statsHome=null, statsAway=null;
-    if(withinBudget(2) && leagueId && season){
-      [statsHome,statsAway]=await Promise.all([
-        fetchTeamStats(leagueId,season,homeId).catch(()=>null),
-        fetchTeamStats(leagueId,season,awayId).catch(()=>null),
+  // Shortlist by model_prob (desc) — take Top K for deep
+  const K = Math.max(5, Math.min(CFG.DEEP_TOP, pass1.length));
+  const shortlist = pass1.slice().sort((a,b)=> (b.model_prob||0)-(a.model_prob||0)).slice(0, K);
+  const shortlistSet = new Set(shortlist.map(x=>x.fx));
+
+  // 2) PASS 2: deep data only for shortlist (odds + stats + h2h + near extras)
+  const deepPicks = [];
+  for (const base of shortlist) {
+    const { fx, league, teams, kickoffISO } = base;
+
+    // odds
+    let oddsPack=null; if (canCallAF()) { oddsPack = await fetchOdds(fx).catch(()=>null); }
+    const odds = oddsPack?.odds || null;
+    const bookmakers_count = Number(oddsPack?.bookmakers_count || 0);
+
+    // stats & h2h
+    let statsHome=null, statsAway=null, h2h={summary:"",count:0};
+    if (canCallAF(3) && league?.id && league?.season && teams?.home?.id && teams?.away?.id) {
+      [statsHome, statsAway] = await Promise.all([
+        fetchTeamStats(league.id, league.season, teams.home.id).catch(()=>null),
+        fetchTeamStats(league.id, league.season, teams.away.id).catch(()=>null),
       ]);
+      h2h = await fetchH2H(teams.home.id, teams.away.id, CFG.H2H_LAST).catch(()=>({summary:"",count:0}));
     }
-    const { λh, λa } = poissonLambdas(statsHome,statsAway);
 
-    let oddsPack=null; if(withinBudget(1)) oddsPack=await fetchOdds(fx).catch(()=>null);
-    const { odds, bookmakers_count } = oddsPack || {};
+    // form
+    const form = (()=>{ const fscore = (s)=>{ const sform=s?.form || s?.fixtures?.form || ""; if(!sform) return null; const map={W:1,D:0.5,L:0}; const v=sform.toString().slice(-5).split("").map(c=>map[c]??0); return v.length? v.reduce((a,b)=>a+b,0)/v.length : null; }; const sh=fscore(statsHome), sa=fscore(statsAway); const text=(statsHome?.form||statsHome?.fixtures?.form||"")&&(statsAway?.form||statsAway?.fixtures?.form||"") ? `${(statsHome?.form||statsHome?.fixtures?.form||"").slice(-5)} vs ${(statsAway?.form||statsAway?.fixtures?.form||"").slice(-5)}` : ""; return { score: (sh==null||sa==null)?0.5:Math.max(0,Math.min(1,0.5+(sh-sa)/2)), text };})();
 
-    // 3) form/h2h
-    const form = (()=>{ const fscore = (stats)=>{ const s=stats?.form || stats?.fixtures?.form || ""; if(!s) return null; const map={W:1,D:0.5,L:0}; const v=s.toString().slice(-5).split("").map(c=>map[c]??0); return v.length? v.reduce((a,b)=>a+b,0)/v.length : null; }; const sh=fscore(statsHome), sa=fscore(statsAway); const text=(statsHome?.form||statsHome?.fixtures?.form||"")&&(statsAway?.form||statsAway?.fixtures?.form||"") ? `${(statsHome?.form||statsHome?.fixtures?.form||"").slice(-5)} vs ${(statsAway?.form||statsAway?.fixtures?.form||"").slice(-5)}` : ""; return { score: (sh==null||sa==null)?0.5:Math.max(0,Math.min(1,0.5+(sh-sa)/2)), text };})();
-    const h2h = withinBudget(1) ? await fetchH2H(homeId,awayId,AF.H2H_LAST).catch(()=>({summary:"",count:0})) : {summary:"",count:0};
-
-    // 4) near-kickoff extras
+    // near-kickoff extras
     let injuries_count=0, lineups_status="unknown";
-    const kickoffISO=sanitizeIso(f?.datetime_local?.starting_at?.date_time);
     const minsTo = kickoffISO ? Math.round((new Date(kickoffISO).getTime()-Date.now())/60000) : null;
-    if(minsTo!==null && minsTo<=AF.NEAR_WINDOW_MIN && minsTo>=-180){
-      if(withinBudget(2)){
-        const [inj,lin]=await Promise.all([
+    if (minsTo!==null && minsTo<=CFG.NEAR_WINDOW_MIN && minsTo>=-180) {
+      if (canCallAF(2)) {
+        const [inj, lin] = await Promise.all([
           fetchInjuries(fx).catch(()=>({count:0})),
           fetchLineups(fx).catch(()=>({status:"unknown"})),
         ]);
-        injuries_count=inj.count||0; lineups_status=lin.status||"unknown";
+        injuries_count = inj.count||0; lineups_status = lin.status||"unknown";
       }
     }
 
-    const base = {
-      fx, teams:f.teams, league:f.league,
-      kickoffISO, form_score:form.score, form_text:form.text, h2h_summary:h2h.summary,
-      lineups_status, injuries_count, bookmakers_count: Number(bookmakers_count)||0
-    };
+    // lambdas for Poisson
+    const { λh, λa } = poissonLambdas(statsHome, statsAway);
 
-    // 5) market candidates
+    // build market candidates
     const candidates = [];
 
-    // 1X2 (model = AF preds, ako postoje; inače slab fallback)
-    if(preds){
-      const pick = pickFromPreds(preds);
-      const p = pick.prob;
-      const sel = pick.selection;
-      const o = odds?.["1X2"]?.[sel] ?? null;
+    // 1X2 (we already have model_prob from pass1 & selection by preds)
+    {
+      const sel = base.selection;
+      const p  = base.model_prob;
+      const o  = odds?.["1X2"]?.[sel] ?? null;
       const imp = impliedFromDecimal(o);
       const edge_pp = (Number.isFinite(imp) ? (p - imp)*100 : null);
       const ev = Number.isFinite(o) ? evFrom(p, o) : null;
@@ -437,88 +436,121 @@ export default async function handler(req, res){
       candidates.push({ market:"1X2", market_label:"1X2", selection:sel, model_prob:p, odds_dec:o, implied_prob:imp, edge_pp, ev, movement_pct:move });
     }
 
-    // BTTS Yes/No (Poisson)
+    // BTTS (Poisson)
     {
       const btts = modelBTTS(λh, λa);
       const yesO = odds?.["BTTS"]?.["Yes"] ?? null;
       const noO  = odds?.["BTTS"]?.["No"]  ?? null;
       const yesImp = impliedFromDecimal(yesO);
       const noImp  = impliedFromDecimal(noO);
-
-      const pushCandidate = (sel, p, o, imp) => {
-        const edge_pp = Number.isFinite(imp) ? (p - imp)*100 : null;
-        const ev = Number.isFinite(o) ? evFrom(p, o) : null;
-        const move = Number.isFinite(o) ? movementPP(fx, "BTTS", sel, o) : 0;
-        candidates.push({ market:"BTTS", market_label:"BTTS", selection:sel, model_prob:p, odds_dec:o, implied_prob:imp, edge_pp, ev, movement_pct:move });
-      };
-      // biramo bolju stranu samo ako ima neku kvotu (ili obe)
-      if(yesO || noO){
-        if(yesO) pushCandidate("Yes", btts.Yes, yesO, yesImp);
-        if(noO)  pushCandidate("No",  btts.No,  noO,  noImp);
-      }
+      if(yesO){ const edge_pp = Number.isFinite(yesImp)?(btts.Yes-yesImp)*100:null; const ev=Number.isFinite(yesO)?evFrom(btts.Yes, yesO):null; const move=Number.isFinite(yesO)?movementPP(fx,"BTTS","Yes",yesO):0; candidates.push({ market:"BTTS", market_label:"BTTS", selection:"Yes", model_prob:btts.Yes, odds_dec:yesO, implied_prob:yesImp, edge_pp, ev, movement_pct:move }); }
+      if(noO) { const edge_pp = Number.isFinite(noImp)?(btts.No-noImp)*100:null;    const ev=Number.isFinite(noO)?evFrom(btts.No, noO):null;   const move=Number.isFinite(noO)?movementPP(fx,"BTTS","No",noO):0; candidates.push({ market:"BTTS", market_label:"BTTS", selection:"No",  model_prob:btts.No,  odds_dec:noO,  implied_prob:noImp,  edge_pp, ev, movement_pct:move }); }
     }
 
-    // Over 2.5 (Poisson)
+    // Over 2.5
     {
-      const ou = modelOver25(λh, λa); // {Over, Under, line:2.5}
-      const key="2.5";
-      const overO = odds?.["OU"]?.[key]?.["Over"] ?? null;
-      const underO= odds?.["OU"]?.[key]?.["Under"] ?? null;
+      const ou = modelOver25(λh, λa);
+      const overO = odds?.["OU"]?.["2.5"]?.["Over"] ?? null;
+      const underO= odds?.["OU"]?.["2.5"]?.["Under"] ?? null;
       const overImp = impliedFromDecimal(overO);
       const underImp= impliedFromDecimal(underO);
-
-      const pushCandidate = (sel, p, o, imp) => {
-        const edge_pp = Number.isFinite(imp) ? (p - imp)*100 : null;
-        const ev = Number.isFinite(o) ? evFrom(p, o) : null;
-        const move = Number.isFinite(o) ? movementPP(fx, "OU2.5", sel, o) : 0;
-        const label = sel === "Over" ? "Over 2.5" : "Under 2.5";
-        candidates.push({ market:"OU2.5", market_label:label, selection:sel, model_prob:p, odds_dec:o, implied_prob:imp, edge_pp, ev, movement_pct:move });
-      };
-      if(overO || underO){
-        if(overO)  pushCandidate("Over",  ou.Over,  overO,  overImp);
-        if(underO) pushCandidate("Under", ou.Under, underO, underImp);
-      }
+      if(overO){ const edge_pp=Number.isFinite(overImp)?(ou.Over-overImp)*100:null; const ev=Number.isFinite(overO)?evFrom(ou.Over,overO):null; const move=Number.isFinite(overO)?movementPP(fx,"OU2.5","Over",overO):0; candidates.push({ market:"OU2.5", market_label:"Over 2.5", selection:"Over", model_prob:ou.Over, odds_dec:overO, implied_prob:overImp, edge_pp, ev, movement_pct:move }); }
+      if(underO){ const edge_pp=Number.isFinite(underImp)?(ou.Under-underImp)*100:null; const ev=Number.isFinite(underO)?evFrom(ou.Under,underO):null; const move=Number.isFinite(underO)?movementPP(fx,"OU2.5","Under",underO):0; candidates.push({ market:"OU2.5", market_label:"Under 2.5", selection:"Under", model_prob:ou.Under, odds_dec:underO, implied_prob:underImp, edge_pp, ev, movement_pct:move }); }
     }
 
-    // Ako baš nema kvota ni za jedan market -> zadrži bar 1X2 fallback na 0.52
-    if(candidates.length===0){
-      const p = num(process.env.FALLBACK_MIN_PROB, 0.52);
-      candidates.push({ market:"1X2", market_label:"1X2", selection:"1", model_prob:p, odds_dec:null, implied_prob:null, edge_pp:null, ev:null, movement_pct:0 });
-    }
-
-    // 6) odaberi "best" market:
-    // prioritet: (a) najveći EV (ako imamo kvote), (b) edge_pp, (c) model_prob
+    // choose best candidate: prefer EV, then edge_pp, then model_prob
     const best = candidates.slice().sort((a,b)=>{
-      const aHasOdds = Number.isFinite(a.odds_dec), bHasOdds = Number.isFinite(b.odds_dec);
+      const aHasOdds=Number.isFinite(a.odds_dec), bHasOdds=Number.isFinite(b.odds_dec);
       if(aHasOdds!==bHasOdds) return bHasOdds - aHasOdds;
-      const evA = Number.isFinite(a.ev) ? a.ev : -Infinity;
-      const evB = Number.isFinite(b.ev) ? b.ev : -Infinity;
-      if(evA !== evB) return evB - evA;
-      const eA = Number.isFinite(a.edge_pp) ? a.edge_pp : -Infinity;
-      const eB = Number.isFinite(b.edge_pp) ? b.edge_pp : -Infinity;
-      if(eA !== eB) return eB - eA;
-      return (b.model_prob||0) - (a.model_prob||0);
+      const evA = Number.isFinite(a.ev)?a.ev:-Infinity;
+      const evB = Number.isFinite(b.ev)?b.ev:-Infinity;
+      if(evA!==evB) return evB-evA;
+      const eA = Number.isFinite(a.edge_pp)?a.edge_pp:-Infinity;
+      const eB = Number.isFinite(b.edge_pp)?b.edge_pp:-Infinity;
+      if(eA!==eB) return eB-eA;
+      return (b.model_prob||0)-(a.model_prob||0);
     })[0];
 
-    out.push(formatPickForUI(base, best));
+    deepPicks.push(formatPick({
+      fx, teams, league, kickoffISO,
+      form_score: form.score, form_text: form.text,
+      h2h_summary: h2h.summary, lineups_status, injuries_count,
+      bookmakers_count
+    }, best));
   }
 
-  // rangiranje: MODEL+ODDS ispred FALLBACK-a, pa po _score
+  // 3) fallback entries for non-AF fixtures (minimal)
+  const fallbacks = nonAf.map(f=>{
+    const p = num(process.env.FALLBACK_MIN_PROB,0.52);
+    return formatPick({
+      fx:f.fixture_id, teams:f.teams, league:f.league,
+      kickoffISO: sanitizeIso(f?.datetime_local?.starting_at?.date_time),
+      form_score:0.5, form_text:"", h2h_summary:"",
+      lineups_status:"unknown", injuries_count:0, bookmakers_count:0
+    }, { market:"1X2", market_label:"1X2", selection:"1", model_prob:p, odds_dec:null, implied_prob:null, edge_pp:null, ev:null, movement_pct:0 });
+  });
+
+  // 4) Merge & rank
+  const out = deepPicks.concat(fallbacks);
   out.sort((a,b)=>{
     if(a.type!==b.type) return a.type==="MODEL+ODDS"?-1:1;
     if(b._score!==a._score) return b._score-a._score;
-    const ea = Number.isFinite(a.edge_pp)?a.edge_pp:-999, eb = Number.isFinite(b.edge_pp)?b.edge_pp:-999;
+    const ea = Number.isFinite(a.edge_pp)?a.edge_pp:-999;
+    const eb = Number.isFinite(b.edge_pp)?b.edge_pp:-999;
     return eb - ea;
   });
 
-  const top = out.slice(0,10);
-
+  const top = out.slice(0, 10);
   const payload = {
     generated_at: new Date().toISOString(),
     tz_display: TZ,
     value_bets: top,
-    _meta: debug ? { total_candidates: fixtures.length, counters: CACHE.counters, took_ms: Date.now()-t0 } : undefined,
+    _meta: { total_candidates: fixtures.length, counters: CACHE.counters, run_calls: RUN_CALLS, took_ms: Date.now()-t0 }
   };
-  res.setHeader("Cache-Control","s-maxage=60, stale-while-revalidate=60");
-  res.status(200).json(payload);
+  return payload;
+}
+
+// ---------- API handler with in-flight dedup & 60s memo ----------
+export default async function handler(req, res){
+  const now = Date.now();
+
+  // short-term memo: ako imamo payload u zadnjih 60s, vrati isti (ignoriše ?debug)
+  if (CACHE.lastPayload && (now - CACHE.lastPayload.ts) < CFG.PAYLOAD_MEMO_MS) {
+    res.setHeader("Cache-Control","s-maxage=300, stale-while-revalidate=60");
+    return res.status(200).json(CACHE.lastPayload.data);
+  }
+
+  // in-flight dedup: drugi zahtev čeka prvi
+  if (CACHE.inflight) {
+    try {
+      const data = await CACHE.inflight;
+      res.setHeader("Cache-Control","s-maxage=300, stale-while-revalidate=60");
+      return res.status(200).json(data);
+    } catch (e) {
+      // padamo na fresh run
+    }
+  }
+
+  const run = (async () => {
+    try {
+      const data = await computePayload();
+      CACHE.lastPayload = { ts: Date.now(), data };
+      return data;
+    } finally {
+      CACHE.inflight = null;
+      CACHE.inflightAt = 0;
+    }
+  })();
+
+  CACHE.inflight = run;
+  CACHE.inflightAt = now;
+
+  try {
+    const data = await run;
+    res.setHeader("Cache-Control","s-maxage=300, stale-while-revalidate=60");
+    res.status(200).json(data);
+  } catch (err) {
+    console.warn("value-bets run error:", err?.message || err);
+    res.status(500).json({ error: "value-bets failed" });
+  }
 }
