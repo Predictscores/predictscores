@@ -1,51 +1,47 @@
 // FILE: pages/api/diag.js
-
 export default async function handler(req, res) {
-  try {
-    const now = new Date().toISOString();
-    const branch = process.env.VERCEL_GIT_COMMIT_REF || 'unknown-branch';
-    const commit = process.env.VERCEL_GIT_COMMIT_SHA || 'unknown-sha';
+  const headers = req.headers || {};
+  const proto = headers["x-forwarded-proto"] || "http";
+  const host = headers["x-forwarded-host"] || headers.host;
+  const base = `${proto}://${host}`;
 
-    // Check if key exists (don’t echo full value)
-    const hasSportMonks = !!process.env.SPORTMONKS_KEY;
-    const hasOdds = !!process.env.ODDS_API_KEY;
+  const has = (k) => !!(process.env[k] && String(process.env[k]).trim() !== "");
 
-    // Simple SportMonks fetch test for today
-    let sportmonksResult = null;
+  // in-memory counters iz value-bets route-a (ako postoji)
+  const g = globalThis;
+  const cache = g.__VB_CACHE__;
+  const counters = cache?.counters || null;
+
+  async function quick(path) {
     try {
-      const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-      const url = `https://soccer.sportmonks.com/api/v2.0/fixtures/date/${encodeURIComponent(
-        date
-      )}?include=localTeam,visitorTeam,league&api_token=${encodeURIComponent(
-        process.env.SPORTMONKS_KEY || ''
-      )}&tz=UTC`;
-
-      const resp = await fetch(url);
-      const text = await resp.text();
-      sportmonksResult = {
-        fetch_url: url,
-        status: resp.status,
-        ok: resp.ok,
-        snippet: text.slice(0, 1000), // first 1k chars
-      };
+      const r = await fetch(`${base}${path}`, { cache: "no-store" });
+      const ct = r.headers.get("content-type") || "";
+      if (!ct.includes("application/json")) return { ok: false, status: r.status };
+      const j = await r.json();
+      const key = Object.keys(j).find((k) => Array.isArray(j[k]));
+      const count = key ? j[key].length : 0;
+      return { ok: true, status: r.status, count, sampleKeys: key ? Object.keys(j[key][0] || {}) : [] };
     } catch (e) {
-      sportmonksResult = { error: e.message };
+      return { ok: false, error: String(e) };
     }
-
-    return res.status(200).json({
-      timestamp: now,
-      deploy: {
-        branch,
-        commit: commit.slice(0, 7),
-      },
-      env: {
-        hasSportMonks,
-        hasOdds,
-      },
-      sportmonksTest: sportmonksResult,
-      note: 'If sportmonksTest.ok is false or status is 400/401, there is either bad date formatting or auth issue on SPORTMONKS_KEY.',
-    });
-  } catch (err) {
-    return res.status(500).json({ error: 'diag failed', details: err.message });
   }
+
+  const [cryptoProbe, valueProbe] = await Promise.all([
+    quick("/api/crypto").catch(() => null),
+    quick("/api/value-bets").catch(() => null),
+  ]);
+
+  res.setHeader("Cache-Control", "no-store");
+  res.status(200).json({
+    env: {
+      API_FOOTBALL_KEY: has("API_FOOTBALL_KEY"),
+      SPORTMONKS_KEY: has("SPORTMONKS_KEY"),
+      FOOTBALL_DATA_KEY: has("FOOTBALL_DATA_KEY"),
+      ODDS_API_KEY: has("ODDS_API_KEY"),
+      TZ_DISPLAY: process.env.TZ_DISPLAY || null,
+    },
+    counters,
+    probes: { crypto: cryptoProbe, valueBets: valueProbe },
+    now: new Date().toISOString(),
+  });
 }
