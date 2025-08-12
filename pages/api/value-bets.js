@@ -6,7 +6,7 @@
  * - TWO-PASS:
  *    Pass1 (cheap): AF /predictions for all AF fixtures -> shortlist by model_prob
  *    Pass2 (deep): for Top K -> AF /odds + /teams/statistics (home+away) + /h2h + (near kickoff) lineups/injuries
- * - In-flight dedup & short-term in-memory payload cache (60s) + CDN cache 300s
+ * - In-flight dedup & short-term in-memory payload cache (60s) + CDN cache (default 600s)
  * - Hard cap on AF calls per run to avoid budget spikes
  */
 
@@ -15,17 +15,20 @@ const AF_KEY = process.env.API_FOOTBALL_KEY;
 const SM_KEY = process.env.SPORTMONKS_KEY || "";
 const FD_KEY = process.env.FOOTBALL_DATA_KEY || "";
 
-const CFG = {
-  BUDGET_DAILY: num(process.env.AF_BUDGET_DAILY, 5000),
-  ROLLING_WINDOW_HOURS: num(process.env.AF_ROLLING_WINDOW_HOURS, 24),
-  H2H_LAST: num(process.env.AF_H2H_LAST, 10),
-  NEAR_WINDOW_MIN: num(process.env.AF_NEAR_WINDOW_MIN, 60), // smanjeno sa 90 -> 60
-  DEEP_TOP: num(process.env.AF_DEEP_TOP, 20),               // Top K za deep sloj
-  RUN_HARDCAP: num(process.env.AF_RUN_MAX_CALLS, 150),      // max AF poziva u jednom run-u
-  PAYLOAD_MEMO_MS: 60 * 1000,                               // 60s payload memo (nezavisno od query stringa)
-};
-
+// ---- config (env-overridable) ----
 function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; }
+const CFG = {
+  BUDGET_DAILY:           num(process.env.AF_BUDGET_DAILY,        5000),
+  ROLLING_WINDOW_HOURS:   num(process.env.AF_ROLLING_WINDOW_HOURS, 24),
+  H2H_LAST:               num(process.env.AF_H2H_LAST,             10),
+  NEAR_WINDOW_MIN:        num(process.env.AF_NEAR_WINDOW_MIN,      60),
+  DEEP_TOP:               num(process.env.AF_DEEP_TOP,             30),  // dublji drugi sloj
+  RUN_HARDCAP:            num(process.env.AF_RUN_MAX_CALLS,        220), // sigurnosni limit
+  PAYLOAD_MEMO_MS:        60 * 1000,
+  VB_LIMIT:               num(process.env.VB_LIMIT,                 25), // izlaz: Top-25
+  S_MAXAGE:               num(process.env.CDN_SMAXAGE_SEC,         600),
+  SWR:                    num(process.env.CDN_STALE_SEC,           120),
+};
 
 // ---------- global caches ----------
 const g = globalThis;
@@ -34,10 +37,9 @@ if (!g.__VB_CACHE__) {
     byKey: new Map(),
     counters: { day: todayYMD(), apiFootball: 0, sportMonks: 0, footballData: 0 },
     snapshots: new Map(), // odds movement snapshots
-    // run dedup
-    inflight: null,                 // Promise
+    inflight: null,
     inflightAt: 0,
-    lastPayload: null,              // { ts, data }
+    lastPayload: null,
   };
 }
 const CACHE = g.__VB_CACHE__;
@@ -63,7 +65,6 @@ function sanitizeIso(s){ if(!s||typeof s!=="string") return null; let iso=s.trim
 function impliedFromDecimal(o){ const x=Number(o); return Number.isFinite(x)&&x>1.01?1/x:null; }
 function bucketFromPct(p){ if(p>=90) return "TOP"; if(p>=75) return "High"; if(p>=50) return "Moderate"; return "Low"; }
 function toLocalYMD(d, tz){ return new Intl.DateTimeFormat("sv-SE",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit"}).format(d); }
-function sum(a){ return a.reduce((x,y)=>x+y,0); }
 function evFrom(p, o){ const odds=Number(o); if(!Number.isFinite(odds)||odds<=1.01) return null; return p*(odds-1) - (1-p); }
 
 // --- Poisson ---
@@ -352,7 +353,7 @@ function formatPick(base, pick){
 
 // ---------- main compute (two-pass with caps) ----------
 async function computePayload(){
-  RUN_CALLS = 0; // reset hardcap counter for this run
+  RUN_CALLS = 0;
   const t0 = Date.now();
 
   // 0) Fixtures
@@ -371,7 +372,6 @@ async function computePayload(){
       fx: f.fixture_id, league: f.league, teams: f.teams,
       kickoffISO: sanitizeIso(f?.datetime_local?.starting_at?.date_time),
       selection, model_prob,
-      // placeholders for deep layer:
       form_score: 0.5, form_text: "", h2h_summary: "",
       lineups_status: "unknown", injuries_count: 0, bookmakers_count: 0,
     });
@@ -380,9 +380,8 @@ async function computePayload(){
   // Shortlist by model_prob (desc) — take Top K for deep
   const K = Math.max(5, Math.min(CFG.DEEP_TOP, pass1.length));
   const shortlist = pass1.slice().sort((a,b)=> (b.model_prob||0)-(a.model_prob||0)).slice(0, K);
-  const shortlistSet = new Set(shortlist.map(x=>x.fx));
 
-  // 2) PASS 2: deep data only for shortlist (odds + stats + h2h + near extras)
+  // 2) PASS 2: deep data only for shortlist
   const deepPicks = [];
   for (const base of shortlist) {
     const { fx, league, teams, kickoffISO } = base;
@@ -424,7 +423,7 @@ async function computePayload(){
     // build market candidates
     const candidates = [];
 
-    // 1X2 (we already have model_prob from pass1 & selection by preds)
+    // 1X2
     {
       const sel = base.selection;
       const p  = base.model_prob;
@@ -436,7 +435,7 @@ async function computePayload(){
       candidates.push({ market:"1X2", market_label:"1X2", selection:sel, model_prob:p, odds_dec:o, implied_prob:imp, edge_pp, ev, movement_pct:move });
     }
 
-    // BTTS (Poisson)
+    // BTTS
     {
       const btts = modelBTTS(λh, λa);
       const yesO = odds?.["BTTS"]?.["Yes"] ?? null;
@@ -458,7 +457,7 @@ async function computePayload(){
       if(underO){ const edge_pp=Number.isFinite(underImp)?(ou.Under-underImp)*100:null; const ev=Number.isFinite(underO)?evFrom(ou.Under,underO):null; const move=Number.isFinite(underO)?movementPP(fx,"OU2.5","Under",underO):0; candidates.push({ market:"OU2.5", market_label:"Under 2.5", selection:"Under", model_prob:ou.Under, odds_dec:underO, implied_prob:underImp, edge_pp, ev, movement_pct:move }); }
     }
 
-    // choose best candidate: prefer EV, then edge_pp, then model_prob
+    // choose best candidate
     const best = candidates.slice().sort((a,b)=>{
       const aHasOdds=Number.isFinite(a.odds_dec), bHasOdds=Number.isFinite(b.odds_dec);
       if(aHasOdds!==bHasOdds) return bHasOdds - aHasOdds;
@@ -500,7 +499,7 @@ async function computePayload(){
     return eb - ea;
   });
 
-  const top = out.slice(0, 10);
+  const top = out.slice(0, CFG.VB_LIMIT);
   const payload = {
     generated_at: new Date().toISOString(),
     tz_display: TZ,
@@ -516,7 +515,7 @@ export default async function handler(req, res){
 
   // short-term memo: ako imamo payload u zadnjih 60s, vrati isti (ignoriše ?debug)
   if (CACHE.lastPayload && (now - CACHE.lastPayload.ts) < CFG.PAYLOAD_MEMO_MS) {
-    res.setHeader("Cache-Control","s-maxage=300, stale-while-revalidate=60");
+    res.setHeader("Cache-Control", `s-maxage=${CFG.S_MAXAGE}, stale-while-revalidate=${CFG.SWR}`);
     return res.status(200).json(CACHE.lastPayload.data);
   }
 
@@ -524,7 +523,7 @@ export default async function handler(req, res){
   if (CACHE.inflight) {
     try {
       const data = await CACHE.inflight;
-      res.setHeader("Cache-Control","s-maxage=300, stale-while-revalidate=60");
+      res.setHeader("Cache-Control", `s-maxage=${CFG.S_MAXAGE}, stale-while-revalidate=${CFG.SWR}`);
       return res.status(200).json(data);
     } catch (e) {
       // padamo na fresh run
@@ -547,10 +546,11 @@ export default async function handler(req, res){
 
   try {
     const data = await run;
-    res.setHeader("Cache-Control","s-maxage=300, stale-while-revalidate=60");
+    res.setHeader("Cache-Control", `s-maxage=${CFG.S_MAXAGE}, stale-while-revalidate=${CFG.SWR}`);
     res.status(200).json(data);
   } catch (err) {
     console.warn("value-bets run error:", err?.message || err);
+    res.setHeader("Cache-Control", `s-maxage=${CFG.S_MAXAGE}, stale-while-revalidate=${CFG.SWR}`);
     res.status(500).json({ error: "value-bets failed" });
   }
 }
