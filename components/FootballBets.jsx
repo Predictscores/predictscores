@@ -28,9 +28,6 @@ function fmtTime(it) {
     ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
     : "—";
 }
-function pct(n) {
-  return Number.isFinite(n) ? `${Math.round(n * 100)}%` : "—";
-}
 function confPct(n) {
   if (Number.isFinite(n)) return `${Math.round(n)}%`;
   if (Number.isFinite(n?.confidence_pct)) return `${Math.round(n.confidence_pct)}%`;
@@ -51,7 +48,7 @@ function todayYMD() {
   return y; // "YYYY-MM-DD"
 }
 
-/** Renders a single football pick */
+/** Single card */
 function Card({ pick }) {
   const market = pick.market_label || pick.market || "";
   const sel = pick.selection || "";
@@ -126,9 +123,7 @@ function Card({ pick }) {
         </div>
       ) : null}
 
-      {/* Spacer */}
       <div className="flex-1" />
-      {/* Label type */}
       <div className="mt-3 text-[11px] text-slate-500">
         {pick.type === "MODEL+ODDS" ? "Model + Odds" : "Model-only"}
       </div>
@@ -140,12 +135,8 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
   const date = todayYMD();
   const { bets = [], loading, error } = useValueBets(date);
 
-  // ----- LOCAL CONTROLS (samo u full layoutu) -----
-  const [sortBy, setSortBy] = useState("recommended"); // recommended | kickoff | confidence | ev
-  const [showTop, setShowTop] = useState(true);
-  const [showHigh, setShowHigh] = useState(true);
-  const [showModerate, setShowModerate] = useState(true);
-  const [showLow, setShowLow] = useState(false);
+  // DVA dugmeta: Kickoff / Confidence
+  const [sortBy, setSortBy] = useState("kickoff"); // "kickoff" | "confidence"
 
   const filtered = useMemo(() => {
     let arr = Array.isArray(bets) ? bets.slice() : [];
@@ -156,52 +147,24 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
       if (strong.length >= limit) {
         arr = strong;
       } else {
-        // dopuni po EV, ali izbegni duplikate
         const rest = arr
           .filter((b) => !(b.confidence_pct >= COMBINED_MIN_CONF))
           .sort((a, b) => (Number(b.ev || -1) - Number(a.ev || -1)));
         arr = strong.concat(rest);
       }
-    } else {
-      // Full layout: bucket filter
-      arr = arr.filter((b) => {
-        const c = b.confidence_pct || 0;
-        if (c >= 90) return showTop;
-        if (c >= 75) return showHigh;
-        if (c >= 50) return showModerate;
-        return showLow;
-      });
     }
 
-    // Sortiranje
-    if (sortBy === "kickoff") {
-      arr.sort((a, b) => kickoffMs(a) - kickoffMs(b));
-    } else if (sortBy === "confidence") {
-      arr.sort((a, b) => (b.confidence_pct || 0) - (a.confidence_pct || 0));
-    } else if (sortBy === "ev") {
-      arr.sort((a, b) => (Number(b.ev || -1) - Number(a.ev || -1)));
-    } else {
-      // recommended: _score -> edge_pp -> ev
-      arr.sort((a, b) => {
-        if ((b._score || 0) !== (a._score || 0)) return (b._score || 0) - (a._score || 0);
-        const eA = Number.isFinite(a.edge_pp) ? a.edge_pp : -999;
-        const eB = Number.isFinite(b.edge_pp) ? b.edge_pp : -999;
-        if (eB !== eA) return eB - eA;
-        return Number(b.ev || -1) - Number(a.ev || -1);
-      });
+    // Sortiranje (samo u full layoutu)
+    if (layout === "full") {
+      if (sortBy === "kickoff") {
+        arr.sort((a, b) => kickoffMs(a) - kickoffMs(b));
+      } else {
+        arr.sort((a, b) => (b.confidence_pct || 0) - (a.confidence_pct || 0));
+      }
     }
 
     return arr;
-  }, [
-    bets,
-    sortBy,
-    showTop,
-    showHigh,
-    showModerate,
-    showLow,
-    layout,
-    limit,
-  ]);
+  }, [bets, layout, limit, sortBy]);
 
   const top = useMemo(() => filtered.slice(0, limit), [filtered, limit]);
 
@@ -209,9 +172,9 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
     return <div className="text-slate-400 text-sm">Loading football…</div>;
   if (error)
     return (
-      <div className="text-amber-400 text-sm">
-        Football feed error: {String(error)}
-      </div>
+        <div className="text-amber-400 text-sm">
+          Football feed error: {String(error)}
+        </div>
     );
 
   // ----- COMBINED: samo lista -----
@@ -231,58 +194,37 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
   // ----- FULL: levi stub (singles) + desni stub (tickets) -----
   return (
     <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-start">
-      {/* LEFT: Filters + Singles */}
+      {/* LEFT: Controls + Singles */}
       <div className="md:col-span-2">
-        {/* Controls */}
-        <div className="mb-3 flex flex-wrap items-center gap-2">
-          <div className="text-xs text-slate-300 mr-2">Sort by:</div>
-          <div className="flex gap-2">
-            {["recommended", "kickoff", "confidence", "ev"].map((key) => (
-              <button
-                key={key}
-                onClick={() => setSortBy(key)}
-                className={
-                  "px-3 py-1.5 rounded-full text-xs font-semibold transition " +
-                  (sortBy === key
-                    ? "bg-[#151830] text-white"
-                    : "bg-[#1f2339] text-slate-300 hover:bg-[#202542]")
-                }
-                type="button"
-              >
-                {key === "recommended"
-                  ? "Recommended"
-                  : key === "kickoff"
-                  ? "Kickoff (Soonest)"
-                  : key === "confidence"
-                  ? "Confidence"
-                  : "EV"}
-              </button>
-            ))}
-          </div>
-
-          <div className="hidden md:inline-block w-px h-5 bg-white/10 mx-1" />
-
-          <div className="text-xs text-slate-300 mr-2">Buckets:</div>
-          {[
-            ["Top", showTop, setShowTop],
-            ["High", showHigh, setShowHigh],
-            ["Moderate", showModerate, setShowModerate],
-            ["Low", showLow, setShowLow],
-          ].map(([label, val, set]) => (
+        {/* Controls: dva dugmeta */}
+        <div className="mb-3 flex items-center gap-2">
+          <span className="text-xs text-slate-300">Sort by:</span>
+          <div className="inline-flex rounded-lg overflow-hidden bg-[#1f2339]">
             <button
-              key={label}
-              onClick={() => set(!val)}
-              className={
-                "px-3 py-1.5 rounded-full text-xs font-semibold transition " +
-                (val
-                  ? "bg-[#151830] text-white"
-                  : "bg-[#1f2339] text-slate-300 hover:bg-[#202542]")
-              }
               type="button"
+              onClick={() => setSortBy("kickoff")}
+              className={
+                "px-3 py-2 text-xs font-semibold transition " +
+                (sortBy === "kickoff"
+                  ? "bg-[#151830] text-white"
+                  : "text-slate-300 hover:bg-[#202542]")
+              }
             >
-              {label}
+              Kickoff (Soonest)
             </button>
-          ))}
+            <button
+              type="button"
+              onClick={() => setSortBy("confidence")}
+              className={
+                "px-3 py-2 text-xs font-semibold transition " +
+                (sortBy === "confidence"
+                  ? "bg-[#151830] text-white"
+                  : "text-slate-300 hover:bg-[#202542]")
+              }
+            >
+              Confidence (High → Low)
+            </button>
+          </div>
         </div>
 
         {/* Singles list */}
