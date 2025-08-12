@@ -1,34 +1,33 @@
 // FILE: pages/api/value-bets.js
 /**
- * Value Bets (multi-market, throttled)
+ * Value Bets (odds-only)
  * - Rolling 24h (Europe/Belgrade)
- * - Markets: 1X2 (AF preds), BTTS (Poisson), Over 2.5 (Poisson)
+ * - Markets: 1X2, BTTS, Over/Under 2.5
  * - TWO-PASS:
- *    Pass1 (cheap): AF /predictions for all AF fixtures -> shortlist by model_prob
- *    Pass2 (deep): for Top K -> AF /odds + /teams/statistics (home+away) + /h2h + (near kickoff) lineups/injuries
- * - In-flight dedup & short-term in-memory payload cache (60s) + CDN cache (default 600s)
- * - Hard cap on AF calls per run to avoid budget spikes
+ *    Pass1 (cheap): AF /predictions za sve AF fixtur-e -> shortlist po model_prob
+ *    Pass2 (deep): za Top K -> AF /odds + /teams/statistics (home+away) + /h2h + (near kickoff) lineups/injuries
+ * - Vraćamo SAMO predloge sa realnim kvotama (MODEL+ODDS). Parovi bez kvota se uklanjaju iz izlaza.
+ * - In-flight dedup & 60s in-memory memo + CDN cache 600s.
  */
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-const AF_KEY = process.env.API_FOOTBALL_KEY;
+const AF_KEY = process.env.API_FOOTBALL_KEY || process.env.API_FOOTBALL_KEY_1 || process.env.API_FOOTBALL_KEY_2 || "";
 const SM_KEY = process.env.SPORTMONKS_KEY || "";
 const FD_KEY = process.env.FOOTBALL_DATA_KEY || "";
 
-// ---- config (env-overridable) ----
-function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; }
 const CFG = {
-  BUDGET_DAILY:           num(process.env.AF_BUDGET_DAILY,        5000),
-  ROLLING_WINDOW_HOURS:   num(process.env.AF_ROLLING_WINDOW_HOURS, 24),
-  H2H_LAST:               num(process.env.AF_H2H_LAST,             10),
-  NEAR_WINDOW_MIN:        num(process.env.AF_NEAR_WINDOW_MIN,      60),
-  DEEP_TOP:               num(process.env.AF_DEEP_TOP,             30),  // dublji drugi sloj
-  RUN_HARDCAP:            num(process.env.AF_RUN_MAX_CALLS,        220), // sigurnosni limit
-  PAYLOAD_MEMO_MS:        60 * 1000,
-  VB_LIMIT:               num(process.env.VB_LIMIT,                 25), // izlaz: Top-25
-  S_MAXAGE:               num(process.env.CDN_SMAXAGE_SEC,         600),
-  SWR:                    num(process.env.CDN_STALE_SEC,           120),
+  BUDGET_DAILY: num(process.env.AF_BUDGET_DAILY, 5000),
+  ROLLING_WINDOW_HOURS: num(process.env.AF_ROLLING_WINDOW_HOURS, 24),
+  H2H_LAST: num(process.env.AF_H2H_LAST, 10),
+  NEAR_WINDOW_MIN: num(process.env.AF_NEAR_WINDOW_MIN, 60),
+  DEEP_TOP: num(process.env.AF_DEEP_TOP, 30),            // ⬆️ 20 -> 30
+  RUN_HARDCAP: num(process.env.AF_RUN_MAX_CALLS, 180),   // blago pojačano
+  PAYLOAD_MEMO_MS: 60 * 1000,                            // 60s in-memory memo
+  CDN_SMAXAGE: num(process.env.CDN_SMAXAGE_SEC, 600),    // 10min
+  CDN_SWR: num(process.env.CDN_STALE_SEC, 120)
 };
+
+function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; }
 
 // ---------- global caches ----------
 const g = globalThis;
@@ -36,7 +35,7 @@ if (!g.__VB_CACHE__) {
   g.__VB_CACHE__ = {
     byKey: new Map(),
     counters: { day: todayYMD(), apiFootball: 0, sportMonks: 0, footballData: 0 },
-    snapshots: new Map(), // odds movement snapshots
+    snapshots: new Map(),
     inflight: null,
     inflightAt: 0,
     lastPayload: null,
@@ -63,11 +62,13 @@ function noteAF(qty=1){ RUN_CALLS += qty; }
 // ---------- helpers ----------
 function sanitizeIso(s){ if(!s||typeof s!=="string") return null; let iso=s.trim().replace(" ","T"); iso=iso.replace("+00:00Z","Z").replace("Z+00:00","Z"); return iso; }
 function impliedFromDecimal(o){ const x=Number(o); return Number.isFinite(x)&&x>1.01?1/x:null; }
-function bucketFromPct(p){ if(p>=90) return "TOP"; if(p>=75) return "High"; if(p>=50) return "Moderate"; return "Low"; }
-function toLocalYMD(d, tz){ return new Intl.DateTimeFormat("sv-SE",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit"}).format(d); }
 function evFrom(p, o){ const odds=Number(o); if(!Number.isFinite(odds)||odds<=1.01) return null; return p*(odds-1) - (1-p); }
+function toLocalYMD(d, tz){ return new Intl.DateTimeFormat("sv-SE",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit"}).format(d); }
+function bucketFromPct(p){ if(p>=90) return "TOP"; if(p>=75) return "High"; if(p>=50) return "Moderate"; return "Low"; }
+const sum = (a)=>a.reduce((x,y)=>x+y,0);
+const median = (arr)=> arr.length ? arr.slice().sort((a,b)=>a-b)[Math.floor(arr.length/2)] : null;
 
-// --- Poisson ---
+// --- Poisson (za BTTS/OU2.5)
 function poissonPMF(k, lambda){ if(lambda<=0) return k===0?1:0; let logP = -lambda; for(let i=1;i<=k;i++) logP += Math.log(lambda) - Math.log(i); return Math.exp(logP); }
 function poissonCDF(k, lambda){ let acc=0; for(let i=0;i<=k;i++) acc+=poissonPMF(i,lambda); return acc; }
 
@@ -84,21 +85,8 @@ async function afFetch(path,{ttl=0}={}){
   if(!res.ok) throw new Error(`AF ${path} -> ${res.status}`);
   const j=await res.json(); if(ttl) setCache(ck,j,ttl); return j;
 }
-async function smFetch(url,{ttl=0}={}){
-  const ck=`SM:${url}`;
-  if(ttl){ const c=getCache(ck); if(c) return c; }
-  const res=await fetch(url);
-  inc("sportMonks"); if(!res.ok) throw new Error(`SM ${url} -> ${res.status}`);
-  const j=await res.json(); if(ttl) setCache(ck,j,ttl); return j;
-}
-async function fdFetch(path,{ttl=0}={}){
-  const url=`https://api.football-data.org/v4${path}`;
-  const ck=`FD:${url}`;
-  if(ttl){ const c=getCache(ck); if(c) return c; }
-  const res=await fetch(url,{headers:{ "X-Auth-Token":FD_KEY }});
-  inc("footballData"); if(!res.ok) throw new Error(`FD ${path} -> ${res.status}`);
-  const j=await res.json(); if(ttl) setCache(ck,j,ttl); return j;
-}
+async function smFetch(url,{ttl=0}={}){ const ck=`SM:${url}`; if(ttl){ const c=getCache(ck); if(c) return c; } const res=await fetch(url); inc("sportMonks"); if(!res.ok) throw new Error(`SM ${url} -> ${res.status}`); const j=await res.json(); if(ttl) setCache(ck,j,ttl); return j; }
+async function fdFetch(path,{ttl=0}={}){ const url=`https://api.football-data.org/v4${path}`; const ck=`FD:${url}`; if(ttl){ const c=getCache(ck); if(c) return c; } const res=await fetch(url,{headers:{ "X-Auth-Token":FD_KEY }}); inc("footballData"); if(!res.ok) throw new Error(`FD ${path} -> ${res.status}`); const j=await res.json(); if(ttl) setCache(ck,j,ttl); return j; }
 
 // ---------- fetchers ----------
 async function fetchAFByDate(ymd){
@@ -135,7 +123,7 @@ async function fetchFixturesRolling(nowUTC=new Date()){
 
   if(inWindow.length) return inWindow;
 
-  // fallback (samo da UI ne bude prazan)
+  // fallback (da UI ne bude prazan)
   try{
     if(SM_KEY){
       const ymd=toLocalYMD(dNow,tz);
@@ -181,59 +169,93 @@ async function fetchPredictions(fx){
   return null;
 }
 
+function leaguePriority(leagueName="") {
+  const s = leagueName.toLowerCase();
+  // top: UCL, UEL, top 5, top 10
+  if (/(champions league|europa|premier league|la liga|bundesliga|serie a|ligue 1|eredivisie|primeira|mls)/i.test(s)) return 0;
+  if (/(super league|superliga|first division|j1|liga profesional|liga mx)/i.test(s)) return 1;
+  if (/(u23|reserves|ii|b team|next pro|youth|academy)/i.test(s)) return 3;
+  return 2;
+}
+
+/**
+ * Popravljeni aggregator: prolazimo KROZ SVE BOOKMAKERE i skupljamo kvote,
+ * pa računamo median po marketu.
+ */
 async function fetchOdds(fx){
   const j=await afFetch(`/odds?fixture=${fx}`,{ttl:10*60});
   const resp=j?.response||[];
-  const acc = { '1X2':{ "1":[], "X":[], "2":[] }, 'BTTS':{ Yes:[], No:[] }, 'OU':{} };
+
+  const acc = {
+    "1X2": { "1":[], "X":[], "2":[] },
+    "BTTS": { "Yes":[], "No":[] },
+    "OU": {} // key "2.5": {Over:[], Under:[]}
+  };
+  let bookmakersUsed = 0;
+
   for(const row of resp){
-    const bets=row?.bookmakers?.[0]?.bets||[];
-    for(const m of bets){
-      const name=(m?.name||"").toLowerCase();
-      // 1X2
-      if(name.includes("match winner")||name.includes("1x2")){
-        for(const v of m.values||[]){
-          const lbl=(v?.value||"").toUpperCase();
-          const odd=Number(v?.odd); if(!Number.isFinite(odd)) continue;
-          if(lbl==="HOME"||lbl==="1") acc['1X2']["1"].push(odd);
-          if(lbl==="DRAW"||lbl==="X") acc['1X2']["X"].push(odd);
-          if(lbl==="AWAY"||lbl==="2") acc['1X2']["2"].push(odd);
+    const books = row?.bookmakers || [];
+    for (const bm of books) {
+      const bets = bm?.bets || [];
+      let usedThisBook = false;
+
+      for (const bet of bets) {
+        const name = (bet?.name || "").toLowerCase();
+
+        // 1X2 varijante
+        if (name.includes("match winner") || name.includes("1x2") || name.includes("full time result")) {
+          for (const v of (bet?.values||[])) {
+            const lbl = (v?.value||"").toUpperCase();
+            const odd = Number(v?.odd);
+            if (!Number.isFinite(odd)) continue;
+            if (lbl==="HOME"||lbl==="1") acc['1X2']["1"].push(odd), usedThisBook = true;
+            if (lbl==="DRAW"||lbl==="X") acc['1X2']["X"].push(odd), usedThisBook = true;
+            if (lbl==="AWAY"||lbl==="2") acc['1X2']["2"].push(odd), usedThisBook = true;
+          }
+        }
+
+        // BTTS
+        if (name.includes("both teams to score") || name.includes("btts")) {
+          for (const v of (bet?.values||[])) {
+            const lbl=(v?.value||"").toLowerCase();
+            const odd=Number(v?.odd);
+            if(!Number.isFinite(odd)) continue;
+            if(lbl.includes("yes")) acc['BTTS'].Yes.push(odd), usedThisBook=true;
+            if(lbl.includes("no"))  acc['BTTS'].No.push(odd),  usedThisBook=true;
+          }
+        }
+
+        // Over/Under (Total Goals)
+        if (name.includes("over/under") || name.includes("goals over/under") || name.includes("totals") || name.includes("total goals")) {
+          for (const v of (bet?.values||[])) {
+            const lbl=(v?.value||"").toLowerCase(); // "Over 2.5"
+            const odd=Number(v?.odd);
+            if(!Number.isFinite(odd)) continue;
+            const parts=lbl.split(" ");
+            const side=parts[0];
+            const line=parseFloat(parts[1]);
+            if(!Number.isFinite(line)) continue;
+            const key=line.toFixed(1);
+            if(!acc['OU'][key]) acc['OU'][key]={ Over:[], Under:[] };
+            if(side.startsWith("over"))  acc['OU'][key].Over.push(odd), usedThisBook=true;
+            if(side.startsWith("under")) acc['OU'][key].Under.push(odd), usedThisBook=true;
+          }
         }
       }
-      // BTTS
-      if(name.includes("both teams to score") || name.includes("btts")){
-        for(const v of m.values||[]){
-          const lbl=(v?.value||"").toLowerCase();
-          const odd=Number(v?.odd); if(!Number.isFinite(odd)) continue;
-          if(lbl.includes("yes")) acc['BTTS'].Yes.push(odd);
-          if(lbl.includes("no"))  acc['BTTS'].No.push(odd);
-        }
-      }
-      // Totals (Over/Under)
-      if(name.includes("over/under") || name.includes("goals over/under") || name.includes("totals")){
-        for(const v of m.values||[]){
-          const lbl=(v?.value||"").toLowerCase(); // “Over 2.5”
-          const odd=Number(v?.odd); if(!Number.isFinite(odd)) continue;
-          const parts=lbl.split(" ");
-          const side=parts[0]; const lineStr=parts[1]||""; const line=parseFloat(lineStr);
-          if(!lineStr||!Number.isFinite(line)) continue;
-          const key=line.toFixed(1);
-          if(!acc['OU'][key]) acc['OU'][key]={ Over:[], Under:[] };
-          if(side.startsWith("over"))  acc['OU'][key].Over.push(odd);
-          if(side.startsWith("under")) acc['OU'][key].Under.push(odd);
-        }
-      }
+
+      if (usedThisBook) bookmakersUsed++;
     }
   }
-  const median=arr=>arr.length? (arr.slice().sort((a,b)=>a-b)[Math.floor(arr.length/2)]) : null;
+
   const odds = {
     "1X2": { "1": median(acc['1X2']["1"]), "X": median(acc['1X2']["X"]), "2": median(acc['1X2']["2"]) },
     "BTTS": { "Yes": median(acc['BTTS'].Yes), "No": median(acc['BTTS'].No) },
     "OU": {}
   };
-  for(const line of Object.keys(acc['OU'])){
+  for (const line of Object.keys(acc['OU'])) {
     odds["OU"][line] = { "Over": median(acc['OU'][line].Over), "Under": median(acc['OU'][line].Under) };
   }
-  return { odds, bookmakers_count: resp.length||0 };
+  return { odds, bookmakers_count: bookmakersUsed };
 }
 
 async function fetchTeamStats(leagueId,season,teamId){
@@ -255,7 +277,7 @@ async function fetchH2H(homeId,awayId,last){
 async function fetchInjuries(fx){ try{ const j=await afFetch(`/injuries?fixture=${fx}`,{ttl:10*60}); return { count:(j?.response||[]).length||0 }; }catch(_){ return {count:0}; } }
 async function fetchLineups(fx){ try{ const j=await afFetch(`/fixtures/lineups?fixture=${fx}`,{ttl:5*60}); const ln=j?.response||[]; const confirmed=ln.some(x=>Array.isArray(x?.startXI)&&x.startXI.length>0); return { status: confirmed ? "confirmed" : (ln.length ? "expected" : "unknown") }; }catch(_){ return {status:"unknown"}; } }
 
-// --- models ---
+// --- models
 function pickFromPreds(preds){ const map={ "1":preds?.p1||0, "X":preds?.px||0, "2":preds?.p2||0 }; const sel=Object.keys(map).sort((a,b)=>map[b]-map[a])[0]||"1"; return { selection:sel, prob: map[sel]||0 }; }
 function poissonLambdas(statsHome, statsAway){
   const get = (s, path) => path.split(".").reduce((o,k)=>o?.[k], s);
@@ -291,6 +313,7 @@ function movementPP(fxId, market, sel, oddsVal){
 }
 
 function overallConfidence(v){
+  // Sada se gotovo uvek radi sa kvotama, ali zadržavamo težine
   const hasOdds = Number.isFinite(v.odds_dec) && Number.isFinite(v.implied_prob);
   const pPred=v.model_prob||0;
   const edge=Number.isFinite(v.edge_pp)? Math.max(-15, Math.min(15, v.edge_pp)) / 100 : 0;
@@ -330,7 +353,7 @@ function formatPick(base, pick){
     datetime_local: { starting_at: { date_time: base.kickoffISO } },
     market: pick.market, market_label: pick.market_label,
     selection: pick.selection,
-    type: Number.isFinite(pick.odds_dec) ? "MODEL+ODDS" : "FALLBACK",
+    type: "MODEL+ODDS",
     model_prob: pick.model_prob ?? null,
     market_odds: Number.isFinite(pick.odds_dec) ? pick.odds_dec : null,
     implied_prob: Number.isFinite(pick.implied_prob) ? pick.implied_prob : null,
@@ -353,15 +376,18 @@ function formatPick(base, pick){
 
 // ---------- main compute (two-pass with caps) ----------
 async function computePayload(){
-  RUN_CALLS = 0;
+  RUN_CALLS = 0; // reset hardcap counter
   const t0 = Date.now();
 
   // 0) Fixtures
-  const fixtures = await fetchFixturesRolling(new Date());
-  const afFixtures = fixtures.filter(f => f.source === "AF");
-  const nonAf = fixtures.filter(f => f.source !== "AF");
+  let fixtures = await fetchFixturesRolling(new Date());
 
-  // 1) PASS 1: predictions for AF fixtures (cheap layer)
+  // Blagi prioritet liga (top napred)
+  fixtures.sort((a,b) => leaguePriority(a?.league?.name) - leaguePriority(b?.league?.name));
+
+  const afFixtures = fixtures.filter(f => f.source === "AF");
+
+  // 1) PASS 1: predictions (cheap)
   const pass1 = [];
   for (const f of afFixtures) {
     if (!canCallAF()) break;
@@ -377,19 +403,26 @@ async function computePayload(){
     });
   }
 
-  // Shortlist by model_prob (desc) — take Top K for deep
+  // shortlist po model_prob
   const K = Math.max(5, Math.min(CFG.DEEP_TOP, pass1.length));
   const shortlist = pass1.slice().sort((a,b)=> (b.model_prob||0)-(a.model_prob||0)).slice(0, K);
 
-  // 2) PASS 2: deep data only for shortlist
+  // 2) PASS 2: deep (odds + stats + h2h + near extras)
   const deepPicks = [];
   for (const base of shortlist) {
     const { fx, league, teams, kickoffISO } = base;
 
-    // odds
+    // odds (agregator preko SVIH bookmakera)
     let oddsPack=null; if (canCallAF()) { oddsPack = await fetchOdds(fx).catch(()=>null); }
     const odds = oddsPack?.odds || null;
     const bookmakers_count = Number(oddsPack?.bookmakers_count || 0);
+
+    // Ako NEMA kvota ni za jedan market -> SKIP (ne želimo model-only)
+    const hasAnyOdds =
+      Number.isFinite(odds?.["1X2"]?.["1"]) || Number.isFinite(odds?.["1X2"]?.["X"]) || Number.isFinite(odds?.["1X2"]?.["2"]) ||
+      Number.isFinite(odds?.["BTTS"]?.["Yes"]) || Number.isFinite(odds?.["BTTS"]?.["No"]) ||
+      Number.isFinite(odds?.["OU"]?.["2.5"]?.["Over"]) || Number.isFinite(odds?.["OU"]?.["2.5"]?.["Under"]);
+    if (!hasAnyOdds) continue;
 
     // stats & h2h
     let statsHome=null, statsAway=null, h2h={summary:"",count:0};
@@ -417,22 +450,24 @@ async function computePayload(){
       }
     }
 
-    // lambdas for Poisson
+    // λ za Poisson
     const { λh, λa } = poissonLambdas(statsHome, statsAway);
 
-    // build market candidates
+    // kandidati — SAMO sa kvotama
     const candidates = [];
 
     // 1X2
     {
-      const sel = base.selection;
+      const sel = base.selection;            // iz preds
       const p  = base.model_prob;
       const o  = odds?.["1X2"]?.[sel] ?? null;
-      const imp = impliedFromDecimal(o);
-      const edge_pp = (Number.isFinite(imp) ? (p - imp)*100 : null);
-      const ev = Number.isFinite(o) ? evFrom(p, o) : null;
-      const move = Number.isFinite(o) ? movementPP(fx, "1X2", sel, o) : 0;
-      candidates.push({ market:"1X2", market_label:"1X2", selection:sel, model_prob:p, odds_dec:o, implied_prob:imp, edge_pp, ev, movement_pct:move });
+      if (Number.isFinite(o)) {
+        const imp = impliedFromDecimal(o);
+        const edge_pp = (Number.isFinite(imp) ? (p - imp)*100 : null);
+        const ev = evFrom(p, o);
+        const move = movementPP(fx, "1X2", sel, o) || 0;
+        candidates.push({ market:"1X2", market_label:"1X2", selection:sel, model_prob:p, odds_dec:o, implied_prob:imp, edge_pp, ev, movement_pct:move });
+      }
     }
 
     // BTTS
@@ -440,27 +475,48 @@ async function computePayload(){
       const btts = modelBTTS(λh, λa);
       const yesO = odds?.["BTTS"]?.["Yes"] ?? null;
       const noO  = odds?.["BTTS"]?.["No"]  ?? null;
-      const yesImp = impliedFromDecimal(yesO);
-      const noImp  = impliedFromDecimal(noO);
-      if(yesO){ const edge_pp = Number.isFinite(yesImp)?(btts.Yes-yesImp)*100:null; const ev=Number.isFinite(yesO)?evFrom(btts.Yes, yesO):null; const move=Number.isFinite(yesO)?movementPP(fx,"BTTS","Yes",yesO):0; candidates.push({ market:"BTTS", market_label:"BTTS", selection:"Yes", model_prob:btts.Yes, odds_dec:yesO, implied_prob:yesImp, edge_pp, ev, movement_pct:move }); }
-      if(noO) { const edge_pp = Number.isFinite(noImp)?(btts.No-noImp)*100:null;    const ev=Number.isFinite(noO)?evFrom(btts.No, noO):null;   const move=Number.isFinite(noO)?movementPP(fx,"BTTS","No",noO):0; candidates.push({ market:"BTTS", market_label:"BTTS", selection:"No",  model_prob:btts.No,  odds_dec:noO,  implied_prob:noImp,  edge_pp, ev, movement_pct:move }); }
+      if(Number.isFinite(yesO)){
+        const yesImp = impliedFromDecimal(yesO);
+        const edge_pp=(btts.Yes-yesImp)*100;
+        const ev=evFrom(btts.Yes, yesO);
+        const move=movementPP(fx,"BTTS","Yes",yesO);
+        candidates.push({ market:"BTTS", market_label:"BTTS", selection:"Yes", model_prob:btts.Yes, odds_dec:yesO, implied_prob:yesImp, edge_pp, ev, movement_pct:move });
+      }
+      if(Number.isFinite(noO)){
+        const noImp = impliedFromDecimal(noO);
+        const edge_pp=(btts.No-noImp)*100;
+        const ev=evFrom(btts.No, noO);
+        const move=movementPP(fx,"BTTS","No",noO);
+        candidates.push({ market:"BTTS", market_label:"BTTS", selection:"No", model_prob:btts.No, odds_dec:noO, implied_prob:noImp, edge_pp, ev, movement_pct:move });
+      }
     }
 
-    // Over 2.5
+    // OU 2.5
     {
       const ou = modelOver25(λh, λa);
       const overO = odds?.["OU"]?.["2.5"]?.["Over"] ?? null;
       const underO= odds?.["OU"]?.["2.5"]?.["Under"] ?? null;
-      const overImp = impliedFromDecimal(overO);
-      const underImp= impliedFromDecimal(underO);
-      if(overO){ const edge_pp=Number.isFinite(overImp)?(ou.Over-overImp)*100:null; const ev=Number.isFinite(overO)?evFrom(ou.Over,overO):null; const move=Number.isFinite(overO)?movementPP(fx,"OU2.5","Over",overO):0; candidates.push({ market:"OU2.5", market_label:"Over 2.5", selection:"Over", model_prob:ou.Over, odds_dec:overO, implied_prob:overImp, edge_pp, ev, movement_pct:move }); }
-      if(underO){ const edge_pp=Number.isFinite(underImp)?(ou.Under-underImp)*100:null; const ev=Number.isFinite(underO)?evFrom(ou.Under,underO):null; const move=Number.isFinite(underO)?movementPP(fx,"OU2.5","Under",underO):0; candidates.push({ market:"OU2.5", market_label:"Under 2.5", selection:"Under", model_prob:ou.Under, odds_dec:underO, implied_prob:underImp, edge_pp, ev, movement_pct:move }); }
+      if(Number.isFinite(overO)){
+        const overImp = impliedFromDecimal(overO);
+        const edge_pp=(ou.Over-overImp)*100;
+        const ev=evFrom(ou.Over,overO);
+        const move=movementPP(fx,"OU2.5","Over",overO);
+        candidates.push({ market:"OU2.5", market_label:"Over 2.5", selection:"Over", model_prob:ou.Over, odds_dec:overO, implied_prob:overImp, edge_pp, ev, movement_pct:move });
+      }
+      if(Number.isFinite(underO)){
+        const underImp = impliedFromDecimal(underO);
+        const edge_pp=(ou.Under-underImp)*100;
+        const ev=evFrom(ou.Under,underO);
+        const move=movementPP(fx,"OU2.5","Under",underO);
+        candidates.push({ market:"OU2.5", market_label:"Under 2.5", selection:"Under", model_prob:ou.Under, odds_dec:underO, implied_prob:underImp, edge_pp, ev, movement_pct:move });
+      }
     }
 
-    // choose best candidate
+    // Ako nema nijednog kandidata sa kvotama -> SKIP
+    if (!candidates.length) continue;
+
+    // odabir najboljeg: EV, edge, model_prob
     const best = candidates.slice().sort((a,b)=>{
-      const aHasOdds=Number.isFinite(a.odds_dec), bHasOdds=Number.isFinite(b.odds_dec);
-      if(aHasOdds!==bHasOdds) return bHasOdds - aHasOdds;
       const evA = Number.isFinite(a.ev)?a.ev:-Infinity;
       const evB = Number.isFinite(b.ev)?b.ev:-Infinity;
       if(evA!==evB) return evB-evA;
@@ -478,56 +534,42 @@ async function computePayload(){
     }, best));
   }
 
-  // 3) fallback entries for non-AF fixtures (minimal)
-  const fallbacks = nonAf.map(f=>{
-    const p = num(process.env.FALLBACK_MIN_PROB,0.52);
-    return formatPick({
-      fx:f.fixture_id, teams:f.teams, league:f.league,
-      kickoffISO: sanitizeIso(f?.datetime_local?.starting_at?.date_time),
-      form_score:0.5, form_text:"", h2h_summary:"",
-      lineups_status:"unknown", injuries_count:0, bookmakers_count:0
-    }, { market:"1X2", market_label:"1X2", selection:"1", model_prob:p, odds_dec:null, implied_prob:null, edge_pp:null, ev:null, movement_pct:0 });
-  });
+  // 3) (Nema više fallbacks bez kvota) → deepPicks je konačna lista
 
-  // 4) Merge & rank
-  const out = deepPicks.concat(fallbacks);
-  out.sort((a,b)=>{
-    if(a.type!==b.type) return a.type==="MODEL+ODDS"?-1:1;
+  // 4) rangiranje
+  deepPicks.sort((a,b)=>{
     if(b._score!==a._score) return b._score-a._score;
     const ea = Number.isFinite(a.edge_pp)?a.edge_pp:-999;
     const eb = Number.isFinite(b.edge_pp)?b.edge_pp:-999;
     return eb - ea;
   });
 
-  const top = out.slice(0, CFG.VB_LIMIT);
-  const payload = {
+  const top = deepPicks.slice(0, 40); // gornja granica za locked 25/backup 15
+
+  return {
     generated_at: new Date().toISOString(),
     tz_display: TZ,
     value_bets: top,
     _meta: { total_candidates: fixtures.length, counters: CACHE.counters, run_calls: RUN_CALLS, took_ms: Date.now()-t0 }
   };
-  return payload;
 }
 
-// ---------- API handler with in-flight dedup & 60s memo ----------
+// ---------- API handler ----------
 export default async function handler(req, res){
   const now = Date.now();
 
-  // short-term memo: ako imamo payload u zadnjih 60s, vrati isti (ignoriše ?debug)
+  // 60s in-memory memo (ignoriše query razlike)
   if (CACHE.lastPayload && (now - CACHE.lastPayload.ts) < CFG.PAYLOAD_MEMO_MS) {
-    res.setHeader("Cache-Control", `s-maxage=${CFG.S_MAXAGE}, stale-while-revalidate=${CFG.SWR}`);
+    res.setHeader("Cache-Control", `s-maxage=${CFG.CDN_SMAXAGE}, stale-while-revalidate=${CFG.CDN_SWR}`);
     return res.status(200).json(CACHE.lastPayload.data);
   }
 
-  // in-flight dedup: drugi zahtev čeka prvi
   if (CACHE.inflight) {
     try {
       const data = await CACHE.inflight;
-      res.setHeader("Cache-Control", `s-maxage=${CFG.S_MAXAGE}, stale-while-revalidate=${CFG.SWR}`);
+      res.setHeader("Cache-Control", `s-maxage=${CFG.CDN_SMAXAGE}, stale-while-revalidate=${CFG.CDN_SWR}`);
       return res.status(200).json(data);
-    } catch (e) {
-      // padamo na fresh run
-    }
+    } catch(_){/* fall through */}
   }
 
   const run = (async () => {
@@ -546,11 +588,10 @@ export default async function handler(req, res){
 
   try {
     const data = await run;
-    res.setHeader("Cache-Control", `s-maxage=${CFG.S_MAXAGE}, stale-while-revalidate=${CFG.SWR}`);
+    res.setHeader("Cache-Control", `s-maxage=${CFG.CDN_SMAXAGE}, stale-while-revalidate=${CFG.CDN_SWR}`);
     res.status(200).json(data);
   } catch (err) {
     console.warn("value-bets run error:", err?.message || err);
-    res.setHeader("Cache-Control", `s-maxage=${CFG.S_MAXAGE}, stale-while-revalidate=${CFG.SWR}`);
     res.status(500).json({ error: "value-bets failed" });
   }
 }
