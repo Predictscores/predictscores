@@ -1,4 +1,3 @@
-// FILE: components/CombinedBets.jsx
 import React from "react";
 import Tabs from "./Tabs";
 import FootballBets from "./FootballBets";
@@ -6,29 +5,29 @@ import CryptoTopSignals from "./CryptoTopSignals";
 
 /**
  * Raspored:
- * - Combined: grid sa 3 kolone (md+). Levo: Football (Top 5) -> 1 kolona (≈33%).
- *             Desno: Crypto (Top 5) -> span 2 kolone (≈66%).
- * - Football tab: Top 25 (sa filterima/sortom + desni stub Tickets 3×3)
+ * - Combined: grid sa 3 kolone (md+). Levo: Football (Top 3) -> 1 kolona (≈33%).
+ *             Desno: Crypto (Top 3) -> span 2 kolone (≈66%).
+ * - Football tab: Top 25 (LOCKED)
  * - Crypto tab: Top 10
  */
 const CombinedBets = () => (
   <Tabs>
     <div label="Combined">
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-stretch">
-        {/* Levo: Football Top 5 (stroži filter ≥70% confidence, dopuna po EV) */}
+        {/* Levo: Football Top 3, u "combined" layoutu, kartice iste visine */}
         <div className="md:col-span-1">
-          <FootballBets limit={5} layout="combined" />
+          <FootballBets limit={3} layout="combined" />
         </div>
 
-        {/* Desno: Crypto Top 5 */}
+        {/* Desno: Crypto Top 3, širi prostor */}
         <div className="md:col-span-2">
-          <CryptoTopSignals limit={5} />
+          <CryptoTopSignals limit={3} />
         </div>
       </div>
     </div>
 
     <div label="Football">
-      {/* Top 25 + filteri/sort + desni stub sa Tiketima (BTTS/HT-FT/1X2 po 3) */}
+      {/* LOCKED lista — prikaži do 25 */}
       <FootballBets limit={25} layout="full" />
     </div>
 
