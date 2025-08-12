@@ -1,4 +1,3 @@
-// FILE: contexts/DataContext.js
 import React, { createContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const initialState = {
@@ -23,13 +22,9 @@ async function fetchJson(url) {
 }
 
 function parseFootballStartISO(item) {
-  // pokušaj nekoliko oblika koje smo viđali
   try {
     const a = item?.datetime_local;
-    if (a?.starting_at?.date_time) {
-      // "2025-08-10 16:00:00" (lokalno) -> tretiramo kao lokalni string bez Z
-      return a.starting_at.date_time.replace(" ", "T");
-    }
+    if (a?.starting_at?.date_time) return a.starting_at.date_time.replace(" ", "T");
     if (a?.date_time) return a.date_time.replace(" ", "T");
     const b = item?.time?.starting_at?.date_time;
     if (b) return b.replace(" ", "T");
@@ -76,10 +71,8 @@ export function DataProvider({ children }) {
       const list = Array.isArray(data?.crypto) ? data.crypto : [];
       setCrypto(list);
       setCryptoLastGeneratedAt(new Date().toISOString());
-      // sledeći refresh za ~10 minuta (možeš da promeniš interval)
-      setNextCryptoUpdate(msFromNow(10));
+      setNextCryptoUpdate(msFromNow(10)); // ~10 min
     } catch (e) {
-      // ne ruši UI
       console.warn("loadCrypto error:", e?.message || e);
     } finally {
       setLoadingCrypto(false);
@@ -89,12 +82,13 @@ export function DataProvider({ children }) {
   const loadFootball = useCallback(async () => {
     setLoadingFootball(true);
     try {
-      const data = await fetchJson("/api/value-bets");
+      // KORISTI LOCKED ENDPOINT
+      const data = await fetchJson("/api/value-bets-locked");
       const bets = Array.isArray(data?.value_bets) ? data.value_bets : [];
       setFootball(bets);
-      setFootballLastGeneratedAt(
-        data?.generated_at ? new Date(data.generated_at).toISOString() : new Date().toISOString()
-      );
+      // built_at ili generated_at ako postoji
+      const builtAt = data?.built_at || data?.generated_at || new Date().toISOString();
+      setFootballLastGeneratedAt(new Date(builtAt).toISOString());
       setNextKickoffAt(computeNextKickoffISO(bets));
     } catch (e) {
       console.warn("loadFootball error:", e?.message || e);
@@ -112,7 +106,6 @@ export function DataProvider({ children }) {
 
   // prvi load na klijentu
   useEffect(() => {
-    // samo na klijentu (Next SSR zaštita)
     if (typeof window === "undefined") return;
     refreshAll();
   }, [refreshAll]);
@@ -157,10 +150,8 @@ export function DataProvider({ children }) {
   return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
 }
 
-// kompatibilnost: i default i named export-i
 export default DataProvider;
 
-// user friendly hook (zbog starog koda koji ga očekuje)
 export function useData() {
   const ctx = React.useContext(DataContext);
   return ctx || initialState;
