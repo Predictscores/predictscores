@@ -1,5 +1,4 @@
 // FILE: hooks/useValueBets.js
-
 import { useState, useEffect } from 'react';
 
 /**
@@ -21,14 +20,9 @@ function sortValueBets(bets = []) {
     });
 }
 
-/**
- * Helper: fetch raw bets for a given date
- */
-async function fetchRawBetsForDate(date) {
+async function fetchLockedBetsForDate(date) {
   const res = await fetch(
-    `/api/value-bets?sport_key=soccer&date=${encodeURIComponent(
-      date
-    )}&min_edge=0.05&min_odds=1.3`
+    `/api/value-bets-locked?date=${encodeURIComponent(date)}`
   );
   if (!res.ok) {
     const txt = await res.text();
@@ -39,10 +33,10 @@ async function fetchRawBetsForDate(date) {
 }
 
 /**
- * useValueBets hook:
+ * useValueBets hook (locked variant):
  * - date: string "YYYY-MM-DD"
  * - caches results in localStorage under key `valueBets_<date>`
- * - if no bets for date, falls back to date-1
+ * - if empty, tries yesterday
  */
 export default function useValueBets(date) {
   const [bets, setBets] = useState([]);
@@ -54,13 +48,12 @@ export default function useValueBets(date) {
     const cacheKey = `valueBets_${date}`;
     let cancelled = false;
 
-    // Load from cache if available
     const cached = localStorage.getItem(cacheKey);
     if (cached) {
       try {
         setBets(JSON.parse(cached));
         setLoading(false);
-        return; // skip fetch on initial load
+        return;
       } catch {
         localStorage.removeItem(cacheKey);
       }
@@ -70,15 +63,15 @@ export default function useValueBets(date) {
       setLoading(true);
       setError(null);
       try {
-        // 1) Try today
-        let raw = await fetchRawBetsForDate(date);
+        // 1) Try today (locked)
+        let raw = await fetchLockedBetsForDate(date);
 
-        // 2) If empty, try yesterday
+        // 2) If empty, try yesterday (locked)
         if (raw.length === 0) {
           const d = new Date(date);
           d.setDate(d.getDate() - 1);
           const ystr = d.toISOString().slice(0, 10);
-          raw = await fetchRawBetsForDate(ystr);
+          raw = await fetchLockedBetsForDate(ystr);
         }
 
         const sorted = sortValueBets(raw);
