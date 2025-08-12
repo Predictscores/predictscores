@@ -1,8 +1,8 @@
-// FILE: pages/index.js
 import React, { useEffect, useMemo, useState } from "react";
 import Head from "next/head";
 import dynamic from "next/dynamic";
 
+// CombinedBets samo na klijentu (bez SSR) + jednostavan loader
 const CombinedBets = dynamic(() => import("../components/CombinedBets"), {
   ssr: false,
   loading: () => (
@@ -10,6 +10,7 @@ const CombinedBets = dynamic(() => import("../components/CombinedBets"), {
   ),
 });
 
+// --------- Dark mode toggle (lokalno)
 function useDarkMode() {
   const [dark, setDark] = useState(true);
   useEffect(() => {
@@ -32,6 +33,7 @@ function useDarkMode() {
   return { toggle };
 }
 
+// --------- helperi
 async function safeJson(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url} -> ${res.status}`);
@@ -69,23 +71,26 @@ function fmtCountdown(ms) {
   return `${m}m ${String(s).padStart(2, "0")}s`;
 }
 
+// --------- Header (bez DataContext-a)
 function HeaderBar() {
   const { toggle } = useDarkMode();
 
   const [now, setNow] = useState(Date.now());
-  const [nextKickoffAt, setNextKickoffAt] = useState(null);
-  const [cryptoNextAt, setCryptoNextAt] = useState(null);
+  const [nextKickoffAt, setNextKickoffAt] = useState(null); // ISO string
+  const [cryptoNextAt, setCryptoNextAt] = useState(null); // timestamp (ms)
 
+  // tikanje tajmera
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
 
+  // inicijalno pokupi podatke za tajmere (NE koristi DataContext)
   useEffect(() => {
     (async () => {
       try {
         const [fb, cr] = await Promise.allSettled([
-          safeJson("/api/value-bets"),
+          safeJson("/api/value-bets-locked"),
           safeJson("/api/crypto"),
         ]);
         if (fb.status === "fulfilled") {
@@ -95,12 +100,16 @@ function HeaderBar() {
           setNextKickoffAt(nearestFutureKickoff(list));
         }
         if (cr.status === "fulfilled") {
+          // sledeći refresh ~10 min posle uspešnog poziva
           setCryptoNextAt(Date.now() + 10 * 60 * 1000);
         }
-      } catch {}
+      } catch {
+        // ne ruši UI
+      }
     })();
   }, []);
 
+  // countdown-ovi
   const cryptoTL = useMemo(() => {
     if (!cryptoNextAt) return null;
     const ms = Math.max(0, cryptoNextAt - now);
@@ -113,6 +122,7 @@ function HeaderBar() {
     return fmtCountdown(ms);
   }, [nextKickoffAt, now]);
 
+  // ručni refresh: reload (da povuče sve iz nove sesije/keša)
   const hardRefresh = () => {
     if (typeof window !== "undefined") window.location.reload();
   };
@@ -150,6 +160,7 @@ function HeaderBar() {
   );
 }
 
+// --------- Legenda
 function Legend() {
   return (
     <div className="mt-10 text-sm text-slate-300 flex flex-wrap items-center gap-4">
@@ -179,6 +190,10 @@ export default function Index() {
       <Head>
         <title>Predictscores — Live Picks</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
+        {/* spreči keširanje HTML-a da ne vidiš stari UI */}
+        <meta httpEquiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+        <meta httpEquiv="Pragma" content="no-cache" />
+        <meta httpEquiv="Expires" content="0" />
       </Head>
 
       <main className="min-h-screen bg-[#0f1116] text-white">
