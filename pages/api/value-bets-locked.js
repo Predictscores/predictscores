@@ -10,20 +10,17 @@ const store = global.__VBETS_LOCK__ || (global.__VBETS_LOCK__ = {
 });
 
 function beogradDayKey(d = new Date()) {
-  // "YYYY-MM-DD" in Europe/Belgrade
   const fmt = new Intl.DateTimeFormat("sv-SE", {
     timeZone: "Europe/Belgrade",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
   });
-  return fmt.format(d);
+  return fmt.format(d); // "YYYY-MM-DD"
 }
-function nowISO() {
-  return new Date().toISOString();
-}
+function nowISO() { return new Date().toISOString(); }
+
 function rankBets(arr = []) {
-  // MODEL+ODDS is better than FALLBACK; then edge desc; then model_prob desc; tiebreak by fixture_id
   return arr.slice().sort((a, b) => {
     if (a.type !== b.type) return a.type === "MODEL+ODDS" ? -1 : 1;
     const eA = Number(a.edge ?? 0);
@@ -37,16 +34,21 @@ function rankBets(arr = []) {
 }
 
 function setCDNHeaders(res) {
-  const S_MAXAGE = Number(process.env.CDN_SMAXAGE_SEC || 600);    // 10min
-  const SWR      = Number(process.env.CDN_STALE_SEC     || 120);  // 2min
+  const S_MAXAGE = Number(process.env.CDN_SMAXAGE_SEC || 600);
+  const SWR      = Number(process.env.CDN_STALE_SEC     || 120);
   res.setHeader("Cache-Control", `s-maxage=${S_MAXAGE}, stale-while-revalidate=${SWR}`);
 }
 
 export default async function handler(req, res) {
   try {
-    // Clear lock if day changed
-    const today = beogradDayKey();
-    if (store.dayKey && store.dayKey !== today) {
+    const forceRebuild = String(req.query.rebuild || "") === "1";
+    const dayParam = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
+      ? String(req.query.date)
+      : beogradDayKey();
+    const targetDay = dayParam;
+
+    // Clear lock if day changed OR explicit rebuild
+    if (store.dayKey && (store.dayKey !== targetDay || forceRebuild)) {
       store.dayKey = null;
       store.builtAt = null;
       store.pinned = null;
@@ -54,8 +56,8 @@ export default async function handler(req, res) {
       store.raw = null;
     }
 
-    // If already built for today, serve immediately
-    if (store.dayKey === today && Array.isArray(store.pinned) && store.pinned.length > 0) {
+    // Serve from lock if already built for targetDay
+    if (!forceRebuild && store.dayKey === targetDay && Array.isArray(store.pinned) && store.pinned.length > 0) {
       setCDNHeaders(res);
       return res.status(200).json({
         value_bets: store.pinned,
@@ -65,18 +67,18 @@ export default async function handler(req, res) {
       });
     }
 
-    // Need to (re)build for today → call existing /api/value-bets and lock TOP-25
-    // Build absolute URL to our own endpoint
+    // Build: call our existing /api/value-bets (now returns up to VB_LIMIT=25)
     const proto = req.headers["x-forwarded-proto"] || "https";
     const host = req.headers.host;
     const origin = `${proto}://${host}`;
 
-    // Preserve ?date=… if dolazi iz hook-a (ili default današnji)
     const search = new URLSearchParams(req.query);
-    if (!search.get("date")) search.set("date", today);
-    // Hint: tražimo do 40 da imamo backup; tvoj endpoint već limitira do 10, ali svejedno sortiramo ceo set koji vrati
-    const innerURL = `${origin}/api/value-bets?${search.toString()}`;
+    search.set("date", targetDay);
+    // (nije potrebno, ali ne škodi) prosledi "limit" ka /api/value-bets
+    const vbLimit = Number(process.env.VB_LIMIT || 25);
+    search.set("limit", String(vbLimit));
 
+    const innerURL = `${origin}/api/value-bets?${search.toString()}`;
     const innerRes = await fetch(innerURL, { headers: { "x-locked-proxy": "1" } });
     if (!innerRes.ok) {
       const text = await innerRes.text();
@@ -87,21 +89,16 @@ export default async function handler(req, res) {
     const list = Array.isArray(json?.value_bets) ? json.value_bets : [];
 
     const ranked = rankBets(list);
-    const pinned = ranked.slice(0, 25);
-    const backup = ranked.slice(25, 40);
+    const pinned = ranked.slice(0, vbLimit);
+    const backup = ranked.slice(vbLimit, vbLimit + 15);
 
-    store.dayKey = today;
+    store.dayKey = targetDay;
     store.builtAt = nowISO();
     store.pinned = pinned;
     store.backup = backup;
     store.raw = list;
 
-    // Optional cookie pin (kratak, samo dayKey)
-    res.setHeader(
-      "Set-Cookie",
-      `vb_day=${today}; Path=/; SameSite=Lax; Max-Age=86400`
-    );
-
+    res.setHeader("Set-Cookie", `vb_day=${targetDay}; Path=/; SameSite=Lax; Max-Age=86400`);
     setCDNHeaders(res);
     return res.status(200).json({
       value_bets: pinned,
