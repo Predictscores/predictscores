@@ -3,7 +3,6 @@ import React, { useEffect, useMemo, useState } from "react";
 import Head from "next/head";
 import dynamic from "next/dynamic";
 
-// CombinedBets samo na klijentu (bez SSR) + jednostavan loader
 const CombinedBets = dynamic(() => import("../components/CombinedBets"), {
   ssr: false,
   loading: () => (
@@ -11,7 +10,6 @@ const CombinedBets = dynamic(() => import("../components/CombinedBets"), {
   ),
 });
 
-// --------- Dark mode toggle (lokalno)
 function useDarkMode() {
   const [dark, setDark] = useState(true);
   useEffect(() => {
@@ -34,7 +32,6 @@ function useDarkMode() {
   return { toggle };
 }
 
-// --------- helperi
 async function safeJson(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url} -> ${res.status}`);
@@ -48,7 +45,6 @@ function parseStartISO(item) {
       item?.time?.starting_at?.date_time ||
       null;
     if (!dt) return null;
-    // "YYYY-MM-DD HH:mm:ss" -> "YYYY-MM-DDTHH:mm:ss"
     return dt.replace(" ", "T");
   } catch {
     return null;
@@ -73,21 +69,18 @@ function fmtCountdown(ms) {
   return `${m}m ${String(s).padStart(2, "0")}s`;
 }
 
-// --------- Header (bez DataContext-a)
 function HeaderBar() {
   const { toggle } = useDarkMode();
 
   const [now, setNow] = useState(Date.now());
-  const [nextKickoffAt, setNextKickoffAt] = useState(null); // ISO string
-  const [cryptoNextAt, setCryptoNextAt] = useState(null); // timestamp (ms)
+  const [nextKickoffAt, setNextKickoffAt] = useState(null);
+  const [cryptoNextAt, setCryptoNextAt] = useState(null);
 
-  // tikanje tajmera
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
 
-  // inicijalno pokupi podatke za tajmere (ne zavisi od context-a)
   useEffect(() => {
     (async () => {
       try {
@@ -102,16 +95,12 @@ function HeaderBar() {
           setNextKickoffAt(nearestFutureKickoff(list));
         }
         if (cr.status === "fulfilled") {
-          // sledeći refresh ~10 min posle uspešnog poziva
           setCryptoNextAt(Date.now() + 10 * 60 * 1000);
         }
-      } catch {
-        // ne ruši UI
-      }
+      } catch {}
     })();
   }, []);
 
-  // countdown-ovi
   const cryptoTL = useMemo(() => {
     if (!cryptoNextAt) return null;
     const ms = Math.max(0, cryptoNextAt - now);
@@ -124,7 +113,6 @@ function HeaderBar() {
     return fmtCountdown(ms);
   }, [nextKickoffAt, now]);
 
-  // ručni refresh: za stabilnost samo reload (da povuče sve iz nove sesije)
   const hardRefresh = () => {
     if (typeof window !== "undefined") window.location.reload();
   };
@@ -153,7 +141,6 @@ function HeaderBar() {
           </button>
         </div>
 
-        {/* Info chipovi: SAMO dva komada */}
         <div className="px-4 py-2 rounded-full bg-[#202542] text-white text-sm inline-flex items-center gap-6">
           <span>Crypto next refresh: {cryptoTL || "—"}</span>
           <span>Next kickoff: {kickoffTL || "—"}</span>
@@ -163,7 +150,6 @@ function HeaderBar() {
   );
 }
 
-// --------- Legenda
 function Legend() {
   return (
     <div className="mt-10 text-sm text-slate-300 flex flex-wrap items-center gap-4">
@@ -185,7 +171,6 @@ function Legend() {
 }
 
 export default function Index() {
-  // kartice prikazujemo tek nakon mount-a (da izbegnemo SSR trzavice)
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
