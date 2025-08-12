@@ -3,20 +3,29 @@ export const config = { api: { bodyParser: false } };
 
 const store = global.__VBETS_LOCK__ || (global.__VBETS_LOCK__ = {
   dayKey: null,
-  builtAt: null,
-  pinned: null,   // array of 25
-  backup: null,   // array of 15 (26-40)
-  raw: null,      // original full payload from /api/value-bets
+  builtAt: null,   // ISO (UTC)
+  builtLocalHour: null, // broj sata u Europe/Belgrade kad je urađen build
+  pinned: null,    // array (Top-N)
+  backup: null,    // array (sledećih 15)
+  raw: null
 });
 
 function beogradDayKey(d = new Date()) {
-  const fmt = new Intl.DateTimeFormat("sv-SE", {
+  return new Intl.DateTimeFormat("sv-SE", {
     timeZone: "Europe/Belgrade",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  });
-  return fmt.format(d); // "YYYY-MM-DD"
+  }).format(d); // "YYYY-MM-DD"
+}
+function belgradeHour(d = new Date()) {
+  return Number(
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Europe/Belgrade",
+      hour: "2-digit",
+      hour12: false
+    }).format(d)
+  );
 }
 function nowISO() { return new Date().toISOString(); }
 
@@ -34,50 +43,77 @@ function rankBets(arr = []) {
 }
 
 function setCDNHeaders(res) {
-  const S_MAXAGE = Number(process.env.CDN_SMAXAGE_SEC || 600);
-  const SWR      = Number(process.env.CDN_STALE_SEC     || 120);
+  const S_MAXAGE = Number(process.env.CDN_SMAXAGE_SEC || 600);   // 10 min
+  const SWR      = Number(process.env.CDN_STALE_SEC     || 120); // 2 min
   res.setHeader("Cache-Control", `s-maxage=${S_MAXAGE}, stale-while-revalidate=${SWR}`);
 }
 
 export default async function handler(req, res) {
   try {
-    const forceRebuild = String(req.query.rebuild || "") === "1";
-    const dayParam = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
+    const targetDay = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
       ? String(req.query.date)
       : beogradDayKey();
-    const targetDay = dayParam;
 
-    // Clear lock if day changed OR explicit rebuild
-    if (store.dayKey && (store.dayKey !== targetDay || forceRebuild)) {
+    const lockHour = Number(process.env.LOCK_BUILD_HOUR || 14); // ⟵ default 14:00
+    const vbLimit  = Number(process.env.VB_LIMIT || 25);
+    const now = new Date();
+    const todayKey = beogradDayKey(now);
+    const nowHr = belgradeHour(now);
+
+    const forceRebuild = String(req.query.rebuild || "") === "1";
+
+    // Reset ako menjamo dan u locku ili ako je tražen rebuild za drugi dan
+    if (store.dayKey && (store.dayKey !== targetDay) && !forceRebuild) {
       store.dayKey = null;
       store.builtAt = null;
+      store.builtLocalHour = null;
       store.pinned = null;
       store.backup = null;
       store.raw = null;
     }
 
-    // Serve from lock if already built for targetDay
-    if (!forceRebuild && store.dayKey === targetDay && Array.isArray(store.pinned) && store.pinned.length > 0) {
+    // AUTO re-lock u 14:00: ako već postoji današnji lock ali je napravljen pre 14h, a sada je posle 14h -> rebuild
+    const needAutoRelock =
+      store.dayKey === todayKey &&
+      typeof store.builtLocalHour === "number" &&
+      store.builtLocalHour < lockHour &&
+      nowHr >= lockHour;
+
+    // Serve iz memorije ako imamo lock za traženi dan i nije potreban auto-relock, niti forceRebuild
+    if (!needAutoRelock && !forceRebuild && store.dayKey === targetDay && Array.isArray(store.pinned) && store.pinned.length > 0) {
       setCDNHeaders(res);
       return res.status(200).json({
         value_bets: store.pinned,
         built_at: store.builtAt,
         day: store.dayKey,
-        source: "locked-cache",
+        source: "locked-cache"
       });
     }
 
-    // Build: call our existing /api/value-bets (now returns up to VB_LIMIT=25)
+    // Ako je target današnji dan, a još uvek je PRE 14:00 i nemamo lock — NEMOJ auto-build (izbegavamo rani set).
+    // Dozvoljen je build samo ako je forceRebuild=1 ili je posle 14h.
+    if (targetDay === todayKey && nowHr < lockHour && !forceRebuild) {
+      // Ako već postoji neki lock (npr. iz ranijeg cold starta), posluži ga; inače prazan set uz "pending"
+      setCDNHeaders(res);
+      return res.status(200).json({
+        value_bets: Array.isArray(store.pinned) ? store.pinned : [],
+        built_at: store.builtAt,
+        day: targetDay,
+        pending_until_hour: lockHour,
+        source: "locked-pending"
+      });
+    }
+
+    // --- Build (ili Re-build) ---
     const proto = req.headers["x-forwarded-proto"] || "https";
-    const host = req.headers.host;
+    const host  = req.headers.host;
     const origin = `${proto}://${host}`;
 
     const search = new URLSearchParams(req.query);
     search.set("date", targetDay);
-    // (nije potrebno, ali ne škodi) prosledi "limit" ka /api/value-bets
-    const vbLimit = Number(process.env.VB_LIMIT || 25);
     search.set("limit", String(vbLimit));
 
+    // Vrlo važno: pošalji header da rewrite NE presretne ovaj poziv
     const innerURL = `${origin}/api/value-bets?${search.toString()}`;
     const innerRes = await fetch(innerURL, { headers: { "x-locked-proxy": "1" } });
     if (!innerRes.ok) {
@@ -94,6 +130,7 @@ export default async function handler(req, res) {
 
     store.dayKey = targetDay;
     store.builtAt = nowISO();
+    store.builtLocalHour = belgradeHour(new Date()); // zabeleži lokalan sat kad je rađen build
     store.pinned = pinned;
     store.backup = backup;
     store.raw = list;
@@ -104,7 +141,7 @@ export default async function handler(req, res) {
       value_bets: pinned,
       built_at: store.builtAt,
       day: store.dayKey,
-      source: "locked-build",
+      source: needAutoRelock ? "locked-auto14" : (forceRebuild ? "locked-rebuild" : "locked-build")
     });
   } catch (e) {
     setCDNHeaders(res);
