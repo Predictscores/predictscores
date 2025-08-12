@@ -1,171 +1,305 @@
 // FILE: components/FootballBets.jsx
-import React, { useContext, useMemo, useState } from "react";
-import { DataContext } from "../contexts/DataContext";
+import React, { useMemo, useState } from "react";
+import useValueBets from "../hooks/useValueBets";
+import TicketPanel from "./TicketPanel";
 
-// ---------- helpers ----------
-function ccToFlag(cc){ const code=String(cc||"").toUpperCase(); if(!/^[A-Z]{2}$/.test(code)) return ""; return String.fromCodePoint(...[...code].map(c=>0x1f1e6+(c.charCodeAt(0)-65))); }
-const NAME_TO_CC={ usa:"US","united states":"US",america:"US", iceland:"IS",japan:"JP",germany:"DE",england:"GB",scotland:"GB",wales:"GB","faroe-islands":"FO",denmark:"DK",sweden:"SE",norway:"NO",finland:"FI",portugal:"PT",spain:"ES",italy:"IT",france:"FR",netherlands:"NL",belgium:"BE",austria:"AT",switzerland:"CH",turkey:"TR",greece:"GR",serbia:"RS",croatia:"HR",slovenia:"SI",bosnia:"BA",montenegro:"ME","north macedonia":"MK",albania:"AL",mexico:"MX",nicaragua:"NI", bund:"DE",laliga:"ES",seriea:"IT",ligue:"FR",eredivisie:"NL",primeira:"PT",j1:"JP",urvalsdeild:"IS",meistaradeildin:"FO",usl:"US",mls:"US","mls next pro":"US",championship:"GB" };
-function guessFlag(league={}){ const c=String(league.country||"").toLowerCase(); const n=String(league.name||"").toLowerCase(); for(const k of Object.keys(NAME_TO_CC)) if(c.includes(k)) return ccToFlag(NAME_TO_CC[k]); for(const k of Object.keys(NAME_TO_CC)) if(n.includes(k)) return ccToFlag(NAME_TO_CC[k]); return ""; }
-function sanitizeIso(s){ if(!s||typeof s!=="string") return null; let iso=s.trim().replace(" ","T"); iso=iso.replace("+00:00Z","Z").replace("Z+00:00","Z"); return iso; }
-function extractKickoffISO(v){ const dt=v?.datetime_local?.starting_at?.date_time||v?.datetime_local?.date_time||v?.time?.starting_at?.date_time||v?.kickoff||null; return sanitizeIso(dt); }
-function toBelgradeHM(iso){ try{ const d=new Date(iso); if(isNaN(d)) return "—"; return d.toLocaleString("sr-RS",{timeZone:"Europe/Belgrade",hour12:false,hour:"2-digit",minute:"2-digit",day:"2-digit",month:"2-digit"});}catch{return "—";} }
-function fmtOdds(x){ return typeof x==="number"&&isFinite(x)?x.toFixed(2):"—"; }
-function bucket(conf){ const c=typeof conf==="number"?conf:0; if(c>=90) return {text:"Top Pick",cls:"text-orange-400"}; if(c>=75) return {text:"High",cls:"text-emerald-400"}; if(c>=50) return {text:"Moderate",cls:"text-sky-400"}; return {text:"Low",cls:"text-amber-400"}; }
-function Badge({children,className=""}){ return <span className={`px-2 py-1 rounded-full border border-white/10 text-xs text-slate-300 ${className}`}>{children}</span>; }
-
-function InfoDot({ text }) {
-  if (!text) return null;
-  return (
-    <div className="relative group inline-flex items-center">
-      <span className="ml-2 w-4 h-4 rounded-full bg-white/10 text-xs leading-4 text-slate-200 inline-flex items-center justify-center select-none">i</span>
-      <div className="absolute z-10 hidden group-hover:block top-5 right-0 w-64 bg-[#1f2339] text-slate-200 text-xs p-3 rounded-xl border border-white/10 shadow">
-        {text}
-      </div>
-    </div>
-  );
-}
-
-function MarketAndSelection({ v, home, away }){
-  const label = v?.market_label || v?.market || "—";
-  const sel = String(v?.selection || "—");
-  // Prijateljski prikaz za 1X2
-  if ((v?.market||"").toUpperCase() === "1X2") {
-    let pick = sel;
-    if (sel === "1") pick = `${home} (1)`;
-    else if (sel === "2") pick = `${away} (2)`;
-    else if (sel.toUpperCase() === "X") pick = "Draw (X)";
-    return (<><span className="text-white font-bold">{pick}</span> <span className="text-slate-400">[{label}]</span></>);
+/** Utils */
+function parseISO(it) {
+  try {
+    const dt =
+      it?.datetime_local?.starting_at?.date_time ||
+      it?.datetime_local?.date_time ||
+      it?.time?.starting_at?.date_time ||
+      null;
+    return dt ? dt.replace(" ", "T") : null;
+  } catch {
+    return null;
   }
-  // ostala tržišta (BTTS, OU)
-  return (<><span className="text-white font-bold">{label}: {sel}</span></>);
+}
+function kickoffMs(it) {
+  const iso = parseISO(it);
+  const t = iso ? new Date(iso).getTime() : NaN;
+  return Number.isFinite(t) ? t : NaN;
+}
+function fmtTime(it) {
+  const iso = parseISO(it);
+  const d = iso ? new Date(iso) : null;
+  return d
+    ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : "—";
+}
+function pct(n) {
+  return Number.isFinite(n) ? `${Math.round(n * 100)}%` : "—";
+}
+function confPct(n) {
+  if (Number.isFinite(n)) return `${Math.round(n)}%`;
+  if (Number.isFinite(n?.confidence_pct)) return `${Math.round(n.confidence_pct)}%`;
+  return "—";
 }
 
-// ---------- Card ----------
-function FootballCard({ v, layout="full" }){
-  const league=v?.league||{};
-  const home=v?.teams?.home?.name||"Home";
-  const away=v?.teams?.away?.name||"Away";
-  const iso=extractKickoffISO(v);
-  const when=iso?toBelgradeHM(iso):"—";
-  const flag=guessFlag(league);
+const COMBINED_MIN_CONF = 70; // Combined: tražimo ≥70%, dopuna po EV
 
-  const confPct=Math.max(0,Math.min(100,v?.confidence_pct??0));
-  const b=bucket(confPct);
-  const odds=Number.isFinite(v?.market_odds)?v.market_odds:null;
+function todayYMD() {
+  const now = new Date();
+  // uvek Beograd za konzistentnost prikaza
+  const y = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Europe/Belgrade",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
+  return y; // "YYYY-MM-DD"
+}
 
-  const minH = layout==="combined" ? "min-h-[220px] md:min-h-[240px]" : "min-h-[180px]";
-  const [open,setOpen]=useState(false);
-  const summary=v?.explain?.summary||"";
-  const bullets=Array.isArray(v?.explain?.bullets)?v.explain.bullets:[];
+/** Renders a single football pick */
+function Card({ pick }) {
+  const market = pick.market_label || pick.market || "";
+  const sel = pick.selection || "";
+  const odds =
+    Number.isFinite(pick.market_odds) && pick.market_odds > 0
+      ? pick.market_odds.toFixed(2)
+      : null;
 
-  const formText = (v?.form_text && v.form_text.trim() && v.form_text.trim() !== "vs") ? v.form_text : "";
+  const conf =
+    Number.isFinite(pick.confidence_pct) ? pick.confidence_pct : null;
+  let bucket = "Low";
+  if (conf >= 90) bucket = "Top Pick";
+  else if (conf >= 75) bucket = "High";
+  else if (conf >= 50) bucket = "Moderate";
+
+  const edgePP =
+    Number.isFinite(pick.edge_pp) ? `${pick.edge_pp.toFixed(1)} pp` : "—";
+  const evTxt =
+    Number.isFinite(pick.ev) ? `${(pick.ev * 100).toFixed(1)}%` : "—";
 
   return (
-    <div className={`w-full bg-[#1f2339] p-5 rounded-2xl shadow flex flex-col ${minH}`}>
-      {/* Header */}
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <span className="text-xl">{flag}</span>
-          <div className="text-sm text-slate-300">
-            <div className="font-semibold text-white">{league?.name||"League"}</div>
-            <div className="text-slate-400">{when} (Beograd)</div>
+    <div className="bg-[#1f2339] rounded-2xl p-4 h-full flex flex-col">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="text-xs text-slate-400">
+            {pick.league?.name || "—"} • {fmtTime(pick)}
+          </div>
+          <div className="text-base font-semibold text-white">
+            {pick.teams?.home?.name} vs {pick.teams?.away?.name}
+          </div>
+          <div className="text-sm text-slate-200 mt-1">
+            <span className="font-semibold">{market}</span>: {sel}
+            {odds ? <span className="text-slate-400"> @ {odds}</span> : null}
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          {v?.lineups_status==="confirmed" && <Badge className="text-emerald-300">Lineups: Confirmed</Badge>}
-          {v?.lineups_status==="expected" && <Badge>Lineups: Expected</Badge>}
-          {Number.isFinite(v?.injuries_count)&&v.injuries_count>0 && <Badge>INJ: {v.injuries_count}</Badge>}
-        </div>
-      </div>
 
-      {/* Timovi */}
-      <div className="mt-3 text-lg font-semibold">
-        {home} <span className="text-slate-400">vs</span> {away}
-      </div>
-
-      {/* Predlog / kvota / edge / move */}
-      <div className="mt-2 text-sm flex flex-wrap items-center gap-3">
-        <div>Pick: <MarketAndSelection v={v} home={home} away={away} /></div>
-        <div className="text-slate-300">Odds: <span className="font-semibold">{fmtOdds(odds)}</span></div>
-        {Number.isFinite(v?.edge_pp) && <div className="text-slate-300">Edge: <span className={v.edge_pp>=0?"text-emerald-300":"text-rose-300"}>{v.edge_pp.toFixed(1)}pp</span></div>}
-        {Number.isFinite(v?.movement_pct)&&v.movement_pct!==0 && <div className="text-slate-300">Move: <span className={v.movement_pct>=0?"text-emerald-300":"text-rose-300"}>{v.movement_pct>0?"↑":"↓"} {Math.abs(v.movement_pct).toFixed(2)}pp</span></div>}
-        {layout==="combined" && summary && <InfoDot text={summary} />}
-      </div>
-
-      {/* Confidence */}
-      <div className="mt-3">
-        <div className="text-xs text-gray-400 mb-1">Confidence</div>
-        <div className="flex items-center gap-2">
-          <div className="flex-1 h-2 rounded-full bg-white/10 overflow-hidden">
-            <div className="h-2 rounded-full bg-gradient-to-r from-emerald-500 to-emerald-400" style={{width:`${confPct}%`}} />
-          </div>
-          <span className="text-xs text-gray-300">{confPct}%</span>
-        </div>
-        <div className="mt-1 text-[12px] text-slate-300 flex items-center gap-2">
-          <span className={b.cls}>●</span>
-          <span className="text-slate-200">{b.text}</span>
-          {formText ? <span className="text-slate-400">· {formText}</span> : null}
-        </div>
-      </div>
-
-      {/* H2H */}
-      {v?.h2h_summary && v.h2h_summary.trim() && (
-        <div className="mt-2 text-[11px] text-slate-400">H2H: {v.h2h_summary}</div>
-      )}
-
-      {/* Why this pick (samo u Football tabu) */}
-      {layout==="full" && (summary || bullets.length>0) && (
-        <div className="mt-3">
-          <button onClick={()=>setOpen(x=>!x)} className="text-xs text-slate-300 underline underline-offset-2" type="button">
-            {open ? "Hide details" : "Why this pick"}
-          </button>
-          {open && (
-            <div className="mt-2 text-sm text-slate-300">
-              {summary && <div className="mb-1">{summary}</div>}
-              {bullets.length>0 && <ul className="list-disc pl-5 space-y-1">{bullets.map((b,i)=><li key={i}>{b}</li>)}</ul>}
+        {/* Confidence pill */}
+        <div className="text-right">
+          <div className="text-xs text-slate-400">Confidence</div>
+          <div className="flex items-center gap-2">
+            <div className="w-28 h-2 bg-white/10 rounded-full overflow-hidden">
+              <div
+                className={`h-2 ${
+                  conf >= 90
+                    ? "bg-orange-400"
+                    : conf >= 75
+                    ? "bg-emerald-400"
+                    : conf >= 50
+                    ? "bg-sky-400"
+                    : "bg-amber-400"
+                }`}
+                style={{ width: `${Math.max(0, Math.min(100, conf || 0))}%` }}
+              />
             </div>
-          )}
+            <div className="text-xs text-white">{confPct(conf)}</div>
+          </div>
+          <div className="text-[11px] text-slate-400">{bucket}</div>
         </div>
-      )}
+      </div>
+
+      {/* Micro row */}
+      <div className="mt-3 text-xs text-slate-400">
+        EV {evTxt} · Edge {edgePP} · {pick.bookmakers_count || 0} bookies
+        {pick.h2h_summary ? ` · H2H ${pick.h2h_summary}` : ""}
+      </div>
+
+      {/* Why this pick */}
+      {pick.explain?.summary ? (
+        <div className="mt-3 text-[13px] text-slate-300">
+          <span className="text-slate-400">Why: </span>
+          {pick.explain.summary}
+        </div>
+      ) : null}
+
+      {/* Spacer */}
+      <div className="flex-1" />
+      {/* Label type */}
+      <div className="mt-3 text-[11px] text-slate-500">
+        {pick.type === "MODEL+ODDS" ? "Model + Odds" : "Model-only"}
+      </div>
     </div>
   );
 }
 
-function sortValueBets(bets=[]){
-  return bets.slice().sort((a,b)=>{
-    if(a.type!==b.type) return a.type==="MODEL+ODDS"?-1:1;
-    if((b._score??0)!==(a._score??0)) return (b._score??0)-(a._score??0);
-    const eA = Number.isFinite(a.edge_pp) ? a.edge_pp : -999;
-    const eB = Number.isFinite(b.edge_pp) ? b.edge_pp : -999;
-    return eB - eA;
-  });
-}
+export default function FootballBets({ limit = 10, layout = "full" }) {
+  const date = todayYMD();
+  const { bets = [], loading, error } = useValueBets(date);
 
-export default function FootballBets({ limit=10, layout="full" }){
-  const { football=[], loadingFootball } = useContext(DataContext) || {};
-  const list = useMemo(()=>{
-    const base=Array.isArray(football)?football:[];
-    const sorted=sortValueBets(base);
-    return typeof limit==="number"?sorted.slice(0,limit):sorted;
-  },[football,limit]);
+  // ----- LOCAL CONTROLS (samo u full layoutu) -----
+  const [sortBy, setSortBy] = useState("recommended"); // recommended | kickoff | confidence | ev
+  const [showTop, setShowTop] = useState(true);
+  const [showHigh, setShowHigh] = useState(true);
+  const [showModerate, setShowModerate] = useState(true);
+  const [showLow, setShowLow] = useState(false);
 
-  if(loadingFootball) return <div className="text-slate-400 text-sm">Loading football picks…</div>;
-  if(!list.length) return <div className="text-slate-400 text-sm">No football suggestions at the moment.</div>;
+  const filtered = useMemo(() => {
+    let arr = Array.isArray(bets) ? bets.slice() : [];
 
-  if(layout==="combined"){
+    // Combined: stroži filter (≥70%), dopuna po EV ako nema dovoljno
+    if (layout === "combined") {
+      const strong = arr.filter((b) => (b.confidence_pct || 0) >= COMBINED_MIN_CONF);
+      if (strong.length >= limit) {
+        arr = strong;
+      } else {
+        // dopuni po EV, ali izbegni duplikate
+        const rest = arr
+          .filter((b) => !(b.confidence_pct >= COMBINED_MIN_CONF))
+          .sort((a, b) => (Number(b.ev || -1) - Number(a.ev || -1)));
+        arr = strong.concat(rest);
+      }
+    } else {
+      // Full layout: bucket filter
+      arr = arr.filter((b) => {
+        const c = b.confidence_pct || 0;
+        if (c >= 90) return showTop;
+        if (c >= 75) return showHigh;
+        if (c >= 50) return showModerate;
+        return showLow;
+      });
+    }
+
+    // Sortiranje
+    if (sortBy === "kickoff") {
+      arr.sort((a, b) => kickoffMs(a) - kickoffMs(b));
+    } else if (sortBy === "confidence") {
+      arr.sort((a, b) => (b.confidence_pct || 0) - (a.confidence_pct || 0));
+    } else if (sortBy === "ev") {
+      arr.sort((a, b) => (Number(b.ev || -1) - Number(a.ev || -1)));
+    } else {
+      // recommended: _score -> edge_pp -> ev
+      arr.sort((a, b) => {
+        if ((b._score || 0) !== (a._score || 0)) return (b._score || 0) - (a._score || 0);
+        const eA = Number.isFinite(a.edge_pp) ? a.edge_pp : -999;
+        const eB = Number.isFinite(b.edge_pp) ? b.edge_pp : -999;
+        if (eB !== eA) return eB - eA;
+        return Number(b.ev || -1) - Number(a.ev || -1);
+      });
+    }
+
+    return arr;
+  }, [
+    bets,
+    sortBy,
+    showTop,
+    showHigh,
+    showModerate,
+    showLow,
+    layout,
+    limit,
+  ]);
+
+  const top = useMemo(() => filtered.slice(0, limit), [filtered, limit]);
+
+  if (loading)
+    return <div className="text-slate-400 text-sm">Loading football…</div>;
+  if (error)
+    return (
+      <div className="text-amber-400 text-sm">
+        Football feed error: {String(error)}
+      </div>
+    );
+
+  // ----- COMBINED: samo lista -----
+  if (layout === "combined") {
     return (
       <div className="grid grid-cols-1 gap-4 items-stretch">
-        {list.map(v=>(
-          <FootballCard key={v?.fixture_id || `${v?.league?.id}-${v?.teams?.home?.name}-${v?.teams?.away?.name}`} v={v} layout="combined" />
+        {top.map((p) => (
+          <Card key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}`} pick={p} />
         ))}
+        {top.length === 0 && (
+          <div className="text-slate-400 text-sm">No football suggestions.</div>
+        )}
       </div>
     );
   }
+
+  // ----- FULL: levi stub (singles) + desni stub (tickets) -----
   return (
-    <div className="space-y-4">
-      {list.map(v=>(
-        <FootballCard key={v?.fixture_id || `${v?.league?.id}-${v?.teams?.home?.name}-${v?.teams?.away?.name}`} v={v} layout="full" />
-      ))}
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-start">
+      {/* LEFT: Filters + Singles */}
+      <div className="md:col-span-2">
+        {/* Controls */}
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <div className="text-xs text-slate-300 mr-2">Sort by:</div>
+          <div className="flex gap-2">
+            {["recommended", "kickoff", "confidence", "ev"].map((key) => (
+              <button
+                key={key}
+                onClick={() => setSortBy(key)}
+                className={
+                  "px-3 py-1.5 rounded-full text-xs font-semibold transition " +
+                  (sortBy === key
+                    ? "bg-[#151830] text-white"
+                    : "bg-[#1f2339] text-slate-300 hover:bg-[#202542]")
+                }
+                type="button"
+              >
+                {key === "recommended"
+                  ? "Recommended"
+                  : key === "kickoff"
+                  ? "Kickoff (Soonest)"
+                  : key === "confidence"
+                  ? "Confidence"
+                  : "EV"}
+              </button>
+            ))}
+          </div>
+
+          <div className="hidden md:inline-block w-px h-5 bg-white/10 mx-1" />
+
+          <div className="text-xs text-slate-300 mr-2">Buckets:</div>
+          {[
+            ["Top", showTop, setShowTop],
+            ["High", showHigh, setShowHigh],
+            ["Moderate", showModerate, setShowModerate],
+            ["Low", showLow, setShowLow],
+          ].map(([label, val, set]) => (
+            <button
+              key={label}
+              onClick={() => set(!val)}
+              className={
+                "px-3 py-1.5 rounded-full text-xs font-semibold transition " +
+                (val
+                  ? "bg-[#151830] text-white"
+                  : "bg-[#1f2339] text-slate-300 hover:bg-[#202542]")
+              }
+              type="button"
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {/* Singles list */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch">
+          {top.map((p) => (
+            <Card key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}`} pick={p} />
+          ))}
+          {top.length === 0 && (
+            <div className="text-slate-400 text-sm">No football suggestions.</div>
+          )}
+        </div>
+      </div>
+
+      {/* RIGHT: Tickets 3× */}
+      <div className="md:col-span-1">
+        <TicketPanel bets={filtered} />
+      </div>
     </div>
   );
 }
