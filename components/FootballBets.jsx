@@ -3,7 +3,7 @@ import React, { useMemo, useState } from "react";
 import useValueBets from "../hooks/useValueBets";
 import TicketPanel from "./TicketPanel";
 
-/** Helpers */
+/** Utils */
 function parseISO(it) {
   try {
     const dt =
@@ -24,15 +24,15 @@ function kickoffMs(it) {
 function fmtTime(it) {
   const iso = parseISO(it);
   const d = iso ? new Date(iso) : null;
-  return d ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—";
+  return d
+    ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : "—";
 }
 function confPct(n) {
   if (Number.isFinite(n)) return `${Math.round(n)}%`;
   if (Number.isFinite(n?.confidence_pct)) return `${Math.round(n.confidence_pct)}%`;
   return "—";
 }
-const COMBINED_MIN_CONF = 70;
-
 function todayYMD() {
   const now = new Date();
   const y = new Intl.DateTimeFormat("sv-SE", {
@@ -41,43 +41,34 @@ function todayYMD() {
     month: "2-digit",
     day: "2-digit",
   }).format(now);
-  return y;
+  return y; // "YYYY-MM-DD"
 }
 
-/** Tiny helpers for “explain” text (2 kratke linije umesto EV/Edge) */
-function shortSummary(pick) {
-  // Primarno koristimo explain.summary ako postoji; očistimo brojeve/“pp” itd.
-  const raw = pick?.explain?.summary || "";
-  if (!raw) return "Solid signal vs market";
-  // Ukloni brojeve/pp/%, ostavi kjučne reči
-  const cleaned = raw
-    .replace(/\b\d+(\.\d+)?%/g, "")
-    .replace(/\b\d+(\.\d+)?pp/g, "")
-    .replace(/\s{2,}/g, " ")
-    .replace(/[·|]/g, " ")
-    .trim();
-  // Skrati na ~60 karaktera
-  return cleaned.length > 60 ? cleaned.slice(0, 57) + "…" : cleaned || "Model agrees with market";
+// ---- badge za confidence
+function confBadge(conf) {
+  if (conf >= 90) return "🔥 Top Pick";
+  if (conf >= 75) return "🟢 High";
+  if (conf >= 50) return "🔵 Moderate";
+  return "🟡 Low";
 }
-function shortContext(pick) {
-  if (pick?.h2h_summary) return "H2H insight present";
-  if (pick?.bookmakers_count > 0) return "Broad odds coverage";
-  if (pick?.lineups_status && pick.lineups_status !== "unknown") return "Lineups status known";
-  return "Recent form considered";
-}
-
-/** Confidence badge text/emoji */
-function confBadge(pct) {
-  if (!Number.isFinite(pct)) return "Low";
-  if (pct >= 90) return "🔥 Top";
-  if (pct >= 75) return "High";
-  if (pct >= 50) return "Moderate";
-  return "Low";
+// kratko objašnjenje
+function shortWhy(p) {
+  // 1) ako API šalje sažetak — koristi to
+  const s = p?.explain?.summary;
+  if (s && typeof s === "string" && s.trim()) {
+    return s.trim();
+  }
+  // 2) fallback: smislen, kratak
+  const league = p?.league?.name || "";
+  const mk = p?.market_label || p?.market || "";
+  const sel = p?.selection || "";
+  return [league ? `Kontekst: ${league}` : null, mk && sel ? `Model naginje: ${mk} ${sel}` : null]
+    .filter(Boolean)
+    .join(" · ");
 }
 
-/** Single card — NOVI raspored, stabilan na mobilu */
+/** Single card */
 function Card({ pick }) {
-  const league = pick?.league?.name || "—";
   const market = pick.market_label || pick.market || "";
   const sel = pick.selection || "";
   const odds =
@@ -85,47 +76,52 @@ function Card({ pick }) {
       ? pick.market_odds.toFixed(2)
       : null;
 
-  const conf = Number.isFinite(pick.confidence_pct) ? pick.confidence_pct : null;
+  const conf =
+    Number.isFinite(pick.confidence_pct) ? pick.confidence_pct : null;
 
   return (
-    <div className="bg-[#1f2339] rounded-2xl px-4 py-3 md:py-4 h-full flex flex-col">
-      {/* Gornji red: liga + vreme  */}
-      <div className="text-xs text-slate-400 flex items-center gap-2">
-        {/* (opciono mesto za zastavicu) */}
-        {/* <span className="text-base leading-none">🇪🇺</span> */}
-        <span className="truncate">{league}</span>
-        <span className="opacity-60">•</span>
-        <span>{fmtTime(pick)}</span>
+    <div className="bg-[#1f2339] rounded-2xl p-4 h-full flex flex-col">
+      {/* Header: liga + vreme + naslov */}
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-xs text-slate-400 truncate">
+            {pick.league?.name || "—"} • {fmtTime(pick)}
+          </div>
+          <div className="text-base font-semibold text-white leading-snug">
+            <span className="truncate block">
+              {pick.teams?.home?.name} vs {pick.teams?.away?.name}
+            </span>
+          </div>
+
+          {/* Tip + kvota */}
+          <div className="text-sm text-slate-200 mt-1">
+            <span className="font-semibold">{market}</span>: {sel}
+            {odds ? <span className="text-slate-400"> @ {odds}</span> : null}
+          </div>
+        </div>
+
+        {/* Značka nivoa (kratko) */}
+        <div className="shrink-0 text-right">
+          <div className="text-xs text-slate-300">{confBadge(conf || 0)}</div>
+        </div>
       </div>
 
-      {/* Par */}
-      <div className="mt-1 text-base md:text-lg font-semibold text-white leading-snug line-clamp-2">
-        {pick?.teams?.home?.name} vs {pick?.teams?.away?.name}
+      {/* Zašto baš ovaj pick (kratko) */}
+      <div className="mt-3 text-[13px] text-slate-300">
+        <span className="text-slate-400">Zašto: </span>
+        {shortWhy(pick)}
       </div>
 
-      {/* Igra i kvota */}
-      <div className="mt-1 text-sm text-slate-200">
-        <span className="font-semibold">{market}</span>
-        {sel ? `: ${sel}` : ""}
-        {odds ? <span className="text-slate-400"> @ {odds}</span> : null}
-      </div>
-
-      {/* Kratko “objašnjenje” – 2 reda */}
-      <div className="mt-2 text-[13px] text-slate-300">
-        <div className="line-clamp-1">{shortSummary(pick)}</div>
-        <div className="line-clamp-1 text-slate-400">{shortContext(pick)}</div>
-      </div>
-
-      {/* FILLER */}
+      {/* filler */}
       <div className="flex-1" />
 
-      {/* Confidence footer – uvek na dnu, fiksna visina */}
-      <div className="mt-3">
-        <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
+      {/* Confidence bar u dnu — stabilne margine, bez prelivanja na mobilnom */}
+      <div className="mt-4">
+        <div className="flex items-center justify-between text-xs text-slate-400">
           <span>Confidence</span>
           <span className="text-white">{confPct(conf)}</span>
         </div>
-        <div className="w-full h-2 bg-white/10 rounded-full overflow-hidden">
+        <div className="mt-1 w-full h-2 bg-white/10 rounded-full overflow-hidden">
           <div
             className={`h-2 ${
               conf >= 90
@@ -139,33 +135,42 @@ function Card({ pick }) {
             style={{ width: `${Math.max(0, Math.min(100, conf || 0))}%` }}
           />
         </div>
-        <div className="mt-1 text-[11px] text-slate-400">{confBadge(conf)}</div>
+      </div>
+
+      {/* oznaka tipa modela */}
+      <div className="mt-2 text-[11px] text-slate-500">
+        {pick.type === "MODEL+ODDS" ? "Model + Odds" : "Model-only"}
       </div>
     </div>
   );
 }
 
+const COMBINED_MIN_CONF = 0; // više ne forsiramo prag; sortiramo po confidence
+
 export default function FootballBets({ limit = 10, layout = "full" }) {
   const date = todayYMD();
   const { bets = [], loading, error } = useValueBets(date);
 
+  // DVA dugmeta: Kickoff / Confidence
   const [sortBy, setSortBy] = useState("kickoff"); // "kickoff" | "confidence"
 
   const filtered = useMemo(() => {
     let arr = Array.isArray(bets) ? bets.slice() : [];
 
+    // ----- COMBINED: Top by CONFIDENCE (tie-break EV), bez dodatnih redova -----
     if (layout === "combined") {
-      const strong = arr.filter((b) => (b.confidence_pct || 0) >= COMBINED_MIN_CONF);
-      if (strong.length >= limit) {
-        arr = strong;
-      } else {
-        const rest = arr
-          .filter((b) => !(b.confidence_pct >= COMBINED_MIN_CONF))
-          .sort((a, b) => Number(b.ev || -1) - Number(a.ev || -1));
-        arr = strong.concat(rest);
-      }
+      arr.sort((a, b) => {
+        const ca = Number(a.confidence_pct || 0);
+        const cb = Number(b.confidence_pct || 0);
+        if (cb !== ca) return cb - ca;
+        const eva = Number.isFinite(a.ev) ? a.ev : -Infinity;
+        const evb = Number.isFinite(b.ev) ? b.ev : -Infinity;
+        return evb - eva;
+      });
+      return arr;
     }
 
+    // ----- FULL: postojeće sortiranje -----
     if (layout === "full") {
       if (sortBy === "kickoff") {
         arr.sort((a, b) => kickoffMs(a) - kickoffMs(b));
@@ -173,13 +178,13 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
         arr.sort((a, b) => (b.confidence_pct || 0) - (a.confidence_pct || 0));
       }
     }
-
     return arr;
-  }, [bets, layout, limit, sortBy]);
+  }, [bets, layout, sortBy]);
 
   const top = useMemo(() => filtered.slice(0, limit), [filtered, limit]);
 
-  if (loading) return <div className="text-slate-400 text-sm">Loading football…</div>;
+  if (loading)
+    return <div className="text-slate-400 text-sm">Loading football…</div>;
   if (error)
     return (
       <div className="text-amber-400 text-sm">
@@ -187,29 +192,31 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
       </div>
     );
 
-  /** COMBINED: jednostavna lista (kompaktne kartice) */
+  // ----- COMBINED: samo lista (kompaktnije kartice) -----
   if (layout === "combined") {
     return (
       <div className="grid grid-cols-1 gap-4 items-stretch">
         {top.map((p) => (
           <Card
-            key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}-${p.teams?.away?.name}`}
+            key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}`}
             pick={p}
           />
         ))}
         {top.length === 0 && (
-          <div className="text-slate-400 text-sm">No football suggestions.</div>
+          <div className="text-slate-400 text-sm">
+            No football suggestions.
+          </div>
         )}
       </div>
     );
   }
 
-  /** FULL: 2 kolone — levo singles, desno tickets (više mesta za tickets) */
+  // ----- FULL: levi stub (singles) + desni stub (tickets) -----
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start md:[grid-template-columns:3fr_2fr]">
-      {/* LEFT: Controls + Singles */}
-      <div className="md:col-span-1">
-        {/* Controls */}
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-start">
+      {/* LEFT: Controls + Singles (kompaktniji razmaci na mobilnom) */}
+      <div className="md:col-span-2">
+        {/* Controls: dva dugmeta */}
         <div className="mb-3 flex items-center gap-2">
           <span className="text-xs text-slate-300">Sort by:</span>
           <div className="inline-flex rounded-lg overflow-hidden bg-[#1f2339]">
@@ -240,21 +247,23 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
           </div>
         </div>
 
-        {/* Singles list (kompaktnije na mobilu) */}
+        {/* Singles list — kartice malo “kraće” na mobilnom */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch">
           {top.map((p) => (
             <Card
-              key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}-${p.teams?.away?.name}`}
+              key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}`}
               pick={p}
             />
           ))}
           {top.length === 0 && (
-            <div className="text-slate-400 text-sm">No football suggestions.</div>
+            <div className="text-slate-400 text-sm">
+              No football suggestions.
+            </div>
           )}
         </div>
       </div>
 
-      {/* RIGHT: Tickets (širi stub ~40%) */}
+      {/* RIGHT: Tickets 3× */}
       <div className="md:col-span-1">
         <TicketPanel bets={filtered} />
       </div>
