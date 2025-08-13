@@ -1,4 +1,4 @@
-// pages/api/football.js
+// FILE: pages/api/football.js
 
 /**
  * Kombinovani fudbalski predikcioni endpoint.
@@ -10,7 +10,9 @@
  * Fallback stub je prisutan ako nema konsenzusa.
  */
 
-const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
+const API_FOOTBALL_KEY =
+  process.env.API_FOOTBALL_KEY ||
+  process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || "";   // ← fallback ako koristiš taj naziv
 const SPORTMONKS_KEY = process.env.SPORTMONKS_KEY;
 
 const STUB_PREDICTIONS = [
@@ -84,14 +86,11 @@ async function fetchFromAPIFootball() {
     const fixturesRes = await fetch(
       'https://v3.football.api-sports.io/fixtures?next=10',
       {
-        headers: {
-          'x-apisports-key': API_FOOTBALL_KEY,
-        },
+        headers: { 'x-apisports-key': API_FOOTBALL_KEY },
       }
     );
     if (!fixturesRes.ok) return [];
     const fxJson = await fixturesRes.json();
-    const fixtures = (fxJson.response || []).map((f) => f.fixture).filter(Boolean);
     const preds = [];
 
     // for each fixture, get predictions
@@ -104,11 +103,7 @@ async function fetchFromAPIFootball() {
 
           const predRes = await fetch(
             `https://v3.football.api-sports.io/predictions?fixture=${fixture.id}`,
-            {
-              headers: {
-                'x-apisports-key': API_FOOTBALL_KEY,
-              },
-            }
+            { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
           );
           if (!predRes.ok) return;
           const predJson = await predRes.json();
@@ -117,7 +112,7 @@ async function fetchFromAPIFootball() {
 
           const predictionBlock = arr[0].predictions || {};
 
-          // 1X2
+          // 1X2  (kvote NISU u /predictions → odds ostaje null)
           if (predictionBlock['1x2']) {
             const pickKey = predictionBlock['1x2'].winner; // 'home'|'draw'|'away'
             let pickLabel = null;
@@ -126,13 +121,11 @@ async function fetchFromAPIFootball() {
             else if (pickKey === 'away') pickLabel = '2';
             if (pickLabel) {
               const rawConfidence = predictionBlock['1x2'].percentage?.[pickKey] ?? null;
-              const oddsObj = predictionBlock['1x2'].odds || {};
-              const odds = oddsObj[pickKey] || null;
               preds.push({
                 match: matchName,
                 market: '1X2',
                 pick: pickLabel,
-                odds,
+                odds: null,
                 confidence: rawConfidence ? Math.round(rawConfidence) : 0,
                 source: 'api-football',
               });
@@ -145,13 +138,11 @@ async function fetchFromAPIFootball() {
             const pickLabel = pickKey === 'yes' ? 'Yes' : 'No';
             const rawConfidence =
               predictionBlock['both_to_score'].percentage?.[pickKey] ?? null;
-            const oddsObj = predictionBlock['both_to_score'].odds || {};
-            const odds = oddsObj[pickKey] || null;
             preds.push({
               match: matchName,
               market: 'BTTS',
               pick: pickLabel,
-              odds,
+              odds: null,
               confidence: rawConfidence ? Math.round(rawConfidence) : 0,
               source: 'api-football',
             });
@@ -163,21 +154,18 @@ async function fetchFromAPIFootball() {
             const pickLabel = pickKey || null;
             const rawConfidence =
               predictionBlock['half_time_full_time'].percentage?.[pickKey] ?? null;
-            const oddsObj = predictionBlock['half_time_full_time'].odds || {};
-            const odds = oddsObj[pickKey] || null;
             if (pickLabel) {
               preds.push({
                 match: matchName,
                 market: 'HT/FT',
                 pick: pickLabel,
-                odds,
+                odds: null,
                 confidence: rawConfidence ? Math.round(rawConfidence) : 0,
                 source: 'api-football',
               });
             }
           }
         } catch (e) {
-          // ignore per-fixture error
           console.warn('api-football per-fixture parse error', e.message);
         }
       })
@@ -199,7 +187,6 @@ async function fetchFromSportmonks() {
     const tomorrow = new Date(now.getTime() + 24 * 3600 * 1000);
     const to = tomorrow.toISOString().split('T')[0];
 
-    // Example endpoint - adjust include params based on your Sportmonks plan
     const url = `https://soccer.sportmonks.com/api/v2.0/fixtures/between/${from}/${to}?api_token=${SPORTMONKS_KEY}&include=odds,localTeam,visitorTeam`;
     const res = await fetch(url);
     if (!res.ok) return [];
@@ -212,22 +199,14 @@ async function fetchFromSportmonks() {
       const away = f.visitorTeam?.data?.name || 'Away';
       const matchName = `${home} vs ${away}`;
 
-      // Parse odds object - structure may vary by your plan.
-      // Here we attempt to extract 1X2 and BTTS if present.
       const oddsWrapper = f.odds?.data || [];
-      // For simplicity, we mock a few predictions based on available odds if structure unknown.
-      // Real implementation should inspect f.odds.data contents and map to markets.
 
-      // Example: if there's a "1X2" market in oddsWrapper
       oddsWrapper.forEach((market) => {
         const marketName = (market.name || '').toLowerCase();
         if (marketName.includes('1x2')) {
-          // assume market has odds array
           (market?.odds || []).forEach((o) => {
-            // o might have label '1','X','2' and value
             const pick = o.label;
             const oddsVal = o.price || o.value || null;
-            // dummy confidence derived from implied probability
             let confidence = 0;
             if (oddsVal) {
               const implied = 1 / parseFloat(oddsVal);
@@ -243,7 +222,6 @@ async function fetchFromSportmonks() {
             });
           });
         } else if (marketName.includes('both to score') || marketName.includes('btts')) {
-          // BTTS
           (market?.odds || []).forEach((o) => {
             const pick = o.label; // Yes/No
             const oddsVal = o.price || o.value || null;
@@ -262,7 +240,7 @@ async function fetchFromSportmonks() {
             });
           });
         }
-        // HT/FT could be similar if available
+        // HT/FT ako postoji u planu, mapirati slično
       });
     });
 
@@ -275,13 +253,11 @@ async function fetchFromSportmonks() {
 
 export default async function handler(req, res) {
   try {
-    // Debug loaded keys existence (does not log values)
     console.log('football API keys loaded:', {
       apiFootball: !!API_FOOTBALL_KEY,
       sportmonks: !!SPORTMONKS_KEY,
     });
 
-    // Fetch in parallel
     const [apiFootballPreds, sportmonksPreds] = await Promise.all([
       fetchFromAPIFootball(),
       fetchFromSportmonks(),
@@ -289,10 +265,8 @@ export default async function handler(req, res) {
 
     const allPreds = [...apiFootballPreds, ...sportmonksPreds];
 
-    // Derive consensus (needs at least 2 sources matching same match+market+pick)
     const consensus = deriveConsensus(allPreds);
 
-    // If no consensus, fallback to stub
     const footballTop = consensus.length ? consensus : STUB_PREDICTIONS;
 
     return res.status(200).json({
