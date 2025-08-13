@@ -1,80 +1,50 @@
-import { useState, useEffect } from 'react';
+// FILE: hooks/useValueBets.js
+import { useEffect, useRef, useState } from "react";
 
 /**
- * useValueBets (LOCKED):
- * - date: "YYYY-MM-DD"
- * - čita /api/value-bets-locked?date=...
- * - kešira u localStorage (ključ valueBetsLocked_<date>)
- * - bez fallback-a na juče (da ne diže pozive)
+ * Čita /api/value-bets (ne zaključanu rutu).
+ * Parametar `date` je opciono informativan (endpoint koristi rolling window).
+ * Vraća: { bets, loading, error }
  */
-
-function sortValueBets(bets = []) {
-  return bets
-    .slice()
-    .sort((a, b) => {
-      if (a.type !== b.type) return a.type === 'MODEL+ODDS' ? -1 : 1;
-      const eA = a.edge ?? 0;
-      const eB = b.edge ?? 0;
-      if (eB !== eA) return eB - eA;
-      return (b.model_prob ?? 0) - (a.model_prob ?? 0);
-    });
-}
-
-async function fetchLockedForDate(date) {
-  const res = await fetch(`/api/value-bets-locked?date=${encodeURIComponent(date)}`);
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`HTTP ${res.status}: ${txt}`);
-  }
-  const json = await res.json();
-  return Array.isArray(json.value_bets) ? json.value_bets : [];
-}
-
 export default function useValueBets(date) {
   const [bets, setBets] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const abortRef = useRef(null);
 
   useEffect(() => {
-    if (!date) return;
-    const cacheKey = `valueBetsLocked_${date}`;
-    let cancelled = false;
+    setLoading(true);
+    setError(null);
 
-    const cached = localStorage.getItem(cacheKey);
-    if (cached) {
-      try {
-        setBets(JSON.parse(cached));
-        setLoading(false);
-        return;
-      } catch {
-        localStorage.removeItem(cacheKey);
-      }
-    }
+    // prekini prethodni fetch ako postoji
+    if (abortRef.current) abortRef.current.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
 
-    const run = async () => {
-      setLoading(true);
-      setError(null);
+    (async () => {
       try {
-        const raw = await fetchLockedForDate(date);
-        const sorted = sortValueBets(raw);
-        if (!cancelled) {
-          setBets(sorted);
-          localStorage.setItem(cacheKey, JSON.stringify(sorted));
+        // važna stvar: koristimo /api/value-bets
+        const res = await fetch("/api/value-bets", {
+          cache: "no-store",
+          signal: ac.signal,
+        });
+        if (!res.ok) {
+          throw new Error(`/api/value-bets -> ${res.status}`);
         }
+        const json = await res.json();
+        const arr = Array.isArray(json?.value_bets) ? json.value_bets : [];
+        setBets(arr);
       } catch (e) {
-        console.error('useValueBets (locked) error', e);
-        if (!cancelled) {
-          setError(e.message);
-          setBets([]);
-        }
+        if (e.name !== "AbortError") setError(e.message || String(e));
       } finally {
-        if (!cancelled) setLoading(false);
+        setLoading(false);
       }
-    };
+    })();
 
-    run();
-    return () => { cancelled = true; };
-  }, [date]);
+    return () => {
+      ac.abort();
+    };
+  }, [date]); // refetch kad se promeni dan
 
   return { bets, loading, error };
 }
