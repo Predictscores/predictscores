@@ -1,32 +1,34 @@
 // FILE: pages/api/value-bets.js
 /**
  * Value Bets (odds-only, coverage-aware)
- * - Rolling 24h (Europe/Belgrade)
+ * - Rolling (Europe/Belgrade)
  * - Markets: 1X2, BTTS, Over/Under 2.5
  * - TWO-PASS:
- *    Pass1 (cheap): AF /predictions -> shortlist (ali samo lige sa odds coverage)
- *    Pass2 (deep):  za shortlist -> AF /odds (svi bookies, median), pa tek onda stats/h2h/lineups
+ *    Pass1 (cheap, capped): AF /predictions -> shortlist (samo lige sa odds coverage)
+ *    Pass2 (deep): za shortlist -> AF /odds (median preko bookmakera), pa tek onda stats/h2h/lineups
  * - Vraćamo SAMO predloge sa realnim kvotama (MODEL+ODDS). Bez fallbacka.
- * - In-flight dedup, 60s in-memory memo, CDN cache 600s (podeš.)
+ * - In-flight dedup, 60s in-memory memo, CDN cache 600s.
  */
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const AF_KEY =
-  process.env.NEXT_PUBLIC_API_FOOTBALL_KEY ||   // ← poravnato sa Vercel var
+  process.env.NEXT_PUBLIC_API_FOOTBALL_KEY ||
   process.env.API_FOOTBALL_KEY ||
   process.env.API_FOOTBALL_KEY_1 ||
   process.env.API_FOOTBALL_KEY_2 ||
   "";
 
 const CFG = {
+  // ↓↓↓ PODESIVO PREKO ENV ↓↓↓
   BUDGET_DAILY: num(process.env.AF_BUDGET_DAILY, 5000),
-  ROLLING_WINDOW_HOURS: num(process.env.AF_ROLLING_WINDOW_HOURS, 24),
+  ROLLING_WINDOW_HOURS: num(process.env.AF_ROLLING_WINDOW_HOURS, 12),  // bilo 24
+  PASS1_CAP: num(process.env.AF_PASS1_CAP, 80),                         // NOVO: max predikcija u Pass1
   H2H_LAST: num(process.env.AF_H2H_LAST, 10),
   NEAR_WINDOW_MIN: num(process.env.AF_NEAR_WINDOW_MIN, 60),
   DEEP_TOP: num(process.env.AF_DEEP_TOP, 30),
-  RUN_HARDCAP: num(process.env.AF_RUN_MAX_CALLS, 180),
+  RUN_HARDCAP: num(process.env.AF_RUN_MAX_CALLS, 360),                  // bilo 180
   PAYLOAD_MEMO_MS: 60 * 1000,
-  CDN_SMAXAGE: num(process.env.CDN_SMAXAGE_SEC, 600), // 10 min
+  CDN_SMAXAGE: num(process.env.CDN_SMAXAGE_SEC, 600),
   CDN_SWR: num(process.env.CDN_STALE_SEC, 120),
   OU_LINE: "2.5",
 };
@@ -334,18 +336,26 @@ async function computePayload(){
 
   // fixtures u prozoru
   let fixtures = await fetchFixturesRolling(new Date());
+  // prioritet liga
   fixtures.sort((a,b) => leaguePriority(a?.league?.name) - leaguePriority(b?.league?.name));
 
-  // pre-filter: samo lige sa odds coverage (ALI SAMO AKO GA IMA)
+  // pre-filter: samo lige sa odds coverage (ako postoji lista)
   const coverage = await getOddsCoverageLeagues();
   if (coverage && coverage.size > 0) {
     fixtures = fixtures.filter(f => coverage.has(Number(f?.league?.id)));
   }
 
-  // PASS1: predictions -> shortlist
+  // Dodatni “soft cap” pre Pass1: ne obrađuj hiljade — uzmi prvih PASS1_CAP*2
+  if (fixtures.length > CFG.PASS1_CAP * 2) {
+    fixtures = fixtures.slice(0, CFG.PASS1_CAP * 2);
+  }
+
+  // PASS1: predictions -> shortlist (CAP!)
   const pass1 = [];
   for (const f of fixtures) {
     if (!canCallAF()) break;
+    if (pass1.length >= CFG.PASS1_CAP) break;      // ← NOVO: cap Pass1
+
     const preds = await fetchPredictions(f.fixture_id).catch(()=>null);
     let selection="1", model_prob = 0.52;
     if (preds) { const p = pickFromPreds(preds); selection=p.selection; model_prob=p.prob; }
@@ -359,6 +369,7 @@ async function computePayload(){
   }
 
   pass1.sort((a,b)=> (b.model_prob||0)-(a.model_prob||0));
+
   const deepPicks = [];
   for (const base of pass1) {
     if (!canCallAF()) break;
@@ -376,7 +387,7 @@ async function computePayload(){
       Number.isFinite(odds?.["OU"]?.[CFG.OU_LINE]?.["Over"]) || Number.isFinite(odds?.["OU"]?.[CFG.OU_LINE]?.["Under"]);
     if (!hasAnyOdds) continue;
 
-    // tek onda stats/h2h
+    // tek onda stats/h2h (opcionalno — čuva pozive)
     let statsHome=null, statsAway=null, h2h={summary:"",count:0};
     if (canCallAF(3) && league?.id && league?.season && teams?.home?.id && teams?.away?.id) {
       [statsHome, statsAway] = await Promise.all([
