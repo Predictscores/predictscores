@@ -1,4 +1,3 @@
-// FILE: pages/index.js
 import React, { useEffect, useMemo, useState } from "react";
 import Head from "next/head";
 import dynamic from "next/dynamic";
@@ -71,6 +70,83 @@ function fmtCountdown(ms) {
   const s = Math.floor((ms % 60000) / 1000);
   return `${m}m ${String(s).padStart(2, "0")}s`;
 }
+function todayYMD() {
+  const now = new Date();
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Europe/Belgrade",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
+}
+
+// --------- Export CSV (bez mreže, iz keša)
+function exportFootballCSV() {
+  try {
+    const key = `valueBetsLocked_${todayYMD()}`;
+    const raw = localStorage.getItem(key);
+    const arr = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(arr) || arr.length === 0) {
+      alert("Nema podataka za izvoz (prazno ili nije učitano).");
+      return;
+    }
+    const tz = "Europe/Belgrade";
+    const rows = arr.map((p) => {
+      const iso =
+        p?.datetime_local?.starting_at?.date_time?.replace(" ", "T") || null;
+      const dt = iso
+        ? new Date(iso).toLocaleString("sv-SE", {
+            timeZone: tz,
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+          })
+        : "";
+      return {
+        datetime: dt,
+        league: p?.league?.name || "",
+        home: p?.teams?.home?.name || "",
+        away: p?.teams?.away?.name || "",
+        market: p?.market_label || p?.market || "",
+        selection: p?.selection || "",
+        odds: Number.isFinite(p?.market_odds) ? p.market_odds : "",
+        confidence_pct: Number.isFinite(p?.confidence_pct) ? p.confidence_pct : "",
+        edge_pp: Number.isFinite(p?.edge_pp) ? p.edge_pp : "",
+        ev: Number.isFinite(p?.ev) ? p.ev : "",
+      };
+    });
+
+    const headers = Object.keys(rows[0]);
+    const csv = [
+      headers.join(","),
+      ...rows.map((r) =>
+        headers
+          .map((h) => {
+            const v = r[h];
+            if (v === null || v === undefined) return "";
+            const s = String(v).replace(/"/g, '""');
+            return /[",\n]/.test(s) ? `"${s}"` : s;
+          })
+          .join(",")
+      ),
+    ].join("\n");
+
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `predictscores_${todayYMD()}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    console.error("CSV export error:", e);
+    alert("Greška pri izvozu.");
+  }
+}
 
 // --------- Header (bez DataContext-a)
 function HeaderBar() {
@@ -79,7 +155,6 @@ function HeaderBar() {
   const [now, setNow] = useState(Date.now());
   const [nextKickoffAt, setNextKickoffAt] = useState(null); // ISO string
   const [cryptoNextAt, setCryptoNextAt] = useState(null); // timestamp (ms)
-  const [cryptoRefreshing, setCryptoRefreshing] = useState(false);
 
   // tikanje tajmera
   useEffect(() => {
@@ -87,7 +162,7 @@ function HeaderBar() {
     return () => clearInterval(t);
   }, []);
 
-  // inicijalno pokupi podatke za tajmere
+  // inicijalno pokupi podatke za tajmere (NE koristi DataContext)
   useEffect(() => {
     (async () => {
       try {
@@ -100,53 +175,41 @@ function HeaderBar() {
             ? fb.value.value_bets
             : [];
           setNextKickoffAt(nearestFutureKickoff(list));
+          // keširaj u LS da Export ima iz čega da izveze
+          try {
+            const ymd = todayYMD();
+            localStorage.setItem(`valueBetsLocked_${ymd}`, JSON.stringify(list));
+          } catch {}
         }
         if (cr.status === "fulfilled") {
           // sledeći refresh ~10 min posle uspešnog poziva
           setCryptoNextAt(Date.now() + 10 * 60 * 1000);
         }
       } catch {
-        // tiho
+        // ne ruši UI
       }
     })();
   }, []);
-
-  // KAD dođe do nule — uradi tih auto-refresh kripta pa resetuj timer
-  useEffect(() => {
-    if (!cryptoNextAt) return;
-    if (cryptoRefreshing) return;
-    if (Date.now() < cryptoNextAt) return;
-
-    (async () => {
-      try {
-        setCryptoRefreshing(true);
-        await safeJson("/api/crypto"); // jedan poziv
-        setCryptoNextAt(Date.now() + 10 * 60 * 1000); // novi ciklus
-      } catch {
-        // ostavi 0m 00s, pokušaće sledeći put kada korisnik refrešuje
-      } finally {
-        setCryptoRefreshing(false);
-      }
-    })();
-  }, [now, cryptoNextAt, cryptoRefreshing]);
 
   // countdown-ovi
   const cryptoTL = useMemo(() => {
     if (!cryptoNextAt) return null;
     const ms = Math.max(0, cryptoNextAt - now);
-    return fmtCountdown(ms);
+    return ms === 0 ? "—" : fmtCountdown(ms);
   }, [cryptoNextAt, now]);
 
   const kickoffTL = useMemo(() => {
     if (!nextKickoffAt) return null;
     const ms = Math.max(0, new Date(nextKickoffAt).getTime() - now);
-    return fmtCountdown(ms);
+    return ms === 0 ? "—" : fmtCountdown(ms);
   }, [nextKickoffAt, now]);
 
-  // ručni refresh: reload
+  // ručni refresh: reload (da povuče sve iz nove sesije/keša)
   const hardRefresh = () => {
     if (typeof window !== "undefined") window.location.reload();
   };
+
+  const doExport = () => exportFootballCSV();
 
   return (
     <div className="flex items-start justify-between gap-4">
@@ -162,6 +225,14 @@ function HeaderBar() {
             type="button"
           >
             Refresh all
+          </button>
+          <button
+            onClick={doExport}
+            className="px-4 py-2 rounded-xl bg-[#202542] text-white font-semibold"
+            type="button"
+            title="Izvezi današnje fudbalske predloge u CSV"
+          >
+            Export CSV
           </button>
           <button
             onClick={toggle}
