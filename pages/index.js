@@ -1,3 +1,4 @@
+// FILE: pages/index.js
 import React, { useEffect, useMemo, useState } from "react";
 import Head from "next/head";
 import dynamic from "next/dynamic";
@@ -90,7 +91,8 @@ function HeaderBar() {
     (async () => {
       try {
         const [fb, cr] = await Promise.allSettled([
-          safeJson("/api/value-bets-locked"),
+          // ⬇️⬇️ OVDE JE BITNA IZMJENA: koristimo /api/value-bets (NE locked)
+          safeJson("/api/value-bets"),
           safeJson("/api/crypto"),
         ]);
         if (fb.status === "fulfilled") {
