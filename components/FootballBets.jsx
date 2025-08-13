@@ -1,4 +1,3 @@
-// FILE: components/FootballBets.jsx
 import React, { useMemo, useState } from "react";
 import useValueBets from "../hooks/useValueBets";
 import TicketPanel from "./TicketPanel";
@@ -21,11 +20,16 @@ function kickoffMs(it) {
   const t = iso ? new Date(iso).getTime() : NaN;
   return Number.isFinite(t) ? t : NaN;
 }
+// >>> Beograd vreme za prikaz (fix pogrešnog lokalnog prikaza)
 function fmtTime(it) {
   const iso = parseISO(it);
   const d = iso ? new Date(iso) : null;
   return d
-    ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    ? d.toLocaleTimeString([], {
+        timeZone: "Europe/Belgrade",
+        hour: "2-digit",
+        minute: "2-digit",
+      })
     : "—";
 }
 function confPct(n) {
@@ -51,14 +55,20 @@ function confBadge(conf) {
   if (conf >= 50) return "🔵 Moderate";
   return "🟡 Low";
 }
-// kratko objašnjenje
+
+// kratko objašnjenje (sažeto, razumljivo)
 function shortWhy(p) {
-  // 1) ako API šalje sažetak — koristi to
   const s = p?.explain?.summary;
   if (s && typeof s === "string" && s.trim()) {
-    return s.trim();
+    // malo očistimo tipične tehničke fraze
+    return s
+      .replace(/Edge\s+\d+(\.\d+)?pp/gi, "")
+      .replace(/Model\s+\d+%/gi, "")
+      .replace(/Market\s+/gi, "")
+      .replace(/\s+·\s+$/g, "")
+      .replace(/^\s+·\s+/g, "")
+      .trim() || s.trim();
   }
-  // 2) fallback: smislen, kratak
   const league = p?.league?.name || "";
   const mk = p?.market_label || p?.market || "";
   const sel = p?.selection || "";
@@ -109,7 +119,7 @@ function Card({ pick }) {
       {/* Zašto baš ovaj pick (kratko) */}
       <div className="mt-3 text-[13px] text-slate-300">
         <span className="text-slate-400">Zašto: </span>
-        {shortWhy(pick)}
+        {shortWhy(pick) || "Povoljan odnos kvote i modela."}
       </div>
 
       {/* filler */}
@@ -157,7 +167,7 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
   const filtered = useMemo(() => {
     let arr = Array.isArray(bets) ? bets.slice() : [];
 
-    // ----- COMBINED: Top by CONFIDENCE (tie-break EV), bez dodatnih redova -----
+    // ----- COMBINED: Top by CONFIDENCE (tie-break EV), bez dodatnih redova
     if (layout === "combined") {
       arr.sort((a, b) => {
         const ca = Number(a.confidence_pct || 0);
@@ -170,7 +180,7 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
       return arr;
     }
 
-    // ----- FULL: postojeće sortiranje -----
+    // ----- FULL: postojeće sortiranje
     if (layout === "full") {
       if (sortBy === "kickoff") {
         arr.sort((a, b) => kickoffMs(a) - kickoffMs(b));
@@ -192,7 +202,7 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
       </div>
     );
 
-  // ----- COMBINED: samo lista (kompaktnije kartice) -----
+  // ----- COMBINED: samo lista (kompaktnije kartice)
   if (layout === "combined") {
     return (
       <div className="grid grid-cols-1 gap-4 items-stretch">
@@ -211,10 +221,10 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
     );
   }
 
-  // ----- FULL: levi stub (singles) + desni stub (tickets) -----
+  // ----- FULL: levi stub (singles) + desni stub (tickets)
   return (
     <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-start">
-      {/* LEFT: Controls + Singles (kompaktniji razmaci na mobilnom) */}
+      {/* LEFT: Controls + Singles */}
       <div className="md:col-span-2">
         {/* Controls: dva dugmeta */}
         <div className="mb-3 flex items-center gap-2">
@@ -247,7 +257,7 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
           </div>
         </div>
 
-        {/* Singles list — kartice malo “kraće” na mobilnom */}
+        {/* Singles list */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch">
           {top.map((p) => (
             <Card
