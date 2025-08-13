@@ -18,24 +18,45 @@ const AF_KEY =
   process.env.API_FOOTBALL_KEY_2 ||
   "";
 
+/** ---- Konfiguracija (može preko ENV) ---- */
+function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; }
+
 const CFG = {
-  // ↓↓↓ PODESIVO PREKO ENV ↓↓↓
   BUDGET_DAILY: num(process.env.AF_BUDGET_DAILY, 5000),
-  ROLLING_WINDOW_HOURS: num(process.env.AF_ROLLING_WINDOW_HOURS, 12),  // bilo 24
-  PASS1_CAP: num(process.env.AF_PASS1_CAP, 80),                         // NOVO: max predikcija u Pass1
+  ROLLING_WINDOW_HOURS: num(process.env.AF_ROLLING_WINDOW_HOURS, 12),
+  PASS1_CAP: num(process.env.AF_PASS1_CAP, 80),
   H2H_LAST: num(process.env.AF_H2H_LAST, 10),
   NEAR_WINDOW_MIN: num(process.env.AF_NEAR_WINDOW_MIN, 60),
   DEEP_TOP: num(process.env.AF_DEEP_TOP, 30),
-  RUN_HARDCAP: num(process.env.AF_RUN_MAX_CALLS, 360),                  // bilo 180
+  RUN_HARDCAP: num(process.env.AF_RUN_MAX_CALLS, 360),
   PAYLOAD_MEMO_MS: 60 * 1000,
   CDN_SMAXAGE: num(process.env.CDN_SMAXAGE_SEC, 600),
   CDN_SWR: num(process.env.CDN_STALE_SEC, 120),
   OU_LINE: "2.5",
+  MIN_BOOKIES: num(process.env.VB_MIN_BOOKIES, 3),
 };
 
-function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; }
+/** ---- League blacklist (prilagodljivo preko ENV) ----
+ *  Default isključuje:
+ *   - Friendlies/Club Friendlies
+ *   - U23/U21/U20/U19 (i varijante sa razmakom)
+ *   - Reserves, II, B team
+ *   - Youth/Academy
+ *   - Trial/Test
+ *   - Indoor/Futsal/Beach
+ *  (NE isključujemo ženske lige namerno.)
+ */
+const EXCLUDE_REGEX_RAW =
+  process.env.VB_EXCLUDE_REGEX ||
+  "(friendlies|friendly|club\\s*friendlies|\\bu\\s?23\\b|\\bu\\s?21\\b|\\bu\\s?20\\b|\\bu\\s?19\\b|reserves?|\\bii\\b|b\\s*team|youth|academy|trial|test|indoor|futsal|beach)";
+const EXCLUDE_RE = new RegExp(EXCLUDE_REGEX_RAW, "i");
 
-// ---------- global caches ----------
+function isLeagueExcluded(league = {}) {
+  const name = `${league.name || ""} ${league.country || ""}`.trim();
+  return EXCLUDE_RE.test(name);
+}
+
+/** ---- Global cache ---- */
 const g = globalThis;
 if (!g.__VB_CACHE__) {
   g.__VB_CACHE__ = {
@@ -64,7 +85,7 @@ let RUN_CALLS = 0;
 function canCallAF(qty=1){ return RUN_CALLS + qty <= CFG.RUN_HARDCAP; }
 function noteAF(qty=1){ RUN_CALLS += qty; }
 
-// ---------- helpers ----------
+/** ---- Helpers ---- */
 function sanitizeIso(s){ if(!s||typeof s!=="string") return null; let iso=s.trim().replace(" ","T"); iso=iso.replace("+00:00Z","Z").replace("Z+00:00","Z"); return iso; }
 function impliedFromDecimal(o){ const x=Number(o); return Number.isFinite(x)&&x>1.01?1/x:null; }
 function evFrom(p, o){ const odds=Number(o); if(!Number.isFinite(odds)||odds<=1.01) return null; return p*(odds-1) - (1-p); }
@@ -76,7 +97,7 @@ const median = (arr)=> arr.length ? arr.slice().sort((a,b)=>a-b)[Math.floor(arr.
 function poissonPMF(k, lambda){ if(lambda<=0) return k===0?1:0; let logP = -lambda; for(let i=1;i<=k;i++) logP += Math.log(lambda) - Math.log(i); return Math.exp(logP); }
 function poissonCDF(k, lambda){ let acc=0; for(let i=0;i<=k;i++) acc+=poissonPMF(i,lambda); return acc; }
 
-// ---------- HTTP ----------
+/** ---- HTTP ---- */
 async function afFetch(path,{ttl=0}={}){
   if(!AF_KEY) throw new Error("API_FOOTBALL_KEY missing");
   const url=`https://v3.football.api-sports.io${path}`;
@@ -90,7 +111,7 @@ async function afFetch(path,{ttl=0}={}){
   const j=await res.json(); if(ttl) setCache(ck,j,ttl); return j;
 }
 
-// ---------- coverage ----------
+/** ---- Coverage ---- */
 async function getOddsCoverageLeagues(){
   const FRESH_MS = 12*3600*1000;
   if (Date.now() - CACHE.oddsCoverageLeagues.ts < FRESH_MS && CACHE.oddsCoverageLeagues.set.size) {
@@ -103,7 +124,7 @@ async function getOddsCoverageLeagues(){
   return set;
 }
 
-// ---------- fetchers ----------
+/** ---- Fetchers ---- */
 async function fetchAFByDate(ymd){
   const af=await afFetch(`/fixtures?date=${ymd}`,{ttl:15*60});
   return (af?.response||[]).map(f=>({
@@ -329,32 +350,34 @@ function formatPick(base, pick){
   };
 }
 
-// ---------- main compute ----------
+/** ---- Main compute ---- */
 async function computePayload(){
   RUN_CALLS = 0;
   const t0 = Date.now();
 
-  // fixtures u prozoru
+  // 1) fixtures u prozoru
   let fixtures = await fetchFixturesRolling(new Date());
-  // prioritet liga
-  fixtures.sort((a,b) => leaguePriority(a?.league?.name) - leaguePriority(b?.league?.name));
 
-  // pre-filter: samo lige sa odds coverage (ako postoji lista)
+  // 2) filtriraj pokrivene lige i izbaci friendlies/Uxx/rezervne itd.
   const coverage = await getOddsCoverageLeagues();
   if (coverage && coverage.size > 0) {
     fixtures = fixtures.filter(f => coverage.has(Number(f?.league?.id)));
   }
+  fixtures = fixtures.filter(f => !isLeagueExcluded(f?.league));
 
-  // Dodatni “soft cap” pre Pass1: ne obrađuj hiljade — uzmi prvih PASS1_CAP*2
+  // 3) prioritet liga
+  fixtures.sort((a,b) => leaguePriority(a?.league?.name) - leaguePriority(b?.league?.name));
+
+  // 4) soft cap pre Pass1
   if (fixtures.length > CFG.PASS1_CAP * 2) {
     fixtures = fixtures.slice(0, CFG.PASS1_CAP * 2);
   }
 
-  // PASS1: predictions -> shortlist (CAP!)
+  // 5) PASS1: predictions -> shortlist (cap)
   const pass1 = [];
   for (const f of fixtures) {
     if (!canCallAF()) break;
-    if (pass1.length >= CFG.PASS1_CAP) break;      // ← NOVO: cap Pass1
+    if (pass1.length >= CFG.PASS1_CAP) break;
 
     const preds = await fetchPredictions(f.fixture_id).catch(()=>null);
     let selection="1", model_prob = 0.52;
@@ -370,16 +393,19 @@ async function computePayload(){
 
   pass1.sort((a,b)=> (b.model_prob||0)-(a.model_prob||0));
 
+  // 6) PASS2: odds + kandidati
   const deepPicks = [];
   for (const base of pass1) {
     if (!canCallAF()) break;
 
     const { fx, league, teams, kickoffISO } = base;
 
-    // Najpre ODDs; ako nema kvota -> SKIP (bez stats/h2h troška)
+    // ODDs: ako nema kvota -> skip
     const oddsPack = await fetchOdds(fx).catch(()=>null);
     const odds = oddsPack?.odds || null;
     const bookmakers_count = Number(oddsPack?.bookmakers_count || 0);
+
+    if (bookmakers_count < CFG.MIN_BOOKIES) continue;
 
     const hasAnyOdds =
       Number.isFinite(odds?.["1X2"]?.["1"]) || Number.isFinite(odds?.["1X2"]?.["X"]) || Number.isFinite(odds?.["1X2"]?.["2"]) ||
@@ -387,7 +413,7 @@ async function computePayload(){
       Number.isFinite(odds?.["OU"]?.[CFG.OU_LINE]?.["Over"]) || Number.isFinite(odds?.["OU"]?.[CFG.OU_LINE]?.["Under"]);
     if (!hasAnyOdds) continue;
 
-    // tek onda stats/h2h (opcionalno — čuva pozive)
+    // stats/h2h (opcionalno)
     let statsHome=null, statsAway=null, h2h={summary:"",count:0};
     if (canCallAF(3) && league?.id && league?.season && teams?.home?.id && teams?.away?.id) {
       [statsHome, statsAway] = await Promise.all([
@@ -410,10 +436,8 @@ async function computePayload(){
       }
     }
 
-    // Poisson λ
     const { λh, λa } = poissonLambdas(statsHome, statsAway);
 
-    // kandidati (samo sa kvotama)
     const cands = [];
 
     // 1X2
@@ -498,7 +522,7 @@ async function computePayload(){
   };
 }
 
-// ---------- handler ----------
+/** ---- Handler ---- */
 export default async function handler(req, res){
   const now = Date.now();
 
