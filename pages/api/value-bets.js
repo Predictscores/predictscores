@@ -7,11 +7,12 @@
  *    Pass1 (cheap): AF /predictions -> shortlist (ali samo lige sa odds coverage)
  *    Pass2 (deep):  za shortlist -> AF /odds (svi bookies, median), pa tek onda stats/h2h/lineups
  * - Vraćamo SAMO predloge sa realnim kvotama (MODEL+ODDS). Bez fallbacka.
- * - In-flight dedup, 60s in-memory memo, CDN cache 600s (podeš.
+ * - In-flight dedup, 60s in-memory memo, CDN cache 600s (podeš.)
  */
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const AF_KEY =
+  process.env.NEXT_PUBLIC_API_FOOTBALL_KEY ||   // ← poravnato sa Vercel var
   process.env.API_FOOTBALL_KEY ||
   process.env.API_FOOTBALL_KEY_1 ||
   process.env.API_FOOTBALL_KEY_2 ||
@@ -335,9 +336,11 @@ async function computePayload(){
   let fixtures = await fetchFixturesRolling(new Date());
   fixtures.sort((a,b) => leaguePriority(a?.league?.name) - leaguePriority(b?.league?.name));
 
-  // pre-filter: samo lige sa odds coverage
+  // pre-filter: samo lige sa odds coverage (ALI SAMO AKO GA IMA)
   const coverage = await getOddsCoverageLeagues();
-  fixtures = fixtures.filter(f => coverage.has(Number(f?.league?.id)));
+  if (coverage && coverage.size > 0) {
+    fixtures = fixtures.filter(f => coverage.has(Number(f?.league?.id)));
+  }
 
   // PASS1: predictions -> shortlist
   const pass1 = [];
