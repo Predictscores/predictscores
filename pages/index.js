@@ -79,6 +79,7 @@ function HeaderBar() {
   const [now, setNow] = useState(Date.now());
   const [nextKickoffAt, setNextKickoffAt] = useState(null); // ISO string
   const [cryptoNextAt, setCryptoNextAt] = useState(null); // timestamp (ms)
+  const [cryptoRefreshing, setCryptoRefreshing] = useState(false);
 
   // tikanje tajmera
   useEffect(() => {
@@ -86,13 +87,12 @@ function HeaderBar() {
     return () => clearInterval(t);
   }, []);
 
-  // inicijalno pokupi podatke za tajmere (NE koristi DataContext)
+  // inicijalno pokupi podatke za tajmere
   useEffect(() => {
     (async () => {
       try {
         const [fb, cr] = await Promise.allSettled([
-          // ⬇️⬇️ OVDE JE BITNA IZMJENA: koristimo /api/value-bets (NE locked)
-          safeJson("/api/value-bets"),
+          safeJson("/api/value-bets-locked"),
           safeJson("/api/crypto"),
         ]);
         if (fb.status === "fulfilled") {
@@ -106,10 +106,29 @@ function HeaderBar() {
           setCryptoNextAt(Date.now() + 10 * 60 * 1000);
         }
       } catch {
-        // ne ruši UI
+        // tiho
       }
     })();
   }, []);
+
+  // KAD dođe do nule — uradi tih auto-refresh kripta pa resetuj timer
+  useEffect(() => {
+    if (!cryptoNextAt) return;
+    if (cryptoRefreshing) return;
+    if (Date.now() < cryptoNextAt) return;
+
+    (async () => {
+      try {
+        setCryptoRefreshing(true);
+        await safeJson("/api/crypto"); // jedan poziv
+        setCryptoNextAt(Date.now() + 10 * 60 * 1000); // novi ciklus
+      } catch {
+        // ostavi 0m 00s, pokušaće sledeći put kada korisnik refrešuje
+      } finally {
+        setCryptoRefreshing(false);
+      }
+    })();
+  }, [now, cryptoNextAt, cryptoRefreshing]);
 
   // countdown-ovi
   const cryptoTL = useMemo(() => {
@@ -124,7 +143,7 @@ function HeaderBar() {
     return fmtCountdown(ms);
   }, [nextKickoffAt, now]);
 
-  // ručni refresh: reload (da povuče sve iz nove sesije/keša)
+  // ručni refresh: reload
   const hardRefresh = () => {
     if (typeof window !== "undefined") window.location.reload();
   };
