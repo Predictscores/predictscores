@@ -9,6 +9,8 @@ import CryptoTopSignals from "./CryptoTopSignals";
  *             Desno: Crypto (Top 3) -> span 2 kolone (≈66%).
  * - Football tab: Top 25 (LOCKED)
  * - Crypto tab: Top 10
+ *
+ * Napomena: Combined sada bira Top 3 po CONFIDENCE (EV samo kao tie-break).
  */
 const CombinedBets = () => (
   <Tabs>
