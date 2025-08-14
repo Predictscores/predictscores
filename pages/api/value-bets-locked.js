@@ -4,13 +4,13 @@ export const config = { api: { bodyParser: false } };
 const store = global.__VBETS_LOCK__ || (global.__VBETS_LOCK__ = {
   dayKey: null,
   builtAt: null,
-  pinned: null,
-  backup: null,
+  pinned: null,   // array (limit)
+  backup: null,   // array (next up to 40)
   raw: null,
 });
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-const LIMIT = Math.max(1, Number(process.env.VB_LIMIT || 15));
+const LIMIT = Math.max(1, Number(process.env.VB_LIMIT || 15)); // dogovor: 15
 
 function beogradDayKey(d = new Date()) {
   const fmt = new Intl.DateTimeFormat("sv-SE", {
@@ -18,11 +18,21 @@ function beogradDayKey(d = new Date()) {
   });
   return fmt.format(d);
 }
+function belgradeHour(d = new Date()) {
+  const h = new Intl.DateTimeFormat("en-GB", {
+    timeZone: TZ, hour: "2-digit", hour12: false
+  }).format(d);
+  return Number(h);
+}
+function slotLabel() {
+  const h = belgradeHour();
+  return h < 13 ? "10" : "15"; // naša dva ciklusa
+}
 function nowISO(){ return new Date().toISOString(); }
 function parseISO(x){ try{ return new Date(String(x).replace(" ","T")).getTime(); }catch{ return NaN; } }
 
 function setCDNHeaders(res) {
-  const S_MAXAGE = Number(process.env.CDN_SMAXAGE_SEC || 600);
+  const S_MAXAGE = Number(process.env.CDN_SMAXAGE_SEC || 600); // 10 min
   const SWR      = Number(process.env.CDN_STALE_SEC     || 120);
   res.setHeader("Cache-Control", `s-maxage=${S_MAXAGE}, stale-while-revalidate=${SWR}`);
 }
@@ -48,11 +58,27 @@ function filterFuture(arr=[]) {
   });
 }
 
+async function kvSet(key, value) {
+  const url = process.env.KV_REST_API_URL;
+  const token = process.env.KV_REST_API_TOKEN;
+  if (!url || !token) return;
+  try {
+    await fetch(`${url}/set/${encodeURIComponent(key)}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ value: JSON.stringify(value) })
+    });
+  } catch (e) {
+    console.error("KV set fail:", key, e && e.message || e);
+  }
+}
+
 export default async function handler(req, res) {
   try {
     const today = beogradDayKey();
     const rebuild = String(req.query.rebuild || "").trim() === "1";
 
+    // novi dan -> reset
     if (store.dayKey && store.dayKey !== today) {
       store.dayKey = null; store.builtAt = null;
       store.pinned = null; store.backup = null; store.raw = null;
@@ -63,6 +89,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ value_bets: store.pinned, built_at: store.builtAt, day: store.dayKey, source: "locked-cache" });
     }
 
+    // pozovi interni /api/value-bets (koji sada vraća SAMO MODEL+ODDS)
     const proto = req.headers["x-forwarded-proto"] || "https";
     const origin = `${proto}://${req.headers.host}`;
     const innerURL = `${origin}/api/value-bets`;
@@ -87,34 +114,27 @@ export default async function handler(req, res) {
     store.backup = backup;
     store.raw = future;
 
-    // ===== NOVO: snapshot u KV za history (samo ako je ukljucen FEATURE_HISTORY) =====
-    if (process.env.FEATURE_HISTORY === "1" && process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) {
-      try {
-        const key = `vb:day:${today}:${rebuild ? "reb" + Date.now() : "std"}`;
-        const snapshot = pinned.map(p => ({
-          fixture_id: p.fixture_id,
-          home: p.teams?.home?.name || "",
-          away: p.teams?.away?.name || "",
-          market: p.market_label || p.market || "",
-          selection: p.selection || "",
-          odds: p.market_odds || null,
-          kickoff: p?.datetime_local?.starting_at?.date_time || null
-        }));
-        await fetch(`${process.env.KV_REST_API_URL}/set/${encodeURIComponent(key)}`, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${process.env.KV_REST_API_TOKEN}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ value: JSON.stringify(snapshot) })
-        });
-      } catch (e) {
-        console.error("KV snapshot fail", e);
-      }
+    // ===== NOVO: snapshot u KV za history (stabilni ključevi)
+    if (process.env.FEATURE_HISTORY === "1") {
+      const snapshot = pinned.map(p => ({
+        fixture_id: p.fixture_id,
+        home: p.teams?.home?.name || "",
+        away: p.teams?.away?.name || "",
+        market: p.market_label || p.market || "",
+        selection: p.selection || "",
+        odds: p.market_odds || null,
+        kickoff: p?.datetime_local?.starting_at?.date_time || null
+      }));
+      // poslednji snapshot tog dana + snapshot po slotu (10/15)
+      await kvSet(`vb:day:${today}:last`, snapshot);
+      await kvSet(`vb:day:${today}:${slotLabel()}`, snapshot);
     }
-    // ==============================================================================
+    // ===================================================================
 
     res.setHeader("Set-Cookie", `vb_day=${today}; Path=/; SameSite=Lax; Max-Age=86400`);
     setCDNHeaders(res);
     return res.status(200).json({
-      value_bets: pinned,
+      value_bets: store.pinned,
       built_at: store.builtAt,
       day: store.dayKey,
       source: rebuild ? "locked-rebuild" : "locked-build"
