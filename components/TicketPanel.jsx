@@ -1,187 +1,105 @@
 // FILE: components/TicketPanel.jsx
 import React, { useMemo } from "react";
 
-/**
- * TicketPanel gradi tri tiketa (po 3 para) iz već dobijenih "bets".
- * - Grupe: BTTS, HT-FT, 1X2
- * - Pravila: min odds 1.30, rang EV -> edge_pp -> confidence -> fixture_id
- * - Max 1 par po ligi unutar jednog tiketa, kickoff gap >= 20 min
- * - Dozvoljeno da isti meč bude u različitim tiketima (nema duplikata u istom tiketu)
- */
-const MIN_ODDS = 1.30;
-const TICKET_EACH = 3;
-const TICKET_GROUPS = ["BTTS", "HT-FT", "1X2"];
-const MIN_GAP_MIN = 20;
+const MAX_BTTS = Number(process.env.NEXT_PUBLIC_TKT_MAX_ODDS_BTTS || 4.0);
+const MAX_OU   = Number(process.env.NEXT_PUBLIC_TKT_MAX_ODDS_OU   || 4.0);
+const MAX_1X2  = Number(process.env.NEXT_PUBLIC_TKT_MAX_ODDS_1X2  || 6.0);
+const MAX_HTFT = Number(process.env.NEXT_PUBLIC_TKT_MAX_ODDS_HTFT || 9.0);
 
-function parseKickoffISO(it) {
-  try {
-    const dt =
-      it?.datetime_local?.starting_at?.date_time ||
-      it?.datetime_local?.date_time ||
-      it?.time?.starting_at?.date_time ||
-      null;
-    return dt ? dt.replace(" ", "T") : null;
-  } catch {
-    return null;
-  }
+const MIN_CONF = Number(process.env.NEXT_PUBLIC_TKT_MIN_CONF || 55);
+const MIN_BKS_OU_BTTS = Number(process.env.NEXT_PUBLIC_TKT_MIN_BOOKIES_BOTH || 5);
+const MIN_BKS_1X2_HTFT = Number(process.env.NEXT_PUBLIC_TKT_MIN_BOOKIES_1X2 || 3);
+
+function catOf(p) {
+  const m = String(p.market_label || p.market || "").toLowerCase();
+  if (m.includes("btts")) return "BTTS";
+  if (m.includes("over") || m.includes("under") || m.includes("ou")) return "OU";
+  if (m.includes("ht-ft") || m.includes("ht/ft")) return "HT-FT";
+  if (m.includes("1x2") || m === "1x2" || m.includes("match winner")) return "1X2";
+  return "OTHER";
+}
+function withinOdds(cat, odds) {
+  if (!Number.isFinite(odds) || odds <= 0) return false;
+  if (cat === "BTTS") return odds <= MAX_BTTS;
+  if (cat === "OU") return odds <= MAX_OU;
+  if (cat === "1X2") return odds <= MAX_1X2;
+  if (cat === "HT-FT") return odds <= MAX_HTFT;
+  return false;
+}
+function meetsBookies(cat, n) {
+  const x = Number(n||0);
+  return (cat==="BTTS"||cat==="OU") ? x >= MIN_BKS_OU_BTTS : x >= MIN_BKS_1X2_HTFT;
 }
 
-function kickoffMs(it) {
-  const iso = parseKickoffISO(it);
-  const t = iso ? new Date(iso).getTime() : NaN;
-  return Number.isFinite(t) ? t : NaN;
-}
-
-function gapOk(a, b) {
-  const ta = kickoffMs(a);
-  const tb = kickoffMs(b);
-  if (!Number.isFinite(ta) || !Number.isFinite(tb)) return true;
-  return Math.abs(ta - tb) >= MIN_GAP_MIN * 60_000;
-}
-
-function byTicketRank(a, b) {
-  const evA = Number.isFinite(a.ev) ? a.ev : -Infinity;
-  const evB = Number.isFinite(b.ev) ? b.ev : -Infinity;
-  if (evB !== evA) return evB - evA;
-
-  const eA = Number.isFinite(a.edge_pp) ? a.edge_pp : -Infinity;
-  const eB = Number.isFinite(b.edge_pp) ? b.edge_pp : -Infinity;
-  if (eB !== eA) return eB - eA;
-
-  const cA = Number.isFinite(a.confidence_pct) ? a.confidence_pct : -Infinity;
-  const cB = Number.isFinite(b.confidence_pct) ? b.confidence_pct : -Infinity;
-  if (cB !== cA) return cB - cA;
-
-  return String(a.fixture_id).localeCompare(String(b.fixture_id));
-}
-
-function pickTicket(items, group) {
-  // Filtriraj po grupi i min kvoti
-  const pool = items
-    .filter((it) => {
-      // market normalize
-      const m = (it.market_label || it.market || "").toUpperCase();
-      const odds = Number(it.market_odds);
-      if (!Number.isFinite(odds) || odds < MIN_ODDS) return false;
-      if (group === "1X2") return m.includes("1X2");
-      if (group === "BTTS") return m.includes("BTTS");
-      if (group === "HT-FT") return m.includes("HT") || m.includes("HT-FT");
-      return false;
-    })
-    .sort(byTicketRank);
-
-  const out = [];
-  const leagues = new Set();
-
-  for (const cand of pool) {
-    if (out.length >= TICKET_EACH) break;
-    const lg = cand?.league?.name || "";
-    if (leagues.has(lg)) continue;
-
-    // gap check vs. već odabranih
-    if (out.some((x) => !gapOk(x, cand))) continue;
-
-    out.push(cand);
-    leagues.add(lg);
-  }
-
-  return out;
-}
-
-function Row({ item }) {
-  const iso = parseKickoffISO(item);
-  const t = iso ? new Date(iso) : null;
-  const timeLocal = t
-    ? t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-    : "—";
-
-  const odds =
-    Number.isFinite(item.market_odds) && item.market_odds > 0
-      ? item.market_odds.toFixed(2)
-      : "—";
-  const ev =
-    Number.isFinite(item.ev) ? `${(item.ev * 100).toFixed(1)}%` : "—";
-  const conf = Number.isFinite(item.confidence_pct)
-    ? `${item.confidence_pct}%`
-    : "—";
-
-  const label = `${item.market_label || item.market || ""}: ${
-    item.selection || ""
-  }`;
-
+function Section({ title, items }) {
   return (
-    <div className="flex items-center justify-between py-2 border-b border-white/10 last:border-b-0">
-      <div className="flex-1 pr-3">
-        <div className="text-sm text-white font-semibold">
-          {item.teams?.home?.name} vs {item.teams?.away?.name}
+    <div className="mb-4">
+      <div className="text-sm font-semibold text-white mb-2">{title} (3)</div>
+      {items.length ? (
+        <div className="space-y-2 text-sm">
+          {items.map((p, i) => (
+            <div key={i} className="p-3 rounded-xl bg-[#1f2339]">
+              <div className="text-slate-200">
+                <span className="font-semibold">{p.teams?.home?.name}</span> vs{" "}
+                <span className="font-semibold">{p.teams?.away?.name}</span>
+              </div>
+              <div className="text-slate-400 text-xs">
+                {(p.league?.name || "—")} • {new Date((p.datetime_local?.starting_at?.date_time||"").replace(" ","T")).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"})}
+              </div>
+              <div className="text-slate-300 mt-1">
+                <span className="font-semibold">{p.market_label || p.market}</span>: {p.selection}
+                {Number.isFinite(p.market_odds) ? <span className="text-slate-400"> ({Number(p.market_odds).toFixed(2)})</span> : null}
+              </div>
+              <div className="text-[12px] text-slate-400 mt-1">
+                EV {Number.isFinite(p.edge_pp) ? `${Math.round(p.edge_pp*10)/10}%` : (Number.isFinite(p.ev)?`${Math.round(p.ev*1000)/10}%`:"—")} · C {Number.isFinite(p.confidence_pct) ? Math.round(p.confidence_pct) : "—"}%
+              </div>
+            </div>
+          ))}
         </div>
-        <div className="text-xs text-slate-400">
-          {item.league?.name || ""} • {timeLocal} • {label}
-        </div>
-      </div>
-      <div className="text-right text-xs">
-        <div className="text-white">@ {odds}</div>
-        <div className="text-slate-400">EV {ev} · C {conf}</div>
-      </div>
+      ) : (
+        <div className="text-slate-400 text-sm">Nema dovoljno kandidata.</div>
+      )}
     </div>
   );
 }
 
 export default function TicketPanel({ bets = [] }) {
-  const { btts, htft, oneXtwo } = useMemo(() => {
-    const b = pickTicket(bets, "BTTS");
-    const h = pickTicket(bets, "HT-FT");
-    const x = pickTicket(bets, "1X2");
-    return { btts: b, htft: h, oneXtwo: x };
+  const groups = useMemo(() => {
+    const cats = { BTTS: [], OU: [], "1X2": [], "HT-FT": [] };
+    for (const p of bets) {
+      const cat = catOf(p);
+      if (!cats[cat]) continue;
+
+      const conf = Number(p.confidence_pct || 0);
+      const odds = Number(p.market_odds);
+      const bks  = Number(p.bookmakers_count || 0);
+
+      if (conf < MIN_CONF) continue;
+      if (!withinOdds(cat, odds)) continue;
+      if (!meetsBookies(cat, bks)) continue;
+
+      cats[cat].push(p);
+    }
+    // sort: Confidence → EV
+    for (const k of Object.keys(cats)) {
+      cats[k].sort((a,b) => {
+        const ca = Number(a.confidence_pct||0), cb = Number(b.confidence_pct||0);
+        if (cb!==ca) return cb - ca;
+        const eva = Number.isFinite(a.ev) ? a.ev : (Number.isFinite(a.edge_pp)? a.edge_pp/100 : -Infinity);
+        const evb = Number.isFinite(b.ev) ? b.ev : (Number.isFinite(b.edge_pp)? b.edge_pp/100 : -Infinity);
+        return evb - eva;
+      });
+      cats[k] = cats[k].slice(0,3);
+    }
+    return cats;
   }, [bets]);
 
   return (
-    <aside className="bg-[#151830] rounded-2xl p-4 md:p-5 shadow-md sticky top-4">
-      <h3 className="text-lg font-bold mb-3">Tickets (3×)</h3>
-
-      {/* BTTS */}
-      <div className="mb-4">
-        <div className="text-sm text-slate-300 mb-1">BTTS (3)</div>
-        <div className="bg-white/5 rounded-xl p-2">
-          {btts.length ? (
-            btts.map((it) => <Row key={`btts-${it.fixture_id}`} item={it} />)
-          ) : (
-            <div className="text-xs text-slate-400 py-2">
-              Nema dovoljno kandidata.
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* HT-FT */}
-      <div className="mb-4">
-        <div className="text-sm text-slate-300 mb-1">HT-FT (3)</div>
-        <div className="bg-white/5 rounded-xl p-2">
-          {htft.length ? (
-            htft.map((it) => <Row key={`htft-${it.fixture_id}`} item={it} />)
-          ) : (
-            <div className="text-xs text-slate-400 py-2">
-              Nema dovoljno kandidata.
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* 1X2 */}
-      <div>
-        <div className="text-sm text-slate-300 mb-1">1X2 (3)</div>
-        <div className="bg-white/5 rounded-xl p-2">
-          {oneXtwo.length ? (
-            oneXtwo.map((it) => (
-              <Row key={`1x2-${it.fixture_id}`} item={it} />
-            ))
-          ) : (
-            <div className="text-xs text-slate-400 py-2">
-              Nema dovoljno kandidata.
-            </div>
-          )}
-        </div>
-      </div>
-    </aside>
+    <div>
+      <Section title="BTTS" items={groups.BTTS} />
+      <Section title="OU 2.5" items={groups.OU} />
+      <Section title="HT-FT" items={groups["HT-FT"]} />
+      <Section title="1X2" items={groups["1X2"]} />
+    </div>
   );
 }
