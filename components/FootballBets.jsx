@@ -1,287 +1,50 @@
-// FILE: components/FootballBets.jsx
-import React, { useMemo, useState } from "react";
-import useValueBets from "../hooks/useValueBets";
-import TicketPanel from "./TicketPanel";
+// ... (sav tvoj postojeći kod iznad ostaje isti)
 
-/** Utils */
-function parseISO(it) {
-  try {
-    const dt =
-      it?.datetime_local?.starting_at?.date_time ||
-      it?.datetime_local?.date_time ||
-      it?.time?.starting_at?.date_time ||
-      null;
-    if (!dt) return null;
-    // Normalizacija: space -> 'T', i ako nema TZ (Z ili ±HH:MM), tretiramo kao UTC dodavanjem 'Z'
-    const s = dt.replace(" ", "T");
-    const hasTZ = /Z$|[+-]\d{2}:\d{2}$/.test(s);
-    return hasTZ ? s : `${s}Z`;
-  } catch {
-    return null;
-  }
-}
-function kickoffMs(it) {
-  const iso = parseISO(it);
-  const t = iso ? new Date(iso).getTime() : NaN;
-  return Number.isFinite(t) ? t : NaN;
-}
-// >>> Beograd vreme za prikaz (fix pogrešnog lokalnog prikaza)
-function fmtTime(it) {
-  const iso = parseISO(it);
-  const d = iso ? new Date(iso) : null;
-  return d
-    ? d.toLocaleTimeString([], {
-        timeZone: "Europe/Belgrade",
-        hour: "2-digit",
-        minute: "2-digit",
+import { useEffect, useState } from "react";
+
+function HistoryCard() {
+  const [rows, setRows] = useState([]);
+  useEffect(() => {
+    fetch("/api/history")
+      .then(r => r.json())
+      .then(data => {
+        if (Array.isArray(data.history)) {
+          setRows(data.history);
+        }
       })
-    : "—";
-}
-function confPct(n) {
-  if (Number.isFinite(n)) return `${Math.round(n)}%`;
-  if (Number.isFinite(n?.confidence_pct)) return `${Math.round(n.confidence_pct)}%`;
-  return "—";
-}
-function todayYMD() {
-  const now = new Date();
-  const y = new Intl.DateTimeFormat("sv-SE", {
-    timeZone: "Europe/Belgrade",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(now);
-  return y; // "YYYY-MM-DD"
-}
+      .catch(() => {});
+  }, []);
 
-// ---- badge za confidence
-function confBadge(conf) {
-  if (conf >= 90) return "🔥 Top Pick";
-  if (conf >= 75) return "🟢 High";
-  if (conf >= 50) return "🔵 Moderate";
-  return "🟡 Low";
-}
-
-// kratko objašnjenje (sažeto, razumljivo)
-function shortWhy(p) {
-  const s = p?.explain?.summary;
-  if (s && typeof s === "string" && s.trim()) {
-    // malo očistimo tipične tehničke fraze
-    return s
-      .replace(/Edge\s+\d+(\.\d+)?pp/gi, "")
-      .replace(/Model\s+\d+%/gi, "")
-      .replace(/Market\s+/gi, "")
-      .replace(/\s+·\s+$/g, "")
-      .replace(/^\s+·\s+/g, "")
-      .trim() || s.trim();
-  }
-  const league = p?.league?.name || "";
-  const mk = p?.market_label || p?.market || "";
-  const sel = p?.selection || "";
-  return [league ? `Kontekst: ${league}` : null, mk && sel ? `Model naginje: ${mk} ${sel}` : null]
-    .filter(Boolean)
-    .join(" · ");
-}
-
-/** Single card */
-function Card({ pick }) {
-  const market = pick.market_label || pick.market || "";
-  const sel = pick.selection || "";
-  const odds =
-    Number.isFinite(pick.market_odds) && pick.market_odds > 0
-      ? pick.market_odds.toFixed(2)
-      : null;
-
-  const conf =
-    Number.isFinite(pick.confidence_pct) ? pick.confidence_pct : null;
+  if (!rows.length) return null;
 
   return (
-    <div className="bg-[#1f2339] rounded-2xl p-4 h-full flex flex-col">
-      {/* Header: liga + vreme + naslov */}
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-xs text-slate-400 truncate">
-            {pick.league?.name || "—"} • {fmtTime(pick)}
-          </div>
-          <div className="text-base font-semibold text-white leading-snug">
-            <span className="truncate block">
-              {pick.teams?.home?.name} vs {pick.teams?.away?.name}
+    <div className="mt-6 p-4 bg-[#1f2339] rounded-2xl">
+      <div className="text-sm font-semibold text-white mb-2">History (30 dana)</div>
+      <div className="space-y-1 text-xs text-slate-300">
+        {rows.map((m, i) => (
+          <div key={i} className="flex justify-between">
+            <span className="truncate">{m.home} vs {m.away} — {m.market} {m.selection} ({m.odds?.toFixed ? m.odds.toFixed(2) : m.odds})</span>
+            <span className={m.status === "won" ? "text-emerald-400" : "text-rose-400"}>
+              {m.status === "won" ? "✅" : "❌"}
             </span>
           </div>
-
-          {/* Tip + kvota */}
-          <div className="text-sm text-slate-200 mt-1">
-            <span className="font-semibold">{market}</span>: {sel}
-            {odds ? <span className="text-slate-400"> @ {odds}</span> : null}
-          </div>
-        </div>
-
-        {/* Značka nivoa (kratko) */}
-        <div className="shrink-0 text-right">
-          <div className="text-xs text-slate-300">{confBadge(conf || 0)}</div>
-        </div>
-      </div>
-
-      {/* Zašto baš ovaj pick (kratko) */}
-      <div className="mt-3 text-[13px] text-slate-300">
-        <span className="text-slate-400">Zašto: </span>
-        {shortWhy(pick) || "Povoljan odnos kvote i modela."}
-      </div>
-
-      {/* filler */}
-      <div className="flex-1" />
-
-      {/* Confidence bar u dnu — stabilne margine, bez prelivanja na mobilnom */}
-      <div className="mt-4">
-        <div className="flex items-center justify-between text-xs text-slate-400">
-          <span>Confidence</span>
-          <span className="text-white">{confPct(conf)}</span>
-        </div>
-        <div className="mt-1 w-full h-2 bg-white/10 rounded-full overflow-hidden">
-          <div
-            className={`h-2 ${
-              conf >= 90
-                ? "bg-orange-400"
-                : conf >= 75
-                ? "bg-emerald-400"
-                : conf >= 50
-                ? "bg-sky-400"
-                : "bg-amber-400"
-            }`}
-            style={{ width: `${Math.max(0, Math.min(100, conf || 0))}%` }}
-          />
-        </div>
-      </div>
-
-      {/* oznaka tipa modela */}
-      <div className="mt-2 text-[11px] text-slate-500">
-        {pick.type === "MODEL+ODDS" ? "Model + Odds" : "Model-only"}
-      </div>
-    </div>
-  );
-}
-
-const COMBINED_MIN_CONF = 0; // više ne forsiramo prag; sortiramo po confidence
-
-export default function FootballBets({ limit = 10, layout = "full" }) {
-  const date = todayYMD();
-  const { bets = [], loading, error } = useValueBets(date);
-
-  // DVA dugmeta: Kickoff / Confidence
-  const [sortBy, setSortBy] = useState("kickoff"); // "kickoff" | "confidence"
-
-  const filtered = useMemo(() => {
-    let arr = Array.isArray(bets) ? bets.slice() : [];
-
-    // ----- COMBINED: Top by CONFIDENCE (tie-break EV), bez dodatnih redova
-    if (layout === "combined") {
-      arr.sort((a, b) => {
-        const ca = Number(a.confidence_pct || 0);
-        const cb = Number(b.confidence_pct || 0);
-        if (cb !== ca) return cb - ca;
-        const eva = Number.isFinite(a.ev) ? a.ev : -Infinity;
-        const evb = Number.isFinite(b.ev) ? b.ev : -Infinity;
-        return evb - eva;
-      });
-      return arr;
-    }
-
-    // ----- FULL: postojeće sortiranje
-    if (layout === "full") {
-      if (sortBy === "kickoff") {
-        arr.sort((a, b) => kickoffMs(a) - kickoffMs(b));
-      } else {
-        arr.sort((a, b) => (b.confidence_pct || 0) - (a.confidence_pct || 0));
-      }
-    }
-    return arr;
-  }, [bets, layout, sortBy]);
-
-  const top = useMemo(() => filtered.slice(0, limit), [filtered, limit]);
-
-  if (loading)
-    return <div className="text-slate-400 text-sm">Loading football…</div>;
-  if (error)
-    return (
-      <div className="text-amber-400 text-sm">
-        Football feed error: {String(error)}
-      </div>
-    );
-
-  // ----- COMBINED: samo lista (kompaktnije kartice)
-  if (layout === "combined") {
-    return (
-      <div className="grid grid-cols-1 gap-4 items-stretch">
-        {top.map((p) => (
-          <Card
-            key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}`}
-            pick={p}
-          />
         ))}
-        {top.length === 0 && (
-          <div className="text-slate-400 text-sm">
-            No football suggestions.
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  // ----- FULL: levi stub (singles) + desni stub (tickets)
-  return (
-    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-start">
-      {/* LEFT: Controls + Singles */}
-      <div className="md:col-span-2">
-        {/* Controls: dva dugmeta */}
-        <div className="mb-3 flex items-center gap-2">
-          <span className="text-xs text-slate-300">Sort by:</span>
-          <div className="inline-flex rounded-lg overflow-hidden bg-[#1f2339]">
-            <button
-              type="button"
-              onClick={() => setSortBy("kickoff")}
-              className={
-                "px-3 py-2 text-xs font-semibold transition " +
-                (sortBy === "kickoff"
-                  ? "bg-[#151830] text-white"
-                  : "text-slate-300 hover:bg-[#202542]")
-              }
-            >
-              Kickoff (Soonest)
-            </button>
-            <button
-              type="button"
-              onClick={() => setSortBy("confidence")}
-              className={
-                "px-3 py-2 text-xs font-semibold transition " +
-                (sortBy === "confidence"
-                  ? "bg-[#151830] text-white"
-                  : "text-slate-300 hover:bg-[#202542]")
-              }
-            >
-              Confidence (High → Low)
-            </button>
-          </div>
-        </div>
-
-        {/* Singles list */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch">
-          {top.map((p) => (
-            <Card
-              key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}`}
-              pick={p}
-            />
-          ))}
-          {top.length === 0 && (
-            <div className="text-slate-400 text-sm">
-              No football suggestions.
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* RIGHT: Tickets 3× */}
-      <div className="md:col-span-1">
-        <TicketPanel bets={filtered} />
       </div>
     </div>
   );
 }
+
+// U return delu FULL layout-a:
+return (
+  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-start">
+    <div className="md:col-span-2">
+      {/* controls + singles list */}
+      {/* ... tvoj postojeći levi stub */}
+    </div>
+
+    <div className="md:col-span-1">
+      <TicketPanel bets={filtered} />
+      <HistoryCard /> {/* NOVO */}
+    </div>
+  </div>
+);
