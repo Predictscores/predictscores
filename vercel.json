@@ -1,8 +1,8 @@
 {
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "crons": [
     { "path": "/api/cron/rebuild",   "schedule": "0 8 * * *"  },
     { "path": "/api/cron/rebuild",   "schedule": "0 13 * * *" },
-
     { "path": "/api/locked-floats",  "schedule": "30 14,17 * * *" },
     { "path": "/api/insights-build", "schedule": "5 8,13 * * *"   },
     { "path": "/api/learning-build", "schedule": "30 22 * * *"    }
