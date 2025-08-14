@@ -1,3 +1,4 @@
+// FILE: components/FootballBets.jsx
 import React, { useMemo, useState } from "react";
 import useValueBets from "../hooks/useValueBets";
 import TicketPanel from "./TicketPanel";
@@ -10,7 +11,11 @@ function parseISO(it) {
       it?.datetime_local?.date_time ||
       it?.time?.starting_at?.date_time ||
       null;
-    return dt ? dt.replace(" ", "T") : null;
+    if (!dt) return null;
+    // Normalizacija: space -> 'T', i ako nema TZ (Z ili ±HH:MM), tretiramo kao UTC dodavanjem 'Z'
+    const s = dt.replace(" ", "T");
+    const hasTZ = /Z$|[+-]\d{2}:\d{2}$/.test(s);
+    return hasTZ ? s : `${s}Z`;
   } catch {
     return null;
   }
