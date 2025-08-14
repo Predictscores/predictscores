@@ -11,6 +11,7 @@ const store = global.__VBETS_LOCK__ || (global.__VBETS_LOCK__ = {
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const LIMIT = Math.max(1, Number(process.env.VB_LIMIT || 15)); // dogovor: 15
+const MAX_PER_LEAGUE = Math.max(1, Number(process.env.VB_MAX_PER_LEAGUE || 2)); // cap po ligi (osim UEFA)
 
 function beogradDayKey(d = new Date()) {
   const fmt = new Intl.DateTimeFormat("sv-SE", {
@@ -58,6 +59,16 @@ function filterFuture(arr=[]) {
   });
 }
 
+// UEFA izuzeci: Champions / Europa / Conference (uključujući kvalifikacije)
+function isUEFA(name = "") {
+  const n = String(name).toLowerCase();
+  return (
+    n.includes("champions league") ||
+    n.includes("europa league") ||
+    n.includes("conference league")
+  );
+}
+
 async function kvSet(key, value) {
   const url = process.env.KV_REST_API_URL;
   const token = process.env.KV_REST_API_TOKEN;
@@ -89,7 +100,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ value_bets: store.pinned, built_at: store.builtAt, day: store.dayKey, source: "locked-cache" });
     }
 
-    // pozovi interni /api/value-bets (koji sada vraća SAMO MODEL+ODDS)
+    // pozovi interni /api/value-bets (MODEL+ODDS skup)
     const proto = req.headers["x-forwarded-proto"] || "https";
     const origin = `${proto}://${req.headers.host}`;
     const innerURL = `${origin}/api/value-bets`;
@@ -103,20 +114,65 @@ export default async function handler(req, res) {
     const json = await r.json();
     const raw = Array.isArray(json?.value_bets) ? json.value_bets : [];
 
+    // filtriraj buduće i rangiraj
     const future = filterFuture(raw);
     const ranked = rankBets(future);
-    const pinned = ranked.slice(0, LIMIT);
-    const backup = ranked.slice(LIMIT, Math.max(LIMIT, 40));
+
+    // ====== NOVO: cap po ligi (MAX_PER_LEAGUE), sa izuzetkom UEFA takmičenja ======
+    const perLeague = new Map();
+    const pinned = [];
+    const skippedByCap = [];
+
+    const keyOfLeague = (p) => String(p?.league?.id ?? p?.league?.name ?? "").toLowerCase();
+
+    for (const p of ranked) {
+      const lname = p?.league?.name || "";
+      const key = keyOfLeague(p);
+
+      // bez limita za UEFA (UCL/UEL/UECL, uključujući kval.)
+      if (!isUEFA(lname)) {
+        const cnt = perLeague.get(key) || 0;
+        if (cnt >= MAX_PER_LEAGUE) {
+          skippedByCap.push(p);
+          continue;
+        }
+        perLeague.set(key, cnt + 1);
+      }
+      pinned.push(p);
+      if (pinned.length >= LIMIT) break;
+    }
+
+    // Fallback pass: ako cap ostavi manje od LIMIT, dopuni preostalim (ignorisi cap)
+    if (pinned.length < LIMIT) {
+      for (const p of skippedByCap) {
+        if (pinned.length >= LIMIT) break;
+        pinned.push(p);
+      }
+      if (pinned.length < LIMIT) {
+        for (const p of ranked) {
+          if (pinned.length >= LIMIT) break;
+          if (!pinned.includes(p)) pinned.push(p);
+        }
+      }
+    }
+    // ==============================================================================
+
+    // backup = ostatak liste (bez pinned, zadrži redosled)
+    const pinnedSet = new Set(pinned.map(p => p.fixture_id ?? `${p.league?.id}-${p.teams?.home?.name}-${p.teams?.away?.name}`));
+    const backup = ranked.filter(p => {
+      const id = p.fixture_id ?? `${p.league?.id}-${p.teams?.home?.name}-${p.teams?.away?.name}`;
+      return !pinnedSet.has(id);
+    }).slice(0, Math.max(LIMIT, 40));
 
     store.dayKey = today;
     store.builtAt = nowISO();
-    store.pinned = pinned;
+    store.pinned = pinned.slice(0, LIMIT);
     store.backup = backup;
     store.raw = future;
 
-    // ===== NOVO: snapshot u KV za history (stabilni ključevi)
+    // snapshot u KV (ako je uključeno)
     if (process.env.FEATURE_HISTORY === "1") {
-      const snapshot = pinned.map(p => ({
+      const snapshot = store.pinned.map(p => ({
         fixture_id: p.fixture_id,
         home: p.teams?.home?.name || "",
         away: p.teams?.away?.name || "",
@@ -125,11 +181,9 @@ export default async function handler(req, res) {
         odds: p.market_odds || null,
         kickoff: p?.datetime_local?.starting_at?.date_time || null
       }));
-      // poslednji snapshot tog dana + snapshot po slotu (10/15)
       await kvSet(`vb:day:${today}:last`, snapshot);
       await kvSet(`vb:day:${today}:${slotLabel()}`, snapshot);
     }
-    // ===================================================================
 
     res.setHeader("Set-Cookie", `vb_day=${today}; Path=/; SameSite=Lax; Max-Age=86400`);
     setCDNHeaders(res);
