@@ -118,7 +118,7 @@ export default async function handler(req, res) {
     const future = filterFuture(raw);
     const ranked = rankBets(future);
 
-    // ====== NOVO: cap po ligi (MAX_PER_LEAGUE), sa izuzetkom UEFA takmičenja ======
+    // ====== cap po ligi (MAX_PER_LEAGUE), sa izuzetkom UEFA takmičenja ======
     const perLeague = new Map();
     const pinned = [];
     const skippedByCap = [];
@@ -142,7 +142,7 @@ export default async function handler(req, res) {
       if (pinned.length >= LIMIT) break;
     }
 
-    // Fallback pass: ako cap ostavi manje od LIMIT, dopuni preostalim (ignorisi cap)
+    // Fallback pass: ako cap ostavi manje od LIMIT, dopuni preostalim (ignoriši cap)
     if (pinned.length < LIMIT) {
       for (const p of skippedByCap) {
         if (pinned.length >= LIMIT) break;
@@ -170,16 +170,19 @@ export default async function handler(req, res) {
     store.backup = backup;
     store.raw = future;
 
-    // snapshot u KV (ako je uključeno)
+    // snapshot u KV (ako je uključeno) — DODATO: conf i liga info
     if (process.env.FEATURE_HISTORY === "1") {
       const snapshot = store.pinned.map(p => ({
         fixture_id: p.fixture_id,
         home: p.teams?.home?.name || "",
         away: p.teams?.away?.name || "",
+        league_id: p.league?.id ?? null,
+        league_name: p.league?.name || "",
         market: p.market_label || p.market || "",
         selection: p.selection || "",
         odds: p.market_odds || null,
-        kickoff: p?.datetime_local?.starting_at?.date_time || null
+        kickoff: p?.datetime_local?.starting_at?.date_time || null,
+        conf: Number.isFinite(p.confidence_pct) ? Number(p.confidence_pct) : null
       }));
       await kvSet(`vb:day:${today}:last`, snapshot);
       await kvSet(`vb:day:${today}:${slotLabel()}`, snapshot);
