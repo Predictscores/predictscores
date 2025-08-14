@@ -1,5 +1,5 @@
 // FILE: components/FootballBets.jsx
-import React, { useMemo, useState, useEffect } from "react";
+import React, { useMemo, useState } from "react";
 import useValueBets from "../hooks/useValueBets";
 import TicketPanel from "./TicketPanel";
 
@@ -12,7 +12,6 @@ function parseISO(it) {
       it?.time?.starting_at?.date_time ||
       null;
     if (!dt) return null;
-    // Normalizacija: space -> 'T', i ako nema TZ (Z ili ±HH:MM), tretiramo kao UTC dodavanjem 'Z'
     const s = dt.replace(" ", "T");
     const hasTZ = /Z$|[+-]\d{2}:\d{2}$/.test(s);
     return hasTZ ? s : `${s}Z`;
@@ -25,7 +24,6 @@ function kickoffMs(it) {
   const t = iso ? new Date(iso).getTime() : NaN;
   return Number.isFinite(t) ? t : NaN;
 }
-// >>> Beograd vreme za prikaz (fix pogrešnog lokalnog prikaza)
 function fmtTime(it) {
   const iso = parseISO(it);
   const d = iso ? new Date(iso) : null;
@@ -50,7 +48,26 @@ function todayYMD() {
     month: "2-digit",
     day: "2-digit",
   }).format(now);
-  return y; // "YYYY-MM-DD"
+  return y;
+}
+// simple country -> emoji (fallback UEFA trophy)
+const FLAG = new Map(Object.entries({
+  "world": "🏆", "uefa": "🏆",
+  "england":"🇬🇧","scotland":"🏴","wales":"🏴","northern ireland":"🏴",
+  "spain":"🇪🇸","france":"🇫🇷","germany":"🇩🇪","italy":"🇮🇹","portugal":"🇵🇹","netherlands":"🇳🇱",
+  "belgium":"🇧🇪","switzerland":"🇨🇭","austria":"🇦🇹","croatia":"🇭🇷","serbia":"🇷🇸","bosnia and herzegovina":"🇧🇦","slovenia":"🇸🇮","hungary":"🇭🇺","romania":"🇷🇴","bulgaria":"🇧🇬","greece":"🇬🇷","turkiye":"🇹🇷","turkey":"🇹🇷",
+  "russia":"🇷🇺","ukraine":"🇺🇦","poland":"🇵🇱","czech-republic":"🇨🇿","czech republic":"🇨🇿","slovakia":"🇸🇰",
+  "usa":"🇺🇸","united-states":"🇺🇸","united states":"🇺🇸","canada":"🇨🇦","mexico":"🇲🇽","brazil":"🇧🇷","argentina":"🇦🇷","uruguay":"🇺🇾","chile":"🇨🇱","colombia":"🇨🇴","peru":"🇵🇪",
+  "japan":"🇯🇵","south-korea":"🇰🇷","south korea":"🇰🇷","china":"🇨🇳","india":"🇮🇳","bhutan":"🇧🇹","egypt":"🇪🇬","morocco":"🇲🇦",
+}));
+function flagEmoji(country, leagueName="") {
+  const c = String(country||"").toLowerCase().trim();
+  if (!c || c==="null" || c==="undefined" || c==="world") {
+    // UEFA / intercontinental
+    if (/uefa|champions|europa|conference/i.test(leagueName||"")) return "🏆";
+    return "🌍";
+  }
+  return FLAG.get(c) || "🏳️";
 }
 
 // ---- badge za confidence
@@ -61,83 +78,26 @@ function confBadge(conf) {
   return "🟡 Low";
 }
 
-// kratko objašnjenje (sažeto, razumljivo)
 function shortWhy(p) {
+  // koristimo summary koji generiše API (soft mode) ako postoji
   const s = p?.explain?.summary;
-  if (s && typeof s === "string" && s.trim()) {
-    // malo očistimo tipične tehničke fraze
-    return s
-      .replace(/Edge\s+\d+(\.\d+)?pp/gi, "")
-      .replace(/Model\s+\d+%/gi, "")
-      .replace(/Market\s+/gi, "")
-      .replace(/\s+·\s+$/g, "")
-      .replace(/^\s+·\s+/g, "")
-      .trim() || s.trim();
-  }
-  const league = p?.league?.name || "";
+  if (s && typeof s === "string" && s.trim()) return s.trim();
+  // fallback
   const mk = p?.market_label || p?.market || "";
   const sel = p?.selection || "";
-  return [league ? `Kontekst: ${league}` : null, mk && sel ? `Model naginje: ${mk} ${sel}` : null]
-    .filter(Boolean)
-    .join(" · ");
-}
-
-/** History (mala kartica, prikazuje se samo u Football/full layoutu) */
-function HistoryCard() {
-  const [rows, setRows] = useState([]);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const r = await fetch("/api/history");
-        if (!r.ok) return;
-        const data = await r.json();
-        if (!cancelled && Array.isArray(data.history)) {
-          // prikazuj samo završene (won/lost)
-          const finals = data.history.filter(
-            (m) => m.status === "won" || m.status === "lost"
-          );
-          setRows(finals);
-        }
-      } catch {}
-    })();
-    return () => { cancelled = true; };
-  }, []);
-
-  if (!rows.length) return null;
-
-  return (
-    <div className="mt-6 p-4 bg-[#1f2339] rounded-2xl">
-      <div className="text-sm font-semibold text-white mb-2">History (30 dana)</div>
-      <div className="space-y-1 text-xs text-slate-300">
-        {rows.map((m, i) => (
-          <div key={i} className="flex justify-between">
-            <span className="truncate">
-              {m.home} vs {m.away} — {m.market} {m.selection}
-              {m.odds ? ` (${Number(m.odds).toFixed(2)})` : ""}{m.ft ? ` — FT ${m.ft}` : ""}
-            </span>
-            <span className={m.status === "won" ? "text-emerald-400" : "text-rose-400"}>
-              {m.status === "won" ? "✅" : "❌"}
-            </span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
+  return [mk && sel ? `${mk}: ${sel}` : null].filter(Boolean).join(" · ");
 }
 
 /** Single card */
 function Card({ pick }) {
   const market = pick.market_label || pick.market || "";
   const sel = pick.selection || "";
-  const odds =
-    Number.isFinite(pick.market_odds) && pick.market_odds > 0
-      ? pick.market_odds.toFixed(2)
-      : null;
+  const odds = Number.isFinite(pick.market_odds) && pick.market_odds > 0 ? pick.market_odds.toFixed(2) : null;
+  const conf = Number.isFinite(pick.confidence_pct) ? pick.confidence_pct : null;
 
-  const conf =
-    Number.isFinite(pick.confidence_pct) ? pick.confidence_pct : null;
+  const leagueName = pick.league?.name || "—";
+  const country = pick.league?.country || pick.league?.cc || null;
+  const flag = flagEmoji(country, leagueName);
 
   return (
     <div className="bg-[#1f2339] rounded-2xl p-4 h-full flex flex-col">
@@ -145,7 +105,7 @@ function Card({ pick }) {
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="text-xs text-slate-400 truncate">
-            {pick.league?.name || "—"} • {fmtTime(pick)}
+            <span className="mr-1">{flag}</span>{leagueName} • {fmtTime(pick)}
           </div>
           <div className="text-base font-semibold text-white leading-snug">
             <span className="truncate block">
@@ -156,7 +116,7 @@ function Card({ pick }) {
           {/* Tip + kvota */}
           <div className="text-sm text-slate-200 mt-1">
             <span className="font-semibold">{market}</span>: {sel}
-            {odds ? <span className="text-slate-400"> @ {odds}</span> : null}
+            {odds ? <span className="text-slate-400"> ({odds})</span> : null}
           </div>
         </div>
 
@@ -166,16 +126,23 @@ function Card({ pick }) {
         </div>
       </div>
 
-      {/* Zašto baš ovaj pick (kratko) */}
+      {/* Zašto (sažeto) */}
       <div className="mt-3 text-[13px] text-slate-300">
         <span className="text-slate-400">Zašto: </span>
         {shortWhy(pick) || "Povoljan odnos kvote i modela."}
       </div>
 
+      {/* Insight linija (forma/H2H) — prikazi samo ako postoji */}
+      {pick._insight_line ? (
+        <div className="mt-2 text-[12px] text-slate-400">
+          {pick._insight_line}
+        </div>
+      ) : null}
+
       {/* filler */}
       <div className="flex-1" />
 
-      {/* Confidence bar u dnu — stabilne margine, bez prelivanja na mobilnom */}
+      {/* Confidence bar u dnu */}
       <div className="mt-4">
         <div className="flex items-center justify-between text-xs text-slate-400">
           <span>Confidence</span>
@@ -197,27 +164,20 @@ function Card({ pick }) {
         </div>
       </div>
 
-      {/* oznaka tipa modela */}
-      <div className="mt-2 text-[11px] text-slate-500">
-        {pick.type === "MODEL+ODDS" ? "Model + Odds" : "Model-only"}
-      </div>
+      {/* uklonjen "Model + Odds" footer da napravimo mesta */}
     </div>
   );
 }
-
-const COMBINED_MIN_CONF = 0; // više ne forsiramo prag; sortiramo po confidence
 
 export default function FootballBets({ limit = 10, layout = "full" }) {
   const date = todayYMD();
   const { bets = [], loading, error } = useValueBets(date);
 
-  // DVA dugmeta: Kickoff / Confidence
   const [sortBy, setSortBy] = useState("kickoff"); // "kickoff" | "confidence"
 
   const filtered = useMemo(() => {
     let arr = Array.isArray(bets) ? bets.slice() : [];
 
-    // ----- COMBINED: Top by CONFIDENCE (tie-break EV), bez dodatnih redova
     if (layout === "combined") {
       arr.sort((a, b) => {
         const ca = Number(a.confidence_pct || 0);
@@ -230,7 +190,6 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
       return arr;
     }
 
-    // ----- FULL: postojeće sortiranje
     if (layout === "full") {
       if (sortBy === "kickoff") {
         arr.sort((a, b) => kickoffMs(a) - kickoffMs(b));
@@ -243,40 +202,25 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
 
   const top = useMemo(() => filtered.slice(0, limit), [filtered, limit]);
 
-  if (loading)
-    return <div className="text-slate-400 text-sm">Loading football…</div>;
-  if (error)
-    return (
-      <div className="text-amber-400 text-sm">
-        Football feed error: {String(error)}
-      </div>
-    );
+  if (loading) return <div className="text-slate-400 text-sm">Loading football…</div>;
+  if (error) return <div className="text-amber-400 text-sm">Football feed error: {String(error)}</div>;
 
-  // ----- COMBINED: samo lista (kompaktnije kartice) — BEZ Ticket panela
   if (layout === "combined") {
     return (
       <div className="grid grid-cols-1 gap-4 items-stretch">
         {top.map((p) => (
-          <Card
-            key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}`}
-            pick={p}
-          />
+          <Card key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}`} pick={p} />
         ))}
-        {top.length === 0 && (
-          <div className="text-slate-400 text-sm">
-            No football suggestions.
-          </div>
-        )}
+        {top.length === 0 && <div className="text-slate-400 text-sm">No football suggestions.</div>}
       </div>
     );
   }
 
-  // ----- FULL: levi stub (singles) + desni stub (tickets + history)
+  // FULL: levi stub (singles) + desni stub (tickets)
   return (
     <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-start">
       {/* LEFT: Controls + Singles */}
       <div className="md:col-span-2">
-        {/* Controls: dva dugmeta */}
         <div className="mb-3 flex items-center gap-2">
           <span className="text-xs text-slate-300">Sort by:</span>
           <div className="inline-flex rounded-lg overflow-hidden bg-[#1f2339]">
@@ -285,9 +229,7 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
               onClick={() => setSortBy("kickoff")}
               className={
                 "px-3 py-2 text-xs font-semibold transition " +
-                (sortBy === "kickoff"
-                  ? "bg-[#151830] text-white"
-                  : "text-slate-300 hover:bg-[#202542]")
+                (sortBy === "kickoff" ? "bg-[#151830] text-white" : "text-slate-300 hover:bg-[#202542]")
               }
             >
               Kickoff (Soonest)
@@ -297,9 +239,7 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
               onClick={() => setSortBy("confidence")}
               className={
                 "px-3 py-2 text-xs font-semibold transition " +
-                (sortBy === "confidence"
-                  ? "bg-[#151830] text-white"
-                  : "text-slate-300 hover:bg-[#202542]")
+                (sortBy === "confidence" ? "bg-[#151830] text-white" : "text-slate-300 hover:bg-[#202542]")
               }
             >
               Confidence (High → Low)
@@ -307,26 +247,15 @@ export default function FootballBets({ limit = 10, layout = "full" }) {
           </div>
         </div>
 
-        {/* Singles list */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch">
-          {top.map((p) => (
-            <Card
-              key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}`}
-              pick={p}
-            />
-          ))}
-          {top.length === 0 && (
-            <div className="text-slate-400 text-sm">
-              No football suggestions.
-            </div>
-          )}
+          {top.map((p) => <Card key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}`} pick={p} />)}
+          {top.length === 0 && <div className="text-slate-400 text-sm">No football suggestions.</div>}
         </div>
       </div>
 
-      {/* RIGHT: Tickets 3× + History (samo u FULL layoutu) */}
+      {/* RIGHT: Tickets 3× */}
       <div className="md:col-span-1">
         <TicketPanel bets={filtered} />
-        <HistoryCard />
       </div>
     </div>
   );
