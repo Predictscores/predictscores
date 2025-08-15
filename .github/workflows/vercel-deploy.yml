@@ -1,8 +1,7 @@
 name: Vercel Deploy Hook
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -11,4 +10,11 @@ jobs:
     steps:
       - name: Trigger Vercel Production Deploy
         run: |
-          curl -fsSL -X POST "https://api.vercel.com/v1/integrations/deploy/prj_zs9kf5e2NRdyDvFwI1LVhkRg0oBr/gWKzM5JmJY"
+          set -e
+          URL="https://api.vercel.com/v1/integrations/deploy/prj_zs9kf5e2NRdyDvFwI1LVhkRg0oBr/gWKzM5JmJY"
+          echo "POST $URL"
+          CODE=$(curl -sS -o /tmp/resp.json -w "%{http_code}" -X POST "$URL")
+          echo "HTTP $CODE"
+          echo "Response:"
+          cat /tmp/resp.json || true
+          test "$CODE" -ge 200 -a "$CODE" -lt 300
