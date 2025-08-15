@@ -1,12 +1,18 @@
-name: Vercel: Manual Redeploy
+name: Vercel Deploy Hook
+
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
   trigger-vercel:
     runs-on: ubuntu-latest
     steps:
-      - name: Call Vercel Deploy Hook
+      - name: Trigger Vercel Deploy (force)
+        env:
+          HOOK: "https://api.vercel.com/v1/integrations/deploy/prj_zs9kf5e2NRdyDvFwI1LVhkRg0oBr/gWKzM5JmJY"
         run: |
-          set -euo pipefail
-          curl -fsS -X POST "https://api.vercel.com/v1/integrations/deploy/prj_zs9kf5e2NRdyDvFwI1LVhkRg0oBr/gWKzM5JmJY?force=1"
+          set -euxo pipefail
+          curl -fsS -X POST "$HOOK?force=1"
