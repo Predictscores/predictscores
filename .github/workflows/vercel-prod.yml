@@ -1,4 +1,4 @@
-name: Vercel Prod
+name: Vercel Prod (debug)
 
 on:
   push:
@@ -13,42 +13,43 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      # moraš da imaš ova 3 secreta u repo Settings → Secrets → Actions
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}        # npr. team_xxxxx
-      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }} # prj_zs9kf5e2NRdyDvFwI1LVhkRg0oBr
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}          # team_XXXX (ID)
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}  # prj_XXXX
+      VERCEL_TEAM_SLUG: ${{ secrets.VERCEL_TEAM_SLUG }}    # npr. predictscores
+      VERCEL_LOG_LEVEL: debug
       CI: true
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Node & Vercel CLI
-        run: |
-          node -v
-          npm -v
-          npm i -g vercel@latest
-          vercel --version
+      - name: Install Vercel CLI
+        run: npm i -g vercel@latest
 
-      - name: Sanity check & auth
+      - name: Echo inputs
         run: |
-          test -n "$VERCEL_TOKEN" || (echo "❌ VERCEL_TOKEN is empty" && exit 1)
-          test -n "$VERCEL_ORG_ID" || (echo "❌ VERCEL_ORG_ID is empty" && exit 1)
-          test -n "$VERCEL_PROJECT_ID" || (echo "❌ VERCEL_PROJECT_ID is empty" && exit 1)
-          # Provera tokena i scopa (team-a)
-          vercel whoami --token "$VERCEL_TOKEN" --scope "$VERCEL_ORG_ID"
+          echo "ORG_ID=$VERCEL_ORG_ID"
+          echo "PROJ_ID=$VERCEL_PROJECT_ID"
+          echo "TEAM_SLUG=$VERCEL_TEAM_SLUG"
 
-      - name: Write .vercel/project.json
+      - name: whoami (scope must be SLUG)
+        run: vercel whoami --token "$VERCEL_TOKEN" --scope "$VERCEL_TEAM_SLUG"
+
+      - name: Write .vercel/project.json (needs ORG ID + PROJECT ID)
         run: |
           mkdir -p .vercel
-          echo "{\"orgId\":\"$VERCEL_ORG_ID\",\"projectId\":\"$VERCEL_PROJECT_ID\"}" > .vercel/project.json
+          printf '{"orgId":"%s","projectId":"%s"}' "$VERCEL_ORG_ID" "$VERCEL_PROJECT_ID" > .vercel/project.json
           cat .vercel/project.json
 
-      - name: vercel pull (production)
-        run: vercel pull --yes --environment=production --token "$VERCEL_TOKEN" --scope "$VERCEL_ORG_ID"
+      - name: List projects (sanity)
+        run: vercel projects ls --token "$VERCEL_TOKEN" --scope "$VERCEL_TEAM_SLUG"
 
-      - name: vercel build --prod
-        run: vercel build --prod --token "$VERCEL_TOKEN" --scope "$VERCEL_ORG_ID"
+      - name: Pull env (production)
+        run: vercel pull --yes --environment=production --token "$VERCEL_TOKEN" --scope "$VERCEL_TEAM_SLUG"
 
-      - name: vercel deploy --prebuilt --prod
-        run: vercel deploy --prebuilt --prod --yes --token "$VERCEL_TOKEN" --scope "$VERCEL_ORG_ID"
+      - name: Build (prod)
+        run: vercel build --prod --token "$VERCEL_TOKEN" --scope "$VERCEL_TEAM_SLUG"
+
+      - name: Deploy (prebuilt prod)
+        run: vercel deploy --prebuilt --prod --yes --token "$VERCEL_TOKEN" --scope "$VERCEL_TEAM_SLUG"
