@@ -2,53 +2,13 @@
 export const config = { api: { bodyParser: false } };
 
 /**
- * Dispatcher za Hobby (max 2 Vercel cron joba):
- * - Na svakih 5 min proverava Beograd vreme.
- * - Uz KV "lock" ključeve (NX + EX) obezbeđuje da se svaka meta-tačka okine SAMO jednom.
- * - Ne troši AF pozive (poziva tvoje interne API-je).
- *
- * ENV očekivanja:
- *  - KV_REST_API_URL / KV_URL / UPSTASH_REDIS_REST_URL
- *  - KV_REST_API_TOKEN / UPSTASH_REDIS_REST_TOKEN
- *  - CRON_SCHEDULER_OFF=1 (opciono, gasi dispatcher)
+ * Scheduler (jedan cron na */5):
+ * - U tačnim slotovima: preview / rebuild / insights
+ * - Svakih 5 min gađa /api/locked-floats, ali sama ruta ima lock/frekvenciju (45m/<4h, 120m/ostalo)
  */
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-const WINDOW_MIN = Number(process.env.SCHEDULER_MINUTE_WINDOW || 4); // dozvoljeni prozor (min) zbog 5-min crona
-
-// Upstash REST (bez dodatnih dependencija)
-function kvCreds() {
-  const url =
-    process.env.KV_REST_API_URL ||
-    process.env.KV_URL ||
-    process.env.UPSTASH_REDIS_REST_URL ||
-    process.env.REDIS_URL;
-  const token =
-    process.env.KV_REST_API_TOKEN ||
-    process.env.UPSTASH_REDIS_REST_TOKEN ||
-    process.env.KV_REST_API_READ_ONLY_TOKEN;
-  return { url, token };
-}
-
-async function kvSetNX(key, ttlSec = 86400) {
-  const { url, token } = kvCreds();
-  if (!url || !token) return false;
-
-  // Upstash REST: POST {["SET", key, "1", "NX", "EX", ttl]}
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(["SET", key, "1", "NX", "EX", ttlSec]),
-  }).catch(() => null);
-
-  if (!r) return false;
-  const j = await r.json().catch(() => ({}));
-  // Rezultat: { result: "OK" } kada je set uspeo (NX = true), ili null kada već postoji
-  return j?.result === "OK";
-}
+const WINDOW_MIN = Number(process.env.SCHEDULER_MINUTE_WINDOW || 4);
 
 function belgradeNowParts(now = new Date()) {
   const fmt = new Intl.DateTimeFormat("sv-SE", {
@@ -65,69 +25,62 @@ function belgradeNowParts(now = new Date()) {
   const [H, M] = hm.split(":").map((x) => Number(x));
   return { date, H, M, hm };
 }
-
-function mins(h, m) {
-  return h * 60 + m;
-}
-function diffNowTo(targetHM, H, M) {
-  const [tH, tM] = targetHM.split(":").map((x) => Number(x));
-  return mins(H, M) - mins(tH, tM); // >0 znači posle targeta
+function mins(h, m){ return h*60+m; }
+function diffNowTo(targetHM, H, M){
+  const [tH, tM] = targetHM.split(":").map(Number);
+  return mins(H,M) - mins(tH,tM); // [0..WINDOW] znači "pogođeno"
 }
 
 async function triggerInternal(req, path) {
   const proto = req.headers["x-forwarded-proto"] || "https";
   const host = req.headers.host;
   const origin = `${proto}://${host}`;
-  const url = `${origin}${path}`;
-  return fetch(url, { headers: { "x-internal-cron": "1" } });
+  return fetch(`${origin}${path}`, { headers: { "x-internal-cron": "1" } });
 }
 
-export default async function handler(req, res) {
+export default async function handler(req, res){
   try {
-    if (String(process.env.CRON_SCHEDULER_OFF || "") === "1") {
-      return res.status(200).json({ ok: true, skipped: "CRON_SCHEDULER_OFF=1" });
-    }
-
     const { date, H, M, hm } = belgradeNowParts();
+
+    // SLOTOVI
     const slots = [
-      // insights-build
+      // preview noću (K≈6)
+      { time: "00:20", key: "preview", path: "/api/locked-floats?preview=1" },
+      { time: "06:20", key: "preview", path: "/api/locked-floats?preview=1" },
+
+      // insights (2x)
       { time: "08:05", key: "insights", path: "/api/insights-build" },
       { time: "13:05", key: "insights", path: "/api/insights-build" },
-      // locked-floats
-      { time: "14:30", key: "locked", path: "/api/locked-floats" },
-      { time: "17:30", key: "locked", path: "/api/locked-floats" },
-      // learning-build
-      { time: "22:30", key: "learning", path: "/api/learning-build" },
+
+      // rebuild + learning (2x)
+      { time: "10:00", key: "rebuild", path: "/api/cron/rebuild" },
+      { time: "15:00", key: "rebuild", path: "/api/cron/rebuild" },
     ];
 
     const matches = [];
     for (const s of slots) {
       const d = diffNowTo(s.time, H, M);
-      // pogodak ako smo u intervalu [0 .. WINDOW_MIN]
-      if (d >= 0 && d <= WINDOW_MIN) {
-        matches.push(s);
-      }
+      if (d >= 0 && d <= WINDOW_MIN) matches.push(s);
     }
 
-    const fired = [];
+    const triggered = [];
     for (const m of matches) {
-      const lockKey = `cron:${m.key}:${date}:${m.time}`;
-      // TTL dovoljno dug da pokrije eventualno kašnjenje (npr. 1 dan)
-      const got = await kvSetNX(lockKey, 26 * 3600);
-      if (got) {
-        await triggerInternal(req, m.path);
-        fired.push({ ...m, lockKey });
-      }
+      const ok = await triggerInternal(req, m.path);
+      triggered.push({ ...m, status: ok?.status||0 });
     }
 
+    // FLOTS/SCOUT – svake 5 min (ruta sama ima frekvenciju/lock i neće raditi ništa kad nije vreme)
+    const floats = await triggerInternal(req, "/api/locked-floats");
+
+    res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
       ok: true,
       now: { tz: TZ, hm, date },
       windowMin: WINDOW_MIN,
-      matched: matches,
-      triggered: fired,
+      triggered,
+      floatsStatus: floats?.status || 0
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok:false, error:String(e?.message||e) });
   }
-        }
+}
