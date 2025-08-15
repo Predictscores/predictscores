@@ -1,20 +1,26 @@
+# .github/workflows/vercel-deploy.yml
 name: Vercel Deploy Hook
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
 
+env:
+  # tvoj hook:
+  VERCEL_DEPLOY_HOOK: "https://api.vercel.com/v1/integrations/deploy/prj_zs9kf5e2NRdyDvFwI1LVhkRg0oBr/gWKzM5JmJY"
+
 jobs:
   trigger-vercel:
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger Vercel Production Deploy
+      - name: Call Vercel Deploy Hook (print response & fail on non-2xx)
         run: |
-          set -e
-          URL="https://api.vercel.com/v1/integrations/deploy/prj_zs9kf5e2NRdyDvFwI1LVhkRg0oBr/gWKzM5JmJY"
-          echo "POST $URL"
-          CODE=$(curl -sS -o /tmp/resp.json -w "%{http_code}" -X POST "$URL")
-          echo "HTTP $CODE"
-          echo "Response:"
-          cat /tmp/resp.json || true
-          test "$CODE" -ge 200 -a "$CODE" -lt 300
+          set -euo pipefail
+          echo "POST $VERCEL_DEPLOY_HOOK"
+          HTTP=$(curl -sS -o resp.json -w "%{http_code}" -X POST "$VERCEL_DEPLOY_HOOK")
+          echo "HTTP $HTTP"
+          echo "----- response body -----"
+          cat resp.json || true
+          echo "-------------------------"
+          # fail ako nije 2xx
+          test "$HTTP" -ge 200 -a "$HTTP" -lt 300
