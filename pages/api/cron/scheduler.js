@@ -1,84 +1,44 @@
 // FILE: pages/api/cron/scheduler.js
 export const config = { api: { bodyParser: false } };
 
-// Scheduler (slot-based)
-// - U tačnim slotovima: preview / rebuild / insights
-// - Ne koristi sekvencu "*/" u komentarima; blok-komentari je zatvaraju i lome build.
-
-const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-const WINDOW_MIN = Number(process.env.SCHEDULER_MINUTE_WINDOW || 4);
-
-function belgradeNowParts(now = new Date()) {
-  const fmt = new Intl.DateTimeFormat("sv-SE", {
-    timeZone: TZ,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-  const s = fmt.format(now); // "YYYY-MM-DD HH:MM"
-  const [date, hm] = s.split(" ");
-  const [H, M] = hm.split(":").map(Number);
-  return { date, H, M, hm };
-}
-
-function mins(h, m) { return h * 60 + m; }
-
-function diffNowTo(targetHM, H, M) {
-  const [tH, tM] = targetHM.split(":").map(Number);
-  return mins(H, M) - mins(tH, tM); // [0..WINDOW] znači "pogođeno"
-}
+// Minimalni, robustan scheduler za 2 crona (08:00 i 13:00 UTC):
+// - kada se pozove, UVEK poziva rebuild, pa odmah insights.
+// - bez slot-računanja i prozora, jer poziv tačno u 10:00/15:00 dolazi iz Vercel crona.
 
 async function triggerInternal(req, path) {
-  const proto = req.headers["x-forwarded-proto"] || "https";
-  const host = req.headers.host;
-  const origin = `${proto}://${host}`;
-  return fetch(`${origin}${path}`, { headers: { "x-internal-cron": "1" } });
+  try {
+    const proto = req.headers["x-forwarded-proto"] || "https";
+    const host = req.headers["x-forwarded-host"] || req.headers.host;
+    const origin = `${proto}://${host}`;
+    const r = await fetch(`${origin}${path}`, { headers: { "x-internal-cron": "1" } });
+    return { ok: r.ok, status: r.status };
+  } catch (e) {
+    return { ok: false, status: 0, error: String(e?.message || e) };
+  }
 }
 
 export default async function handler(req, res) {
   try {
-    const { date, H, M, hm } = belgradeNowParts();
+    const startedAt = new Date().toISOString();
 
-    // SLOTOVI
-    const slots = [
-      // preview noću (K≈6)
-      { time: "00:20", key: "preview", path: "/api/locked-floats?preview=1" },
-      { time: "06:20", key: "preview", path: "/api/locked-floats?preview=1" },
+    // 1) Rebuild (lock feed)
+    const r1 = await triggerInternal(req, "/api/cron/rebuild");
 
-      // insights (2x)
-      { time: "08:05", key: "insights", path: "/api/insights-build" },
-      { time: "13:05", key: "insights", path: "/api/insights-build" },
+    // 2) Insights odmah nakon lock-a (nema trećeg crona, nema :05 slotova)
+    const r2 = await triggerInternal(req, "/api/insights-build");
 
-      // rebuild + learning (2x)
-      { time: "10:00", key: "rebuild", path: "/api/cron/rebuild" },
-      { time: "15:00", key: "rebuild", path: "/api/cron/rebuild" },
-    ];
-
-    const matches = [];
-    for (const s of slots) {
-      const d = diffNowTo(s.time, H, M);
-      if (d >= 0 && d <= WINDOW_MIN) matches.push(s);
-    }
-
-    const triggered = [];
-    for (const m of matches) {
-      const ok = await triggerInternal(req, m.path);
-      triggered.push({ ...m, status: ok?.status || 0 });
-    }
-
-    // FLOTS/SCOUT – periodično; sama ruta ima lock/throttle pa neće preterivati sa spoljnim API pozivima
-    const floats = await triggerInternal(req, "/api/locked-floats");
+    // 3) (opciono) Floats/Smart – best-effort; ignoriši ako nema rute
+    const r3 = await triggerInternal(req, "/api/locked-floats");
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
       ok: true,
-      now: { tz: TZ, hm, date },
-      windowMin: WINDOW_MIN,
-      triggered,
-      floatsStatus: floats?.status || 0,
+      startedAt,
+      steps: [
+        { step: "rebuild",  status: r1.status, ok: r1.ok },
+        { step: "insights", status: r2.status, ok: r2.ok },
+        { step: "floats",   status: r3.status, ok: r3.ok },
+      ],
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
