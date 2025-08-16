@@ -2,9 +2,10 @@
 export const config = { api: { bodyParser: false } };
 
 /**
- * Scheduler (jedan cron na */5):
+ * Scheduler (slot-based):
  * - U tačnim slotovima: preview / rebuild / insights
- * - Svakih 5 min gađa /api/locked-floats, ali sama ruta ima lock/frekvenciju (45m/<4h, 120m/ostalo)
+ * - Napomena: ne koristiti sekvencu '*/' u komentarima jer zatvara blok komentar u JS.
+ * - Ranije je stajalo "na */5", što je lomilo build; sada je komentar preformulisan.
  */
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
@@ -25,10 +26,14 @@ function belgradeNowParts(now = new Date()) {
   const [H, M] = hm.split(":").map((x) => Number(x));
   return { date, H, M, hm };
 }
-function mins(h, m){ return h*60+m; }
-function diffNowTo(targetHM, H, M){
+
+function mins(h, m) {
+  return h * 60 + m;
+}
+
+function diffNowTo(targetHM, H, M) {
   const [tH, tM] = targetHM.split(":").map(Number);
-  return mins(H,M) - mins(tH,tM); // [0..WINDOW] znači "pogođeno"
+  return mins(H, M) - mins(tH, tM); // [0..WINDOW] znači "pogođeno"
 }
 
 async function triggerInternal(req, path) {
@@ -38,7 +43,7 @@ async function triggerInternal(req, path) {
   return fetch(`${origin}${path}`, { headers: { "x-internal-cron": "1" } });
 }
 
-export default async function handler(req, res){
+export default async function handler(req, res) {
   try {
     const { date, H, M, hm } = belgradeNowParts();
 
@@ -66,10 +71,10 @@ export default async function handler(req, res){
     const triggered = [];
     for (const m of matches) {
       const ok = await triggerInternal(req, m.path);
-      triggered.push({ ...m, status: ok?.status||0 });
+      triggered.push({ ...m, status: ok?.status || 0 });
     }
 
-    // FLOTS/SCOUT – svake 5 min (ruta sama ima frekvenciju/lock i neće raditi ništa kad nije vreme)
+    // FLOTS/SCOUT – periodično; sama ruta ima lock/throttle pa neće preterivati sa spoljnim API pozivima
     const floats = await triggerInternal(req, "/api/locked-floats");
 
     res.setHeader("Cache-Control", "no-store");
@@ -78,9 +83,11 @@ export default async function handler(req, res){
       now: { tz: TZ, hm, date },
       windowMin: WINDOW_MIN,
       triggered,
-      floatsStatus: floats?.status || 0
+      floatsStatus: floats?.status || 0,
     });
   } catch (e) {
-    return res.status(500).json({ ok:false, error:String(e?.message||e) });
+    return res
+      .status(500)
+      .json({ ok: false, error: String(e?.message || e) });
   }
 }
