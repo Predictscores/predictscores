@@ -1,12 +1,9 @@
 // FILE: pages/api/cron/scheduler.js
 export const config = { api: { bodyParser: false } };
 
-/**
- * Scheduler (slot-based):
- * - U tačnim slotovima: preview / rebuild / insights
- * - Napomena: ne koristiti sekvencu '*/' u komentarima jer zatvara blok komentar u JS.
- * - Ranije je stajalo "na */5", što je lomilo build; sada je komentar preformulisan.
- */
+// Scheduler (slot-based)
+// - U tačnim slotovima: preview / rebuild / insights
+// - Ne koristi sekvencu "*/" u komentarima; blok-komentari je zatvaraju i lome build.
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const WINDOW_MIN = Number(process.env.SCHEDULER_MINUTE_WINDOW || 4);
@@ -23,13 +20,11 @@ function belgradeNowParts(now = new Date()) {
   });
   const s = fmt.format(now); // "YYYY-MM-DD HH:MM"
   const [date, hm] = s.split(" ");
-  const [H, M] = hm.split(":").map((x) => Number(x));
+  const [H, M] = hm.split(":").map(Number);
   return { date, H, M, hm };
 }
 
-function mins(h, m) {
-  return h * 60 + m;
-}
+function mins(h, m) { return h * 60 + m; }
 
 function diffNowTo(targetHM, H, M) {
   const [tH, tM] = targetHM.split(":").map(Number);
@@ -86,8 +81,6 @@ export default async function handler(req, res) {
       floatsStatus: floats?.status || 0,
     });
   } catch (e) {
-    return res
-      .status(500)
-      .json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 }
