@@ -17,7 +17,7 @@ const LIMITS = {
   PASS1_CAP:     num(process.env.AF_PASS1_CAP, 40),
   MAX_FIX_SCAN:  num(process.env.VB_MAX_FIX_SCAN, 150),
   MIN_ODDS:      1.30,
-  MIN_BOOKIES:   num(process.env.VB_MIN_BOOKIES, 2), // default 2 da vidiš više tržišta
+  MIN_BOOKIES:   num(process.env.VB_MIN_BOOKIES, 2),
 };
 
 const SAFE_EDGE_MIN_PP = -0.5;
@@ -52,7 +52,7 @@ function toLocalISO(d){
   return `${dFmt.format(d)} ${tFmt.format(d)}`;
 }
 
-/* ---------------- AF fetch ---------------- */
+/* ---------------- AF fetch (works for API-Football or RapidAPI) ---------------- */
 async function afFetch(path){
   const KEY =
     process.env.NEXT_PUBLIC_API_FOOTBALL_KEY ||
@@ -62,9 +62,18 @@ async function afFetch(path){
   if (!KEY) throw new Error("API_FOOTBALL_KEY missing");
   if (!chargeDaily(1)) throw new Error("AF daily budget limit");
   if (!chargeRun(1))   throw new Error("AF run hardcap");
-  const r = await fetch(`https://v3.football.api-sports.io${path}`, {
-    headers: { "x-apisports-key": KEY }
-  });
+
+  const url = `https://v3.football.api-sports.io${path}`;
+  const headers = {
+    // Direct API-Football
+    "x-apisports-key": KEY,
+    // RapidAPI compatibility (some users only have RapidAPI)
+    "X-RapidAPI-Key": KEY,
+    "x-rapidapi-key": KEY,
+    "X-RapidAPI-Host": "v3.football.api-sports.io"
+  };
+
+  const r = await fetch(url, { headers });
   if (!r.ok) {
     const t = await r.text().catch(()=> "");
     throw new Error(`AF ${path} -> ${r.status} ${t}`);
@@ -85,7 +94,7 @@ async function oddsFallbackInternal(req, { home, away, tsISO }){
     if (!r.ok) return null;
     const j = await r.json().catch(()=> ({}));
     if (Array.isArray(j?.bookmakers) && j.bookmakers.length) {
-      return [{ bookmakers: j.bookmakers }];
+      return [{ bookmakers: j.bookmakers }]; // h2h/1X2 only
     }
     return null;
   }catch(_){ return null; }
@@ -173,7 +182,7 @@ function normalizeOdds(oddsResp){
         }
       }
 
-      // Over/Under (grupiši po liniji; prefer 2.5)
+      // Over/Under (prefer 2.5; grupiši po liniji)
       {
         const m = use.find((b) => {
           const label = String(b?.name || b?.key || "").toLowerCase();
@@ -181,7 +190,7 @@ function normalizeOdds(oddsResp){
         });
         if (m) {
           const vals = m.values || m.outcomes || [];
-          const byLine = new Map(); // line -> rec
+          const byLine = new Map();
           for (const v of vals) {
             const lab = String(v?.value||v?.selection||v?.name||"");
             const dec = asDec(v);
@@ -217,7 +226,7 @@ function normalizeOdds(oddsResp){
           const vals = m.values || m.outcomes || [];
           let got = false;
           for (const v of vals) {
-            const lab = String(v?.value||v?.selection||v?.name||"").toLowerCase(); // "home/draw", "away/home"...
+            const lab = String(v?.value||v?.selection||v?.name||"").toLowerCase(); // "home/draw", "away/home", ...
             const dec = asDec(v);
             if (!Number.isFinite(dec) || dec < LIMITS.MIN_ODDS) continue;
             const parts = lab.split(/[\/\-]/);
@@ -297,12 +306,11 @@ export default async function handler(req, res){
       let pred = null;
       try { const pr = await afFetch(`/predictions?fixture=${fid}`); pred = normPred1x2(pr); } catch {}
 
-      // 4) Helper za push kandidata
+      // 4) Push helper
       const pushCand = ({ market, market_label, selection, odds, p, implied, bookies, scoreBias=0, explain })=>{
         if (!odds || odds < LIMITS.MIN_ODDS) return;
         if (!(p >= 0 && p <= 1)) return;
         if (bookies < LIMITS.MIN_BOOKIES) return;
-        const ev = p*(odds-1) - (1-p);
         const edgePP = Math.round((p - (implied ?? impliedFromDecimal(odds) ?? 0)) * 1000) / 10;
         candAll.push({
           type: "MODEL+ODDS",
@@ -326,53 +334,45 @@ export default async function handler(req, res){
 
       /* ----- 1X2 ----- */
       {
-        const bestH = norm["1X2"].HOME, bestD = norm["1X2"].DRAW, bestA = norm["1X2"].AWAY;
         const bks   = norm["1X2"].bookies;
+        const bestH = norm["1X2"].HOME, bestD = norm["1X2"].DRAW, bestA = norm["1X2"].AWAY;
         const pH = pred?.key==="HOME" ? (pred.pct/100) : (avg(norm["1X2"].imps.H) ?? null);
         const pD = pred?.key==="DRAW" ? (pred.pct/100) : (avg(norm["1X2"].imps.D) ?? null);
         const pA = pred?.key==="AWAY" ? (pred.pct/100) : (avg(norm["1X2"].imps.A) ?? null);
 
-        if (bestH) pushCand({
-          market:"1X2", market_label:"1X2", selection:"HOME", odds:bestH,
+        if (bestH) pushCand({ market:"1X2", market_label:"1X2", selection:"HOME", odds:bestH,
           p: pH ?? avg(norm["1X2"].imps.H) ?? 0,
           implied: avg(norm["1X2"].imps.H) ?? impliedFromDecimal(bestH),
           bookies:bks, scoreBias: pred?.key==="HOME"?0.2:0,
-          explain:{ summary:`Model ${pH?Math.round(pH*100):Math.round((avg(norm["1X2"].imps.H)||0)*100)}% · Bookies ${bks}` }
+          explain:{ summary:`1X2 HOME · Bookies ${bks}` }
         });
-        if (bestD) pushCand({
-          market:"1X2", market_label:"1X2", selection:"DRAW", odds:bestD,
+        if (bestD) pushCand({ market:"1X2", market_label:"1X2", selection:"DRAW", odds:bestD,
           p: pD ?? avg(norm["1X2"].imps.D) ?? 0,
           implied: avg(norm["1X2"].imps.D) ?? impliedFromDecimal(bestD),
           bookies:bks, scoreBias: pred?.key==="DRAW"?0.2:0,
-          explain:{ summary:`Model ${pD?Math.round(pD*100):Math.round((avg(norm["1X2"].imps.D)||0)*100)}% · Bookies ${bks}` }
+          explain:{ summary:`1X2 DRAW · Bookies ${bks}` }
         });
-        if (bestA) pushCand({
-          market:"1X2", market_label:"1X2", selection:"AWAY", odds:bestA,
+        if (bestA) pushCand({ market:"1X2", market_label:"1X2", selection:"AWAY", odds:bestA,
           p: pA ?? avg(norm["1X2"].imps.A) ?? 0,
           implied: avg(norm["1X2"].imps.A) ?? impliedFromDecimal(bestA),
           bookies:bks, scoreBias: pred?.key==="AWAY"?0.2:0,
-          explain:{ summary:`Model ${pA?Math.round(pA*100):Math.round((avg(norm["1X2"].imps.A)||0)*100)}% · Bookies ${bks}` }
+          explain:{ summary:`1X2 AWAY · Bookies ${bks}` }
         });
       }
 
       /* ----- BTTS ----- */
       {
-        const bestYes = norm["BTTS"].YES, bestNo = norm["BTTS"].NO, bks = norm["BTTS"].bookies;
+        const bks = norm["BTTS"].bookies;
+        const bestYes = norm["BTTS"].YES, bestNo = norm["BTTS"].NO;
         const pYes = avg(norm["BTTS"].imps.YES);
         const pNo  = avg(norm["BTTS"].imps.NO);
-        if (bestYes) pushCand({
-          market:"BTTS", market_label:"BTTS", selection:"YES", odds:bestYes, p:pYes ?? 0,
-          implied:pYes ?? impliedFromDecimal(bestYes), bookies:bks,
-          explain:{ summary:`Bookies ${bks} · Avg implied ${pYes?Math.round(pYes*100):"-"}%` }
-        });
-        if (bestNo) pushCand({
-          market:"BTTS", market_label:"BTTS", selection:"NO", odds:bestNo, p:pNo ?? 0,
-          implied:pNo ?? impliedFromDecimal(bestNo), bookies:bks,
-          explain:{ summary:`Bookies ${bks} · Avg implied ${pNo?Math.round(pNo*100):"-"}%` }
-        });
+        if (bestYes) pushCand({ market:"BTTS", market_label:"BTTS", selection:"YES", odds:bestYes, p:pYes ?? 0,
+          implied:pYes ?? impliedFromDecimal(bestYes), bookies:bks, explain:{ summary:`BTTS YES · Bookies ${bks}` } });
+        if (bestNo)  pushCand({ market:"BTTS", market_label:"BTTS", selection:"NO",  odds:bestNo,  p:pNo  ?? 0,
+          implied:pNo  ?? impliedFromDecimal(bestNo),  bookies:bks, explain:{ summary:`BTTS NO · Bookies ${bks}` } });
       }
 
-      /* ----- Over/Under (prefer 2.5; label mora biti "OU <line>") ----- */
+      /* ----- OU 2.5 (ili najbliža linija) ----- */
       {
         let pickLine = 2.5;
         if (!norm["OU"].lines.has(2.5)) {
@@ -389,19 +389,17 @@ export default async function handler(req, res){
           if (rec.OVER) pushCand({
             market:`Over ${pickLine}`, market_label:`OU ${pickLine}`, selection:"OVER",
             odds:rec.OVER, p:pOver ?? 0, implied:pOver ?? impliedFromDecimal(rec.OVER),
-            bookies: rec.bookies,
-            explain:{ summary:`OU ${pickLine} · Bookies ${rec.bookies} · Avg implied ${pOver?Math.round(pOver*100):"-"}%` }
+            bookies: rec.bookies, explain:{ summary:`OU ${pickLine} OVER · Bookies ${rec.bookies}` }
           });
           if (rec.UNDER) pushCand({
             market:`Under ${pickLine}`, market_label:`OU ${pickLine}`, selection:"UNDER",
             odds:rec.UNDER, p:pUnder ?? 0, implied:pUnder ?? impliedFromDecimal(rec.UNDER),
-            bookies: rec.bookies,
-            explain:{ summary:`OU ${pickLine} · Bookies ${rec.bookies} · Avg implied ${pUnder?Math.round(pUnder*100):"-"}%` }
+            bookies: rec.bookies, explain:{ summary:`OU ${pickLine} UNDER · Bookies ${rec.bookies}` }
           });
         }
       }
 
-      /* ----- HT-FT (label mora biti "HT-FT") ----- */
+      /* ----- HT-FT ----- */
       {
         const bks = norm["HT-FT"].bookies || 0;
         for (const [code, rec] of norm["HT-FT"].map.entries()) {
