@@ -1,23 +1,19 @@
 // FILE: pages/api/value-bets.js
 /**
  * Value-bets generator (cron/internal only).
- * Radi u 2 režima:
- *  1) predictions+odds (ako /predictions postoji na tvom API planu)
- *  2) FALLBACK: odds-only — koristi prosečnu implied verovatnoću tržišta (avg 1/kvote)
- *     i traži positive EV u odnosu na najbolju kvotu.
+ * 1) Pokuša predictions+odds (ako tvoj plan ima /predictions).
+ * 2) Fallback: odds-only (avg implied across bookmakers vs best price).
  *
- * Rezultat: lista pickova u formatu koji koriste /rebuild i /value-bets-locked.
+ * KLJUČNA ISPRAVKA: pravilno parsiranje /odds:
+ * response[].bookmakers[].bets[].values[]
  */
 
 export const config = { api: { bodyParser: false } };
 
-// ---- Guard: dozvoli samo iz crona / internog poziva ----
+// ---- Guard: samo cron/internal ----
 function isAllowed(req) {
   const h = req.headers || {};
-  return (
-    String(h["x-vercel-cron"] || "") === "1" ||
-    String(h["x-internal"] || "") === "1"
-  );
+  return String(h["x-vercel-cron"] || "") === "1" || String(h["x-internal"] || "") === "1";
 }
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
@@ -25,10 +21,10 @@ const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; }
 
 const CFG = {
-  DAILY_BUDGET: num(process.env.AF_BUDGET_DAILY, 5000),
-  RUN_HARDCAP:  num(process.env.AF_RUN_MAX_CALLS, 220),
-  PASS1_CAP:    num(process.env.AF_PASS1_CAP, 60),
-  VB_MIN_BOOKIES: num(process.env.VB_MIN_BOOKIES, 3),
+  DAILY_BUDGET:  num(process.env.AF_BUDGET_DAILY, 5000),
+  RUN_HARDCAP:   num(process.env.AF_RUN_MAX_CALLS, 220),
+  PASS1_CAP:     num(process.env.AF_PASS1_CAP, 60),
+  VB_MIN_BOOKIES:num(process.env.VB_MIN_BOOKIES, 3),
   MIN_ODDS: 1.30
 };
 
@@ -38,7 +34,7 @@ const EXCLUDE_RE = new RegExp(
   "i"
 );
 
-// Grubi budžet (u procesu)
+// grubi budžet u procesu
 const RUNTIME = (global.__VBGEN__ = global.__VBGEN__ || { day:null, used:0, run:0 });
 
 function todayYMD() {
@@ -60,6 +56,7 @@ function toLocalISO(d){
   return `${dFmt.format(d)} ${tFmt.format(d)}`;
 }
 
+// --- AF fetch ---
 async function afFetch(path) {
   const KEY =
     process.env.NEXT_PUBLIC_API_FOOTBALL_KEY ||
@@ -79,7 +76,7 @@ async function afFetch(path) {
   return Array.isArray(j?.response) ? j.response : [];
 }
 
-// --- Predictions helper (može da ne postoji na planu) ---
+// --- predictions helper (možda nemaš endpoint na planu) ---
 function normPred1x2(predResp) {
   const p = (s)=>{ const n=Number(String(s||"").replace("%","").trim()); return Number.isFinite(n)?n:null; };
   const pr = Array.isArray(predResp) ? predResp[0] : null;
@@ -94,87 +91,92 @@ function normPred1x2(predResp) {
   return arr[0]?.pct>=0 ? arr[0] : null;
 }
 
-// --- Izvuci 1X2 kvote i broj bookija iz odds odgovora ---
+/**
+ * ISPRAVLJENO: parsiranje odds:
+ * responseItem.bookmakers[].bets[].values[] -> (Home/X/Away)
+ */
 function extract1x2FromOdds(oddsResp){
-  let best = { HOME:null, DRAW:null, AWAY:null }; // najbolje (najveća kvota)
-  let books = 0;
+  let best = { HOME:null, DRAW:null, AWAY:null };
+  let booksWithMarket = 0;
 
-  for (const row of oddsResp) {
-    const markets = row?.bets || row?.markets || row?.bookmakers || row?.odds || [];
-    const all = Array.isArray(markets) ? markets : [];
-    const m = all.find(m=>{
-      const label = (m?.name||m?.label||m?.key||"").toLowerCase();
-      return label.includes("1x2") || label.includes("match winner") || label==="winner" || label==="match-winner";
-    });
-    if (!m) continue;
-    const vals = m.values || m.outcomes || m.odd || m.selections || [];
-    if (!Array.isArray(vals) || !vals.length) continue;
+  for (const item of oddsResp) {
+    const bookmakers = Array.isArray(item?.bookmakers) ? item.bookmakers : [];
+    for (const bk of bookmakers) {
+      const bets = Array.isArray(bk?.bets) ? bk.bets : [];
+      const m = bets.find(b => {
+        const label = String(b?.name||"").toLowerCase();
+        return label.includes("1x2") || label.includes("match winner") || label==="winner" || label==="match-winner";
+      });
+      if (!m) continue;
 
-    let gotAny=false;
-    const trySet=(tag, v)=>{
-      const dec = Number(v?.odd||v?.value||v?.price||v?.decimal);
-      if (Number.isFinite(dec) && dec >= CFG.MIN_ODDS) {
-        best[tag] = Math.max(best[tag]||0, dec);
-        gotAny=true;
+      const vals = Array.isArray(m?.values) ? m.values : [];
+      let got = false;
+
+      const setIfBetter = (tag, v) => {
+        const dec = Number(v?.odd || v?.value || v?.price || v?.decimal);
+        if (Number.isFinite(dec) && dec >= CFG.MIN_ODDS) {
+          best[tag] = Math.max(best[tag] || 0, dec);
+          got = true;
+        }
+      };
+
+      for (const v of vals) {
+        const name = String(v?.value||v?.selection||v?.name||"").toLowerCase();
+        if (["1","home","home team"].includes(name)) setIfBetter("HOME", v);
+        else if (["x","draw"].includes(name))        setIfBetter("DRAW", v);
+        else if (["2","away","away team"].includes(name)) setIfBetter("AWAY", v);
       }
-    };
 
-    for (const v of vals) {
-      const name = String(v?.value||v?.selection||v?.name||"").toLowerCase();
-      if (["1","home","home team"].includes(name)) trySet("HOME", v);
-      else if (["x","draw"].includes(name))       trySet("DRAW", v);
-      else if (["2","away","away team"].includes(name)) trySet("AWAY", v);
+      if (got) booksWithMarket++;
     }
-
-    if (gotAny) books++;
   }
 
-  const bookies = books;
-  const bestHome = best.HOME || null;
-  const bestDraw = best.DRAW || null;
-  const bestAway = best.AWAY || null;
-
-  return { bestHome, bestDraw, bestAway, bookies };
+  return {
+    bestHome: best.HOME || null,
+    bestDraw: best.DRAW || null,
+    bestAway: best.AWAY || null,
+    bookies: booksWithMarket
+  };
 }
 
-// --- izračun prosečne implied verovatnoće po ishodu ---
 function averageImpliedFromOdds(oddsResp){
   const arrH=[], arrD=[], arrA=[];
-  for (const row of oddsResp) {
-    const markets = row?.bets || row?.markets || row?.bookmakers || row?.odds || [];
-    const all = Array.isArray(markets) ? markets : [];
-    const m = all.find(m=>{
-      const label = (m?.name||m?.label||m?.key||"").toLowerCase();
-      return label.includes("1x2") || label.includes("match winner") || label==="winner" || label==="match-winner";
-    });
-    if (!m) continue;
-    const vals = m.values || m.outcomes || m.odd || m.selections || [];
-    if (!Array.isArray(vals) || !vals.length) continue;
+  for (const item of oddsResp) {
+    const bookmakers = Array.isArray(item?.bookmakers) ? item.bookmakers : [];
+    for (const bk of bookmakers) {
+      const bets = Array.isArray(bk?.bets) ? bk.bets : [];
+      const m = bets.find(b => {
+        const label = String(b?.name||"").toLowerCase();
+        return label.includes("1x2") || label.includes("match winner") || label==="winner" || label==="match-winner";
+      });
+      if (!m) continue;
+      const vals = Array.isArray(m?.values) ? m.values : [];
 
-    const pushImp=(tag, v)=>{
-      const dec = Number(v?.odd||v?.value||v?.price||v?.decimal);
-      const imp = impliedFromDecimal(dec);
-      if (imp!=null) {
-        if (tag==="HOME") arrH.push(imp);
-        else if (tag==="DRAW") arrD.push(imp);
-        else if (tag==="AWAY") arrA.push(imp);
+      const pushImp = (tag, v) => {
+        const dec = Number(v?.odd || v?.value || v?.price || v?.decimal);
+        const imp = impliedFromDecimal(dec);
+        if (imp != null) {
+          if (tag==="HOME") arrH.push(imp);
+          else if (tag==="DRAW") arrD.push(imp);
+          else if (tag==="AWAY") arrA.push(imp);
+        }
+      };
+
+      for (const v of vals) {
+        const name = String(v?.value||v?.selection||v?.name||"").toLowerCase();
+        if (["1","home","home team"].includes(name)) pushImp("HOME", v);
+        else if (["x","draw"].includes(name))        pushImp("DRAW", v);
+        else if (["2","away","away team"].includes(name)) pushImp("AWAY", v);
       }
-    };
-
-    for (const v of vals) {
-      const name = String(v?.value||v?.selection||v?.name||"").toLowerCase();
-      if (["1","home","home team"].includes(name)) pushImp("HOME", v);
-      else if (["x","draw"].includes(name))       pushImp("DRAW", v);
-      else if (["2","away","away team"].includes(name)) pushImp("AWAY", v);
     }
   }
-  const avg = (a)=> a.length ? a.reduce((s,x)=>s+x,0)/a.length : null;
+  const avg=(a)=> a.length ? a.reduce((s,x)=>s+x,0)/a.length : null;
   return { avgH: avg(arrH), avgD: avg(arrD), avgA: avg(arrA) };
 }
 
 // --- generator ---
 async function generatePicks(){
-  // 1) fixtures danas
+  // fixtures danas (u tvom TZ)
   const ymd = todayYMD();
   const now = Date.now();
   const fixtures = (await afFetch(`/fixtures?date=${ymd}`))
@@ -193,67 +195,55 @@ async function generatePicks(){
     const fid = Number(fx?.fixture?.id);
     if (!fid) continue;
 
-    // 2) odds (obavezno za oba režima)
+    // odds (obavezno)
     let oddsResp = [];
-    try {
-      oddsResp = await afFetch(`/odds?fixture=${fid}`);
-    } catch { continue; }
+    try { oddsResp = await afFetch(`/odds?fixture=${fid}`); } catch { continue; }
 
     const { bestHome, bestDraw, bestAway, bookies } = extract1x2FromOdds(oddsResp);
     if (bookies < CFG.VB_MIN_BOOKIES) continue;
 
-    // 3) probaj predictions
+    // predictions (probaj)
     let usePred = null;
     try {
       const pr = await afFetch(`/predictions?fixture=${fid}`);
-      usePred = normPred1x2(pr); // { pick:"HOME|DRAW|AWAY", pct: number } | null
-    } catch { /* predictions možda nisu dostupne — nastavljamo sa fallback-om */ }
+      usePred = normPred1x2(pr);
+    } catch {}
 
-    // 4) Izbor selekcije i metrika
-    let selection = null;
-    let modelProb = null;
-    let marketOdds = null;
-
+    // izbor selekcije
+    let selection = null, modelProb = null, marketOdds = null;
     if (usePred) {
       selection = usePred.pick;
-      modelProb = usePred.pct / 100;
+      modelProb = usePred.pct/100;
       marketOdds =
         selection==="HOME" ? bestHome :
         selection==="DRAW" ? bestDraw :
         selection==="AWAY" ? bestAway : null;
     } else {
-      // FALLBACK: odds-only — uzmi prosečnu implied verovatnoću tržišta,
-      // i traži outcome gde best kvota daje pozitivan EV u odnosu na taj p.
+      // odds-only fallback: uporedi best price vs avg implied tržišta
       const { avgH, avgD, avgA } = averageImpliedFromOdds(oddsResp);
-      const candid = [];
-      if (bestHome && avgH!=null) candid.push({ k:"HOME", odds:bestHome, p:avgH });
-      if (bestDraw && avgD!=null) candid.push({ k:"DRAW", odds:bestDraw, p:avgD });
-      if (bestAway && avgA!=null) candid.push({ k:"AWAY", odds:bestAway, p:avgA });
-
-      // sortiraj po EV (p*(odds-1) - (1-p))
-      candid.forEach(c => c.ev = c.p * (c.odds-1) - (1-c.p));
-      candid.sort((a,b)=> b.ev - a.ev);
-
-      const top = candid[0];
-      if (!top || top.ev <= 0) continue; // ne guramo negativan EV u fallback-u
-
-      selection  = top.k;
-      modelProb  = top.p;     // u fallbacku "model" := market average implied
-      marketOdds = top.odds;
+      const candidates = [];
+      if (bestHome && avgH!=null) candidates.push({ k:"HOME", odds:bestHome, p:avgH });
+      if (bestDraw && avgD!=null) candidates.push({ k:"DRAW", odds:bestDraw, p:avgD });
+      if (bestAway && avgA!=null) candidates.push({ k:"AWAY", odds:bestAway, p:avgA });
+      candidates.forEach(c => c.ev = c.p * (c.odds-1) - (1-c.p));
+      candidates.sort((a,b)=> b.ev - a.ev);
+      const top = candidates[0];
+      if (!top || top.ev <= 0) continue;
+      selection = top.k; modelProb = top.p; marketOdds = top.odds;
     }
 
     if (!selection || !marketOdds || marketOdds<CFG.MIN_ODDS) continue;
 
     const implied = impliedFromDecimal(marketOdds);
-    if (implied==null) continue;
+    if (implied == null) continue;
 
     const edgePP = Math.round((modelProb - implied) * 1000) / 10;
-    if (edgePP < 0) continue; // bez negativnog EV
+    if (edgePP < 0) continue;
 
     const kickoff = fx?.fixture?.date ? new Date(fx.fixture.date) : null;
     if (!kickoff) continue;
 
-    const pick = {
+    out.push({
       type: "MODEL+ODDS",
       _score: edgePP,
       fixture_id: fid,
@@ -282,12 +272,9 @@ async function generatePicks(){
       explain: {
         summary: `Model ${Math.round(modelProb*100)}% vs ${Math.round(implied*100)}% · Bookies ${bookies}`
       },
-    };
-
-    out.push(pick);
+    });
   }
 
-  // sort po edge pa kickoff
   out.sort((a,b)=>{
     if ((b._score||0)!==(a._score||0)) return (b._score||0)-(a._score||0);
     const ta=new Date(a?.datetime_local?.starting_at?.date_time?.replace(" ","T")||0).getTime();
