@@ -5,95 +5,88 @@ async function kvGet(key) {
   const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
   if (!url || !token) return null;
   const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${token}` }
+    headers: { Authorization: `Bearer ${token}` },
   });
   if (!r.ok) return null;
   const { result } = await r.json();
   try { return result ? JSON.parse(result) : null; } catch { return null; }
 }
 
-function evalPick(p, sc) {
+function decideStatus(p, sc) {
   if (!sc || sc.ftH == null || sc.ftA == null) return null;
   const ftH = Number(sc.ftH), ftA = Number(sc.ftA);
-  const total = ftH + ftA;
-  const market = String(p.market || "").toLowerCase();
-  const selection = String(p.selection || "").toLowerCase();
+  const market = (p.market || "").toLowerCase();
+  const sel = String(p.selection || "").toUpperCase();
 
   // BTTS
   if (market.includes("btts")) {
-    const yes = selection.includes("yes");
-    const hit = yes ? (ftH>0 && ftA>0) : !(ftH>0 && ftA>0);
-    return hit ? "won" : "lost";
+    const yes = sel.includes("YES");
+    const hit = (ftH > 0 && ftA > 0);
+    return yes ? (hit ? "won" : "lost") : (hit ? "lost" : "won");
   }
-
-  // Over/Under x.y (uzima broj iz market stringa)
+  // Over/Under 2.5 (ili drugi OU)
   if (market.includes("over") || market.includes("under") || market.includes("ou")) {
-    const m = p.market.match(/([0-9]+(?:\.[0-9]+)?)/);
+    const m = String(p.market).match(/([0-9]+(?:\.[0-9]+)?)/);
     const line = m ? Number(m[1]) : 2.5;
-    if (selection.includes("over")) {
-      if (total === line) return null; // push ne prikazujemo
-      return total > line ? "won" : "lost";
-    }
-    if (selection.includes("under")) {
-      if (total === line) return null;
-      return total < line ? "won" : "lost";
-    }
+    const total = ftH + ftA;
+    const over = sel.includes("OVER");
+    if (total === line) return null; // push/void — ne računamo
+    return over ? (total > line ? "won" : "lost") : (total < line ? "won" : "lost");
   }
-
-  // 1X2
-  if (market.includes("1x2") || market.includes("match winner") || market === "1x2") {
-    if (selection === "1" || selection.includes("home")) return ftH > ftA ? "won" : (ftH === ftA ? null : "lost");
-    if (selection === "2" || selection.includes("away")) return ftA > ftH ? "won" : (ftH === ftA ? null : "lost");
-    if (selection === "x" || selection.includes("draw")) return ftH === ftA ? "won" : "lost";
+  // 1X2 / Match Winner
+  if (market.includes("1x2") || market === "1x2" || market.includes("match winner")) {
+    const ft = ftH > ftA ? "1" : (ftH < ftA ? "2" : "X");
+    const want = sel.includes("HOME") ? "1" : sel.includes("AWAY") ? "2" : sel.includes("DRAW") ? "X" : sel;
+    return ft === want ? "won" : "lost";
   }
-
-  // HT-FT (trazimo npr "X/1", "HT X / FT 1", "Draw/Home")
+  // HT/FT
   if (market.includes("ht-ft") || market.includes("ht/ft")) {
-    const ht = (sc.htH!=null && sc.htA!=null) ? (sc.htH>sc.htA?"1":(sc.htH<sc.htA?"2":"X")) : null;
-    const ft = ftH>ftA?"1":(ftH<ftA?"2":"X");
-    const norm = selection
-      .replace(/\s+/g,"").replace("ht","").replace("ft","").replace(/draw/gi,"X").replace(/home/gi,"1").replace(/away/gi,"2");
-    const m = norm.match(/([12X])[/\-]([12X])/i) || norm.match(/^([12x])([12x])$/i);
-    if (!ht || !m) return null;
-    const wantHT = m[1].toUpperCase(), wantFT = m[2].toUpperCase();
-    return (ht===wantHT && ft===wantFT) ? "won" : "lost";
+    const htH = sc.htH, htA = sc.htA;
+    if (htH == null || htA == null) return null;
+    const ht = htH > htA ? "1" : (htH < htA ? "2" : "X");
+    const ft = ftH > ftA ? "1" : (ftH < ftA ? "2" : "X");
+    const norm = String(p.selection||"").replace(/\s+/g,"").toUpperCase();
+    const m = norm.match(/([12X])[/\-]?([12X])/);
+    if (!m) return null;
+    return (m[1] === ht && m[2] === ft) ? "won" : "lost";
   }
-
   return null;
 }
 
 export default async function handler(req, res) {
-  if (process.env.FEATURE_HISTORY !== "1") {
-    return res.status(200).json({ history: [] });
-  }
   try {
-    const days = 30;
-    const now = new Date();
-    const rows = [];
+    const day = String(req.query.day || "").trim();
+    if (!day) return res.status(400).json({ ok:false, error: "Missing ?day=YYYY-MM-DD" });
 
-    for (let i = 0; i < days; i++) {
-      const d = new Date(now); d.setDate(d.getDate() - i);
-      const ymd = d.toISOString().slice(0,10);
-      const snapshot = await kvGet(`vb:day:${ymd}:last`);
-      if (!Array.isArray(snapshot)) continue;
+    const snap = await kvGet(`vb:day:${day}:last`);
+    if (!Array.isArray(snap)) return res.status(200).json({ ok:true, day, items: [] });
 
-      for (const p of snapshot) {
-        const sc = await kvGet(`vb:score:${p.fixture_id}`);
-        const status = evalPick(p, sc);
-        if (!status) continue; // prikazujemo samo zavrsene
-        rows.push({
-          fixture_id: p.fixture_id,
-          home: p.home, away: p.away,
-          market: p.market, selection: p.selection,
-          odds: p.odds, ft: sc?.ft || null,
-          status
-        });
-      }
+    const items = [];
+    for (const p of snap) {
+      const fid = p?.fixture_id;
+      const sc = fid ? await kvGet(`vb:score:${fid}`) : null;
+      const status = decideStatus(p, sc);
+      const home = p?.teams?.home || p?.home_team_name || "";
+      const away = p?.teams?.away || p?.away_team_name || "";
+      const market = p?.market || "";
+      const pick = p?.selection || "";
+      const final = sc && sc.ftH != null && sc.ftA != null ? `${sc.ftH}:${sc.ftA}` : "-";
+      const hit = status === "won";
+      const emoji = status == null ? "•" : (hit ? "✅" : "❌");
+      items.push({
+        fixture_id: fid,
+        match: `${home} — ${away}`,
+        market,
+        pick,
+        final,
+        hit,
+        emoji,
+      });
     }
 
-    // najskoriji na vrh; po želji možeš limitirati npr. na 200
-    res.status(200).json({ history: rows });
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).json({ ok:true, day, total: items.length, items });
   } catch (e) {
-    res.status(500).json({ error: String(e && e.message || e) });
+    return res.status(500).json({ ok:false, error: String(e?.message || e) });
   }
 }
