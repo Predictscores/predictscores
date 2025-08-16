@@ -11,7 +11,7 @@ const store = global.__VBETS_LOCK__ || (global.__VBETS_LOCK__ = {
 });
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-const LIMIT = Math.max(1, Number(process.env.VB_LIMIT || 15));
+const LIMIT = Math.max(1, Number(process.env.VB_LIMIT || 25));
 const MAX_PER_LEAGUE = Math.max(1, Number(process.env.VB_MAX_PER_LEAGUE || 2));
 
 /* ---------------- helpers ---------------- */
@@ -80,11 +80,23 @@ async function kvGet(key) {
   try { return result ? JSON.parse(result) : null; } catch { return null; }
 }
 
+/* --------------- internal --------------- */
+async function fetchGenerator(req){
+  const proto = req.headers["x-forwarded-proto"] || "https";
+  const origin = `${proto}://${req.headers.host}`;
+  try {
+    const r = await fetch(`${origin}/api/value-bets`, { headers: { "x-internal": "1" } });
+    if (!r.ok) return [];
+    const j = await r.json().catch(()=> ({}));
+    return Array.isArray(j?.value_bets) ? j.value_bets : [];
+  } catch { return []; }
+}
+
 /* ---- decorate for frontend compatibility ---- */
 function toLegacyShape(p){
-  // kickoff ISO (local string "YYYY-MM-DD HH:MM" -> ISO)
+  // kickoff ISO (lokalno, bez pogrešnog "Z")
   const isoLocal = p?.datetime_local?.starting_at?.date_time || null;
-  const kickoffIso = isoLocal ? new Date(isoLocal.replace(" ","T") + ":00Z").toISOString() : null;
+  const kickoffIso = isoLocal ? `${isoLocal.replace(" ","T")}:00` : null;
 
   // selection label (HOME/DRAW/AWAY -> 1 / X / 2)
   const selectionLabel =
@@ -92,16 +104,19 @@ function toLegacyShape(p){
     p?.selection === "AWAY" ? "2" :
     p?.selection === "DRAW" ? "X" : (p?.selection || "");
 
+  // timovi: prihvati i string i objekat
+  const homeName = p?.teams?.home?.name || p?.teams?.home || p?.home_team_name || "";
+  const awayName = p?.teams?.away?.name || p?.teams?.away || p?.away_team_name || "";
+
   return {
     ...p,
-    // redundant, for UI:
-    homeTeam: p?.teams?.home || p?.home_team_name || "",
-    awayTeam: p?.teams?.away || p?.away_team_name || "",
+    homeTeam: homeName,
+    awayTeam: awayName,
     leagueName: p?.league?.name || p?.league_name || "",
     country: p?.league?.country || "",
-    kickoff: kickoffIso,                           // ISO string front može direktno da prikaže
-    kickoffLabel: isoLocal || "",                  // originalni "YYYY-MM-DD HH:MM" (local)
-    selectionLabel,                                // "1" | "X" | "2"
+    kickoff: kickoffIso,      // lokalni ISO
+    kickoffLabel: isoLocal || "",
+    selectionLabel,           // "1" | "X" | "2"
   };
 }
 
@@ -134,22 +149,30 @@ export default async function handler(req, res) {
       store.rev = kvRev;
     }
 
-    // PRE 10:00 → koristi preview (min 3 a max 6)
+    // PRE 10:00 → preview AKO POSTOJI, inače SIGURAN FALLBACK NA GENERATOR (min 3, max 6)
     if (hour < 10) {
       const prev = await kvGet(`vb:preview:${today}:last`);
-      const future = filterFuture(Array.isArray(prev)?prev:[]);
-      const ranked = rankBase(future);
-      const limited = capPerLeague(ranked, Math.max(3, Math.min(6, LIMIT)));
+      let list = [];
+      let source = "preview";
+      if (Array.isArray(prev) && prev.length) {
+        list = capPerLeague(rankBase(filterFuture(prev)), Math.max(3, Math.min(6, LIMIT)));
+      }
+      if (!list.length) {
+        const raw = await fetchGenerator(req);
+        const future = filterFuture(raw);
+        list = capPerLeague(rankBase(future), Math.max(3, Math.min(6, LIMIT)));
+        source = "fallback";
+      }
       setCDN(res);
       return res.status(200).json({
-        value_bets: limited.map(toLegacyShape),
+        value_bets: list.map(toLegacyShape),
         built_at: nowISO(),
         day: today,
-        source: "preview"
+        source
       });
     }
 
-    // POSLE 10:00 → snapshot / cache
+    // POSLE 10:00 → snapshot / cache ako postoji
     if (Array.isArray(store.pinned) && store.pinned.length) {
       setCDN(res);
       return res.status(200).json({
@@ -161,20 +184,8 @@ export default async function handler(req, res) {
       });
     }
 
-    // FALLBACK (nema snapshot-a)
-    // Napomena: value-bets generator već postoji i puni teams/home/away i league/name.
-    // Ovdje samo vraćamo minimum 3, max 6 i mapiramo u legacy shape.
-    const proto = req.headers["x-forwarded-proto"] || "https";
-    const origin = `${proto}://${req.headers.host}`;
-    let raw = [];
-    try {
-      const r = await fetch(`${origin}/api/value-bets`, { headers: { "x-internal": "1" } });
-      if (r.ok) {
-        const j = await r.json().catch(()=> ({}));
-        raw = Array.isArray(j?.value_bets) ? j.value_bets : [];
-      }
-    } catch {}
-
+    // FALLBACK POSLE 10:00 (nema snapshot-a)
+    const raw = await fetchGenerator(req);
     const future = filterFuture(raw);
     const ranked = rankBase(future);
     const picked = capPerLeague(ranked, Math.max(3, Math.min(6, LIMIT)));
