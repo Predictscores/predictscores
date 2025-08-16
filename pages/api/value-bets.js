@@ -1,29 +1,35 @@
 // FILE: pages/api/value-bets.js
 export const config = { api: { bodyParser: false } };
 
+/* ---------- access guard ---------- */
 function isAllowed(req) {
   const h = req.headers || {};
   return String(h["x-vercel-cron"] || "") === "1" || String(h["x-internal"] || "") === "1";
 }
 
+/* ---------- env & limits ---------- */
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; }
 
 const LIMITS = {
   DAILY_BUDGET:  num(process.env.AF_BUDGET_DAILY, 1000),
   RUN_HARDCAP:   num(process.env.AF_RUN_MAX_CALLS, 120),
-  PASS1_CAP:     num(process.env.AF_PASS1_CAP, 25),
+  PASS1_CAP:     num(process.env.AF_PASS1_CAP, 40),   // možeš spustiti/dignuti
   MAX_FIX_SCAN:  num(process.env.VB_MAX_FIX_SCAN, 150),
-  MIN_ODDS: 1.30
+  MIN_ODDS:      1.30,
+  MIN_BOOKIES:   num(process.env.VB_MIN_BOOKIES, 3),
 };
+
 const SAFE_EDGE_MIN_PP = -0.5;
 
+/* ---------- league exclude ---------- */
 const EXCLUDE_RE = new RegExp(
   process.env.VB_EXCLUDE_REGEX ||
   "(friendlies|friendly|club\\s*friendlies|\\bu\\s?23\\b|\\bu\\s?21\\b|\\bu\\s?20\\b|\\bu\\s?19\\b|reserves?|\\bii\\b|b\\s*team|youth|academy|trial|test|indoor|futsal|beach)",
   "i"
 );
 
+/* ---------- runtime budget ---------- */
 const RUNTIME = (global.__VBGEN__ = global.__VBGEN__ || { day:null, used:0, run:0 });
 
 function todayYMD() {
@@ -38,6 +44,7 @@ function resetIfNewDay() {
 function chargeDaily(q=1){ resetIfNewDay(); if (RUNTIME.used+q>LIMITS.DAILY_BUDGET) return false; RUNTIME.used+=q; return true; }
 function chargeRun(q=1){ if (RUNTIME.run+q>LIMITS.RUN_HARDCAP) return false; RUNTIME.run+=q; return true; }
 
+/* ---------- utils ---------- */
 function impliedFromDecimal(o){ const x=Number(o); return Number.isFinite(x)&&x>1.01?1/x:null; }
 function toLocalISO(d){
   const dFmt=new Intl.DateTimeFormat("sv-SE",{timeZone:TZ,year:"numeric",month:"2-digit",day:"2-digit"});
@@ -45,6 +52,7 @@ function toLocalISO(d){
   return `${dFmt.format(d)} ${tFmt.format(d)}`;
 }
 
+/* ---------- AF fetch ---------- */
 async function afFetch(path){
   const KEY =
     process.env.NEXT_PUBLIC_API_FOOTBALL_KEY ||
@@ -65,87 +73,7 @@ async function afFetch(path){
   return Array.isArray(j?.response) ? j.response : [];
 }
 
-function extract1x2FromOdds(oddsResp){
-  let best = { HOME:null, DRAW:null, AWAY:null };
-  let booksWithMarket = 0;
-
-  for (const item of oddsResp) {
-    const bookmakers = Array.isArray(item?.bookmakers) ? item.bookmakers : [];
-    for (const bk of bookmakers) {
-      const bets = Array.isArray(bk?.bets) ? bk.bets : [];        // <- naš format
-      const markets = Array.isArray(bk?.markets) ? bk.markets : []; // The Odds API original
-      const use = bets.length ? bets : (markets.length ? markets : []);
-      const m = use.find((b) => {
-        const label = String(b?.name || b?.key || "").toLowerCase();
-        return label.includes("1x2") || label.includes("match winner") || label === "h2h" || label==="winner" || label==="match-winner";
-      });
-      if (!m) continue;
-
-      const vals = m.values || m.outcomes || [];
-      if (!Array.isArray(vals) || !vals.length) continue;
-
-      let got = false;
-      const setIfBetter = (tag, v) => {
-        const dec = Number(v?.odd || v?.value || v?.price || v?.decimal);
-        if (Number.isFinite(dec) && dec >= LIMITS.MIN_ODDS) {
-          best[tag] = Math.max(best[tag] || 0, dec);
-          got = true;
-        }
-      };
-
-      for (const v of vals) {
-        const name = String(v?.value||v?.selection||v?.name||"").toLowerCase();
-        if (["1","home","home team"].includes(name)) setIfBetter("HOME", v);
-        else if (["x","draw"].includes(name))        setIfBetter("DRAW", v);
-        else if (["2","away","away team"].includes(name)) setIfBetter("AWAY", v);
-      }
-      if (got) booksWithMarket++;
-    }
-  }
-  return {
-    bestHome: best.HOME || null,
-    bestDraw: best.DRAW || null,
-    bestAway: best.AWAY || null,
-    bookies: booksWithMarket
-  };
-}
-
-function averageImpliedFromOdds(oddsResp){
-  const arrH=[], arrD=[], arrA=[];
-  for (const item of oddsResp) {
-    const bookmakers = Array.isArray(item?.bookmakers) ? item.bookmakers : [];
-    for (const bk of bookmakers) {
-      const bets = Array.isArray(bk?.bets) ? bk.bets : [];
-      const markets = Array.isArray(bk?.markets) ? bk.markets : [];
-      const use = bets.length ? bets : (markets.length ? markets : []);
-      const m = use.find((b) => {
-        const label = String(b?.name || b?.key || "").toLowerCase();
-        return label.includes("1x2") || label.includes("match winner") || label === "h2h" || label==="winner" || label==="match-winner";
-      });
-      if (!m) continue;
-      const vals = m.values || m.outcomes || [];
-      const pushImp = (tag, v) => {
-        const dec = Number(v?.odd || v?.value || v?.price || v?.decimal);
-        const imp = impliedFromDecimal(dec);
-        if (imp != null) {
-          if (tag==="HOME") arrH.push(imp);
-          else if (tag==="DRAW") arrD.push(imp);
-          else if (tag==="AWAY") arrA.push(imp);
-        }
-      };
-      for (const v of vals) {
-        const name = String(v?.value||v?.selection||v?.name||"").toLowerCase();
-        if (["1","home","home team"].includes(name)) pushImp("HOME", v);
-        else if (["x","draw"].includes(name))        pushImp("DRAW", v);
-        else if (["2","away","away team"].includes(name)) pushImp("AWAY", v);
-      }
-    }
-  }
-  const avg=(a)=> a.length ? a.reduce((s,x)=>s+x,0)/a.length : null;
-  return { avgH: avg(arrH), avgD: avg(arrD), avgA: avg(arrA) };
-}
-
-// NEW: fallback koji šalje home/away/ts ka našem odds-sports endpointu
+/* ---------- fallback (The Odds API via our bridge) -> 1X2 only ---------- */
 async function oddsFallbackInternal(req, { home, away, tsISO }){
   try{
     const proto = req.headers["x-forwarded-proto"] || "https";
@@ -163,6 +91,7 @@ async function oddsFallbackInternal(req, { home, away, tsISO }){
   }catch(_){ return null; }
 }
 
+/* ---------- predictions (1X2) ---------- */
 function normPred1x2(predResp) {
   const p = (s)=>{ const n=Number(String(s||"").replace("%","").trim()); return Number.isFinite(n)?n:null; };
   const pr = Array.isArray(predResp) ? predResp[0] : null;
@@ -177,6 +106,171 @@ function normPred1x2(predResp) {
   return arr[0]?.pct>=0 ? arr[0] : null;
 }
 
+/* ---------- odds parsing (AF + fallback) ---------- */
+/* normalizujemo 4 tržišta: 1X2, BTTS, OU (linija ~2.5), HT-FT */
+function normalizeOdds(oddsResp){
+  // struktura „najbolje kvote“ + broja bukija
+  const acc = {
+    "1X2":   { HOME:null, DRAW:null, AWAY:null, bookies:0, imps:{H:[],D:[],A:[]} },
+    "BTTS":  { YES:null, NO:null, bookies:0, imps:{YES:[],NO:[]} },
+    "OU":    { lines: new Map() }, // line -> { OVER:null, UNDER:null, bookies:0, imps:{OVER:[],UNDER:[]} }
+    "HT-FT": { map: new Map(), bookies:0 }, // code ("1/1","1/X",...) -> { odd }
+  };
+
+  const asDec = (v)=> Number(v?.odd || v?.value || v?.price || v?.decimal);
+  const pushImp = (arr, dec)=> { const imp = impliedFromDecimal(dec); if (imp!=null) arr.push(imp); };
+
+  for (const item of oddsResp) {
+    const bookmakers = Array.isArray(item?.bookmakers) ? item.bookmakers : [];
+    for (const bk of bookmakers) {
+      const bets = Array.isArray(bk?.bets) ? bk.bets : [];        // AF struktura
+      const markets = Array.isArray(bk?.markets) ? bk.markets : []; // The Odds API struktura
+      const use = bets.length ? bets : (markets.length ? markets : []);
+
+      // --- 1X2 / Match Winner / H2H
+      {
+        const m = use.find((b) => {
+          const label = String(b?.name || b?.key || "").toLowerCase();
+          return label.includes("1x2") || label.includes("match winner") || label==="h2h" || label==="winner" || label==="match-winner";
+        });
+        if (m) {
+          const vals = m.values || m.outcomes || [];
+          let got = false;
+          for (const v of vals) {
+            const name = String(v?.value||v?.selection||v?.name||"").toLowerCase();
+            const dec = asDec(v);
+            if (!Number.isFinite(dec) || dec < LIMITS.MIN_ODDS) continue;
+            if (["1","home","home team"].includes(name)) {
+              acc["1X2"].HOME = Math.max(acc["1X2"].HOME || 0, dec);
+              pushImp(acc["1X2"].imps.H, dec);
+              got = true;
+            } else if (["x","draw"].includes(name)) {
+              acc["1X2"].DRAW = Math.max(acc["1X2"].DRAW || 0, dec);
+              pushImp(acc["1X2"].imps.D, dec);
+              got = true;
+            } else if (["2","away","away team"].includes(name)) {
+              acc["1X2"].AWAY = Math.max(acc["1X2"].AWAY || 0, dec);
+              pushImp(acc["1X2"].imps.A, dec);
+              got = true;
+            }
+          }
+          if (got) acc["1X2"].bookies += 1;
+        }
+      }
+
+      // --- BTTS
+      {
+        const m = use.find((b) => {
+          const label = String(b?.name || b?.key || "").toLowerCase();
+          return label.includes("both teams to score") || label.includes("btts");
+        });
+        if (m) {
+          const vals = m.values || m.outcomes || [];
+          let got = false;
+          for (const v of vals) {
+            const name = String(v?.value||v?.selection||v?.name||"").toLowerCase();
+            const dec = asDec(v);
+            if (!Number.isFinite(dec) || dec < LIMITS.MIN_ODDS) continue;
+            if (name.includes("yes")) {
+              acc["BTTS"].YES = Math.max(acc["BTTS"].YES || 0, dec);
+              pushImp(acc["BTTS"].imps.YES, dec);
+              got = true;
+            } else if (name.includes("no")) {
+              acc["BTTS"].NO = Math.max(acc["BTTS"].NO || 0, dec);
+              pushImp(acc["BTTS"].imps.NO, dec);
+              got = true;
+            }
+          }
+          if (got) acc["BTTS"].bookies += 1;
+        }
+      }
+
+      // --- Over/Under (prefer 2.5)
+      {
+        const m = use.find((b) => {
+          const label = String(b?.name || b?.key || "").toLowerCase();
+          return label.includes("over/under") || label.includes("goals over/under");
+        });
+        if (m) {
+          const vals = m.values || m.outcomes || [];
+          // u AF outcome labeli sadrže "Over 2.5" / "Under 2.5" itd.
+          // grupišemo po liniji
+          const byLine = new Map(); // line -> { OVER:null, UNDER:null, bookies:0, imps:{OVER:[],UNDER:[]} }
+          for (const v of vals) {
+            const lab = String(v?.value||v?.selection||v?.name||"");
+            const dec = asDec(v);
+            if (!Number.isFinite(dec) || dec < LIMITS.MIN_ODDS) continue;
+            const isOver = /over/i.test(lab);
+            const isUnder = /under/i.test(lab);
+            const mLine = lab.match(/([0-9]+(?:\.[0-9]+)?)/);
+            const line = mLine ? Number(mLine[1]) : 2.5;
+            if (!byLine.has(line)) byLine.set(line, { OVER:null, UNDER:null, bookies:0, imps:{OVER:[],UNDER:[]} });
+            const rec = byLine.get(line);
+            if (isOver) {
+              rec.OVER = Math.max(rec.OVER || 0, dec);
+              pushImp(rec.imps.OVER, dec);
+              rec.bookies += 1;
+            } else if (isUnder) {
+              rec.UNDER = Math.max(rec.UNDER || 0, dec);
+              pushImp(rec.imps.UNDER, dec);
+              rec.bookies += 1;
+            }
+          }
+          // upiši u akumulator
+          for (const [line, rec] of byLine.entries()) {
+            const cur = acc["OU"].lines.get(line) || { OVER:null, UNDER:null, bookies:0, imps:{OVER:[],UNDER:[]} };
+            cur.OVER = Math.max(cur.OVER || 0, rec.OVER || 0);
+            cur.UNDER = Math.max(cur.UNDER || 0, rec.UNDER || 0);
+            cur.bookies = Math.max(cur.bookies || 0, rec.bookies || 0);
+            cur.imps.OVER.push(...rec.imps.OVER);
+            cur.imps.UNDER.push(...rec.imps.UNDER);
+            acc["OU"].lines.set(line, cur);
+          }
+        }
+      }
+
+      // --- HT/FT
+      {
+        const m = use.find((b) => {
+          const label = String(b?.name || b?.key || "").toLowerCase();
+          return label.includes("ht/ft") || label.includes("half time / full time");
+        });
+        if (m) {
+          const vals = m.values || m.outcomes || [];
+          let got = false;
+          for (const v of vals) {
+            const lab = String(v?.value||v?.selection||v?.name||"").toLowerCase(); // e.g. "home/home"
+            const dec = asDec(v);
+            if (!Number.isFinite(dec) || dec < LIMITS.MIN_ODDS) continue;
+            const map1 = lab.includes("home") ? "1" : lab.includes("draw") ? "X" : lab.includes("away") ? "2" : null;
+            let code = null;
+            if (map1) {
+              const parts = lab.split(/[\/\-]/);
+              const a = parts[0].includes("home") ? "1" : parts[0].includes("draw") ? "X" : parts[0].includes("away") ? "2" : null;
+              const b = parts[1]?.includes("home") ? "1" : parts[1]?.includes("draw") ? "X" : parts[1]?.includes("away") ? "2" : null;
+              if (a && b) code = `${a}/${b}`;
+            }
+            if (code) {
+              const cur = acc["HT-FT"].map.get(code) || { odd:0, imps:[] };
+              if (dec > cur.odd) cur.odd = dec;
+              pushImp(cur.imps, dec);
+              acc["HT-FT"].map.set(code, cur);
+              got = true;
+            }
+          }
+          if (got) acc["HT-FT"].bookies += 1;
+        }
+      }
+    }
+  }
+
+  return acc;
+}
+
+/* ---------- average helper ---------- */
+const avg = (a)=> a && a.length ? a.reduce((s,x)=>s+x,0)/a.length : null;
+
+/* ---------- handler ---------- */
 export default async function handler(req, res){
   if (!isAllowed(req)) {
     res.setHeader("Cache-Control","no-store");
@@ -188,7 +282,7 @@ export default async function handler(req, res){
     const ymd = todayYMD();
     const now = Date.now();
 
-    // 1) fixtures danas (AF)
+    /* 1) fixtures danas (AF) */
     let fixtures = await afFetch(`/fixtures?date=${ymd}`);
     fixtures = fixtures.filter(f=>{
       const name = `${f?.league?.name||""} ${f?.league?.country||""}`.trim();
@@ -197,11 +291,11 @@ export default async function handler(req, res){
       return Number.isFinite(t) && t > now;
     });
 
-    const out = [];
+    const candAll = [];
     let scanned = 0;
 
     for (const fx of fixtures) {
-      if (out.length >= LIMITS.PASS1_CAP) break;
+      if (candAll.length >= LIMITS.PASS1_CAP) break; // soft cap
       if (scanned >= LIMITS.MAX_FIX_SCAN) break;
       scanned++;
 
@@ -212,13 +306,14 @@ export default async function handler(req, res){
       if (!kickoff) continue;
       const tsISO = kickoff.toISOString();
 
-      // 2) KVOTE: AF /odds, pa fallback /api/odds-sports
+      /* 2) KVOTE: AF /odds, pa fallback (samo 1X2) */
       let oddsResp = [];
       try {
         oddsResp = await afFetch(`/odds?fixture=${fid}`);
       } catch { oddsResp = []; }
 
       if (!Array.isArray(oddsResp) || !oddsResp.length) {
+        // fallback samo za 1X2
         const fb = await oddsFallbackInternal(req, {
           home: fx?.teams?.home?.name || "",
           away: fx?.teams?.away?.name || "",
@@ -228,87 +323,159 @@ export default async function handler(req, res){
       }
       if (!Array.isArray(oddsResp) || !oddsResp.length) continue;
 
-      const { bestHome, bestDraw, bestAway, bookies } = extract1x2FromOdds(oddsResp);
-      if (!bookies || (!bestHome && !bestDraw && !bestAway)) continue;
+      const norm = normalizeOdds(oddsResp);
 
-      // 3) PREDICTIONS (opciono)
+      /* 3) PREDICTIONS (1X2) – opciono */
       let pred = null;
       try {
         const pr = await afFetch(`/predictions?fixture=${fid}`);
         pred = normPred1x2(pr); // {key,pct} | null
       } catch {}
 
-      // 4) Market average implied kao fallback (uvek)
-      const { avgH, avgD, avgA } = averageImpliedFromOdds(oddsResp);
+      /* 4) Kandidati po tržištima */
 
-      const cand = [];
-      const push = (k, odds, p) => {
+      const pushCand = ({ market, market_label, selection, odds, p, implied, bookies, scoreBias=0, explain })=>{
         if (!odds || odds < LIMITS.MIN_ODDS) return;
         if (!(p >= 0 && p <= 1)) return;
-        const implied = impliedFromDecimal(odds);
-        if (implied == null) return;
         const ev = p*(odds-1) - (1-p);
-        const edgePP = Math.round((p - implied) * 1000) / 10;
-        cand.push({ k, odds, p, implied, ev, edgePP });
+        const edgePP = Math.round((p - (implied ?? impliedFromDecimal(odds) ?? 0)) * 1000) / 10;
+        if (bookies < LIMITS.MIN_BOOKIES) return;
+        candAll.push({
+          type: "MODEL+ODDS",
+          _score: edgePP + scoreBias, // mali bias za predikciju/liniju
+          fixture_id: fid,
+          league: {
+            id: fx?.league?.id,
+            name: fx?.league?.name,
+            country: fx?.league?.country,
+          },
+          teams: {
+            home: fx?.teams?.home?.name,
+            away: fx?.teams?.away?.name,
+          },
+          home_id: fx?.teams?.home?.id,
+          away_id: fx?.teams?.away?.id,
+          datetime_local: { starting_at: { date_time: toLocalISO(kickoff) } },
+          market,
+          market_label,
+          selection,
+          confidence_pct: Math.min(99, Math.max(1, Math.round(p*100))),
+          model_prob: p,
+          market_odds: odds,
+          implied_prob: implied ?? impliedFromDecimal(odds),
+          edge_pp: edgePP,
+          bookmakers_count: bookies,
+          movement_pct: 0,
+          explain
+        });
       };
 
-      if (pred) {
-        if (pred.key === "HOME" && bestHome) push("HOME", bestHome, pred.pct/100);
-        if (pred.key === "DRAW" && bestDraw) push("DRAW", bestDraw, pred.pct/100);
-        if (pred.key === "AWAY" && bestAway) push("AWAY", bestAway, pred.pct/100);
+      // --- 1X2
+      {
+        const bestH = norm["1X2"].HOME, bestD = norm["1X2"].DRAW, bestA = norm["1X2"].AWAY;
+        const bks   = norm["1X2"].bookies;
+        const pH = pred?.key==="HOME" ? (pred.pct/100) : (avg(norm["1X2"].imps.H) ?? null);
+        const pD = pred?.key==="DRAW" ? (pred.pct/100) : (avg(norm["1X2"].imps.D) ?? null);
+        const pA = pred?.key==="AWAY" ? (pred.pct/100) : (avg(norm["1X2"].imps.A) ?? null);
+
+        if (bestH) pushCand({
+          market:"1X2", market_label:"1X2", selection:"HOME", odds:bestH, p:pH ?? avg(norm["1X2"].imps.H) ?? 0,
+          implied: avg(norm["1X2"].imps.H) ?? impliedFromDecimal(bestH),
+          bookies:bks,
+          scoreBias: pred?.key==="HOME"?0.2:0,
+          explain:{ summary: `Model ${pH?Math.round(pH*100):Math.round((avg(norm["1X2"].imps.H)||0)*100)}% · Bookies ${bks}` }
+        });
+        if (bestD) pushCand({
+          market:"1X2", market_label:"1X2", selection:"DRAW", odds:bestD, p:pD ?? avg(norm["1X2"].imps.D) ?? 0,
+          implied: avg(norm["1X2"].imps.D) ?? impliedFromDecimal(bestD),
+          bookies:bks,
+          scoreBias: pred?.key==="DRAW"?0.2:0,
+          explain:{ summary: `Model ${pD?Math.round(pD*100):Math.round((avg(norm["1X2"].imps.D)||0)*100)}% · Bookies ${bks}` }
+        });
+        if (bestA) pushCand({
+          market:"1X2", market_label:"1X2", selection:"AWAY", odds:bestA, p:pA ?? avg(norm["1X2"].imps.A) ?? 0,
+          implied: avg(norm["1X2"].imps.A) ?? impliedFromDecimal(bestA),
+          bookies:bks,
+          scoreBias: pred?.key==="AWAY"?0.2:0,
+          explain:{ summary: `Model ${pA?Math.round(pA*100):Math.round((avg(norm["1X2"].imps.A)||0)*100)}% · Bookies ${bks}` }
+        });
       }
-      if (bestHome && avgH!=null) push("HOME", bestHome, avgH);
-      if (bestDraw && avgD!=null) push("DRAW", bestDraw, avgD);
-      if (bestAway && avgA!=null) push("AWAY", bestAway, avgA);
 
-      if (!cand.length) continue;
+      // --- BTTS
+      {
+        const bestYes = norm["BTTS"].YES, bestNo = norm["BTTS"].NO, bks = norm["BTTS"].bookies;
+        const pYes = avg(norm["BTTS"].imps.YES); // koristimo tržišni prosek
+        const pNo  = avg(norm["BTTS"].imps.NO);
+        if (bestYes) pushCand({
+          market:"BTTS", market_label:"BTTS", selection:"YES", odds:bestYes, p:pYes ?? 0,
+          implied: pYes ?? impliedFromDecimal(bestYes), bookies:bks,
+          explain:{ summary:`Bookies ${bks} · Avg implied ${pYes?Math.round(pYes*100):"-"}%` }
+        });
+        if (bestNo) pushCand({
+          market:"BTTS", market_label:"BTTS", selection:"NO", odds:bestNo, p:pNo ?? 0,
+          implied: pNo ?? impliedFromDecimal(bestNo), bookies:bks,
+          explain:{ summary:`Bookies ${bks} · Avg implied ${pNo?Math.round(pNo*100):"-"}%` }
+        });
+      }
 
-      cand.sort((a,b)=> (b.edgePP - a.edgePP) || (b.ev - a.ev));
-      const best = cand.find(c => c.edgePP >= 0) || cand[0];
-      if (!best) continue;
-      if (best.edgePP < SAFE_EDGE_MIN_PP) continue;
+      // --- Over/Under (prefer 2.5 ako postoji, inače linija sa najviše bukija)
+      {
+        let pickLine = 2.5;
+        if (!norm["OU"].lines.has(2.5)) {
+          // nađi liniju sa najviše bukija
+          let bestL = null, bestCnt = -1;
+          for (const [line, rec] of norm["OU"].lines.entries()) {
+            if ((rec.bookies||0) > bestCnt) { bestCnt = rec.bookies||0; bestL = line; }
+          }
+          if (bestL != null) pickLine = bestL;
+        }
+        const rec = norm["OU"].lines.get(pickLine);
+        if (rec) {
+          const pOver = avg(rec.imps.OVER);
+          const pUnder= avg(rec.imps.UNDER);
+          if (rec.OVER) pushCand({
+            market:`Over ${pickLine}`, market_label:`Over/Under ${pickLine}`, selection:"OVER",
+            odds:rec.OVER, p:pOver ?? 0, implied:pOver ?? impliedFromDecimal(rec.OVER),
+            bookies: rec.bookies,
+            explain:{ summary:`OU ${pickLine} · Bookies ${rec.bookies} · Avg implied ${pOver?Math.round(pOver*100):"-"}%` }
+          });
+          if (rec.UNDER) pushCand({
+            market:`Under ${pickLine}`, market_label:`Over/Under ${pickLine}`, selection:"UNDER",
+            odds:rec.UNDER, p:pUnder ?? 0, implied:pUnder ?? impliedFromDecimal(rec.UNDER),
+            bookies: rec.bookies,
+            explain:{ summary:`OU ${pickLine} · Bookies ${rec.bookies} · Avg implied ${pUnder?Math.round(pUnder*100):"-"}%` }
+          });
+        }
+      }
 
-      out.push({
-        type: "MODEL+ODDS",
-        _score: best.edgePP,
-        fixture_id: fid,
-        league: {
-          id: fx?.league?.id,
-          name: fx?.league?.name,
-          country: fx?.league?.country,
-        },
-        teams: {
-          home: fx?.teams?.home?.name,
-          away: fx?.teams?.away?.name,
-        },
-        home_id: fx?.teams?.home?.id,
-        away_id: fx?.teams?.away?.id,
-        datetime_local: { starting_at: { date_time: toLocalISO(kickoff) } },
-        market: "1X2",
-        market_label: "1X2",
-        selection: best.k,
-        confidence_pct: Math.min(99, Math.max(1, Math.round(best.p*100))),
-        model_prob: best.p,
-        market_odds: best.odds,
-        implied_prob: best.implied,
-        edge_pp: best.edgePP,
-        bookmakers_count: bookies,
-        movement_pct: 0,
-        explain: {
-          summary: `Model ${Math.round(best.p*100)}% vs ${Math.round(best.implied*100)}% · Bookies ${bookies}`
-        },
-      });
+      // --- HT/FT
+      {
+        const bks = norm["HT-FT"].bookies || 0;
+        for (const [code, rec] of norm["HT-FT"].map.entries()) {
+          const pCode = avg(rec.imps);
+          if (rec.odd) pushCand({
+            market:"HT-FT", market_label:"HT/FT", selection:code,
+            odds:rec.odd, p:pCode ?? 0, implied:pCode ?? impliedFromDecimal(rec.odd),
+            bookies:bks, explain:{ summary:`HT/FT ${code} · Bookies ${bks}` }
+          });
+        }
+      }
     }
 
-    out.sort((a,b)=>{
+    // sortiraj po edge, pa kickoff (rani)
+    candAll.sort((a,b)=> {
       if ((b._score||0)!==(a._score||0)) return (b._score||0)-(a._score||0);
       const ta=new Date(a?.datetime_local?.starting_at?.date_time?.replace(" ","T")||0).getTime();
       const tb=new Date(b?.datetime_local?.starting_at?.date_time?.replace(" ","T")||0).getTime();
       return ta-tb;
     });
 
+    // zadrži samo kandidate sa ok ivicom (ili top po potrebi), pa PASS1_CAP
+    const filtered = candAll.filter(c => (c.edge_pp ?? -999) >= SAFE_EDGE_MIN_PP && (c.bookmakers_count||0) >= LIMITS.MIN_BOOKIES);
+    const out = (filtered.length ? filtered : candAll).slice(0, LIMITS.PASS1_CAP);
+
     res.setHeader("Cache-Control","no-store");
-    return res.status(200).json({ value_bets: out.slice(0, LIMITS.PASS1_CAP) });
+    return res.status(200).json({ value_bets: out });
   }catch(e){
     res.setHeader("Cache-Control","no-store");
     return res.status(500).json({ error:String(e&&e.message||e) });
