@@ -1,31 +1,23 @@
-// FILE: pages/api/value-bets-locked.js
 export const config = { api: { bodyParser: false } };
 
 const store = global.__VBETS_LOCK__ || (global.__VBETS_LOCK__ = {
-  dayKey: null,
-  builtAt: null,
-  pinned: null,
-  backup: null,
-  raw: null,
-  rev: 0,            // KV rev za live-reload (floats/scout menjaju snapshot)
+  dayKey: null, builtAt: null, pinned: null, backup: null, raw: null, rev: 0
 });
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-const LIMIT = Math.max(1, Number(process.env.VB_LIMIT || 15));
-const MAX_PER_LEAGUE = Math.max(1, Number(process.env.VB_MAX_PER_LEAGUE || 2)); // izuzetak za UEFA
+const LIMIT = Math.max(1, Number(process.env.VB_LIMIT || 25));
+const MAX_PER_LEAGUE = Math.max(1, Number(process.env.VB_MAX_PER_LEAGUE || 2));
 
-/** ---- helpers ---- */
 function beogradDayKey(d = new Date()) {
   const fmt = new Intl.DateTimeFormat("sv-SE", { timeZone: TZ, year:"numeric", month:"2-digit", day:"2-digit" });
   return fmt.format(d);
 }
 function belgradeHM(d=new Date()){
   const fmt = new Intl.DateTimeFormat("sv-SE",{timeZone:TZ,hour:"2-digit",minute:"2-digit",hour12:false});
-  return fmt.format(d); // "HH:MM"
+  return fmt.format(d);
 }
 function nowISO(){ return new Date().toISOString(); }
 function parseISO(x){ try{ return new Date(String(x).replace(" ","T")).getTime(); }catch{ return NaN; } }
-
 function setCDNHeaders(res) {
   const S_MAXAGE = Number(process.env.CDN_SMAXAGE_SEC || 600);
   const SWR      = Number(process.env.CDN_STALE_SEC     || 120);
@@ -55,13 +47,11 @@ function rankBase(arr = []) {
   });
 }
 
-// --- KV helpers (GET/SET + INCR + NX)
+// KV helpers
 async function kvGet(key) {
   const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
   if (!url || !token) return null;
-  const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${token}` }
-  });
+  const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${token}` } });
   if (!r.ok) return null;
   const { result } = await r.json();
   try { return result ? JSON.parse(result) : null; } catch { return null; }
@@ -83,27 +73,36 @@ async function kvIncr(key) {
     headers: { Authorization: `Bearer ${token}`, "Content-Type":"application/json" },
     body: JSON.stringify(["INCR", key])
   }).catch(()=>null);
-  if (!r) return 0;
-  const j = await r.json().catch(()=>({}));
+  const j = await r?.json().catch(()=>({}));
   return Number(j?.result||0);
 }
+async function kvSetNX(key, value, pxMs) {
+  const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
+  if (!url || !token) return true;
+  const r = await fetch(`${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}?nx=true&px=${pxMs}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  }).catch(()=>null);
+  const j = await r?.json().catch(()=>({}));
+  return j?.result === "OK";
+}
+function getOrigin(req){
+  const proto = req?.headers?.["x-forwarded-proto"] || "https";
+  const host  = req?.headers?.host;
+  return `${proto}://${host}`;
+}
 
-// --- soft-mode calibration helpers (iz tvoje verzije)
+// soft-mode calibration helpers
 function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
 function adjConfidence(p, calib) {
   const base = Number.isFinite(p.confidence_pct) ? Number(p.confidence_pct) : null;
   if (base == null) return null;
-
   const mKey = (p.market_label || p.market || "").toLowerCase();
-  const lKey = `${mKey}||${String(p.league?.name||"").toLowerCase()}`;
+  const leagueName = String(p.league?.name||"").toLowerCase();
   let delta = 0;
-
   const marketDelta = Number(calib?.market?.[mKey]?.delta_pp ?? 0);
-  const leagueDelta = Number(calib?.league?.[mKey]?.[String(p.league?.name||"").toLowerCase()]?.delta_vs_market_pp ?? 0);
-
+  const leagueDelta = Number(calib?.league?.[mKey]?.[leagueName]?.delta_vs_market_pp ?? 0);
   delta += clamp(marketDelta, -5, 5);
   delta += clamp(leagueDelta, -8, 8);
-
   return clamp(Math.round(base + delta), 1, 99);
 }
 function buildWhy(p, appliedDelta) {
@@ -112,7 +111,6 @@ function buildWhy(p, appliedDelta) {
   const imp = Number.isFinite(p.implied_prob) ? Math.round(p.implied_prob*100) : (Number.isFinite(p.market_odds) ? Math.round((1/p.market_odds)*100) : null);
   const bks = Number.isFinite(p.bookmakers_count) ? p.bookmakers_count : null;
   const drift = Number.isFinite(p.movement_pct) ? `${Math.round(p.movement_pct)}%` : "0%";
-
   const bits = [];
   if (edge!=null) bits.push(`EV +${edge}`);
   if (mp!=null && imp!=null) bits.push(`Model ${mp}% vs ${imp}%`);
@@ -140,30 +138,27 @@ export default async function handler(req, res) {
     const hm = belgradeHM();
     const hour = Number(hm.split(":")[0] || 0);
 
-    // novi dan -> reset
     if (store.dayKey && store.dayKey !== today) {
       store.dayKey = null; store.builtAt = null;
       store.pinned = null; store.backup = null; store.raw = null; store.rev = 0;
     }
 
-    // LIVE-RELOAD: ako postoji veći KV rev, učitaj ponovo snapshot iz KV
+    // LIVE reload po KV rev-u
     const kvRev = Number(await kvGet(`vb:day:${today}:rev`) || 0);
     if (kvRev && kvRev > (store.rev || 0)) {
       const fresh = await loadSnapshotFromKV(today);
       const future = filterFuture(fresh);
       const ranked = rankBase(future);
 
-      // cap po ligi sa UEFA izuzetkom
       const perLeague = new Map();
       const pinned = [];
-      const skipped = [];
       const keyOfLeague = (p) => String(p?.league?.id ?? p?.league?.name ?? "").toLowerCase();
       for (const p of ranked) {
         const lname = p?.league?.name || "";
         const key = keyOfLeague(p);
         if (!isUEFA(lname)) {
           const cnt = perLeague.get(key) || 0;
-          if (cnt >= MAX_PER_LEAGUE) { skipped.push(p); continue; }
+          if (cnt >= MAX_PER_LEAGUE) continue;
           perLeague.set(key, cnt + 1);
         }
         pinned.push(p);
@@ -178,16 +173,25 @@ export default async function handler(req, res) {
       store.rev = kvRev;
     }
 
-    // PRE 10:00 CET → koristimo PREVIEW ako postoji (nikad ne vraćamo jučerašnje)
+    // PRE 10:00 – obavezno prikaži bar 3 (lazy-build preview ako ga nema)
     if (hour < 10) {
-      const preview = await loadPreviewFromKV(today);
-      const prevFuture = filterFuture(preview);
+      const MIN_NIGHT = 3;
+      const NIGHT_CAP = Math.min(LIMIT, 6);
 
+      let preview = await loadPreviewFromKV(today);
+      if (!Array.isArray(preview) || preview.length < MIN_NIGHT) {
+        const locked = await kvSetNX(`lock:preview:build:${today}`, hm, 5 * 60 * 1000);
+        if (locked) {
+          await fetch(`${getOrigin(req)}/api/locked-floats?preview=1`, { headers: { "x-internal-cron": "1" } }).catch(()=>{});
+        }
+        preview = await loadPreviewFromKV(today);
+      }
+
+      const prevFuture = filterFuture(Array.isArray(preview) ? preview : []).slice(0, NIGHT_CAP);
       const calib = await kvGet("vb:learn:calib:latest");
 
       const enriched = [];
-      for (const p of prevFuture.slice(0, LIMIT)) {
-        // floats overlay (ako postoji)
+      for (const p of prevFuture) {
         const fl = await kvGet(`vb:float:${p.fixture_id}`);
         if (fl && Number.isFinite(fl.odds) && fl.odds > 0) {
           p.market_odds = fl.odds;
@@ -199,20 +203,15 @@ export default async function handler(req, res) {
           p.implied_prob = 1 / p.market_odds;
         }
 
-        // kalibracija
         const baseConf = Number.isFinite(p.confidence_pct) ? Number(p.confidence_pct) : null;
         const adjConf = adjConfidence(p, calib);
         if (adjConf != null) p.confidence_pct = adjConf;
         const appliedDelta = (adjConf!=null && baseConf!=null) ? (adjConf - baseConf) : 0;
 
-        // insight
         const ins = await kvGet(`vb:insight:${p.fixture_id}`);
         if (ins && ins.line) p._insight_line = ins.line;
 
-        // zašto
-        const why = buildWhy(p, appliedDelta);
-        p.explain = { ...(p.explain||{}), summary: why };
-
+        p.explain = { ...(p.explain||{}), summary: buildWhy(p, appliedDelta) };
         enriched.push(p);
       }
 
@@ -225,7 +224,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // POSLE 10:00 – imamo u store-u (ili učitaj iz KV ako prvi put)
+    // POSLE 10:00 – locked snapshot
     if (!Array.isArray(store.pinned) || store.dayKey !== today) {
       const fresh = await loadSnapshotFromKV(today);
       const future = filterFuture(fresh);
@@ -233,14 +232,13 @@ export default async function handler(req, res) {
 
       const perLeague = new Map();
       const pinned = [];
-      const skipped = [];
       const keyOfLeague = (p) => String(p?.league?.id ?? p?.league?.name ?? "").toLowerCase();
       for (const p of ranked) {
         const lname = p?.league?.name || "";
         const key = keyOfLeague(p);
         if (!isUEFA(lname)) {
           const cnt = perLeague.get(key) || 0;
-          if (cnt >= MAX_PER_LEAGUE) { skipped.push(p); continue; }
+          if (cnt >= MAX_PER_LEAGUE) continue;
           perLeague.set(key, cnt + 1);
         }
         pinned.push(p);
@@ -255,7 +253,6 @@ export default async function handler(req, res) {
       store.rev = Number(await kvGet(`vb:day:${today}:rev`) || 0);
     }
 
-    // overlay floats/insights/why na trenutni store.pinned
     const calib = await kvGet("vb:learn:calib:latest");
     const enriched = [];
     for (const p of (store.pinned||[]).slice(0, LIMIT)) {
@@ -270,13 +267,11 @@ export default async function handler(req, res) {
         p.implied_prob = 1 / p.market_odds;
       }
 
-      // kalibracija
       const baseConf = Number.isFinite(p.confidence_pct) ? Number(p.confidence_pct) : null;
       const adjConf = adjConfidence(p, calib);
       if (adjConf != null) p.confidence_pct = adjConf;
       const appliedDelta = (adjConf!=null && baseConf!=null) ? (adjConf - baseConf) : 0;
 
-      // drift nudge ±1pp (Smart 45)
       const minsTo = (() => {
         const iso = p?.datetime_local?.starting_at?.date_time?.replace(" ","T");
         if (!iso) return null;
@@ -287,16 +282,14 @@ export default async function handler(req, res) {
         if (mv >= 1.5) p.confidence_pct = Math.min(99, (p.confidence_pct||0) + 1);
         if (mv <= -1.5) p.confidence_pct = Math.max(1, (p.confidence_pct||0) - 1);
         if (minsTo <= 120 && Number(p.bookmakers_count||0) >= ( (Number(hm.split(":")[0])>=10 && Number(hm.split(":")[0])<=21) ? 4 : 3 )) {
-          p.confidence_pct = Math.min(99, (p.confidence_pct||0) + 1); // TTK bonus
+          p.confidence_pct = Math.min(99, (p.confidence_pct||0) + 1);
         }
       }
 
       const ins = await kvGet(`vb:insight:${p.fixture_id}`);
       if (ins && ins.line) p._insight_line = ins.line;
 
-      const why = buildWhy(p, appliedDelta);
-      p.explain = { ...(p.explain||{}), summary: why };
-
+      p.explain = { ...(p.explain||{}), summary: buildWhy(p, appliedDelta) };
       enriched.push(p);
     }
 
