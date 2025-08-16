@@ -80,20 +80,29 @@ async function kvGet(key) {
   try { return result ? JSON.parse(result) : null; } catch { return null; }
 }
 
-/* ---- internal generator (for fallback) ---- */
-async function callInternalGenerator(req){
-  try{
-    const proto = req.headers["x-forwarded-proto"] || "https";
-    const origin = `${proto}://${req.headers.host}`;
-    const r = await fetch(`${origin}/api/value-bets`, {
-      headers: { "x-internal": "1" }, // endpoint je interni
-      // GET je ok; ako je kod ograničen na POST, promeni ovde na method:"POST"
-    });
-    if (!r.ok) return [];
-    const j = await r.json().catch(()=>({}));
-    const arr = Array.isArray(j?.value_bets) ? j.value_bets : [];
-    return arr;
-  }catch(_){ return []; }
+/* ---- decorate for frontend compatibility ---- */
+function toLegacyShape(p){
+  // kickoff ISO (local string "YYYY-MM-DD HH:MM" -> ISO)
+  const isoLocal = p?.datetime_local?.starting_at?.date_time || null;
+  const kickoffIso = isoLocal ? new Date(isoLocal.replace(" ","T") + ":00Z").toISOString() : null;
+
+  // selection label (HOME/DRAW/AWAY -> 1 / X / 2)
+  const selectionLabel =
+    p?.selection === "HOME" ? "1" :
+    p?.selection === "AWAY" ? "2" :
+    p?.selection === "DRAW" ? "X" : (p?.selection || "");
+
+  return {
+    ...p,
+    // redundant, for UI:
+    homeTeam: p?.teams?.home || p?.home_team_name || "",
+    awayTeam: p?.teams?.away || p?.away_team_name || "",
+    leagueName: p?.league?.name || p?.league_name || "",
+    country: p?.league?.country || "",
+    kickoff: kickoffIso,                           // ISO string front može direktno da prikaže
+    kickoffLabel: isoLocal || "",                  // originalni "YYYY-MM-DD HH:MM" (local)
+    selectionLabel,                                // "1" | "X" | "2"
+  };
 }
 
 /* --------------- main handler --------------- */
@@ -125,26 +134,26 @@ export default async function handler(req, res) {
       store.rev = kvRev;
     }
 
-    // PRE 10:00 → koristi preview ako postoji (nikad jučerašnje)
+    // PRE 10:00 → koristi preview (min 3 a max 6)
     if (hour < 10) {
       const prev = await kvGet(`vb:preview:${today}:last`);
       const future = filterFuture(Array.isArray(prev)?prev:[]);
       const ranked = rankBase(future);
-      const limited = capPerLeague(ranked, Math.min(LIMIT, 6)); // mali feed rano ujutru
+      const limited = capPerLeague(ranked, Math.max(3, Math.min(6, LIMIT)));
       setCDN(res);
       return res.status(200).json({
-        value_bets: limited,
+        value_bets: limited.map(toLegacyShape),
         built_at: nowISO(),
         day: today,
         source: "preview"
       });
     }
 
-    // POSLE 10:00 → probaj iz store/KV…
+    // POSLE 10:00 → snapshot / cache
     if (Array.isArray(store.pinned) && store.pinned.length) {
       setCDN(res);
       return res.status(200).json({
-        value_bets: store.pinned.slice(0, LIMIT),
+        value_bets: store.pinned.slice(0, LIMIT).map(toLegacyShape),
         built_at: store.builtAt,
         day: store.dayKey,
         rev: store.rev || 0,
@@ -152,19 +161,27 @@ export default async function handler(req, res) {
       });
     }
 
-    // …ako i dalje nema ničega (nema snapshot-a u KV) → FALLBACK
-    // ne zapisujemo u KV; samo da UI ne bude prazan
-    const raw = await callInternalGenerator(req);
+    // FALLBACK (nema snapshot-a)
+    // Napomena: value-bets generator već postoji i puni teams/home/away i league/name.
+    // Ovdje samo vraćamo minimum 3, max 6 i mapiramo u legacy shape.
+    const proto = req.headers["x-forwarded-proto"] || "https";
+    const origin = `${proto}://${req.headers.host}`;
+    let raw = [];
+    try {
+      const r = await fetch(`${origin}/api/value-bets`, { headers: { "x-internal": "1" } });
+      if (r.ok) {
+        const j = await r.json().catch(()=> ({}));
+        raw = Array.isArray(j?.value_bets) ? j.value_bets : [];
+      }
+    } catch {}
+
     const future = filterFuture(raw);
     const ranked = rankBase(future);
-
-    // minimalno 3, maksimalno 6 u fallbacku
-    const fallbackLimit = Math.max(3, Math.min(6, LIMIT));
-    const picked = capPerLeague(ranked, fallbackLimit);
+    const picked = capPerLeague(ranked, Math.max(3, Math.min(6, LIMIT)));
 
     setCDN(res);
     return res.status(200).json({
-      value_bets: picked,
+      value_bets: picked.map(toLegacyShape),
       built_at: nowISO(),
       day: today,
       rev: 0,
