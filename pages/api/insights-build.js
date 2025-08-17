@@ -2,13 +2,27 @@ export const config = { api: { bodyParser: false } };
 
 const BASE = "https://v3.football.api-sports.io";
 
+// -- KV helpers sa bezbednim "unwrap" --
+function unwrapKV(raw) {
+  let v = raw;
+  try {
+    if (typeof v === "string") {
+      const p = JSON.parse(v);
+      v = (p && typeof p === "object" && "value" in p) ? p.value : p;
+    }
+    if (typeof v === "string" && (v.startsWith("{") || v.startsWith("["))) v = JSON.parse(v);
+  } catch {}
+  return v;
+}
 async function kvGet(key) {
   const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
   if (!url || !token) return null;
-  const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${token}` } });
-  if (!r.ok) return null;
-  const { result } = await r.json();
-  try { return result ? JSON.parse(result) : null; } catch { return null; }
+  try {
+    const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+    if (!r.ok) return null;
+    const j = await r.json().catch(()=>null);
+    return unwrapKV(j && typeof j.result !== "undefined" ? j.result : null);
+  } catch { return null; }
 }
 async function kvSet(key, value) {
   const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
@@ -17,8 +31,10 @@ async function kvSet(key, value) {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ value: JSON.stringify(value) })
-  });
+  }).catch(()=>{});
 }
+
+// -- API-Football --
 async function afGet(path) {
   const key = process.env.API_FOOTBALL_KEY;
   if (!key) throw new Error("API_FOOTBALL_KEY missing");
@@ -30,6 +46,7 @@ async function afGet(path) {
   return Array.isArray(j?.response) ? j.response : [];
 }
 
+// -- Forma L5 (po timu) --
 function summarizeLast5(list, teamId) {
   let W=0,D=0,L=0, gf=0, ga=0;
   for (const fx of list.slice(0,5)) {
@@ -58,27 +75,40 @@ function headlineFromForms(hForm, aForm) {
   return "Forma ujednačena.";
 }
 
+function ymdTZ() {
+  try {
+    return new Intl.DateTimeFormat("sv-SE", {
+      timeZone: process.env.TZ_DISPLAY||"Europe/Belgrade", year:"numeric", month:"2-digit", day:"2-digit"
+    }).format(new Date());
+  } catch {
+    const d=new Date(), y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,"0"), da=String(d.getDate()).padStart(2,"0");
+    return `${y}-${m}-${da}`;
+  }
+}
+
 export default async function handler(req, res) {
   try {
-    const today = new Intl.DateTimeFormat("sv-SE", { timeZone: process.env.TZ_DISPLAY||"Europe/Belgrade", year:"numeric", month:"2-digit", day:"2-digit" }).format(new Date());
+    const today = ymdTZ();
     const snap = await kvGet(`vb:day:${today}:last`);
-    if (!Array.isArray(snap) || snap.length === 0) return res.status(200).json({ updated: 0, reason: "no snapshot" });
+    if (!Array.isArray(snap) || snap.length === 0) {
+      return res.status(200).json({ updated: 0, reason: "no snapshot" });
+    }
 
     let updated = 0;
     for (const p of snap) {
       const fid = p.fixture_id;
       const home = p.home_id || p.teams?.home?.id;
       const away = p.away_id || p.teams?.away?.id;
-      if (!home || !away) continue;
+      if (!home || !away || !fid) continue;
 
       let homeLast = [], awayLast = [];
-      try { homeLast = await afGet(`/fixtures?team=${home}&last=5`); } catch (_) {}
-      try { awayLast = await afGet(`/fixtures?team=${away}&last=5`); } catch (_) {}
+      try { homeLast = await afGet(`/fixtures?team=${home}&last=5`); } catch {}
+      try { awayLast = await afGet(`/fixtures?team=${away}&last=5`); } catch {}
 
       const sHome = summarizeLast5(homeLast, home);
       const sAway = summarizeLast5(awayLast, away);
 
-      // headline + form_line (samo dve linije, bez EV/kvota)
+      // dve linije: headline + forma
       const headline  = headlineFromForms(sHome, sAway);
       const form_line = `Forma: Domaćin ${fmtForm(sHome)} · Gost ${fmtForm(sAway)}`;
 
