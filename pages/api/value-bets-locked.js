@@ -1,24 +1,44 @@
 // =============================================
-// Locked snapshot + Smart overlay (floats, tiering by (league,country), caps, dynamic limit)
-// Fix: Canadian Premier League više NE upada u Tier1 (striktna (league,country) mapa)
+// Locked snapshot + Smart overlay (floats), tiering (league+country),
+// caps, SAFE-prioritet, dynamic limit, i "auto-rebuild on first refresh"
 // =============================================
 
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
+// VB limit (vikend/radni dan) i cap-ovi
 const VB_LIMIT_FALLBACK = parseInt(process.env.VB_LIMIT || "25", 10);
 const VB_LIMIT_WEEKDAY = parseInt(process.env.VB_LIMIT_WEEKDAY || "15", 10);
 const VB_LIMIT_WEEKEND = parseInt(process.env.VB_LIMIT_WEEKEND || "25", 10);
 const VB_MAX_PER_LEAGUE = parseInt(process.env.VB_MAX_PER_LEAGUE || "2", 10);
 
+// Tier 3 pooštren filter
 const TIER3_MAX_TOTAL = parseInt(process.env.TIER3_MAX_TOTAL || "6", 10);
 const TIER3_MIN_BOOKIES = parseInt(process.env.TIER3_MIN_BOOKIES || "4", 10);
 const TIER3_MIN_EDGE_PP = parseFloat(process.env.TIER3_MIN_EDGE_PP || "8");
 const TIER3_MIN_EV = parseFloat(process.env.TIER3_MIN_EV || "0.08");
 const TIER3_MIN_ODDS = parseFloat(process.env.TIER3_MIN_ODDS || "0"); // 0 = off
 
-// --- Striktna mapa Tier 1/2: ime lige + zemlja (bez MLS-a) ---
+// SAFE prioritet (default uključeno, bez ENV obavezno)
+const VB_SAFE_ENABLED = (process.env.VB_SAFE_ENABLED ?? "1") === "1";
+const SAFE_MIN_PROB = parseFloat(process.env.SAFE_MIN_PROB || "0.65");   // 65%
+const SAFE_MIN_ODDS = parseFloat(process.env.SAFE_MIN_ODDS || "1.50");   // kvota >= 1.50
+const SAFE_MIN_EV   = parseFloat(process.env.SAFE_MIN_EV   || "-0.005"); // dozvoli do -0.5% EV
+const SAFE_MIN_BOOKIES_T12 = parseInt(process.env.SAFE_MIN_BOOKIES_T12 || "4", 10);
+const SAFE_MIN_BOOKIES_T3  = parseInt(process.env.SAFE_MIN_BOOKIES_T3  || "5", 10);
+
+// Auto-rebuild na prvom refreshu (bez Cron-a)
+const LOCKED_STALE_MIN   = parseInt(process.env.LOCKED_STALE_MIN || "60", 10); // minute
+const LOCKED_REBUILD_CD  = parseInt(process.env.LOCKED_REBUILD_CD || "20", 10); // minute
+const LOCKED_ACTIVE_HOURS = process.env.LOCKED_ACTIVE_HOURS || "10-22"; // CET
+
+// UEFA izuzetak
+const UEFA_PATTERNS = (process.env.UEFA_PATTERNS ||
+  "UEFA,Champions League,Europa League,Conference League,UCL,UEL,UECL")
+  .split(",").map(s => s.trim()).filter(Boolean);
+
+// Tier 1 (bez MLS-a) i Tier 2 (EFL) — striktno po (league,country)
 const TIER1_COMBOS = [
   { country: "England",     names: ["Premier League"] },
   { country: "Spain",       names: ["La Liga"] },
@@ -28,17 +48,11 @@ const TIER1_COMBOS = [
   { country: "Serbia",      names: ["SuperLiga","Super Liga"] },
   { country: "Netherlands", names: ["Eredivisie"] },
 ];
-// Tier 2: EFL
 const TIER2_COMBOS = [
   { country: "England", names: ["Championship","League One","League Two","EFL Championship","EFL League One","EFL League Two"] },
 ];
 
-// UEFA izuzetak
-const UEFA_PATTERNS = (process.env.UEFA_PATTERNS ||
-  "UEFA,Champions League,Europa League,Conference League,UCL,UEL,UECL")
-  .split(",").map(s => s.trim()).filter(Boolean);
-
-// Floats overlay
+// Floats overlay (SMART45) — ti si već uključio SMART45_FLOAT_ENABLED=1
 const FLOATS_ENABLED = process.env.SMART45_FLOAT_ENABLED === "1";
 const FLOATS_TOPK = parseInt(process.env.SMART45_FLOAT_TOPK || "8", 10);
 const CD_GLOBAL = parseInt(process.env.SMART45_FLOAT_COOLDOWN_GLOBAL || "900", 10);
@@ -51,17 +65,29 @@ function ymdTZ(d = new Date()) {
 }
 function dayOfWeekTZ(d = new Date()) {
   const f = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, weekday: "short" });
-  const short = f.format(d).toLowerCase(); // sun, mon, ...
+  const short = f.format(d).toLowerCase();
   const map = { sun:0, mon:1, tue:2, wed:3, thu:4, fri:5, sat:6 };
   return map[short] ?? 0;
 }
+function hourTZ(d = new Date()) {
+  const f = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false });
+  return parseInt(f.format(d), 10);
+}
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 function safeStr(x){ try{return String(x||"")}catch{ return ""} }
-function maskErr(e){ try{return String(e?.message||e)}catch{ return "unknown"} }
-
 function includesAny(hay, arr){
   const s = safeStr(hay).toLowerCase();
   return arr.some(p => s.includes(p.toLowerCase()));
+}
+function eqIgnoreCase(a,b){ return safeStr(a).trim().toLowerCase() === safeStr(b).trim().toLowerCase(); }
+function countryIs(c, expected){ return safeStr(c).toLowerCase().includes(safeStr(expected).toLowerCase()); }
+function maskErr(e){ try{return String(e?.message||e)}catch{ return "unknown"} }
+
+function parseActiveHours(str) {
+  // "10-22" -> {start:10, end:22}
+  const m = safeStr(str).match(/^(\d{1,2})\s*-\s*(\d{1,2})$/);
+  if (!m) return { start: 10, end: 22 };
+  return { start: Math.min(23, parseInt(m[1],10)), end: Math.min(23, parseInt(m[2],10)) };
 }
 
 // Upstash unwrap
@@ -100,11 +126,7 @@ async function kvSet(key, value, opts = {}) {
 }
 
 // ---------- tiering (strict by league+country) ----------
-function eqIgnoreCase(a,b){ return safeStr(a).trim().toLowerCase() === safeStr(b).trim().toLowerCase(); }
-function countryIs(c, expected){ return safeStr(c).toLowerCase().includes(safeStr(expected).toLowerCase()); }
-
 function isUEFA(leagueName="") { return includesAny(leagueName, UEFA_PATTERNS); }
-
 function isTier1(leagueName="", country="") {
   if (isUEFA(leagueName)) return true;
   const ln = safeStr(leagueName); const c = safeStr(country);
@@ -162,7 +184,6 @@ function filterWithCapsAndTiers(list, maxPerLeague, tier3MaxTotal){
 
     const lgId = it?.league?.id;
     const lgName = safeStr(it?.league?.name);
-    const country = safeStr(it?.league?.country);
     const uefa = isUEFA(lgName);
     const tier = getTier(it);
 
@@ -182,6 +203,24 @@ function filterWithCapsAndTiers(list, maxPerLeague, tier3MaxTotal){
     out.push(it);
   }
   return out;
+}
+
+// ---------- SAFE prioritet (samo 1X2, iz postojećeg snapshot-a) ----------
+function isSafePick(item){
+  if (!VB_SAFE_ENABLED) return false;
+  if (safeStr(item?.market) !== "1X2") return false;
+  const tier = getTier(item);
+  const prob = Number(item?.model_prob ?? 0);      // 0.00 - 1.00
+  const odds = Number(item?.market_odds ?? 0);
+  const ev   = Number(item?.ev ?? 0);
+  const bkc  = Number(item?.bookmakers_count ?? 0);
+  if (!Number.isFinite(prob) || !Number.isFinite(odds) || !Number.isFinite(ev)) return false;
+  if (prob < SAFE_MIN_PROB) return false;
+  if (odds < SAFE_MIN_ODDS) return false;
+  if (ev < SAFE_MIN_EV) return false;
+  const minBk = (tier === 3 ? SAFE_MIN_BOOKIES_T3 : SAFE_MIN_BOOKIES_T12);
+  if (!Number.isFinite(bkc) || bkc < minBk) return false;
+  return true;
 }
 
 // ---------- floats overlay ----------
@@ -248,6 +287,31 @@ async function backgroundRefreshFloats(req, topList) {
   } catch {}
 }
 
+// ---------- auto-rebuild on first refresh ----------
+async function maybeAutoRebuild(req, today) {
+  // cilj: bez Cron-a, u aktivnim satima, sa cooldown-om
+  const { start, end } = parseActiveHours(LOCKED_ACTIVE_HOURS);
+  const h = hourTZ();
+  const inWindow = h >= start && h <= end;
+
+  if (!inWindow) return false;
+
+  // Hladan throttle: jednom na LOCKED_REBUILD_CD minuta
+  const cdKey = `vb:auto:rebuild:cd:${today}`;
+  const cdOK = await kvSet(cdKey, "1", { nx: true, ex: LOCKED_REBUILD_CD * 60 });
+  if (!cdOK) return false;
+
+  // Opcioni "stale" signal: ako postoji meta vreme — koristi; ako ne postoji — samo pusti rebuild sa cooldown-om
+  // (Generator možda ne zapisuje built_at u KV; zato je fallback da ne "guši" prečesto.)
+  try {
+    const proto = req.headers["x-forwarded-proto"] || (req.headers["x-forwarded-protocol"] || "https");
+    const host  = req.headers["x-forwarded-host"] || req.headers["x-forwarded-hostname"] || req.headers.host;
+    const base  = `${proto}://${host}`;
+    fetch(`${base}/api/cron/rebuild`).catch(() => {});
+    return true;
+  } catch { return false; }
+}
+
 // ---------- main ----------
 export default async function handler(req, res) {
   try {
@@ -262,6 +326,7 @@ export default async function handler(req, res) {
     let snapshot = await kvGet(`vb:day:${today}:last`);
     let source = "locked-cache";
 
+    // 1a) fallback preko rev pointera
     if (!snapshot || (Array.isArray(snapshot) && snapshot.length === 0) || (snapshot && !snapshot.value_bets)) {
       const revRaw = await kvGet(`vb:day:${today}:rev`);
       const rev = parseInt(typeof revRaw === "number" ? String(revRaw) : (revRaw || "").toString(), 10);
@@ -273,6 +338,7 @@ export default async function handler(req, res) {
       }
     }
 
+    // 1b) self-heal ako nema snapshot-a posle 10h
     if (!snapshot || (!Array.isArray(snapshot) && !Array.isArray(snapshot?.value_bets))) {
       const parts = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", minute: "2-digit", hour12: false })
         .formatToParts(new Date()).reduce((a, p) => ((a[p.type] = p.value), a), {});
@@ -291,44 +357,67 @@ export default async function handler(req, res) {
       return res.status(200).json({ value_bets: [], built_at: new Date().toISOString(), day: today, source: "ensure-wait" });
     }
 
+    // 2) lista iz snapshot-a
     const listRaw = Array.isArray(snapshot) ? snapshot : (snapshot.value_bets || []);
 
-    // Sort: Tier (1<2<3), pa edge/EV, pa kickoff
+    // 2a) Sort sa SAFE prioritetom:
+    //  - SAFE pre ostalih
+    //  - zatim Tier (1 < 2 < 3)
+    //  - zatim edge/EV
+    //  - zatim kickoff
     const sorted = [...listRaw].sort((a, b) => {
+      const sa = isSafePick(a), sb = isSafePick(b);
+      if (sa !== sb) return sa ? -1 : 1;
+
       const ta = getTier(a), tb = getTier(b);
       if (ta !== tb) return ta - tb;
+
+      // unutar SAFE grupe blago favorizuj veći model_prob, zatim viši EV
+      if (sa && sb) {
+        const pa = Number(a?.model_prob ?? 0), pb = Number(b?.model_prob ?? 0);
+        if (pb !== pa) return pb - pa;
+      }
       const ea = Number(a?.edge_pp ?? a?.edge ?? 0);
       const eb = Number(b?.edge_pp ?? b?.edge ?? 0);
       if (eb !== ea) return eb - ea;
+
       const da = safeStr(a?.datetime_local?.starting_at?.date_time);
       const db = safeStr(b?.datetime_local?.starting_at?.date_time);
       return da.localeCompare(db);
     });
 
-    // Higijena + cap po ligi (UEFA izuzetak) + Tier3 strict + Tier3 cap
+    // 2b) Higijena + cap po ligi (UEFA izuzetak) + Tier3 strict + Tier3 cap total
     const filteredCapped = filterWithCapsAndTiers(sorted, VB_MAX_PER_LEAGUE, TIER3_MAX_TOTAL);
 
-    // Dinamičan limit
+    // 2c) Dinamičan limit
     let finalList = filteredCapped.slice(0, VB_LIMIT_FINAL);
+
+    // 2d) Fail-safe ako sve odsečemo
     if (finalList.length === 0 && listRaw.length > 0) {
       finalList = listRaw.slice(0, VB_LIMIT_FINAL);
       source = "fallback-unfiltered";
     }
 
-    // Overlay floats
+    // 3) Overlay floats (ne menja poredak)
     const withOverlay = [];
     for (const it of finalList) {
       const fx = it?.fixture_id;
-      let live = null, adjusted = null;
+      let live = null, adjusted = null, safe_flag = undefined;
       if (fx) {
         const lv = await kvGet(`vb:float:${fx}`);
         if (lv) { live = lv; adjusted = applyAdjustedConfidence(it, live); }
       }
-      withOverlay.push(live ? { ...it, live, adjusted } : it);
+      if (VB_SAFE_ENABLED) safe_flag = isSafePick(it);
+      const out = live ? { ...it, live, adjusted } : { ...it };
+      if (typeof safe_flag === "boolean") out.safe = safe_flag;
+      withOverlay.push(out);
     }
 
-    // Pozadinski refresh
+    // 4) Pozadinski refresh floats za TOPK (ne blokira)
     backgroundRefreshFloats(req, finalList).catch(() => {});
+
+    // 5) Auto-rebuild on first refresh (bez čekanja)
+    maybeAutoRebuild(req, today).catch(() => {});
 
     return res.status(200).json({
       value_bets: withOverlay,
@@ -344,6 +433,17 @@ export default async function handler(req, res) {
         tier3_min_ev: TIER3_MIN_EV,
         tier3_min_odds: TIER3_MIN_ODDS,
         floats_enabled: FLOATS_ENABLED,
+        safe_enabled: VB_SAFE_ENABLED,
+        safe_min_prob: SAFE_MIN_PROB,
+        safe_min_odds: SAFE_MIN_ODDS,
+        safe_min_ev: SAFE_MIN_EV,
+        safe_min_bookies_t12: SAFE_MIN_BOOKIES_T12,
+        safe_min_bookies_t3: SAFE_MIN_BOOKIES_T3,
+        auto_rebuild: {
+          active_hours: LOCKED_ACTIVE_HOURS,
+          stale_min: LOCKED_STALE_MIN,
+          rebuild_cooldown_min: LOCKED_REBUILD_CD,
+        },
       },
     });
   } catch (e) {
