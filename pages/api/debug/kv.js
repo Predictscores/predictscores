@@ -10,6 +10,24 @@ function mask(s) {
   return `${str.slice(0, 6)}...${str.slice(-6)}`;
 }
 
+function unwrapKV(raw) {
+  let v = raw;
+  try {
+    if (typeof v === "string") {
+      const p = JSON.parse(v);
+      if (p && typeof p === "object" && "value" in p) {
+        v = p.value;
+      } else {
+        v = p;
+      }
+    }
+    if (typeof v === "string" && (v.startsWith("{") || v.startsWith("["))) {
+      v = JSON.parse(v);
+    }
+  } catch (_) {}
+  return v;
+}
+
 export default async function handler(req, res) {
   try {
     res.setHeader("Cache-Control", "no-store");
@@ -24,7 +42,7 @@ export default async function handler(req, res) {
       day: "2-digit",
     }).format(new Date());
 
-    async function kvGet(key) {
+    async function kvGetRaw(key) {
       const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
         headers: { Authorization: `Bearer ${KV_TOKEN}` },
       }).catch(() => null);
@@ -33,8 +51,11 @@ export default async function handler(req, res) {
       return j?.result ?? null;
     }
 
-    const rev = await kvGet(`vb:day:${today}:rev`);
-    const last = await kvGet(`vb:day:${today}:last`);
+    const revRaw = await kvGetRaw(`vb:day:${today}:rev`);
+    const lastRaw = await kvGetRaw(`vb:day:${today}:last`);
+
+    const rev = unwrapKV(revRaw);
+    const last = unwrapKV(lastRaw);
 
     return res.status(200).json({
       ok: true,
@@ -44,14 +65,19 @@ export default async function handler(req, res) {
         TZ,
       },
       today,
-      rev,
-      last_type: last && typeof last,
-      last_preview:
-        last && typeof last === "string"
-          ? `${last.slice(0, 40)}...`
-          : last && last.value_bets
-          ? `array(${last.value_bets.length})`
-          : last,
+      rev_raw_type: typeof revRaw,
+      rev_raw_preview:
+        typeof revRaw === "string" ? `${revRaw.slice(0, 60)}...` : revRaw,
+      rev_unwrapped: rev,
+      last_raw_type: typeof lastRaw,
+      last_raw_preview:
+        typeof lastRaw === "string" ? `${lastRaw.slice(0, 60)}...` : lastRaw,
+      last_unwrapped_type: typeof last,
+      last_unwrapped_preview: Array.isArray(last?.value_bets)
+        ? `array(${last.value_bets.length})`
+        : typeof last === "string"
+        ? `${last.slice(0, 60)}...`
+        : last,
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
