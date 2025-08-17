@@ -1,10 +1,20 @@
-// Returns the locked daily shortlist (up to VB_LIMIT), with smart fallback rules per SWE-45 brief.
+// pages/api/value-bets-locked.js
+// Locked feed sa "self-heal" mehanizmom (bez novih fajlova):
+// - Ako snapshot za danas postoji -> vraća ga normalno (sa CDN cache).
+// - Ako je PRE 10:00 CET -> opcion noćni mini-feed (FEATURE_NIGHT_MINIFEED=1), inače prazno.
+// - Ako je POSLE 10:00 CET i snapshot NE postoji:
+//      * proveri cooldown u KV (vb:ensure:cooldown:<YYYY-MM-DD>, npr. 600s)
+//      * ako NEMA cooldown -> setuj ga i ASINHRONO "poguraj" /api/cron/rebuild (fire-and-forget)
+//      * vrati prazan odgovor sa source:"ensure-started" (ili "ensure-wait" ako je cooldown aktivan)
+//      * header je no-store da se sledeći refresh ne zalepi za CDN cache
 //
-// Ključne izmene:
-// 1) Posle 10:00 (Europe/Belgrade), ako ne postoji snapshot za danas -> vraćamo PRAZNO (nema dnevnog fallbacka).
-// 2) Pre 10:00: noćni mini-feed je opcion (FEATURE_NIGHT_MINIFEED=1), inače prazno.
-// 3) Garantujemo teams.home.name / teams.away.name i `match` string.
-// 4) Dodajemo lightweight kalibraciju iz vb:learn:calib:latest (samo prikaz; ne menja rang).
+// Env (Production):
+//   KV_REST_API_URL, KV_REST_API_TOKEN (obavezno)
+//   TZ_DISPLAY=Europe/Belgrade
+//   VB_LIMIT=25 (default 25)
+//   CDN_SMAXAGE_SEC=600, CDN_STALE_SEC=120
+//   FEATURE_HISTORY=1
+//   (opciono) FEATURE_NIGHT_MINIFEED=1  -> koristi vb:night:<YYYY-MM-DD>:preview ako postoji
 
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
@@ -13,20 +23,41 @@ const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const CDN_SMAX = parseInt(process.env.CDN_SMAXAGE_SEC || "600", 10);
 const CDN_STALE = parseInt(process.env.CDN_STALE_SEC || "120", 10);
 
+// ---------- helpers ----------
 function setCDN(res) {
   res.setHeader(
     "Cache-Control",
     `public, max-age=60, s-maxage=${CDN_SMAX}, stale-while-revalidate=${CDN_STALE}`
   );
 }
+function setNoStore(res) {
+  res.setHeader("Cache-Control", "no-store");
+}
 
 async function kvGet(key) {
   const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
     headers: { Authorization: `Bearer ${KV_TOKEN}` },
+    cache: "no-store",
   });
   if (!r.ok) return null;
   const j = await r.json().catch(() => null);
   return j && typeof j.result !== "undefined" ? j.result : null;
+}
+
+// Upstash KV REST uglavnom prima "ex" u telu; ako backend ignoriše, samo neće biti TTL-a (i dalje safe).
+async function kvSet(key, value, { ex } = {}) {
+  const body = { value: typeof value === "string" ? value : JSON.stringify(value) };
+  if (ex) body.ex = ex; // seconds
+  const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${KV_TOKEN}`,
+    },
+    body: JSON.stringify(body),
+  });
+  await r.json().catch(() => null);
+  return true;
 }
 
 function fmtDate(d, tz = TZ) {
@@ -39,7 +70,6 @@ function fmtDate(d, tz = TZ) {
     .format(d)
     .replace(/\//g, "-");
 }
-
 function localParts(d = new Date(), tz = TZ) {
   const p = new Intl.DateTimeFormat("en-GB", {
     timeZone: tz,
@@ -57,9 +87,13 @@ function localParts(d = new Date(), tz = TZ) {
   };
 }
 
-function normalizeItem(p, calib) {
-  const isoLocal = p?.datetime_local?.starting_at?.date_time || p?.kickoff || null;
-  const kickoffIso = isoLocal ? String(isoLocal).replace(" ", "T").replace(/Z?$/, "") : null;
+// Normalizacija da UI uvek ima imena timova i "match" string
+function normalizeItem(p, calib /* optional, može biti null */) {
+  const isoLocal =
+    p?.datetime_local?.starting_at?.date_time || p?.kickoff || null;
+  const kickoffIso = isoLocal
+    ? String(isoLocal).replace(" ", "T").replace(/Z?$/, "")
+    : null;
 
   const homeName =
     p?.teams?.home?.name || p?.teams?.home || p?.home_team_name || "Home";
@@ -79,53 +113,59 @@ function normalizeItem(p, calib) {
   const leagueDelta =
     calib?.league?.[marketKey]?.[leagueName]?.delta_vs_market_pp ?? 0;
 
-  const out = {
+  return {
     ...p,
     teams,
     match: `${teams.home.name} vs ${teams.away.name}`,
     league,
     kickoff: kickoffIso,
+    // Prikaz kalibracije je "soft" (ne menja rang):
     calibMarketPP: Math.max(-5, Math.min(5, marketDelta)),
     calibLeaguePP: Math.max(-8, Math.min(8, leagueDelta)),
   };
-  return out;
 }
 
+// Fire-and-forget poziv na internu rutu (ne čeka se rezultat)
+function fireAndForget(url) {
+  // "void" da izbegnemo UnhandledPromiseRejection u Node-u
+  void fetch(url, { cache: "no-store" }).catch(() => {});
+}
+
+// ---------- handler ----------
 export default async function handler(req, res) {
   try {
-    setCDN(res);
     const now = new Date();
-    const today = fmtDate(now, TZ); // YYYY-MM-DD
+    const today = fmtDate(now, TZ);
     const { h } = localParts(now, TZ);
 
-    // Pokušaj da pročitaš kalibraciju (non-fatal)
+    // 1) Učitaj kalibraciju (best-effort; non-fatal)
     let calib = null;
     try {
       const rawCal = await kvGet("vb:learn:calib:latest");
       if (rawCal) calib = typeof rawCal === "string" ? JSON.parse(rawCal) : rawCal;
     } catch (_) {}
 
-    // Pročitaj današnji snapshot zaključanih (25)
+    // 2) Pokušaj da pročitaš DANAŠNJI snapshot
     const raw = await kvGet(`vb:day:${today}:last`);
     const snap = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : null;
 
     if (Array.isArray(snap) && snap.length) {
-      const value_bets = snap
-        .slice(0, VB_LIMIT)
-        .map((x) => normalizeItem(x, calib));
-      return res
-        .status(200)
-        .json({
-          value_bets,
-          built_at: new Date().toISOString(),
-          day: today,
-          source: "locked-cache",
-        });
+      // Snapshot postoji -> standardni cache header
+      setCDN(res);
+      const value_bets = snap.slice(0, VB_LIMIT).map((x) => normalizeItem(x, calib));
+      return res.status(200).json({
+        value_bets,
+        built_at: new Date().toISOString(),
+        day: today,
+        source: "locked-cache",
+      });
     }
 
-    // Nema snapshota
+    // 3) Nema snapshota
     if (h < 10) {
-      // Pre 10:00 — opcion noćni mini-feed
+      // PRE 10:00 CET: opcion noćni mini-feed ili prazno (po specifikaciji)
+      setNoStore(res);
+
       if (process.env.FEATURE_NIGHT_MINIFEED === "1") {
         const nightRaw = await kvGet(`vb:night:${today}:preview`);
         const preview =
@@ -133,37 +173,59 @@ export default async function handler(req, res) {
         const value_bets = (preview || [])
           .slice(0, Math.min(6, VB_LIMIT))
           .map((x) => normalizeItem(x, calib));
-        return res
-          .status(200)
-          .json({
-            value_bets,
-            built_at: new Date().toISOString(),
-            day: today,
-            source: "preview-night",
-          });
-      }
-      return res
-        .status(200)
-        .json({
-          value_bets: [],
+        return res.status(200).json({
+          value_bets,
           built_at: new Date().toISOString(),
           day: today,
-          source: "empty-night",
+          source: "preview-night",
         });
-    }
+      }
 
-    // Posle 10:00 — po brief-u nema dnevnog fallbacka
-    return res
-      .status(200)
-      .json({
+      return res.status(200).json({
         value_bets: [],
         built_at: new Date().toISOString(),
         day: today,
-        source: "empty-no-snapshot",
+        source: "empty-night",
       });
+    }
+
+    // POSLE 10:00 CET: SELF-HEAL (bez novih fajlova)
+    // - globalni cooldown da ne "lopatamo" rebuild više puta
+    // - asinhrono poguramo /api/cron/rebuild i odmah vratimo no-store, pa sledeći refresh/prolaz vidi snapshot
+
+    setNoStore(res);
+
+    const cooldownKey = `vb:ensure:cooldown:${today}`;
+    const cooling = await kvGet(cooldownKey);
+
+    if (!cooling) {
+      // upiši cooldown ~10 min (600s)
+      await kvSet(cooldownKey, "1", { ex: 600 });
+
+      // pokreni rebuild ASINHRONO na istom hostu
+      const host = req.headers["x-forwarded-host"] || req.headers.host;
+      const proto = req.headers["x-forwarded-proto"] || "https";
+      const baseUrl = `${proto}://${host}`;
+      fireAndForget(`${baseUrl}/api/cron/rebuild`);
+
+      return res.status(200).json({
+        value_bets: [],
+        built_at: new Date().toISOString(),
+        day: today,
+        source: "ensure-started",
+      });
+    }
+
+    // cooldown aktivan -> ne pokrećemo opet, samo javimo da se sačeka kratko
+    return res.status(200).json({
+      value_bets: [],
+      built_at: new Date().toISOString(),
+      day: today,
+      source: "ensure-wait",
+    });
   } catch (err) {
     console.error("value-bets-locked error", err);
-    res.setHeader("Cache-Control", "no-store");
+    setNoStore(res);
     return res
       .status(200)
       .json({ value_bets: [], error: String(err?.message || err) });
