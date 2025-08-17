@@ -45,9 +45,18 @@ function summarizeLast5(list, teamId) {
     gf += my; ga += opp;
     if (my>opp) W++; else if (my===opp) D++; else L++;
   }
-  return { W,D,L,gf,ga };
+  return { W,D,L,gf,ga, gd: gf-ga };
 }
-const fmtForm = ({W,D,L}) => `W${W} D${D} L${L}`;
+const fmtForm = ({W,D,L,gf,ga}) => `W${W} D${D} L${L} (${gf}:${ga})`;
+
+function headlineFromForms(hForm, aForm) {
+  const goodHome = (hForm.W >= 3) || (hForm.gd >= 3);
+  const poorAway = (aForm.L >= 3) || (aForm.gd <= -3);
+  if (goodHome && poorAway) return "Domaćin u dobroj formi; gost u lošoj formi.";
+  if (goodHome) return "Domaćin u dobroj formi.";
+  if (poorAway) return "Gost u lošoj formi.";
+  return "Forma ujednačena.";
+}
 
 export default async function handler(req, res) {
   try {
@@ -62,29 +71,18 @@ export default async function handler(req, res) {
       const away = p.away_id || p.teams?.away?.id;
       if (!home || !away) continue;
 
-      let homeLast = [], awayLast = [], h2h = [];
+      let homeLast = [], awayLast = [];
       try { homeLast = await afGet(`/fixtures?team=${home}&last=5`); } catch (_) {}
       try { awayLast = await afGet(`/fixtures?team=${away}&last=5`); } catch (_) {}
-      try { h2h      = await afGet(`/fixtures/headtohead?h2h=${home}-${away}&last=5`); } catch (_) {}
 
       const sHome = summarizeLast5(homeLast, home);
       const sAway = summarizeLast5(awayLast, away);
 
-      let W=0,D=0,L=0, gf=0, ga=0;
-      for (const fx of h2h.slice(0,5)) {
-        const sc = fx.score?.fulltime || fx.score?.ft || fx.score || {};
-        const h = Number(sc.home ?? fx.goals?.home ?? 0);
-        const a = Number(sc.away ?? fx.goals?.away ?? 0);
-        const homeId = fx.teams?.home?.id;
-        const isHome = homeId === home;
-        const my = isHome ? h : a;
-        const opp = isHome ? a : h;
-        gf += my; ga += opp;
-        if (my>opp) W++; else if (my===opp) D++; else L++;
-      }
+      // headline + form_line (samo dve linije, bez EV/kvota)
+      const headline  = headlineFromForms(sHome, sAway);
+      const form_line = `Forma: Domaćin ${fmtForm(sHome)} · Gost ${fmtForm(sAway)}`;
 
-      const line = `H2H: W${W} D${D} L${L} (${gf}:${ga}) · Home: ${fmtForm(sHome)} · Away: ${fmtForm(sAway)}`;
-      await kvSet(`vb:insight:${fid}`, { line, built_at: new Date().toISOString() });
+      await kvSet(`vb:insight:${fid}`, { headline, form_line, built_at: new Date().toISOString() });
       updated++;
     }
 
