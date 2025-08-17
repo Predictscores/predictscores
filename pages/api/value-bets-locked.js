@@ -4,9 +4,9 @@
 // - Ako je PRE 10:00 CET -> opcion noćni mini-feed (FEATURE_NIGHT_MINIFEED=1), inače prazno.
 // - Ako je POSLE 10:00 CET i snapshot NE postoji:
 //      * proveri cooldown u KV (vb:ensure:cooldown:<YYYY-MM-DD>, npr. 600s)
-//      * ako NEMA cooldown -> setuj ga i ASINHRONO "poguraj" /api/cron/rebuild (fire-and-forget)
+//      * ako NEMA cooldown -> setuj ga i ASINHRONO "poguraj" rebuild (oba okidača)
 //      * vrati prazan odgovor sa source:"ensure-started" (ili "ensure-wait" ako je cooldown aktivan)
-//      * header je no-store da se sledeći refresh ne zalepi za CDN cache
+//      * header je no-store da sledeći refresh ne padne u CDN cache
 //
 // Env (Production):
 //   KV_REST_API_URL, KV_REST_API_TOKEN (obavezno)
@@ -44,7 +44,7 @@ async function kvGet(key) {
   return j && typeof j.result !== "undefined" ? j.result : null;
 }
 
-// Upstash KV REST uglavnom prima "ex" u telu; ako backend ignoriše, samo neće biti TTL-a (i dalje safe).
+// Upstash KV REST: možemo poslati TTL (ex) u telu; ako ga backend ignoriše, samo nema isteka.
 async function kvSet(key, value, { ex } = {}) {
   const body = { value: typeof value === "string" ? value : JSON.stringify(value) };
   if (ex) body.ex = ex; // seconds
@@ -88,7 +88,7 @@ function localParts(d = new Date(), tz = TZ) {
 }
 
 // Normalizacija da UI uvek ima imena timova i "match" string
-function normalizeItem(p, calib /* optional, može biti null */) {
+function normalizeItem(p, calib /* optional */) {
   const isoLocal =
     p?.datetime_local?.starting_at?.date_time || p?.kickoff || null;
   const kickoffIso = isoLocal
@@ -127,7 +127,6 @@ function normalizeItem(p, calib /* optional, može biti null */) {
 
 // Fire-and-forget poziv na internu rutu (ne čeka se rezultat)
 function fireAndForget(url) {
-  // "void" da izbegnemo UnhandledPromiseRejection u Node-u
   void fetch(url, { cache: "no-store" }).catch(() => {});
 }
 
@@ -138,19 +137,18 @@ export default async function handler(req, res) {
     const today = fmtDate(now, TZ);
     const { h } = localParts(now, TZ);
 
-    // 1) Učitaj kalibraciju (best-effort; non-fatal)
+    // 1) (neobavezno) kalibracija za prikaz
     let calib = null;
     try {
       const rawCal = await kvGet("vb:learn:calib:latest");
       if (rawCal) calib = typeof rawCal === "string" ? JSON.parse(rawCal) : rawCal;
     } catch (_) {}
 
-    // 2) Pokušaj da pročitaš DANAŠNJI snapshot
+    // 2) Pročitaj DANAŠNJI snapshot
     const raw = await kvGet(`vb:day:${today}:last`);
     const snap = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : null;
 
     if (Array.isArray(snap) && snap.length) {
-      // Snapshot postoji -> standardni cache header
       setCDN(res);
       const value_bets = snap.slice(0, VB_LIMIT).map((x) => normalizeItem(x, calib));
       return res.status(200).json({
@@ -163,7 +161,7 @@ export default async function handler(req, res) {
 
     // 3) Nema snapshota
     if (h < 10) {
-      // PRE 10:00 CET: opcion noćni mini-feed ili prazno (po specifikaciji)
+      // PRE 10:00 CET: opcion noćni mini-feed ili prazno
       setNoStore(res);
 
       if (process.env.FEATURE_NIGHT_MINIFEED === "1") {
@@ -190,8 +188,9 @@ export default async function handler(req, res) {
     }
 
     // POSLE 10:00 CET: SELF-HEAL (bez novih fajlova)
-    // - globalni cooldown da ne "lopatamo" rebuild više puta
-    // - asinhrono poguramo /api/cron/rebuild i odmah vratimo no-store, pa sledeći refresh/prolaz vidi snapshot
+    // - globalni cooldown da ne pokrećemo rebuild često
+    // - asinhrono poguramo oba okidača (ne čekamo ih)
+    // - vraćamo no-store, pa sledeći refresh/prolaz vidi snapshot čim se napiše
 
     setNoStore(res);
 
@@ -199,14 +198,15 @@ export default async function handler(req, res) {
     const cooling = await kvGet(cooldownKey);
 
     if (!cooling) {
-      // upiši cooldown ~10 min (600s)
-      await kvSet(cooldownKey, "1", { ex: 600 });
+      await kvSet(cooldownKey, "1", { ex: 600 }); // ~10 min cooldown
 
-      // pokreni rebuild ASINHRONO na istom hostu
       const host = req.headers["x-forwarded-host"] || req.headers.host;
       const proto = req.headers["x-forwarded-proto"] || "https";
       const baseUrl = `${proto}://${host}`;
+
+      // Pogodi oba okidača (koji god da tvoj kod koristi, biće pokrenut)
       fireAndForget(`${baseUrl}/api/cron/rebuild`);
+      fireAndForget(`${baseUrl}/api/value-bets-locked?rebuild=1`);
 
       return res.status(200).json({
         value_bets: [],
@@ -216,7 +216,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // cooldown aktivan -> ne pokrećemo opet, samo javimo da se sačeka kratko
+    // cooldown aktivan -> sačekaj malo i opet učitaj
     return res.status(200).json({
       value_bets: [],
       built_at: new Date().toISOString(),
