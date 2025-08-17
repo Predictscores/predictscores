@@ -1,5 +1,7 @@
 // FILE: pages/api/value-bets-locked.js
-// Vraća zaključani (KV) dnevni feed sa laganim filtrima i “auto-rebuild on first visit”.
+// Vraća zaključani (KV) dnevni feed sa filtrima i “auto-rebuild on first visit”.
+// DODATO: čita vb:insight:<fixture_id> i ubacuje 2 human linije u explain.*
+// Fallback: ako postoji staro polje `line`, koristi se makar to.
 
 export const config = { api: { bodyParser: false } };
 
@@ -95,7 +97,7 @@ function isTier3(leagueName = "", country = "") {
   return (
     s.includes("3.") || s.includes("third") || s.includes("liga 3") ||
     s.includes("division 2") || s.includes("second division") ||
-    s.includes("regional") || s.includes("amateur") || s.includes("cup - ") // mnoge lokalne kup utakmice
+    s.includes("regional") || s.includes("amateur") || s.includes("cup - ")
   );
 }
 function isExcludedLeagueOrTeam(pick) {
@@ -212,6 +214,28 @@ export default async function handler(req, res) {
     const nBooks = Number(p?.bookmakers_count || 0);
     if (!meetsBookiesFilter(p)) continue;
     if (tier3 && nBooks < TIER3_MIN_BOOKIES) continue;
+
+    // --- UBACI 2 HUMAN LINIJE IZ KV (i fallback na staro `line`) ---
+    const fid = Number(p?.fixture_id);
+    if (Number.isFinite(fid)) {
+      const ins = unwrapKV(await kvGet(`vb:insight:${fid}`));
+      const headline = ins?.headline && String(ins.headline).trim();
+      const formLine = ins?.form_line && String(ins.form_line).trim();
+      const oldLine  = (!headline && !formLine && ins?.line) ? String(ins.line).trim() : null;
+
+      let human = [];
+      if (headline) human.push(headline);
+      if (formLine) human.push(formLine);
+      if (!human.length && oldLine) human = [oldLine];
+
+      if (human.length) {
+        p.explain = p.explain || {};
+        p.explain.summary = human[0];     // prva linija ide u "Zašto"
+        p.explain.human   = human;        // UI može da prikaže obe
+        if (human[1]) p._insight_line = human[1]; // ako UI već koristi dodatnu liniju
+      }
+    }
+    // ---------------------------------------------------------------
 
     // safe badge
     const safe = computeSafe(p, tier3);
