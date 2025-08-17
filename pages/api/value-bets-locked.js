@@ -1,20 +1,8 @@
 // pages/api/value-bets-locked.js
-// Locked feed sa "self-heal" mehanizmom (bez novih fajlova):
-// - Ako snapshot za danas postoji -> vraća ga normalno (sa CDN cache).
-// - Ako je PRE 10:00 CET -> opcion noćni mini-feed (FEATURE_NIGHT_MINIFEED=1), inače prazno.
-// - Ako je POSLE 10:00 CET i snapshot NE postoji:
-//      * proveri cooldown u KV (vb:ensure:cooldown:<YYYY-MM-DD>, npr. 600s)
-//      * ako NEMA cooldown -> setuj ga i ASINHRONO "poguraj" rebuild (oba okidača)
-//      * vrati prazan odgovor sa source:"ensure-started" (ili "ensure-wait" ako je cooldown aktivan)
-//      * header je no-store da sledeći refresh ne padne u CDN cache
-//
-// Env (Production):
-//   KV_REST_API_URL, KV_REST_API_TOKEN (obavezno)
-//   TZ_DISPLAY=Europe/Belgrade
-//   VB_LIMIT=25 (default 25)
-//   CDN_SMAXAGE_SEC=600, CDN_STALE_SEC=120
-//   FEATURE_HISTORY=1
-//   (opciono) FEATURE_NIGHT_MINIFEED=1  -> koristi vb:night:<YYYY-MM-DD>:preview ako postoji
+// Robust locked feed + “self-heal”:
+// 1) Pokušaj `:last`
+// 2) Ako nema, pokušaj `:rev` → `:rev:<n>` i rekonstruiši `:last`
+// 3) Ako i dalje nema, posle 10:00 pokreni self-heal (cooldown)
 
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
@@ -23,16 +11,13 @@ const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const CDN_SMAX = parseInt(process.env.CDN_SMAXAGE_SEC || "600", 10);
 const CDN_STALE = parseInt(process.env.CDN_STALE_SEC || "120", 10);
 
-// ---------- helpers ----------
 function setCDN(res) {
   res.setHeader(
     "Cache-Control",
     `public, max-age=60, s-maxage=${CDN_SMAX}, stale-while-revalidate=${CDN_STALE}`
   );
 }
-function setNoStore(res) {
-  res.setHeader("Cache-Control", "no-store");
-}
+function setNoStore(res) { res.setHeader("Cache-Control", "no-store"); }
 
 async function kvGet(key) {
   const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
@@ -43,18 +28,16 @@ async function kvGet(key) {
   const j = await r.json().catch(() => null);
   return j && typeof j.result !== "undefined" ? j.result : null;
 }
-
-// Upstash KV REST: možemo poslati TTL (ex) u telu; ako ga backend ignoriše, samo nema isteka.
-async function kvSet(key, value, { ex } = {}) {
-  const body = { value: typeof value === "string" ? value : JSON.stringify(value) };
-  if (ex) body.ex = ex; // seconds
+async function kvSet(key, value) {
   const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${KV_TOKEN}`,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      value: typeof value === "string" ? value : JSON.stringify(value),
+    }),
   });
   await r.json().catch(() => null);
   return true;
@@ -62,43 +45,34 @@ async function kvSet(key, value, { ex } = {}) {
 
 function fmtDate(d, tz = TZ) {
   return new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  })
-    .format(d)
-    .replace(/\//g, "-");
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(d).replace(/\//g, "-");
 }
 function localParts(d = new Date(), tz = TZ) {
   const p = new Intl.DateTimeFormat("en-GB", {
-    timeZone: tz,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  })
-    .formatToParts(d)
-    .reduce((acc, x) => ((acc[x.type] = x.value), acc), {});
-  return {
-    h: parseInt(p.hour, 10),
-    m: parseInt(p.minute, 10),
-    s: parseInt(p.second, 10),
-  };
+    timeZone: tz, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  }).formatToParts(d).reduce((a, x) => ((a[x.type] = x.value), a), {});
+  return { h: parseInt(p.hour, 10), m: parseInt(p.minute, 10), s: parseInt(p.second, 10) };
 }
 
-// Normalizacija da UI uvek ima imena timova i "match" string
-function normalizeItem(p, calib /* optional */) {
-  const isoLocal =
-    p?.datetime_local?.starting_at?.date_time || p?.kickoff || null;
-  const kickoffIso = isoLocal
-    ? String(isoLocal).replace(" ", "T").replace(/Z?$/, "")
-    : null;
+function tryParse(raw) {
+  if (!raw) return null;
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "string") {
+    try {
+      const v = JSON.parse(raw);
+      return Array.isArray(v) ? v : v?.value_bets && Array.isArray(v.value_bets) ? v.value_bets : null;
+    } catch { return null; }
+  }
+  return null;
+}
 
-  const homeName =
-    p?.teams?.home?.name || p?.teams?.home || p?.home_team_name || "Home";
-  const awayName =
-    p?.teams?.away?.name || p?.teams?.away || p?.away_team_name || "Away";
+function normalizeItem(p, calib) {
+  const isoLocal = p?.datetime_local?.starting_at?.date_time || p?.kickoff || null;
+  const kickoffIso = isoLocal ? String(isoLocal).replace(" ", "T").replace(/Z?$/, "") : null;
+
+  const homeName = p?.teams?.home?.name || p?.teams?.home || p?.home_team_name || "Home";
+  const awayName = p?.teams?.away?.name || p?.teams?.away || p?.away_team_name || "Away";
 
   const teams = {
     home: { id: p?.teams?.home?.id ?? null, name: String(homeName) },
@@ -108,10 +82,8 @@ function normalizeItem(p, calib /* optional */) {
   const league = p?.league || {};
   const marketKey = String(p?.market || "").toUpperCase();
   const leagueName = league?.name || p?.league_name || "";
-
   const marketDelta = calib?.market?.[marketKey]?.delta_pp ?? 0;
-  const leagueDelta =
-    calib?.league?.[marketKey]?.[leagueName]?.delta_vs_market_pp ?? 0;
+  const leagueDelta = calib?.league?.[marketKey]?.[leagueName]?.delta_vs_market_pp ?? 0;
 
   return {
     ...p,
@@ -119,34 +91,44 @@ function normalizeItem(p, calib /* optional */) {
     match: `${teams.home.name} vs ${teams.away.name}`,
     league,
     kickoff: kickoffIso,
-    // Prikaz kalibracije je "soft" (ne menja rang):
     calibMarketPP: Math.max(-5, Math.min(5, marketDelta)),
     calibLeaguePP: Math.max(-8, Math.min(8, leagueDelta)),
   };
 }
 
-// Fire-and-forget poziv na internu rutu (ne čeka se rezultat)
-function fireAndForget(url) {
-  void fetch(url, { cache: "no-store" }).catch(() => {});
-}
+function fireAndForget(url) { void fetch(url, { cache: "no-store" }).catch(() => {}); }
 
-// ---------- handler ----------
 export default async function handler(req, res) {
   try {
     const now = new Date();
     const today = fmtDate(now, TZ);
     const { h } = localParts(now, TZ);
 
-    // 1) (neobavezno) kalibracija za prikaz
+    // Load calib (best-effort)
     let calib = null;
     try {
       const rawCal = await kvGet("vb:learn:calib:latest");
       if (rawCal) calib = typeof rawCal === "string" ? JSON.parse(rawCal) : rawCal;
-    } catch (_) {}
+    } catch {}
 
-    // 2) Pročitaj DANAŠNJI snapshot
-    const raw = await kvGet(`vb:day:${today}:last`);
-    const snap = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : null;
+    // 1) Pokušaj :last
+    let raw = await kvGet(`vb:day:${today}:last`);
+    let snap = tryParse(raw);
+
+    // 2) Ako nema, pokušaj preko :rev i popravi :last
+    if (!Array.isArray(snap) || snap.length === 0) {
+      const revRaw = await kvGet(`vb:day:${today}:rev`);
+      const rev = revRaw ? Number(revRaw) : NaN;
+      if (Number.isFinite(rev) && rev > 0) {
+        const r2 = await kvGet(`vb:day:${today}:rev:${rev}`);
+        const snap2 = tryParse(r2);
+        if (Array.isArray(snap2) && snap2.length) {
+          // Rekonstruiši :last da front od sad ima stabilan ključ
+          await kvSet(`vb:day:${today}:last`, snap2);
+          snap = snap2;
+        }
+      }
+    }
 
     if (Array.isArray(snap) && snap.length) {
       setCDN(res);
@@ -161,16 +143,11 @@ export default async function handler(req, res) {
 
     // 3) Nema snapshota
     if (h < 10) {
-      // PRE 10:00 CET: opcion noćni mini-feed ili prazno
       setNoStore(res);
-
       if (process.env.FEATURE_NIGHT_MINIFEED === "1") {
         const nightRaw = await kvGet(`vb:night:${today}:preview`);
-        const preview =
-          nightRaw ? (typeof nightRaw === "string" ? JSON.parse(nightRaw) : nightRaw) : [];
-        const value_bets = (preview || [])
-          .slice(0, Math.min(6, VB_LIMIT))
-          .map((x) => normalizeItem(x, calib));
+        const preview = tryParse(nightRaw) || [];
+        const value_bets = preview.slice(0, Math.min(6, VB_LIMIT)).map((x) => normalizeItem(x, calib));
         return res.status(200).json({
           value_bets,
           built_at: new Date().toISOString(),
@@ -178,7 +155,6 @@ export default async function handler(req, res) {
           source: "preview-night",
         });
       }
-
       return res.status(200).json({
         value_bets: [],
         built_at: new Date().toISOString(),
@@ -187,27 +163,18 @@ export default async function handler(req, res) {
       });
     }
 
-    // POSLE 10:00 CET: SELF-HEAL (bez novih fajlova)
-    // - globalni cooldown da ne pokrećemo rebuild često
-    // - asinhrono poguramo oba okidača (ne čekamo ih)
-    // - vraćamo no-store, pa sledeći refresh/prolaz vidi snapshot čim se napiše
-
+    // 4) Posle 10:00 – self-heal (cooldown 10min)
     setNoStore(res);
-
     const cooldownKey = `vb:ensure:cooldown:${today}`;
     const cooling = await kvGet(cooldownKey);
 
     if (!cooling) {
-      await kvSet(cooldownKey, "1", { ex: 600 }); // ~10 min cooldown
-
+      await kvSet(cooldownKey, "1"); // i bez ex je ok; ne-kritično
       const host = req.headers["x-forwarded-host"] || req.headers.host;
       const proto = req.headers["x-forwarded-proto"] || "https";
       const baseUrl = `${proto}://${host}`;
-
-      // Pogodi oba okidača (koji god da tvoj kod koristi, biće pokrenut)
       fireAndForget(`${baseUrl}/api/cron/rebuild`);
       fireAndForget(`${baseUrl}/api/value-bets-locked?rebuild=1`);
-
       return res.status(200).json({
         value_bets: [],
         built_at: new Date().toISOString(),
@@ -216,7 +183,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // cooldown aktivan -> sačekaj malo i opet učitaj
     return res.status(200).json({
       value_bets: [],
       built_at: new Date().toISOString(),
@@ -226,8 +192,6 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error("value-bets-locked error", err);
     setNoStore(res);
-    return res
-      .status(200)
-      .json({ value_bets: [], error: String(err?.message || err) });
+    return res.status(200).json({ value_bets: [], error: String(err?.message || err) });
   }
 }
