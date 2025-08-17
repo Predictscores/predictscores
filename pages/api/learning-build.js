@@ -1,117 +1,204 @@
-export const config = { api: { bodyParser: false } };
+// Nightly learning/calibration builder.
+// Čita poslednjih N dana zaključanih snapshotova + rezultate iz KV (vb:score:<fixture_id>),
+// računa delta između prikazanog confidence-a i realne win-rate po marketu i po ligi,
+// i upisuje rezime u vb:learn:calib:latest (bez menjanja rangiranja u feedu).
+//
+// Pokretanje:
+//   GET /api/learning-build            (default days=30)
+//   GET /api/learning-build?days=60
+//
+// Scheduler: jednom dnevno oko 22:30 CET je dovoljno (sa NX lockom u tvom /api/cron/scheduler)
+//
+// Napomena: radi samo sa FEATURE_HISTORY=1 (da postoje vb:day:YYYY-MM-DD:last ključevi)
+
+const KV_URL = process.env.KV_REST_API_URL;
+const KV_TOKEN = process.env.KV_REST_API_TOKEN;
+const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
 async function kvGet(key) {
-  const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
-  if (!url || !token) return null;
-  const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${token}` } });
-  if (!r.ok) return null;
-  const { result } = await r.json();
-  try { return result ? JSON.parse(result) : null; } catch { return null; }
-}
-async function kvSet(key, value) {
-  const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
-  if (!url || !token) return;
-  await fetch(`${url}/set/${encodeURIComponent(key)}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ value: JSON.stringify(value) })
+  const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${KV_TOKEN}` },
   });
+  if (!r.ok) return null;
+  const j = await r.json().catch(() => null);
+  return j && typeof j.result !== "undefined" ? j.result : null;
 }
 
-const laplaceRate = (w, n, a=1, b=1) => (w + a) / (n + a + b);
-const toPP = (x) => Math.round(x * 1000) / 10;
+async function kvSet(key, value) {
+  const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${KV_TOKEN}`,
+    },
+    body: JSON.stringify({
+      value: typeof value === "string" ? value : JSON.stringify(value),
+    }),
+  });
+  const j = await r.json().catch(() => null);
+  return j?.result === "OK";
+}
+
+function fmtDate(d, tz = TZ) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  })
+    .format(d)
+    .replace(/\//g, "-");
+}
+
+function addDays(d, diff) {
+  const dd = new Date(d);
+  dd.setUTCDate(dd.getUTCDate() + diff);
+  return dd;
+}
+
+function parseScore(obj) {
+  // Očekujemo npr: { ft: { home, away }, ht: {...} } ili sličan oblik.
+  try {
+    const s = typeof obj === "string" ? JSON.parse(obj) : obj;
+    const ft = s?.ft || s?.fulltime || s?.full_time || s?.score || null;
+    if (!ft) return null;
+    const home = Number(ft.home ?? ft.h ?? ft[0]);
+    const away = Number(ft.away ?? ft.a ?? ft[1]);
+    if (!Number.isFinite(home) || !Number.isFinite(away)) return null;
+    return { home, away };
+  } catch (_) {
+    return null;
+  }
+}
+
+function resolveOutcome(market, selection, score /* {home,away} */) {
+  const m = String(market || "").toUpperCase();
+  const sel = String(selection || "").toUpperCase();
+  const { home, away } = score;
+
+  if (m === "1X2" || m === "1X2 FT" || m === "FT 1X2") {
+    const winner = home > away ? "HOME" : home < away ? "AWAY" : "DRAW";
+    const map = { "1": "HOME", "2": "AWAY", X: "DRAW", HOME: "HOME", AWAY: "AWAY", DRAW: "DRAW" };
+    return map[sel] === winner;
+  }
+
+  if (m.includes("BTTS")) {
+    const yes = home > 0 && away > 0;
+    const map = { YES: true, NO: false };
+    return map[sel] === yes;
+  }
+
+  if (m.includes("OVER")) {
+    // Ekstrakcija praga iz selekcije: "Over 2.5", "OVER_2_5", "OVER2.5"
+    const th =
+      /([0-9]+(?:\.[0-9])?)/.exec(selection)?.[1] ||
+      /([0-9]+(?:_[0-9])?)/.exec(selection)?.[1]?.replace("_", ".") ||
+      "2.5";
+    const limit = Number(th);
+    if (!Number.isFinite(limit)) return null;
+    return home + away > limit;
+  }
+
+  // HT-FT i ostalo: za sada preskačemo (vrati null da ne ulazi u statistiku)
+  return null;
+}
 
 export default async function handler(req, res) {
   try {
-    const days = Math.max(7, Math.min(60, Number(process.env.LEARN_WINDOW_DAYS || req.query.days || 30)));
-    const now = new Date();
+    res.setHeader("Cache-Control", "no-store");
 
-    const rows = [];
+    const days = Math.max(1, Math.min(90, parseInt(req.query.days || "30", 10)));
+    const today = new Date();
+
+    const samples = []; // { market, league, conf (0..100), win (bool) }
+
     for (let i = 0; i < days; i++) {
-      const d = new Date(now); d.setDate(d.getDate() - i);
-      const ymd = d.toISOString().slice(0,10);
-      const snap = await kvGet(`vb:day:${ymd}:last`);
-      if (!Array.isArray(snap)) continue;
+      const d = fmtDate(addDays(today, -i), TZ);
+      const raw = await kvGet(`vb:day:${d}:last`);
+      const snap = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : null;
+      if (!Array.isArray(snap) || !snap.length) continue;
 
       for (const p of snap) {
-        const sc = await kvGet(`vb:score:${p.fixture_id}`);
-        if (!sc || sc.ftH==null || sc.ftA==null) continue;
-        const ftH = Number(sc.ftH), ftA = Number(sc.ftA);
-        const market = (p.market || "").toLowerCase();
+        const market = p?.market || "";
+        const conf = Number(p?.confidence ?? p?.confidence_pct ?? p?.conf ?? NaN);
+        const league = p?.league?.name || p?.league_name || "";
+        const fid = p?.fixture_id || p?.fixture || p?.id;
+        if (!fid || !market || !Number.isFinite(conf)) continue;
 
-        let status = null;
-        if (market.includes("btts")) {
-          const yes = String(p.selection||"").toLowerCase().includes("yes");
-          const hit = (ftH>0 && ftA>0);
-          status = yes ? (hit?"won":"lost") : (hit?"lost":"won");
-        } else if (market.includes("over") || market.includes("under") || market.includes("ou")) {
-          const m = String(p.market).match(/([0-9]+(?:\.[0-9]+)?)/);
-          const line = m ? Number(m[1]) : 2.5;
-          const total = ftH + ftA;
-          const over = String(p.selection||"").toLowerCase().includes("over");
-          if (total !== line) status = over ? (total>line?"won":"lost") : (total<line?"won":"lost");
-        } else if (market.includes("1x2") || market === "1x2" || market.includes("match winner")) {
-          const sel = String(p.selection||"").toUpperCase();
-          const ft = ftH>ftA?"1":(ftH<ftA?"2":"X");
-          const want = sel.includes("HOME")?"1":sel.includes("AWAY")?"2":sel.includes("DRAW")?"X":sel;
-          status = ft===want?"won":"lost";
-        } else if (market.includes("ht-ft") || market.includes("ht/ft")) {
-          const htH = sc.htH, htA = sc.htA;
-          if (htH!=null && htA!=null) {
-            const ht = htH>htA?"1":(htH<htA?"2":"X");
-            const ft = ftH>ftA?"1":(ftH<ftA?"2":"X");
-            const norm = String(p.selection||"").replace(/\s+/g,"").toUpperCase();
-            const m = norm.match(/([12X])[/\-]?([12X])/);
-            if (m) status = (m[1]===ht && m[2]===ft)?"won":"lost";
-          }
-        }
-        if (!status) continue;
+        const scRaw = await kvGet(`vb:score:${fid}`);
+        const sc = parseScore(scRaw);
+        if (!sc) continue;
 
-        const conf = Number.isFinite(p.confidence_pct) ? Number(p.confidence_pct) : null;
-        rows.push({ market: p.market || "", league: p.league_name || "", status, conf });
+        const ok = resolveOutcome(market, p?.selection || p?.selectionLabel, sc);
+        if (ok === null) continue; // nepodržano tržište -> preskoči
+
+        samples.push({
+          market: String(market).toUpperCase(),
+          league,
+          conf: Math.max(0, Math.min(100, conf)),
+          win: !!ok,
+        });
       }
     }
 
-    const aggMarket = new Map();
-    const aggLeague = new Map();
-    for (const r of rows) {
-      const kM = r.market.toLowerCase();
-      const kL = `${kM}||${(r.league||"").toLowerCase()}`;
+    // Agregacija
+    const aggMarket = {}; // { [m]: { wins, total, confSum } }
+    const aggLeague = {}; // { [m]: { [league]: { wins, total } } }
 
-      let m = aggMarket.get(kM);
-      if (!m) { m = { market:r.market, n:0, w:0, confSum:0, confN:0 }; aggMarket.set(kM, m); }
-      m.n += 1; if (r.status==="won") m.w += 1;
-      if (Number.isFinite(r.conf)) { m.confSum += r.conf; m.confN += 1; }
+    for (const s of samples) {
+      aggMarket[s.market] ||= { wins: 0, total: 0, confSum: 0 };
+      aggMarket[s.market].wins += s.win ? 1 : 0;
+      aggMarket[s.market].total += 1;
+      aggMarket[s.market].confSum += s.conf;
 
-      let l = aggLeague.get(kL);
-      if (!l) { l = { market:r.market, league:r.league, n:0, w:0 }; aggLeague.set(kL, l); }
-      l.n += 1; if (r.status==="won") l.w += 1;
+      aggLeague[s.market] ||= {};
+      aggLeague[s.market][s.league] ||= { wins: 0, total: 0 };
+      aggLeague[s.market][s.league].wins += s.win ? 1 : 0;
+      aggLeague[s.market][s.league].total += 1;
     }
 
-    const calibMarket = {};
-    for (const [k, a] of aggMarket.entries()) {
-      const act = laplaceRate(a.w, a.n);
-      const pred = a.confN ? (a.confSum / a.confN) / 100 : null;
-      const delta = (pred!=null) ? (act - pred) : 0;
-      calibMarket[k] = { samples: a.n, win_rate_pp: toPP(act), avg_conf_pp: pred!=null?toPP(pred):null, delta_pp: toPP(delta) };
+    // Laplace smoothing i delte
+    const out = { market: {}, league: {} };
+
+    // Market-level delta: (WR - avgConf) u procentnim poenima
+    for (const [m, v] of Object.entries(aggMarket)) {
+      const wr = (v.wins + 1) / (v.total + 2); // Laplace (1,1)
+      const avgConf = (v.confSum / Math.max(1, v.total)) / 100; // 0..1
+      out.market[m] = {
+        delta_pp: Math.round((wr - avgConf) * 1000) / 10, // npr. +2.7pp
+        wr_pct: Math.round(wr * 1000) / 10, // za debug/izveštaj (opciono)
+        avg_conf_pct: Math.round((avgConf * 100) * 10) / 10,
+        total: v.total,
+      };
     }
 
-    const calibLeague = {};
-    for (const [k, a] of aggLeague.entries()) {
-      if (a.n < 25) continue;
-      const [mk, lgKey] = k.split("||");
-      const m = aggMarket.get(mk); if (!m) continue;
-      const actL = laplaceRate(a.w, a.n);
-      const actM = laplaceRate(m.w, m.n);
-      const diff = actL - actM;
-      if (!calibLeague[mk]) calibLeague[mk] = {};
-      calibLeague[mk][lgKey] = { samples: a.n, delta_vs_market_pp: toPP(diff) };
+    // League vs market delta: (WR_league - WR_market) u pp
+    for (const [m, leagues] of Object.entries(aggLeague)) {
+      // izračunaj WR_market sa istim smoothingom
+      const base = aggMarket[m]
+        ? (aggMarket[m].wins + 1) / (aggMarket[m].total + 2)
+        : null;
+
+      out.league[m] ||= {};
+      for (const [lg, v] of Object.entries(leagues)) {
+        const wr = (v.wins + 1) / (v.total + 2);
+        const deltaVsMkt =
+          base === null ? 0 : Math.round((wr - base) * 1000) / 10; // pp
+        out.league[m][lg] = {
+          delta_vs_market_pp: deltaVsMkt,
+          wr_pct: Math.round(wr * 1000) / 10,
+          total: v.total,
+        };
+      }
     }
 
-    const out = { built_at: new Date().toISOString(), window_days: days, market: calibMarket, league: calibLeague };
     await kvSet("vb:learn:calib:latest", out);
-    res.status(200).json({ ok: true, ...out });
-  } catch (e) {
-    res.status(500).json({ error: String(e&&e.message||e) });
+
+    return res
+      .status(200)
+      .json({ ok: true, days, samples: samples.length, wrote: "vb:learn:calib:latest" });
+  } catch (err) {
+    console.error("learning-build error", err);
+    return res.status(200).json({ ok: false, error: String(err?.message || err) });
   }
 }
