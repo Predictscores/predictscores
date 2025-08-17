@@ -17,6 +17,25 @@ function ymdTZ(d = new Date()) {
   return f.format(d);
 }
 
+// isti unwrap kao gore
+function unwrapKV(raw) {
+  let v = raw;
+  try {
+    if (typeof v === "string") {
+      const p = JSON.parse(v);
+      if (p && typeof p === "object" && "value" in p) {
+        v = p.value;
+      } else {
+        v = p;
+      }
+    }
+    if (typeof v === "string" && (v.startsWith("{") || v.startsWith("["))) {
+      v = JSON.parse(v);
+    }
+  } catch (_) {}
+  return v;
+}
+
 async function kvGet(key) {
   const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
     headers: { Authorization: `Bearer ${KV_TOKEN}` },
@@ -24,25 +43,14 @@ async function kvGet(key) {
   }).catch(() => null);
   if (!r || !r.ok) return null;
   const j = await r.json().catch(() => null);
-  return j && typeof j.result !== "undefined" ? j.result : null;
+  return unwrapKV(j && typeof j.result !== "undefined" ? j.result : null);
 }
 
 function toList(raw) {
-  if (!raw) return null;
-  if (Array.isArray(raw)) return raw;
-  if (typeof raw === "string") {
-    try {
-      const v = JSON.parse(raw);
-      if (Array.isArray(v)) return v;
-      if (v && Array.isArray(v.value_bets)) return v.value_bets;
-      return null;
-    } catch {
-      return null;
-    }
-  }
-  if (typeof raw === "object" && Array.isArray(raw.value_bets)) {
-    return raw.value_bets;
-  }
+  const v = unwrapKV(raw);
+  if (!v) return null;
+  if (Array.isArray(v)) return v;
+  if (typeof v === "object" && Array.isArray(v.value_bets)) return v.value_bets;
   return null;
 }
 
@@ -79,8 +87,10 @@ export default async function handler(req, res) {
     }
 
     // 2) preko rev pointera
-    const rev = await kvGet(`vb:day:${today}:rev`);
-    const rnum = parseInt(rev, 10);
+    const revRaw = await kvGet(`vb:day:${today}:rev`);
+    const revStr =
+      typeof revRaw === "number" ? String(revRaw) : (revRaw || "").toString();
+    const rnum = parseInt(revStr, 10);
     if (Number.isFinite(rnum) && rnum > 0) {
       const snap = await kvGet(`vb:day:${today}:rev:${rnum}`);
       const list = toList(snap);
