@@ -1,127 +1,95 @@
-// FILE: pages/api/cron/rebuild.js
-export const config = { api: { bodyParser: false } };
+// pages/api/cron/rebuild.js
+// Rebuild pinned liste: pozove generator (/api/value-bets), isfiltrira/skrati i upiše
+// i rev ključ i "last" pointer u KV tako da /value-bets-locked odmah vidi snapshot.
 
+const KV_URL = process.env.KV_REST_API_URL;
+const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-const LIMIT = Math.max(1, Number(process.env.VB_LIMIT || 15));
-const MAX_PER_LEAGUE = Math.max(1, Number(process.env.VB_MAX_PER_LEAGUE || 2));
+const VB_LIMIT = parseInt(process.env.VB_LIMIT || "25", 10);
 
-function ymd(d = new Date()) {
-  const fmt = new Intl.DateTimeFormat("sv-SE", { timeZone: TZ, year:"numeric", month:"2-digit", day:"2-digit" });
-  return fmt.format(d);
-}
-function isUEFA(name = "") {
-  const n = String(name).toLowerCase();
-  return n.includes("champions league") || n.includes("europa league") || n.includes("conference league");
-}
-function parseISO(x){ try{ return new Date(String(x).replace(" ","T")).getTime(); }catch{ return NaN; } }
-function filterFuture(arr=[]) {
-  const now = Date.now();
-  return arr.filter(x => {
-    const iso = x?.datetime_local?.starting_at?.date_time;
-    const t = parseISO(iso);
-    return Number.isFinite(t) && t > now;
-  });
-}
-function rankBase(arr = []) {
-  return arr.slice().sort((a, b) => {
-    if (a.type !== b.type) return a.type === "MODEL+ODDS" ? -1 : 1;
-    const s = (b._score||0) - (a._score||0);
-    if (s) return s;
-    const eA = Number.isFinite(a.edge_pp)?a.edge_pp:-999;
-    const eB = Number.isFinite(b.edge_pp)?b.edge_pp:-999;
-    if (eB !== eA) return eB - eA;
-    return String(a.fixture_id||"").localeCompare(String(b.fixture_id||""));
-  });
+function fmtDate(d, tz = TZ) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(d).replace(/\//g, "-");
 }
 
-/* KV */
 async function kvGet(key) {
-  const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
-  if (!url || !token) return null;
-  const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${token}` }
-  }).catch(()=>null);
-  if (!r || !r.ok) return null;
-  const { result } = await r.json();
-  try { return result ? JSON.parse(result) : null; } catch { return null; }
+  const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${KV_TOKEN}` },
+    cache: "no-store",
+  });
+  if (!r.ok) return null;
+  const j = await r.json().catch(()=>null);
+  return j && typeof j.result !== "undefined" ? j.result : null;
 }
+
 async function kvSet(key, value) {
-  const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
-  if (!url || !token) return;
-  await fetch(`${url}/set/${encodeURIComponent(key)}`, {
+  const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ value: JSON.stringify(value) })
-  }).catch(()=>{});
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${KV_TOKEN}`,
+    },
+    body: JSON.stringify({ value: typeof value === "string" ? value : JSON.stringify(value) }),
+  });
+  await r.json().catch(()=>null);
+  return true;
 }
-async function kvIncr(key) {
-  const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
-  if (!url || !token) return 0;
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type":"application/json" },
-    body: JSON.stringify(["INCR", key])
-  }).catch(()=>null);
-  if (!r) return 0;
-  const j = await r.json().catch(()=>({}));
-  return Number(j?.result||0);
+
+function perLeagueCap(list, maxPerLeague = 2) {
+  const kept = [];
+  const cnt = new Map();
+  for (const p of list) {
+    const lg = p?.league?.name || p?.league_name || "Unknown";
+    const n = cnt.get(lg) || 0;
+    // UEFA izuzetak – može više po brief-u:
+    const isUEFA = /UEFA|Champions|Europa|Conference/i.test(lg);
+    if (!isUEFA && n >= maxPerLeague) continue;
+    kept.push(p);
+    cnt.set(lg, n + 1);
+    if (kept.length >= VB_LIMIT) break;
+  }
+  return kept;
 }
 
 export default async function handler(req, res) {
   try {
-    // 1) pozovi generator sa timeout-om
+    res.setHeader("Cache-Control", "no-store");
+
+    const today = fmtDate(new Date(), TZ);
+
+    // (opciono) time-guard: radi rebuild samo posle 10:00 lokalno
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: TZ, hour: "2-digit", minute: "2-digit", hour12: false,
+    }).formatToParts(new Date()).reduce((a, p) => (a[p.type] = p.value, a), {});
+    const h = parseInt(parts.hour, 10);
+    if (h < 10) {
+      return res.status(200).json({ ok: true, snapshot_for: today, count: 0, rev: await kvGet(`vb:day:${today}:rev`) || 0, note: "before-10" });
+    }
+
+    // Pozovi generator (isti host) – ovo pravi AF pozive
+    const host = req.headers["x-forwarded-host"] || req.headers.host;
     const proto = req.headers["x-forwarded-proto"] || "https";
-    const origin = `${proto}://${req.headers.host}`;
+    const base = `${proto}://${host}`;
 
-    const ac = new AbortController();
-    const t = setTimeout(() => ac.abort(), 60_000); // 60s
-    let raw = [];
-    try {
-      const gen = await fetch(`${origin}/api/value-bets`, {
-        headers: { "x-internal": "1" },
-        signal: ac.signal
-      });
-      clearTimeout(t);
-      if (!gen.ok) {
-        const txt = await gen.text().catch(()=>String(gen.status));
-        return res.status(502).json({ ok:false, error:"generator_failed", details:txt });
-      }
-      const payload = await gen.json().catch(()=>({}));
-      raw = Array.isArray(payload?.value_bets) ? payload.value_bets : [];
-    } catch (err) {
-      return res.status(504).json({ ok:false, error:"generator_timeout_or_error", details:String(err?.message||err) });
-    }
+    const gen = await fetch(`${base}/api/value-bets`, { cache: "no-store" }).then(r => r.json()).catch(()=>null);
+    const list = Array.isArray(gen?.value_bets) ? gen.value_bets : [];
 
-    // 2) FUTURE + RANK + limit po ligi + LIMIT
-    const future = filterFuture(raw);
-    const ranked = rankBase(future);
+    // Sort/filter (po potrebi) i skrati na VB_LIMIT + max 2 po ligi (UEFA izuzetak)
+    const chosen = perLeagueCap(list, 2).slice(0, VB_LIMIT);
 
-    const perLeague = new Map();
-    const pinned = [];
-    const keyOfLeague = (p) => String(p?.league?.id ?? p?.league?.name ?? "").toLowerCase();
-    for (const p of ranked) {
-      const lname = p?.league?.name || "";
-      const key = keyOfLeague(p);
-      if (!isUEFA(lname)) {
-        const cnt = perLeague.get(key) || 0;
-        if (cnt >= MAX_PER_LEAGUE) continue;
-        perLeague.set(key, cnt + 1);
-      }
-      pinned.push(p);
-      if (pinned.length >= LIMIT) break;
-    }
+    // REV brojač
+    const revKey = `vb:day:${today}:rev`;
+    const currentRev = Number(await kvGet(revKey) || 0);
+    const rev = currentRev + 1;
+    await kvSet(revKey, String(rev));
 
-    const today = ymd();
-    await kvSet(`vb:day:${today}:last`, pinned);
-    const newRev = await kvIncr(`vb:day:${today}:rev`);
+    // Upis snapshot-a pod rev i pod "last" pointer
+    await kvSet(`vb:day:${today}:rev:${rev}`, chosen);
+    await kvSet(`vb:day:${today}:last`, chosen);
 
-    return res.status(200).json({
-      ok: true,
-      snapshot_for: today,
-      count: pinned.length,
-      rev: newRev || 0
-    });
+    return res.status(200).json({ ok: true, snapshot_for: today, count: chosen.length, rev });
   } catch (e) {
-    return res.status(500).json({ ok:false, error:String(e?.message||e) });
+    return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
 }
