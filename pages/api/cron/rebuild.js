@@ -18,6 +18,25 @@ function ymdBelgrade(d = new Date()) {
   return f.format(d); // YYYY-MM-DD
 }
 
+// Unwrap helper: vrati pravi sadržaj (skida {value,ex} i duplo-stringifikovan JSON)
+function unwrapKV(raw) {
+  let v = raw;
+  try {
+    if (typeof v === "string") {
+      const p = JSON.parse(v); // možda je string JSON
+      if (p && typeof p === "object" && "value" in p) {
+        v = p.value; // izvuci polje value
+      } else {
+        v = p; // to je već pravi objekat
+      }
+    }
+    if (typeof v === "string" && (v.startsWith("{") || v.startsWith("["))) {
+      v = JSON.parse(v); // još jedan nivo
+    }
+  } catch (_) {}
+  return v;
+}
+
 async function kvGet(key) {
   const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
     headers: { Authorization: `Bearer ${KV_TOKEN}` },
@@ -25,10 +44,11 @@ async function kvGet(key) {
   }).catch(() => null);
   if (!r || !r.ok) return null;
   const j = await r.json().catch(() => null);
-  return j && typeof j.result !== "undefined" ? j.result : null;
+  return unwrapKV(j && typeof j.result !== "undefined" ? j.result : null);
 }
 
 async function kvSet(key, value, opts = {}) {
+  // Čuvamo kako si već radio: { value: <string ili JSON>, ex }
   const body = {
     value: typeof value === "string" ? value : JSON.stringify(value),
   };
@@ -73,7 +93,10 @@ export default async function handler(req, res) {
     const lastKey = `vb:day:${today}:last`;
 
     let currentRev = await kvGet(revKey);
-    const revNum = Number.parseInt(currentRev, 10);
+    const revNum = Number.parseInt(
+      typeof currentRev === "number" ? String(currentRev) : currentRev,
+      10
+    );
     const nextRev = Number.isFinite(revNum) ? revNum + 1 : 1;
 
     const snapshot = {
