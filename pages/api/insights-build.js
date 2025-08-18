@@ -4,6 +4,28 @@ export const config = { api: { bodyParser: false } };
 const BASE = "https://v3.football.api-sports.io";
 
 /* ---------------- KV helpers ---------------- */
+function unwrapKV(raw) {
+  // Odmotaj Upstash forme: result -> (string) -> JSON -> {value: "..."} -> JSON
+  let v = raw;
+  try {
+    // ako stigne { result: ... }, izdvoji ga pre parsiranja
+    if (v && typeof v === "object" && "result" in v && v.result !== undefined) {
+      v = v.result;
+    }
+    if (typeof v === "string") {
+      try { v = JSON.parse(v); } catch { /* može biti plain string */ }
+    }
+    if (v && typeof v === "object" && "value" in v) {
+      let inner = v.value;
+      if (typeof inner === "string") {
+        try { inner = JSON.parse(inner); } catch { /* ok */ }
+      }
+      v = inner;
+    }
+  } catch {}
+  return v;
+}
+
 async function kvGet(key) {
   const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
   if (!url || !token) return null;
@@ -13,14 +35,7 @@ async function kvGet(key) {
   });
   if (!r.ok) return null;
   const j = await r.json().catch(() => null);
-  try {
-    const v = j?.result;
-    if (!v) return null;
-    const parsed = typeof v === "string" ? JSON.parse(v) : v;
-    return parsed?.value ?? parsed;
-  } catch {
-    return null;
-  }
+  return unwrapKV(j);
 }
 async function kvSet(key, value) {
   const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
@@ -58,7 +73,7 @@ function summarizeLast5(list, teamId) {
     const awayId = fx.teams?.away?.id;
     if (homeId == null || awayId == null) continue;
     const isHome = homeId === teamId;
-    const my = isHome ? h : a;
+    const my  = isHome ? h : a;
     const opp = isHome ? a : h;
     gf += my; ga += opp;
     if (my > opp) W++; else if (my === opp) D++; else L++;
@@ -82,8 +97,10 @@ export default async function handler(req, res) {
       year: "numeric", month: "2-digit", day: "2-digit",
     }).format(new Date());
 
-    // listu zaključanih parova čitamo iz KV
-    const snap = await kvGet(`vb:day:${today}:last`);
+    // čitaj snapshot iz KV (može biti u više formata -> unwrapKV)
+    const snapRaw = await kvGet(`vb:day:${today}:last`);
+    const snap = unwrapKV(snapRaw);
+
     if (!Array.isArray(snap) || snap.length === 0) {
       return res.status(200).json({ updated: 0, reason: "no snapshot" });
     }
@@ -117,7 +134,7 @@ export default async function handler(req, res) {
         if (my > opp) W++; else if (my === opp) D++; else L++;
       }
 
-      // Tekstualni “Zašto”
+      // Tekstualni “Zašto” (u tvom formatu)
       const lead     = `Domaćin ${formLabel(sHome)}; gost ${formLabel(sAway)}.`;
       const formLine = `Forma: Domaćin ${fmtForm(sHome)} (${sHome.gf}:${sHome.ga}) · Gost ${fmtForm(sAway)} (${sAway.gf}:${sAway.ga})`;
       const h2hLine  = (W + D + L) > 0 ? `H2H (L5): W${W} D${D} L${L} (${gf}:${ga})` : null;
