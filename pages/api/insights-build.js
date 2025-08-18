@@ -3,37 +3,54 @@ export const config = { api: { bodyParser: false } };
 
 const BASE = "https://v3.football.api-sports.io";
 
+/* ---------------- KV helpers ---------------- */
 async function kvGet(key) {
   const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
   if (!url || !token) return null;
-  const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${token}` } });
+  const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+    cache: "no-store",
+  });
   if (!r.ok) return null;
-  const { result } = await r.json();
-  try { return result ? JSON.parse(result) : null; } catch { return null; }
+  const j = await r.json().catch(() => null);
+  try {
+    const v = j?.result;
+    if (!v) return null;
+    const parsed = typeof v === "string" ? JSON.parse(v) : v;
+    return parsed?.value ?? parsed;
+  } catch {
+    return null;
+  }
 }
 async function kvSet(key, value) {
   const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
-  if (!url || !token) return;
-  await fetch(`${url}/set/${encodeURIComponent(key)}`, {
+  if (!url || !token) return false;
+  const body = { value: typeof value === "string" ? value : JSON.stringify(value) };
+  const r = await fetch(`${url}/set/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ value: JSON.stringify(value) })
+    body: JSON.stringify(body),
   });
+  return r.ok;
 }
+
+/* ---------------- API-Football ---------------- */
 async function afGet(path) {
   const key = process.env.API_FOOTBALL_KEY;
   if (!key) throw new Error("API_FOOTBALL_KEY missing");
   const r = await fetch(`${BASE}${path}`, {
-    headers: { "x-apisports-key": key, "x-rapidapi-key": key }
+    headers: { "x-apisports-key": key, "x-rapidapi-key": key },
+    cache: "no-store",
   });
   if (!r.ok) throw new Error(`AF ${path} ${r.status}`);
   const j = await r.json();
   return Array.isArray(j?.response) ? j.response : [];
 }
 
+/* ---------------- summarizers ---------------- */
 function summarizeLast5(list, teamId) {
-  let W=0,D=0,L=0, gf=0, ga=0;
-  for (const fx of list.slice(0,5)) {
+  let W = 0, D = 0, L = 0, gf = 0, ga = 0;
+  for (const fx of list.slice(0, 5)) {
     const sc = fx.score?.fulltime || fx.score?.ft || fx.score || {};
     const h = Number(sc.home ?? sc.h ?? fx.goals?.home ?? 0);
     const a = Number(sc.away ?? sc.a ?? fx.goals?.away ?? 0);
@@ -44,15 +61,28 @@ function summarizeLast5(list, teamId) {
     const my = isHome ? h : a;
     const opp = isHome ? a : h;
     gf += my; ga += opp;
-    if (my>opp) W++; else if (my===opp) D++; else L++;
+    if (my > opp) W++; else if (my === opp) D++; else L++;
   }
-  return { W,D,L,gf,ga, points: 3*W + D };
+  return { W, D, L, gf, ga };
 }
-const fmtForm = ({W,D,L,gf,ga}) => `W${W} D${D} L${L} (${gf}:${ga})`;
+const fmtForm = ({ W, D, L }) => `W${W} D${D} L${L}`;
+function formLabel(s) {
+  const pts = s.W * 3 + s.D;
+  if (pts >= 10) return "u odličnoj formi";
+  if (pts >= 7)  return "u dobroj formi";
+  if (pts <= 4)  return "u lošoj formi";
+  return "u promenljivoj formi";
+}
 
+/* ---------------- handler ---------------- */
 export default async function handler(req, res) {
   try {
-    const today = new Intl.DateTimeFormat("sv-SE", { timeZone: process.env.TZ_DISPLAY||"Europe/Belgrade", year:"numeric", month:"2-digit", day:"2-digit" }).format(new Date());
+    const today = new Intl.DateTimeFormat("sv-SE", {
+      timeZone: process.env.TZ_DISPLAY || "Europe/Belgrade",
+      year: "numeric", month: "2-digit", day: "2-digit",
+    }).format(new Date());
+
+    // listu zaključanih parova čitamo iz KV
     const snap = await kvGet(`vb:day:${today}:last`);
     if (!Array.isArray(snap) || snap.length === 0) {
       return res.status(200).json({ updated: 0, reason: "no snapshot" });
@@ -60,50 +90,45 @@ export default async function handler(req, res) {
 
     let updated = 0;
     for (const p of snap) {
-      const fid = p.fixture_id;
+      const fid  = p.fixture_id;
       const home = p.home_id || p.teams?.home?.id;
       const away = p.away_id || p.teams?.away?.id;
-      if (!home || !away) continue;
+      if (!fid || !home || !away) continue;
 
       let homeLast = [], awayLast = [], h2h = [];
-      try { homeLast = await afGet(`/fixtures?team=${home}&last=5`); } catch {}
-      try { awayLast = await afGet(`/fixtures?team=${away}&last=5`); } catch {}
-      try { h2h      = await afGet(`/fixtures/headtohead?h2h=${home}-${away}&last=5`); } catch {}
+      try { homeLast = await afGet(`/fixtures?team=${home}&last=5`); } catch (_) {}
+      try { awayLast = await afGet(`/fixtures?team=${away}&last=5`); } catch (_) {}
+      try { h2h      = await afGet(`/fixtures/headtohead?h2h=${home}-${away}&last=5`); } catch (_) {}
 
       const sHome = summarizeLast5(homeLast, home);
       const sAway = summarizeLast5(awayLast, away);
 
-      let W=0,D=0,L=0, gf=0, ga=0;
-      for (const fx of h2h.slice(0,5)) {
+      // H2H agregat
+      let W = 0, D = 0, L = 0, gf = 0, ga = 0;
+      for (const fx of h2h.slice(0, 5)) {
         const sc = fx.score?.fulltime || fx.score?.ft || fx.score || {};
         const h = Number(sc.home ?? fx.goals?.home ?? 0);
         const a = Number(sc.away ?? fx.goals?.away ?? 0);
         const homeId = fx.teams?.home?.id;
         const isHome = homeId === home;
-        const my = isHome ? h : a;
+        const my  = isHome ? h : a;
         const opp = isHome ? a : h;
         gf += my; ga += opp;
-        if (my>opp) W++; else if (my===opp) D++; else L++;
+        if (my > opp) W++; else if (my === opp) D++; else L++;
       }
 
-      // jednostavan “headline” po formi
-      let headline = null;
-      if (sHome.points >= sAway.points + 3) headline = "Domaćin u boljoj formi.";
-      else if (sAway.points >= sHome.points + 3) headline = "Gost u boljoj formi.";
-      // (povrede ne diramo ovde)
+      // Tekstualni “Zašto”
+      const lead     = `Domaćin ${formLabel(sHome)}; gost ${formLabel(sAway)}.`;
+      const formLine = `Forma: Domaćin ${fmtForm(sHome)} (${sHome.gf}:${sHome.ga}) · Gost ${fmtForm(sAway)} (${sAway.gf}:${sAway.ga})`;
+      const h2hLine  = (W + D + L) > 0 ? `H2H (L5): W${W} D${D} L${L} (${gf}:${ga})` : null;
+      const line     = h2hLine ? `${lead}\n${formLine}\n${h2hLine}` : `${lead}\n${formLine}`;
 
-      const formLine = `Forma: Domaćin ${fmtForm(sHome)} · Gost ${fmtForm(sAway)}`;
-      const h2hLine  = `H2H: W${W} D${D} L${L} (${gf}:${ga})`;
-
-      await kvSet(`vb:insight:${fid}`, {
-        headline, formLine, h2hLine,
-        built_at: new Date().toISOString()
-      });
+      await kvSet(`vb:insight:${fid}`, { line, built_at: new Date().toISOString() });
       updated++;
     }
 
     res.status(200).json({ updated, total_locked: snap.length });
   } catch (e) {
-    res.status(500).json({ error: String(e && e.message || e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 }
