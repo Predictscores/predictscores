@@ -1,41 +1,39 @@
+// pages/api/value-bets-locked.js
 export const config = { api: { bodyParser: false } };
 
-// ---- KV
+// ====== ENV / KONFIG ======
 const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
+const TZ       = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
-// ---- Osnovni limiti (ostalo iz koda, nema novih ENV)
+// Broj kartica + cap po ligi ostaju kao ranije
 const VB_LIMIT   = parseInt(process.env.VB_LIMIT || "25", 10);
 const LEAGUE_CAP = parseInt(process.env.VB_MAX_PER_LEAGUE || "2", 10);
-const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
-// ---- Realističnost kvota
-const MIN_ODDS = 1.50;       // globalno (1X2/BTTS/OU)
-const OU_MAX_ODDS = 2.60;    // plafon za OU 2.5 (odbacuje “fantomske” 3.5+)
-const BTTS_MAX_ODDS = 2.80;  // plafon za BTTS Yes (odbacuje nerealne 3.2+)
+// Realistični pragovi kvota (brani “fantomske” outliere)
+const MIN_ODDS       = 1.50;  // global min
+const OU_MAX_ODDS    = 2.60;  // OU 2.5 plafon
+const BTTS_MAX_ODDS  = 2.80;  // BTTS YES plafon
 
-// ---- Prozor / freeze
-const WINDOW_HOURS = 72;     // samo naredna 72h
-const FREEZE_MIN   = 30;     // ne nudimo <30m do starta
+// Window i freeze (ne menjaj UI)
+const WINDOW_HOURS       = parseInt(process.env.VB_WINDOW_HOURS || "72", 10);
+const FREEZE_MIN_BEFORE  = parseInt(process.env.VB_FREEZE_MIN || "30", 10);
 
-// ---- Bookies pragovi
-const TIER3_MIN_BOOKIES = parseInt(process.env.TIER3_MIN_BOOKIES || "3", 10);
-const MIN_BOOKIES_1X2_HTFT = 2;
-const MIN_BOOKIES_OU_BTTS  = 3;
+// Outlier rez
+const OUTLIER_MULT = 1.25;
 
-// ---- SAFE badge prikaz (info)
-const SAFE_MIN_PROB = 0.65;
-const SAFE_MIN_ODDS = 1.5;
-const SAFE_MIN_EV   = -0.005;
-const SAFE_MIN_BOOKIES_T12 = 4;
-const SAFE_MIN_BOOKIES_T3  = 5;
+// Trusted kladionice
+const TRUSTED_BOOKIES = (process.env.TRUSTED_BOOKIES ||
+  "pinnacle,bet365,betfair,unibet,bwin,william hill,marathonbet,1xbet,888sport,ladbrokes"
+).split(",").map(s => s.trim().toLowerCase());
 
-// ---- Auto rebuild info
-const ACTIVE_HOURS = { from: 10, to: 22 }; // CET
-const REBUILD_COOLDOWN_MIN = parseInt(process.env.LOCKED_REBUILD_CD || "20", 10);
+const TRUSTED_ONLY = String(process.env.ODDS_TRUSTED_ONLY || "1") === "1";
+const TRUSTED_FALLBACK_MIN = parseInt(process.env.ODDS_TRUSTED_FALLBACK_MIN || "2", 10);
 
-// ---------- utils
-function setNoStore(res){ res.setHeader("Cache-Control","no-store"); }
+// API-FOOTBALL key (za ciljane re-check pozive kad kvota “štrči”)
+const AF_KEY = process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.env.API_FOOTBALL_KEY;
+
+// ====== UTIL ======
 function ymdTZ(d=new Date()){
   try {
     const fmt = new Intl.DateTimeFormat("en-CA",{timeZone:TZ,year:"numeric",month:"2-digit",day:"2-digit"});
@@ -52,268 +50,284 @@ function hmTZ(d=new Date()){
     return { h:+p.hour, m:+p.minute };
   } catch { return { h:d.getHours(), m:d.getMinutes() }; }
 }
-function unwrapKV(raw){
-  let v=raw;
-  try {
-    if (typeof v==="string"){
-      const p=JSON.parse(v);
-      v=(p&&typeof p==="object"&&"value" in p)?p.value:p;
-    }
-    if (typeof v==="string"&&(v.startsWith("{")||v.startsWith("["))) v=JSON.parse(v);
-  } catch {}
-  return v;
-}
-async function kvGet(key){
-  if(!KV_URL||!KV_TOKEN) return null;
-  try{
-    const r=await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`,{
-      headers:{Authorization:`Bearer ${KV_TOKEN}`}, cache:"no-store",
-    });
-    if(!r.ok) return null;
-    const j=await r.json().catch(()=>null);
-    return unwrapKV(j&&typeof j.result!=="undefined"?j.result:null);
-  }catch{return null;}
-}
-async function kvSet(key,value,opts={}){
-  if(!KV_URL||!KV_TOKEN) return false;
-  try{
-    const body={value:typeof value==="string"?value:JSON.stringify(value)};
-    if(opts.ex) body.ex=opts.ex;
-    if(opts.nx) body.nx=true;
-    const r=await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`,{
-      method:"POST",
-      headers:{"Content-Type":"application/json",Authorization:`Bearer ${KV_TOKEN}`},
-      body:JSON.stringify(body),
-    });
-    return r.ok;
-  }catch{return false;}
+function isoNow(){ return new Date().toISOString(); }
+
+// KV helpers
+async function kvGET(key){
+  const url = `${KV_URL}/get/${encodeURIComponent(key)}`;
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${KV_TOKEN}` } });
+  if (!r.ok) return null;
+  const ct = r.headers.get("content-type") || "";
+  if (ct.includes("application/json")) {
+    const j = await r.json();
+    // Vercel KV može vratiti {result:"..."} ili "..."
+    const val = (typeof j === "object" && j !== null && "result" in j) ? j.result : j;
+    try { return typeof val === "string" ? JSON.parse(val) : val; } catch { return val; }
+  } else {
+    const t = await r.text();
+    try { return JSON.parse(t); } catch { return t; }
+  }
 }
 
-// ---------- heuristike
-function isTier3(leagueName="",country=""){
-  const s=`${country} ${leagueName}`.toLowerCase();
-  return (
-    s.includes("3.") || s.includes("third") || s.includes("liga 3") ||
-    s.includes("division 2") || s.includes("second division") ||
-    s.includes("regional") || s.includes("amateur") || s.includes("cup - ")
-  );
+// API-Football
+async function afGET(path){
+  if (!AF_KEY) return null;
+  const base = "https://v3.football.api-sports.io";
+  const r = await fetch(`${base}${path}`, { headers: { "x-apisports-key": AF_KEY } });
+  if (!r.ok) return null;
+  const j = await r.json().catch(()=>null);
+  return j?.response || null;
 }
+
+// Odds utils
+const median = a => { const x=[...a].sort((p,q)=>p-q); const n=x.length; return n&1 ? x[(n-1)>>1] : (x[n/2-1]+x[n/2])/2; };
+const trimmedMean = (a,t=0.1)=>{ const x=[...a].sort((p,q)=>p-q), n=x.length, cut=Math.floor(n*t), y=x.slice(cut, Math.max(cut, n-cut)); return y.length? y.reduce((s,v)=>s+v,0)/y.length : null; };
+const isTrusted = name => TRUSTED_BOOKIES.some(b => String(name||"").toLowerCase().includes(b));
+
+function normalizeMarketName(name="") {
+  const s = name.toLowerCase();
+  if (s.includes("match winner") || s.includes("1x2")) return "1X2";
+  if (s.includes("both teams to score")) return "BTTS";
+  if (s.includes("over/under") || s.includes("goals over/under")) return "OU";
+  if (s.includes("half time/full time") || s.includes("ht/ft")) return "HTFT";
+  return name;
+}
+function mapHTFTValue(vRaw) {
+  const s = String(vRaw||"").toUpperCase().replace(/\s+/g,"");
+  const r = s.replace(/^HOME/,"H").replace(/\/HOME/,"/H")
+            .replace(/^AWAY/,"A").replace(/\/AWAY/,"/A")
+            .replace(/^DRAW/,"D").replace(/\/DRAW/,"/D")
+            .replace(/^1/,"H").replace(/\/1/,"/H")
+            .replace(/^2/,"A").replace(/\/2/,"/A")
+            .replace(/^X/,"D").replace(/\/X/,"/D");
+  const OK = ["H/H","H/D","H/A","D/H","D/D","D/A","A/H","A/D","A/A"];
+  return OK.includes(r) ? r : null;
+}
+
+// Konsenzus po ishodu (adaptivno)
+function consensusFrom(arr){
+  const N = arr.length;
+  if (N >= 6) return median(arr);
+  if (N >= 3) return median(arr);
+  if (N === 2) {
+    const ratio = Math.max(arr[0],arr[1]) / Math.min(arr[0],arr[1]);
+    return ratio <= 1.15 ? (arr[0]+arr[1])/2 : Math.min(arr[0],arr[1]); // konzervativno
+  }
+  return arr[0] ?? null;
+}
+
+// Čitanje konsenzus kvota iz AF /odds
+function readConsensusOdds(oddsResponse) {
+  const slot = () => ({ arr:[], count:0, odds:null });
+  const out = {
+    "1X2": { H:slot(), D:slot(), A:slot() },
+    "BTTS": { YES:slot(), NO:slot() },
+    "OU": { OVER25:slot(), UNDER25:slot() },
+    "HTFT": { "H/H":slot(),"H/D":slot(),"H/A":slot(),"D/H":slot(),"D/D":slot(),"D/A":slot(),"A/H":slot(),"A/D":slot(),"A/A":slot() }
+  };
+
+  // 1) probaj sa trusted-only
+  let usedTrusted = TRUSTED_ONLY, totalAdded = 0;
+  for (const pass of [0,1]) {
+    for (const book of (oddsResponse || [])) {
+      for (const bm of (book?.bookmakers || [])) {
+        if (usedTrusted && !isTrusted(bm?.name)) continue;
+        for (const bet of (bm?.bets || [])) {
+          const m = normalizeMarketName(bet?.name || "");
+          for (const v of (bet?.values || [])) {
+            const val = String(v?.value || v?.label || "").toLowerCase();
+            const odd = Number(v?.odd || v?.odds || v?.price);
+            if (!Number.isFinite(odd) || odd <= 1.0) continue;
+
+            if (m === "1X2") {
+              const u = val.includes("home") || val==="1" ? "H" : val.includes("draw") || val==="x" ? "D" : val.includes("away") || val==="2" ? "A" : null;
+              if (!u) continue; out["1X2"][u].arr.push(odd);
+            } else if (m === "BTTS") {
+              const u = val.includes("yes") ? "YES" : val.includes("no") ? "NO" : null;
+              if (!u) continue; out["BTTS"][u].arr.push(odd);
+            } else if (m === "OU") {
+              const is25 = val.includes("over 2.5") || val.includes("under 2.5") || (val === "2.5" && (v?.handicap==2.5 || v?.line==2.5));
+              if (!is25) continue;
+              if (val.includes("over")) out["OU"].OVER25.arr.push(odd);
+              else out["OU"].UNDER25.arr.push(odd);
+            } else if (m === "HTFT") {
+              const key = mapHTFTValue(v?.value || v?.label);
+              if (!key) continue; out["HTFT"][key].arr.push(odd);
+            }
+            totalAdded++;
+          }
+        }
+      }
+    }
+    // fallback ako je premršavo
+    const counts = [
+      out["1X2"].H.arr.length + out["1X2"].D.arr.length + out["1X2"].A.arr.length,
+      out["BTTS"].YES.arr.length + out["BTTS"].NO.arr.length,
+      out["OU"].OVER25.arr.length + out["OU"].UNDER25.arr.length
+    ];
+    const enough = counts.some(c => c >= TRUSTED_FALLBACK_MIN);
+    if (usedTrusted && !enough && pass === 0) {
+      // očisti i probaj bez restrikcije
+      for (const grp of Object.values(out)) for (const k of Object.values(grp)) k.arr = [];
+      usedTrusted = false; totalAdded = 0; continue;
+    }
+    break;
+  }
+
+  // konsenzus & count
+  for (const grpName of Object.keys(out)) {
+    for (const k of Object.keys(out[grpName])) {
+      const arr = out[grpName][k].arr;
+      out[grpName][k].count = Array.isArray(arr) ? arr.length : 0;
+      out[grpName][k].odds  = out[grpName][k].count ? consensusFrom(arr) : null;
+      delete out[grpName][k].arr;
+    }
+  }
+  return out;
+}
+
+// Model helperi
+const impliedFromOdds = odds => (Number(odds) > 0) ? (1/Number(odds)) : null;
+const edgePP = (modelProb, impliedProb) => {
+  if (!Number.isFinite(modelProb) || !Number.isFinite(impliedProb) || impliedProb<=0) return null;
+  return (modelProb / impliedProb - 1) * 100;
+};
+
+// Plausibility prozor za favorita (seče Partizan 2.50 i sl.)
+function plausibleOddsRange(prob){
+  if (!Number.isFinite(prob) || prob <= 0 || prob >= 1) return null;
+  const fair = 1/prob;
+  const lo = fair * 0.80;   // blago ispod fer kvote
+  const hi = fair * OUTLIER_MULT;
+  return [lo, hi];
+}
+
+// Čišćenje liga/timova (ostavi svoj spisak ako već postoji)
 function isExcludedLeagueOrTeam(p){
-  const ln=String(p?.league?.name||"").toLowerCase();
-  const hn=String(p?.teams?.home?.name||"").toLowerCase();
-  const an=String(p?.teams?.away?.name||"").toLowerCase();
-  const bad=/(women|femenin|femmin|ladies|u19|u21|u23|youth|reserve|res\.?)/i;
-  return bad.test(ln)||bad.test(hn)||bad.test(an);
-}
-function isUEFA(leagueName=""){
-  return /uefa|champions league|europa|conference/i.test(String(leagueName));
-}
-function categoryOf(p){
-  const m=String(p.market_label||p.market||"");
-  if(/btts/i.test(m)) return "BTTS";
-  if(/over|under|ou/i.test(m)) return "OU";
-  if(/ht-?ft|ht\/ft/i.test(m)) return "HT-FT";
-  if(/1x2|match winner/i.test(m)) return "1X2";
-  return "OTHER";
-}
-function meetsBookiesFilter(p){
-  const cat=categoryOf(p);
-  const n=Number(p?.bookmakers_count||0);
-  if(cat==="BTTS"||cat==="OU") return n>=MIN_BOOKIES_OU_BTTS;
-  if(cat==="1X2"||cat==="HT-FT") return n>=MIN_BOOKIES_1X2_HTFT;
+  const ln = `${p?.league?.name||""}`.toLowerCase();
+  const tnH = `${p?.teams?.home||p?.home||""}`.toLowerCase();
+  const tnA = `${p?.teams?.away||p?.away||""}`.toLowerCase();
+  if (ln.includes("women") || ln.includes("u19") || ln.includes("reserve")) return true;
+  if (tnH.includes("women") || tnA.includes("women")) return true;
   return false;
 }
-function computeSafe(p,tier3){
-  const prob=Number(p?.model_prob||0);
-  const odds=Number(p?.market_odds||0);
-  const ev=Number(p?.ev);
-  const bks=Number(p?.bookmakers_count||0);
-  const need=tier3?SAFE_MIN_BOOKIES_T3:SAFE_MIN_BOOKIES_T12;
-  return (prob>=SAFE_MIN_PROB && odds>=SAFE_MIN_ODDS && Number.isFinite(ev)&&ev>=SAFE_MIN_EV && bks>=need);
-}
-function kickoffMs(p){
-  const s = String(p?.datetime_local?.starting_at?.date_time||"").replace(" ","T");
-  const t = Date.parse(s); return Number.isFinite(t)?t:Infinity;
-}
 
-// distinct by fixture -> take best by confidence, tie by EV
-function distinctByFixture(arr){
-  const best=new Map();
-  for(const p of arr){
-    const fid=p?.fixture_id;
-    if(!fid) continue;
-    const cur=best.get(fid);
-    if(!cur){ best.set(fid,p); continue; }
-    const ca=Number(p?.confidence_pct||Math.round((p?.model_prob||0)*100));
-    const cb=Number(cur?.confidence_pct||Math.round((cur?.model_prob||0)*100));
-    if(ca>cb) best.set(fid,p);
-    else if(ca===cb){
-      const ea=Number.isFinite(p?.ev)?p.ev:-Infinity;
-      const eb=Number.isFinite(cur?.ev)?cur.ev:-Infinity;
-      if(ea>eb) best.set(fid,p);
-    }
-  }
-  return [...best.values()];
-}
-
-// mala kalibracija conf (ne menja model, samo overlay)
+// Confidence overlay (blagi korektiv)
 function adjustedConfidence(p){
-  let c = Number(p?.confidence_pct || Math.round((p?.model_prob||0)*100));
-  const cat = categoryOf(p);
-  const odds = Number(p?.market_odds || 0);
-  const bks = Number(p?.bookmakers_count || 0);
-
-  // penalizuj nerealno visoke OU/BTTS kvote
-  if(cat==="OU"){
-    if(odds>2.5) c -= 5;
-    if(odds>2.6) c -= 3;
-  }
-  if(cat==="BTTS"){
-    if(odds>2.6) c -= 4;
-    if(odds>2.8) c -= 3;
-  }
-  // slab broj kladionica → penal
-  if(bks < 4) c -= 3;
-  // safe indikatori → blagi plus
-  if(computeSafe(p, isTier3(p?.league?.name||"", p?.league?.country||""))) c += 2;
-
-  c = Math.max(10, Math.min(95, c));
-  return c;
+  const base = Number(p?.confidence_pct || 0);
+  const books = Number(p?.bookmakers_count || 0);
+  const tweak = Math.max(-3, Math.min(3, (books-5)*0.3));
+  return Math.round(Math.max(0, Math.min(100, base + tweak)));
 }
 
-// ---------- handler
-export default async function handler(req,res){
-  setNoStore(res);
+// ====== HANDLER ======
+export default async function handler(req, res){
+  try {
+    const now = new Date();
+    const day = ymdTZ(now);
+    const key = `vb:day:${day}:last`;
 
-  const day = ymdTZ();
-  const { h } = hmTZ();
-  const lastKey = `vb:day:${day}:last`;
-  const revKey  = `vb:day:${day}:rev`;
-  const cdKey   = `vb:auto:rebuild:cd:${day}`;
+    // 1) Učitaj snapshot iz KV
+    let arr = await kvGET(key);
+    let source = "locked-cache";
 
-  // 1) snapshot
-  let arr = unwrapKV(await kvGet(lastKey));
-  if(!Array.isArray(arr)) arr=[];
-
-  // 2) auto-rebuild ako prazno i u aktivnim satima
-  if(arr.length===0 && h>=ACTIVE_HOURS.from && h<=ACTIVE_HOURS.to){
-    const cd=await kvGet(cdKey);
-    const now=Date.now();
-    const okToRebuild=!cd||(Number(cd?.ts||cd)+REBUILD_COOLDOWN_MIN*60*1000<now);
-    if(okToRebuild){
-      await kvSet(cdKey,{ts:now},{ex:6*3600});
-      try{
-        const proto=req.headers["x-forwarded-proto"]||"https";
-        const host =req.headers["x-forwarded-host"]||req.headers.host;
-        await fetch(`${proto}://${host}/api/cron/rebuild`,{cache:"no-store"});
-      }catch{}
-      const retry=unwrapKV(await kvGet(lastKey));
-      if(Array.isArray(retry)&&retry.length) arr=retry;
+    // Ako nema — probaj rebuild pa retry (kratak delay da KV upiše)
+    if (!Array.isArray(arr) || !arr.length) {
+      source = "ensure-wait";
+      try { await fetch(`${req.headers["x-forwarded-proto"]||"https"}://${req.headers.host}/api/cron/rebuild`); } catch {}
+      await new Promise(r => setTimeout(r, 350));
+      arr = await kvGET(key);
+      if (!Array.isArray(arr)) arr = [];
     }
-    if(!arr.length){
-      return res.status(200).json({
-        value_bets: [],
-        built_at: new Date().toISOString(),
-        day,
-        source:"ensure-wait",
-        meta:{ limit_applied:VB_LIMIT, league_cap:LEAGUE_CAP }
-      });
+
+    // 2) Priprema + realističnost kvota + ljudski “Zašto”
+    const byLeague = new Map();
+    const prepared = [];
+    const nowMs = Date.now();
+    const endMs = nowMs + WINDOW_HOURS*3600*1000;
+
+    for (const p0 of arr) {
+      const p = { ...p0 };
+      try {
+        // vreme i prozori
+        const dt = new Date((p?.datetime_local?.starting_at?.date_time || "").replace(" ","T"));
+        const ms = +dt || 0;
+        if (!ms || ms > endMs) continue;
+        const minsToKick = Math.round((ms - nowMs)/60000);
+        if (minsToKick <= FREEZE_MIN_BEFORE) continue;
+
+        // isključenja + cap po ligi
+        if (isExcludedLeagueOrTeam(p)) continue;
+        const lkey = `${p?.league?.id||""}`; const c = byLeague.get(lkey)||0;
+        if (c >= LEAGUE_CAP) continue;
+
+        // guardrails na kvotu (pre korekcije)
+        let odds = Number(p?.market_odds || 0);
+        const market = String(p?.market || "").toUpperCase();
+        const cat    = String(p?.market_label || "").toUpperCase();
+
+        // 2.1 – korekcija očiglednih outlier-a preko AF /odds (konsenzus)
+        let needsFix = false;
+        if (odds && Number.isFinite(odds)) {
+          if (market === "MODEL+ODDS" || market === "MODEL") { /* model only */ }
+          const prob = Number(p?.model_prob || 0);
+          const window = plausibleOddsRange(prob);
+          if (window && (odds < window[0] || odds > window[1])) needsFix = true;
+          if (cat === "OU" && odds > OU_MAX_ODDS) needsFix = true;
+          if (cat === "BTTS" && odds > BTTS_MAX_ODDS) needsFix = true;
+        } else {
+          needsFix = true;
+        }
+
+        if (needsFix && AF_KEY && p.fixture_id) {
+          const resp = await afGET(`/odds?fixture=${p.fixture_id}`);
+          const cons = readConsensusOdds(resp);
+          if (cat === "1X2") {
+            const pick = p.selection === "1" ? "H" : p.selection === "X" ? "D" : p.selection === "2" ? "A" : null;
+            const cell = pick ? cons["1X2"][pick] : null;
+            if (cell?.odds) { odds = cell.odds; p.bookmakers_count = cell.count; }
+          } else if (cat === "OU") {
+            const cell = p.selection?.toUpperCase() === "OVER" ? cons["OU"].OVER25 : cons["OU"].UNDER25;
+            if (cell?.odds) { odds = cell.odds; p.bookmakers_count = cell.count; }
+          } else if (cat === "BTTS") {
+            const cell = p.selection?.toUpperCase() === "YES" ? cons["BTTS"].YES : cons["BTTS"].NO;
+            if (cell?.odds) { odds = cell.odds; p.bookmakers_count = cell.count; }
+          }
+        }
+
+        // globalni minimumi i plafoni
+        if (!Number.isFinite(odds) || odds < MIN_ODDS) continue;
+        if (cat === "OU"   && odds > OU_MAX_ODDS) continue;
+        if (cat === "BTTS" && odds > BTTS_MAX_ODDS) continue;
+
+        // EV (pomoćno)
+        const implied = impliedFromOdds(odds);
+        const evpp = edgePP(Number(p?.model_prob||0), implied);
+        p.market_odds  = Number(odds.toFixed(2));
+        p.implied_prob = implied;
+        p.edge_pp      = evpp;
+
+        // ljudski “Zašto”
+        let explain = p.explain || {};
+        const insight = await kvGET(`vb:insight:${p.fixture_id}`).catch(()=>null);
+        if (insight?.line) explain = { ...explain, summary: insight.line };
+
+        // confidence overlay
+        const conf = adjustedConfidence(p);
+
+        prepared.push({ ...p, explain, confidence_pct: conf });
+        byLeague.set(lkey, c+1);
+        if (prepared.length >= VB_LIMIT) break;
+      } catch { /* ignore single card errors */ }
     }
+
+    return res.status(200).json({
+      value_bets: prepared,
+      built_at: isoNow(),
+      day,
+      source
+    });
+  } catch (e) {
+    return res.status(200).json({ value_bets: [], built_at: isoNow(), day: ymdTZ(new Date()), source: "error", error: String(e?.message||e) });
   }
-
-  // 3) filtriranje
-  const nowMs = Date.now();
-  const maxMs = nowMs + WINDOW_HOURS*3600*1000;
-
-  const byLeagueCount=new Map();
-  const prepared=[];
-
-  for(const p0 of arr){
-    // kopija da ne diramo original
-    const p = { ...p0 };
-
-    // isključenja i prozor/freeze
-    if(isExcludedLeagueOrTeam(p)) continue;
-    const t=kickoffMs(p);
-    if(!(t>nowMs && t<=maxMs)) continue;
-    if(t-nowMs < FREEZE_MIN*60*1000) continue;
-
-    // cap po ligi (UEFA izuzetak -> bar 4)
-    const leagueName = p?.league?.name || "";
-    const leagueKey  = `${p?.league?.country||""}::${leagueName}`;
-    const isUefa = isUEFA(leagueName);
-    const cap = isUefa ? Math.max(LEAGUE_CAP,4) : LEAGUE_CAP;
-    const cur = byLeagueCount.get(leagueKey)||0;
-    if(cur>=cap) continue;
-
-    // bookies
-    const tier3 = isTier3(leagueName, p?.league?.country||"");
-    const nBooks = Number(p?.bookmakers_count||0);
-    if(!meetsBookiesFilter(p)) continue;
-    if(tier3 && nBooks < TIER3_MIN_BOOKIES) continue;
-
-    // realistične kvote
-    const cat = categoryOf(p);
-    const odds = Number(p?.market_odds||0);
-    if(!(Number.isFinite(odds) && odds>=MIN_ODDS)) continue;
-    if(cat==="OU"   && odds>OU_MAX_ODDS) continue;
-    if(cat==="BTTS" && odds>BTTS_MAX_ODDS) continue;
-
-    // SAFE badge (info)
-    const safe = computeSafe(p,tier3);
-
-    // preferiraj tekstualni “Zašto” ako postoje insights
-    const insight = await kvGet(`vb:insight:${p.fixture_id}`).catch(()=>null);
-    let explain = p?.explain || {};
-    if(insight?.line){
-      explain = { ...explain, summary: insight.line };
-    }
-
-    // mala kalibracija confidence-a (overlay)
-    const adj = adjustedConfidence(p);
-
-    prepared.push({ ...p, safe, explain, confidence_pct: adj });
-    byLeagueCount.set(leagueKey, cur+1);
-  }
-
-  // 4) distinct: jedna igra po meču
-  let final = distinctByFixture(prepared);
-
-  // sort po difoltu: confidence, pa EV, pa kickoff
-  final.sort((a,b)=>{
-    const ca = Number(a?.confidence_pct||Math.round((a?.model_prob||0)*100));
-    const cb = Number(b?.confidence_pct||Math.round((b?.model_prob||0)*100));
-    if(cb!==ca) return cb-ca;
-    const ea = Number.isFinite(a?.ev)?a.ev:-Infinity;
-    const eb = Number.isFinite(b?.ev)?b.ev:-Infinity;
-    if(eb!==ea) return eb-ea;
-    return kickoffMs(a)-kickoffMs(b);
-  });
-
-  const revRaw = unwrapKV(await kvGet(revKey));
-  let rev=0; try { rev = parseInt(String(revRaw?.value??revRaw??"0"),10)||0; } catch {}
-
-  return res.status(200).json({
-    value_bets: final.slice(0, VB_LIMIT),
-    built_at: new Date().toISOString(),
-    day,
-    source: "locked-cache",
-    meta: {
-      limit_applied: VB_LIMIT,
-      league_cap: LEAGUE_CAP,
-      floats_enabled: !!process.env.SMART45_FLOAT_ENABLED,
-      safe_enabled: true,
-      safe_min_prob: SAFE_MIN_PROB,
-      safe_min_odds: SAFE_MIN_ODDS,
-      safe_min_ev: SAFE_MIN_EV,
-      safe_min_bookies_t12: SAFE_MIN_BOOKIES_T12,
-      safe_min_bookies_t3:  SAFE_MIN_BOOKIES_T3,
-      window_hours: WINDOW_HOURS,
-      freeze_min: FREEZE_MIN,
-      min_odds: MIN_ODDS,
-      ou_max_odds: OU_MAX_ODDS,
-      btts_max_odds: BTTS_MAX_ODDS,
-      rev
-    },
-  });
 }
