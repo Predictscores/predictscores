@@ -1,88 +1,62 @@
-// FILE: pages/api/cron/rebuild.js
-// Zaključava dnevni snapshot u KV:
-//  - vb:day:YYYY-MM-DD:last  (array pickova)
-//  - vb:day:YYYY-MM-DD:rev   (brojač; TTL 2d)
-//  - vb:day:YYYY-MM-DD:rev:<n> (verzionisani snapshot; TTL 2d)
-
+// pages/api/cron/rebuild.js
 export const config = { api: { bodyParser: false } };
 
-const KV_URL = process.env.KV_REST_API_URL;
+const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
-const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const TZ       = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
-function ymdTZ(d = new Date()) {
-  const fmt = new Intl.DateTimeFormat("sv-SE", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit" });
-  return fmt.format(d);
-}
-function unwrapKV(raw) {
-  let v = raw;
+function ymdInTZ(d=new Date(), tz=TZ) {
   try {
-    if (typeof v === "string") {
-      const p = JSON.parse(v);
-      v = (p && typeof p === "object" && "value" in p) ? p.value : p;
-    }
-    if (typeof v === "string" && (v.startsWith("{") || v.startsWith("["))) v = JSON.parse(v);
-  } catch {}
-  return v;
+    const fmt = new Intl.DateTimeFormat("en-CA",{ timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
+    return fmt.format(d); // YYYY-MM-DD
+  } catch {
+    const y=d.getUTCFullYear(), m=String(d.getUTCMonth()+1).padStart(2,"0"), dd=String(d.getUTCDate()).padStart(2,"0");
+    return `${y}-${m}-${dd}`;
+  }
 }
-async function kvGet(key) {
-  if (!KV_URL || !KV_TOKEN) return null;
-  try {
-    const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
-      headers: { Authorization: `Bearer ${KV_TOKEN}` }, cache: "no-store",
-    });
-    if (!r.ok) return null;
-    const j = await r.json().catch(()=>null);
-    return unwrapKV(j && typeof j.result !== "undefined" ? j.result : null);
-  } catch { return null; }
+async function kvSET(key, value){
+  const body = typeof value === "string" ? value : JSON.stringify(value);
+  const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
+    body
+  });
+  let js=null; try{ js=await r.json(); }catch{}
+  return { ok:r.ok, js };
 }
-async function kvSet(key, value, opts = {}) {
-  if (!KV_URL || !KV_TOKEN) return false;
+export default async function handler(req, res){
   try {
-    const body = { value: typeof value === "string" ? value : JSON.stringify(value) };
-    if (opts.ex) body.ex = opts.ex;
-    if (opts.nx) body.nx = true;
-    const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${KV_TOKEN}` },
-      body: JSON.stringify(body),
-    });
-    return r.ok;
-  } catch { return false; }
-}
-
-export default async function handler(req, res) {
-  try {
-    const today = ymdTZ();
-
-    // 1) pozovi generator interno
-    const proto = req.headers["x-forwarded-proto"] || req.headers["x-forwarded-protocol"] || "https";
-    const host  = req.headers["x-forwarded-host"] || req.headers["x-forwarded-hostname"] || req.headers.host;
+    const proto = req.headers["x-forwarded-proto"] || "https";
+    const host  = req.headers.host;
     const base  = `${proto}://${host}`;
 
-    const r = await fetch(`${base}/api/value-bets`, { cache: "no-store" });
-    const j = await r.json().catch(()=>({ value_bets: [] }));
-    const list = Array.isArray(j?.value_bets) ? j.value_bets : (Array.isArray(j) ? j : []);
+    // 1) GENERATE (ovo je JEDINI deo koji troši API-Football — pokreni jednom dnevno)
+    const r = await fetch(`${base}/api/value-bets`);
+    if (!r.ok) return res.status(200).json({ ok:false, error:"generator failed" });
+    const j = await r.json().catch(()=>null);
+    const arr = Array.isArray(j?.value_bets) ? j.value_bets : [];
+    const count = arr.length;
 
-    // 2) upiši snapshot u KV
-    const lastKey = `vb:day:${today}:last`;
-    await kvSet(lastKey, list, { ex: 2 * 24 * 3600 }); // 2 dana
+    // 2) UPIS u KV — CET i UTC ključevi, direktno :last + jedan :rev timestamp (ne zavisimo od brojača)
+    const now = new Date();
+    const dayCET = ymdInTZ(now, TZ);
+    const dayUTC = ymdInTZ(now, "UTC");
+    const rev = Math.floor(Date.now()/1000); // unix sec
 
-    let rev = 0;
-    const revRaw = await kvGet(`vb:day:${today}:rev`);
-    try { rev = parseInt(String(revRaw?.value ?? revRaw ?? "0"), 10) || 0; } catch {}
-    rev += 1;
+    const writes = [];
+    writes.push(await kvSET(`vb:day:${dayCET}:rev:${rev}`, arr));
+    writes.push(await kvSET(`vb:day:${dayCET}:last`, arr));
+    writes.push(await kvSET(`vb:day:${dayUTC}:last`, arr)); // sigurnosni alias
 
-    await kvSet(`vb:day:${today}:rev`, String(rev), { ex: 2 * 24 * 3600 });
-    await kvSet(`vb:day:${today}:rev:${rev}`, list, { ex: 2 * 24 * 3600 });
-
+    const persisted = writes.every(w => w.ok);
     return res.status(200).json({
       ok: true,
-      snapshot_for: today,
-      count: list.length,
-      rev
+      snapshot_for: dayCET,
+      count,
+      rev,
+      persisted
     });
   } catch (e) {
-    return res.status(200).json({ ok:false, error: String(e?.message || e) });
+    return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
 }
