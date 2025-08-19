@@ -1,13 +1,14 @@
 // pages/api/cron/rebuild.js
 // Slotovani snapshoti (AM/PM/LATE) sa per-slot budžetima i tier-miks selekcijom.
 // UEFA dnevni cap (preko svih slotova). UNION (AM∪PM∪LATE) upis u :last.
-// Idempotent guard: 60s.
+// Idempotent guard: 60s. + HISTORY: snimi Top3/Top1 po slotu (ako FEATURE_HISTORY=1).
 
 export const config = { api: { bodyParser: false } };
 
 const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const TZ       = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const FEATURE_HISTORY = process.env.FEATURE_HISTORY === "1";
 
 // Budžeti po slotu
 const SLOT_WEEKDAY_LIMIT = parseInt(process.env.SLOT_WEEKDAY_LIMIT || "15", 10);
@@ -66,6 +67,12 @@ async function kvSET(key, value){
   let js=null; try{ js=await r.json(); }catch{}
   return { ok:r.ok, js };
 }
+async function kvDEL(key){
+  await fetch(`${KV_URL}/del/${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${KV_TOKEN}` }
+  }).catch(()=>{});
+}
 function parseArray(raw){
   try{ let v=raw; if (typeof v==="string") v=JSON.parse(v);
     if (Array.isArray(v)) return v;
@@ -103,13 +110,31 @@ function groupOf(leagueNameRaw){
 
 // Slot window
 function inSlotWindow(pick, dayCET, slot){
-  const t = String(pick?.datetime_local?.starting_at?.date_time || "").replace(" ","T");
+  const t = String(p?.datetime_local?.starting_at?.date_time || "").replace(" ","T");
   const tz = toTZParts(t, TZ);
   if (tz.ymd !== dayCET) return false;
   if (slot === "am")   return tz.hour >= 10 && tz.hour < 15;
   if (slot === "pm")   return tz.hour >= 15 && tz.hour < 24;
   if (slot === "late") return tz.hour >= 0  && tz.hour <  3;
   return true;
+}
+
+// HISTORY helper
+function toHistoryRecord(slot, pick){
+  return {
+    fixture_id: pick?.fixture_id,
+    teams: { home: pick?.teams?.home?.name, away: pick?.teams?.away?.name },
+    league: { id: pick?.league?.id, name: pick?.league?.name, country: pick?.league?.country },
+    kickoff: String(pick?.datetime_local?.starting_at?.date_time || "").replace(" ","T"),
+    slot: String(slot || "").toUpperCase(),
+    market: pick?.market,
+    selection: pick?.selection,
+    odds: Number(pick?.market_odds),
+    locked_at: new Date().toISOString(),
+    final_score: null,
+    won: null,
+    settled_at: null
+  };
 }
 
 export default async function handler(req, res){
@@ -242,6 +267,35 @@ export default async function handler(req, res){
     await kvSET(`vb:day:${dayCET}:last`, union);
     await kvSET(`vb:day:${ymdInTZ(now, "UTC")}:last`, union);
     await kvSET(`vb:jobs:last:rebuild`, { ts: nowMs, slot });
+
+    // ---------------- HISTORY: upiši Top3/Top1 po slotu (jednokratno) ----------------
+    if (FEATURE_HISTORY) {
+      const histKey = `hist:${dayCET}:${slot}`;
+      const existing = parseArray(await kvGET(histKey));
+      if (!existing || existing.length === 0) {
+        const topN = (slot === "late") ? 1 : 3;
+        const top = picked.slice(0, topN).map(p => toHistoryRecord(slot, p));
+        if (top.length) {
+          await kvSET(histKey, top);
+          // indeks dana i trim >14d
+          const idxKey = `hist:index`;
+          let days = parseArray(await kvGET(idxKey));
+          if (!Array.isArray(days)) days = [];
+          if (!days.includes(dayCET)) days.push(dayCET);
+          // sort DESC i trim na 14
+          days.sort().reverse();
+          const keep = days.slice(0, 14);
+          await kvSET(idxKey, keep);
+          // obriši starije ključeve
+          for (const d of days.slice(14)) {
+            await kvDEL(`hist:${d}:am`);
+            await kvDEL(`hist:${d}:pm`);
+            await kvDEL(`hist:${d}:late`);
+          }
+        }
+      }
+    }
+    // -------------------------------------------------------------------------------
 
     return res.status(200).json({
       ok: true,
