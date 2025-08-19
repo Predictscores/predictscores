@@ -14,6 +14,7 @@ const MIN_ODDS      = 1.50;
 const OU_MAX_ODDS   = 2.60;
 const BTTS_MAX_ODDS = 2.80;
 
+// opcioni fallback za nekoliko MODEL pickova bez kvote (default: off)
 const ALLOW_MODEL_FALLBACK = Number(process.env.ALLOW_MODEL_FALLBACK || "0") === 1;
 const MODEL_FALLBACK_CAP   = parseInt(process.env.MODEL_FALLBACK_CAP || "5", 10);
 
@@ -43,16 +44,33 @@ async function kvGETraw(key){
 }
 
 function normalizeSnapshot(raw) {
-  if (raw == null) return [];
-  let v = raw;
-  try { if (typeof v === "string") v = JSON.parse(v); } catch { return []; }
-  // dozvoli više formata
-  if (Array.isArray(v)) return v;
-  if (v && typeof v === "object") {
-    if (Array.isArray(v.value_bets)) return v.value_bets;
-    if (Array.isArray(v.arr)) return v.arr;
-    if (Array.isArray(v.data)) return v.data;
-  }
+  // prihvatamo: čist niz, string JSON niza, objekat sa value_bets/arr/data
+  // i SPECIFIČNO: objekat { value: "<json-string-niza>" } (što sada vidiš u preview-u)
+  try {
+    let v = raw;
+
+    if (typeof v === "string") {
+      // proba 1: direktno je niz u stringu
+      try { const a = JSON.parse(v); if (Array.isArray(a)) return a; v = a; } catch { /* nastavi */ }
+    }
+
+    if (Array.isArray(v)) return v;
+
+    if (v && typeof v === "object") {
+      if (Array.isArray(v.value_bets)) return v.value_bets;
+      if (Array.isArray(v.arr)) return v.arr;
+      if (Array.isArray(v.data)) return v.data;
+
+      // specijalni slučaj: { value: "<json>" } ili { value: [ ... ] }
+      if ("value" in v) {
+        const inner = v.value;
+        if (typeof inner === "string") {
+          try { const a = JSON.parse(inner); if (Array.isArray(a)) return a; } catch {}
+        }
+        if (Array.isArray(inner)) return inner;
+      }
+    }
+  } catch { /* ignore */ }
   return [];
 }
 
@@ -73,7 +91,7 @@ export default async function handler(req, res){
     const dayCET = ymdInTZ(now, TZ);
     const dayUTC = ymdInTZ(now, "UTC");
 
-    // 1) pročitaj snapshot (CET pa UTC) i normalizuj
+    // 1) čitanje CET pa UTC
     let rawCET = await kvGETraw(`vb:day:${dayCET}:last`);
     let arr = normalizeSnapshot(rawCET);
     let source = "locked-cache";
@@ -87,7 +105,7 @@ export default async function handler(req, res){
       return res.status(200).json({ value_bets: [], built_at: isoNow(), day: dayCET, source });
     }
 
-    // 2) filtriranje (bez eksternih poziva)
+    // 2) filtriranje
     const out = [];
     const byLeague = new Map();
     const nowMs = +now;
@@ -98,17 +116,20 @@ export default async function handler(req, res){
       try {
         const p = { ...p0 };
 
+        // vreme
         const t = String(p?.datetime_local?.starting_at?.date_time || "").replace(" ","T");
         const ms = +new Date(t);
         if (!ms || ms > endMs) continue;
         const mins = Math.round((ms - nowMs)/60000);
         if (mins <= FREEZE_MIN_BEFORE) continue;
 
+        // league cap & exclude
         if (isExcludedLeagueOrTeam(p)) continue;
         const lkey = `${p?.league?.id||""}`;
         const c = byLeague.get(lkey) || 0;
         if (c >= LEAGUE_CAP) continue;
 
+        // kvota/logika
         const cat  = String(p?.market_label || p?.market || "").toUpperCase();
         let odds   = Number(p?.market_odds);
         if (!Number.isFinite(odds)) {
@@ -126,6 +147,7 @@ export default async function handler(req, res){
         const ip = impliedFromOdds(odds);
         const ev = edgePP(Number(p?.model_prob||0), ip);
 
+        // explain
         let line = p?.explain?.summary || null;
         if (!line) {
           const h = p?.teams?.home?.name || p?.teams?.home || "Home";
@@ -146,7 +168,7 @@ export default async function handler(req, res){
 
         byLeague.set(lkey, c+1);
         if (out.length >= VB_LIMIT) break;
-      } catch {/* skip */}
+      } catch { /* skip */ }
     }
 
     return res.status(200).json({
