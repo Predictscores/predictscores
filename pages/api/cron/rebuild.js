@@ -16,11 +16,11 @@ function ymdInTZ(d=new Date(), tz=TZ) {
 }
 
 async function kvSET(key, value){
-  // Upstash/Vercel KV: POST body { value: "<string>" }
+  // Upisujemo ČIST JSON niz, bez wrapper-a (prethodno je bio {"value":"..."}).
   const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ value: JSON.stringify(value) })
+    body: JSON.stringify(value)  // <-- ključna izmena: nema { value: ... }
   });
   let js=null; try{ js=await r.json(); }catch{}
   return { ok:r.ok, js };
@@ -39,18 +39,16 @@ export default async function handler(req, res){
     const arr = Array.isArray(j?.value_bets) ? j.value_bets : [];
     const count = arr.length;
 
-    // 2) UPIS u KV — čuvamo OBJEKAT sa array-em (da reader sigurno prepozna format)
+    // 2) UPIS u KV — CET i UTC ključevi, :last + :rev
     const now = new Date();
     const dayCET = ymdInTZ(now, TZ);
     const dayUTC = ymdInTZ(now, "UTC");
     const rev = Math.floor(Date.now()/1000);
 
-    const payload = { value_bets: arr, meta: { dayCET, dayUTC, rev } };
-
     const writes = [];
-    writes.push(await kvSET(`vb:day:${dayCET}:rev:${rev}`, payload));
-    writes.push(await kvSET(`vb:day:${dayCET}:last`, payload));
-    writes.push(await kvSET(`vb:day:${dayUTC}:last`, payload)); // alias
+    writes.push(await kvSET(`vb:day:${dayCET}:rev:${rev}`, arr));
+    writes.push(await kvSET(`vb:day:${dayCET}:last`, arr));
+    writes.push(await kvSET(`vb:day:${dayUTC}:last`, arr)); // alias
 
     const persisted = writes.every(w => w.ok);
     return res.status(200).json({ ok:true, snapshot_for:dayCET, count, rev, persisted });
