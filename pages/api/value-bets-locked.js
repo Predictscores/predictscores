@@ -1,4 +1,8 @@
 // pages/api/value-bets-locked.js
+// Čita zaključani snapshot iz KV i pravi finalnu stabilnu listu za UI.
+// Uklonjeni hard-capovi za OU/BTTS – sada se oslanjamo na trusted-consensus iz generatora.
+// Filteri: prozor 72h, freeze 30min, league cap, min kvota, isključenja.
+
 export const config = { api: { bodyParser: false } };
 
 const KV_URL   = process.env.KV_REST_API_URL;
@@ -10,9 +14,7 @@ const LEAGUE_CAP = parseInt(process.env.VB_MAX_PER_LEAGUE || "2", 10);
 const WINDOW_HOURS      = parseInt(process.env.VB_WINDOW_HOURS || "72", 10);
 const FREEZE_MIN_BEFORE = parseInt(process.env.VB_FREEZE_MIN || "30", 10);
 
-const MIN_ODDS      = 1.50;
-const OU_MAX_ODDS   = 2.60;
-const BTTS_MAX_ODDS = 2.80;
+const MIN_ODDS = parseFloat(process.env.MIN_ODDS || "1.5");
 
 // opcioni fallback za nekoliko MODEL pickova bez kvote (default: off)
 const ALLOW_MODEL_FALLBACK = Number(process.env.ALLOW_MODEL_FALLBACK || "0") === 1;
@@ -44,24 +46,16 @@ async function kvGETraw(key){
 }
 
 function normalizeSnapshot(raw) {
-  // prihvatamo: čist niz, string JSON niza, objekat sa value_bets/arr/data
-  // i SPECIFIČNO: objekat { value: "<json-string-niza>" } (što sada vidiš u preview-u)
   try {
     let v = raw;
-
     if (typeof v === "string") {
-      // proba 1: direktno je niz u stringu
-      try { const a = JSON.parse(v); if (Array.isArray(a)) return a; v = a; } catch { /* nastavi */ }
+      try { const a = JSON.parse(v); if (Array.isArray(a)) return a; v = a; } catch {}
     }
-
     if (Array.isArray(v)) return v;
-
     if (v && typeof v === "object") {
       if (Array.isArray(v.value_bets)) return v.value_bets;
       if (Array.isArray(v.arr)) return v.arr;
       if (Array.isArray(v.data)) return v.data;
-
-      // specijalni slučaj: { value: "<json>" } ili { value: [ ... ] }
       if ("value" in v) {
         const inner = v.value;
         if (typeof inner === "string") {
@@ -70,7 +64,7 @@ function normalizeSnapshot(raw) {
         if (Array.isArray(inner)) return inner;
       }
     }
-  } catch { /* ignore */ }
+  } catch {}
   return [];
 }
 
@@ -130,18 +124,15 @@ export default async function handler(req, res){
         if (c >= LEAGUE_CAP) continue;
 
         // kvota/logika
-        const cat  = String(p?.market_label || p?.market || "").toUpperCase();
-        let odds   = Number(p?.market_odds);
+        let odds = Number(p?.market_odds);
         if (!Number.isFinite(odds)) {
           if (ALLOW_MODEL_FALLBACK && modelFallbackUsed < MODEL_FALLBACK_CAP) {
             modelFallbackUsed++;
           } else {
             continue;
           }
-        } else {
-          if (odds < MIN_ODDS) continue;
-          if (cat==="OU" && odds>OU_MAX_ODDS) continue;
-          if (cat==="BTTS" && odds>BTTS_MAX_ODDS) continue;
+        } else if (odds < MIN_ODDS) {
+          continue;
         }
 
         const ip = impliedFromOdds(odds);
