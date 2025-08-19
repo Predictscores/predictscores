@@ -369,4 +369,127 @@ export default async function handler(req, res) {
       } else {
         // SAFE favorit
         const fav = [oneX2[0], oneX2[2]].sort((a,b)=>b.prob-a.prob)[0]; // home vs away
-        if (fav && Number.isFinite(fav.odds) && fav.odds >= 1.5 && f
+        if (fav && Number.isFinite(fav.odds) && fav.odds >= 1.5 && fav.prob >= 0.65) {
+          const imp = impliedFromOdds(fav.odds);
+          const er = edgeRatio(fav.prob, imp);
+          if (er != null && er >= -0.005) {
+            out.push(buildPick({
+              fixture: fx,
+              market: "1X2",
+              selection: fav.sel,
+              modelProb: fav.prob,
+              odds: fav.odds,
+              bookmakersCount: fav.count,
+              type: "SAFE"
+            }));
+          }
+        }
+      }
+
+      // --- BTTS: YES ---
+      const bttsYesOdds = o["BTTS"].YES.odds;
+      const bttsYesCnt  = o["BTTS"].YES.count;
+      if (Number.isFinite(bttsYesOdds)) {
+        out.push(buildPick({
+          fixture: fx,
+          market: "BTTS",
+          selection: "YES",
+          modelProb: pBTTS,
+          odds: bttsYesOdds,
+          bookmakersCount: bttsYesCnt,
+          type: "MODEL+ODDS"
+        }));
+      } else {
+        // fallback (MODEL) – bez kvota
+        out.push(buildPick({
+          fixture: fx,
+          market: "BTTS",
+          selection: "YES",
+          modelProb: pBTTS,
+          odds: null,
+          bookmakersCount: 0,
+          type: "MODEL"
+        }));
+      }
+
+      // --- Over 2.5 ---
+      const over25Odds = o["OU"].OVER25.odds;
+      const over25Cnt  = o["OU"].OVER25.count;
+      if (Number.isFinite(over25Odds)) {
+        out.push(buildPick({
+          fixture: fx,
+          market: "OU",
+          selection: "OVER 2.5",
+          modelProb: pOver25,
+          odds: over25Odds,
+          bookmakersCount: over25Cnt,
+          type: "MODEL+ODDS"
+        }));
+      } else {
+        // fallback MODEL
+        out.push(buildPick({
+          fixture: fx,
+          market: "OU",
+          selection: "OVER 2.5",
+          modelProb: pOver25,
+          odds: null,
+          bookmakersCount: 0,
+          type: "MODEL"
+        }));
+      }
+
+      // --- HT-FT (samo kad postoje kvote i >=2 bukija) ---
+      const htftMap = o["HTFT"];
+      // model joint prob (gruba aproksimacija multiplikacijom HT i FT margina)
+      const modelHT = { H: pHT_H, D: pHT_D, A: pHT_A };
+      const modelFT = { H: pHome, D: pDraw, A: pAway };
+      const combos = ["H/H","H/D","H/A","D/H","D/D","D/A","A/H","A/D","A/A"].map(k=>{
+        const [ht, ft] = k.split("/");
+        const prob = (modelHT[ht]||0) * (modelFT[ft]||0);
+        const odds = htftMap[k]?.odds ?? null;
+        const count = htftMap[k]?.count ?? 0;
+        const imp = impliedFromOdds(odds);
+        const er = edgeRatio(prob, imp);
+        return { key:k, prob, odds, count, er };
+      });
+
+      const bestHTFT = combos
+        .filter(c => Number.isFinite(c.odds) && c.count >= 2 && Number.isFinite(c.er))
+        .sort((a,b)=> b.er - a.er)[0];
+
+      if (bestHTFT && bestHTFT.er > 0.02) {
+        out.push(buildPick({
+          fixture: fx,
+          market: "HT-FT",
+          selection: bestHTFT.key,
+          modelProb: bestHTFT.prob,
+          odds: bestHTFT.odds,
+          bookmakersCount: bestHTFT.count,
+          type: "MODEL+ODDS"
+        }));
+      }
+    }
+
+    // Sort: SAFE → veći conf → veći EV → skoriji kickoff
+    out.sort((a, b) => {
+      const A = (a.type === "SAFE") ? 1 : 0;
+      const B = (b.type === "SAFE") ? 1 : 0;
+      if (B !== A) return B - A;
+      if (b.confidence_pct !== a.confidence_pct) return b.confidence_pct - a.confidence_pct;
+      const eva = Number.isFinite(a.ev) ? a.ev : -Infinity;
+      const evb = Number.isFinite(b.ev) ? b.ev : -Infinity;
+      if (evb !== eva) return evb - eva;
+      const ta = Number(new Date(a?.datetime_local?.starting_at?.date_time || 0).getTime());
+      const tb = Number(new Date(b?.datetime_local?.starting_at?.date_time || 0).getTime());
+      return ta - tb;
+    });
+
+    res.status(200).json({
+      value_bets: out,
+      generated_at: new Date().toISOString(),
+      calls_used
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+}
