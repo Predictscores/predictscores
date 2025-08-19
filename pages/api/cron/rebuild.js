@@ -16,7 +16,7 @@ function ymdInTZ(d=new Date(), tz=TZ) {
 }
 
 async function kvSET(key, value){
-  // FIX: Upstash/Vercel KV očekuje { value: "<JSON string>" }
+  // Upstash/Vercel KV: POST body { value: "<string>" }
   const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
@@ -29,35 +29,31 @@ async function kvSET(key, value){
 export default async function handler(req, res){
   try {
     const proto = req.headers["x-forwarded-proto"] || "https";
-    const host  = req.headers.host;
+    const host  = req.headers["x-forwarded-host"] || req.headers.host;
     const base  = `${proto}://${host}`;
 
-    // 1) GENERATE (ovo je JEDINI deo koji troši API-Football — pokreni jednom dnevno)
-    const r = await fetch(`${base}/api/value-bets`);
-    if (!r.ok) return res.status(200).json({ ok:false, error:"generator failed" });
+    // 1) GENERATE (uzima sve kandidate za danas)
+    const r = await fetch(`${base}/api/value-bets`, { headers: { "cache-control":"no-store" } });
+    if (!r.ok) return res.status(200).json({ ok:false, error:`generator ${r.status}` });
     const j = await r.json().catch(()=>null);
     const arr = Array.isArray(j?.value_bets) ? j.value_bets : [];
     const count = arr.length;
 
-    // 2) UPIS u KV — CET i UTC ključevi, :last + :rev
+    // 2) UPIS u KV — čuvamo OBJEKAT sa array-em (da reader sigurno prepozna format)
     const now = new Date();
     const dayCET = ymdInTZ(now, TZ);
     const dayUTC = ymdInTZ(now, "UTC");
-    const rev = Math.floor(Date.now()/1000); // unix sec
+    const rev = Math.floor(Date.now()/1000);
+
+    const payload = { value_bets: arr, meta: { dayCET, dayUTC, rev } };
 
     const writes = [];
-    writes.push(await kvSET(`vb:day:${dayCET}:rev:${rev}`, arr));
-    writes.push(await kvSET(`vb:day:${dayCET}:last`, arr));
-    writes.push(await kvSET(`vb:day:${dayUTC}:last`, arr)); // sigurnosni alias
+    writes.push(await kvSET(`vb:day:${dayCET}:rev:${rev}`, payload));
+    writes.push(await kvSET(`vb:day:${dayCET}:last`, payload));
+    writes.push(await kvSET(`vb:day:${dayUTC}:last`, payload)); // alias
 
     const persisted = writes.every(w => w.ok);
-    return res.status(200).json({
-      ok: true,
-      snapshot_for: dayCET,
-      count,
-      rev,
-      persisted
-    });
+    return res.status(200).json({ ok:true, snapshot_for:dayCET, count, rev, persisted });
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
