@@ -1,10 +1,7 @@
 // pages/api/value-bets.js
-// Generator kandidata (FOOTBALL) sa trusted-consensus kvotama, 1X2 guard, BTTS 1st Half,
-// i "jedan predlog po meču". Ovo se poziva iz /api/cron/rebuild.
-//
-// UI se ne dira. Snapshot koji /rebuild upiše u KV čita /value-bets-locked.
-//
-// Napomena: OU market je striktno "Over 2.5 (FT)" — linija je 2.5 (kvota/cena može biti 2.25, 1.95, ...).
+// Generator kandidata za sve mečeve dana (FOOTBALL) sa trusted-consensus kvotama.
+// EV≥0 za sve markete (1X2 ima SAFE izuzetak), high-odds garde za BTTS/OU,
+// "jedan predlog po meču" i kratko "Zašto" iz forme (H2H ako je dostupno).
 
 export const config = { api: { bodyParser: false } };
 
@@ -12,19 +9,21 @@ export const config = { api: { bodyParser: false } };
 const BASE = "https://v3.football.api-sports.io";
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
-const MIN_ODDS = parseFloat(process.env.MIN_ODDS || "1.5");                     // npr 1.50
-const TRUSTED_SPREAD_MAX = parseFloat(process.env.TRUSTED_SPREAD_MAX || "0.12"); // 12%
-const TRUSTED_UPLIFT_CAP = parseFloat(process.env.TRUSTED_UPLIFT_CAP || "0.08"); // +8% iznad trusted median
-const ALL_SPREAD_MAX = parseFloat(process.env.ALL_SPREAD_MAX || "0.12");         // 12%
-const ONE_TRUSTED_TOL = parseFloat(process.env.ONE_TRUSTED_TOL || "0.05");       // ±5%
+const MIN_ODDS = parseFloat(process.env.MIN_ODDS || "1.5");
 
-// MAX kandidata po run-u: default 90 (možeš spustiti/dići kroz ENV bez obaveze)
+const TRUSTED_SPREAD_MAX = parseFloat(process.env.TRUSTED_SPREAD_MAX || "0.12"); // 12%
+const TRUSTED_UPLIFT_CAP = parseFloat(process.env.TRUSTED_UPLIFT_CAP || "0.08"); // +8%
+const ALL_SPREAD_MAX     = parseFloat(process.env.ALL_SPREAD_MAX || "0.12");     // 12%
+const ONE_TRUSTED_TOL    = parseFloat(process.env.ONE_TRUSTED_TOL || "0.05");    // ±5%
+
+// High-odds garde (za BTTS/OU)
+const HIGH_ODDS_BUFFER_PP = parseFloat(process.env.HIGH_ODDS_BUFFER_PP || "2");  // EV ≥ +2pp kada kvota >2.60
+const HIGH_ODDS_STRICT_AT = parseFloat(process.env.HIGH_ODDS_STRICT_AT || "3.00"); // ako kvota >3.00 → trusted≥3 & ukupno≥10
+
 const VB_CANDIDATE_MAX = parseInt(process.env.VB_CANDIDATE_MAX || "90", 10);
 
 const TRUSTED_BOOKIES = (process.env.TRUSTED_BOOKIES || "")
-  .split(",")
-  .map(s => s.trim().toLowerCase())
-  .filter(Boolean);
+  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 
 // ---------- helpers: fetch ----------
 async function afGet(path) {
@@ -43,7 +42,7 @@ async function afGet(path) {
   return Array.isArray(j?.response) ? j.response : [];
 }
 
-// ---------- time helpers ----------
+// ---------- time ----------
 function ymdTZ(d=new Date()) {
   try {
     return new Intl.DateTimeFormat("sv-SE", {
@@ -55,16 +54,16 @@ function ymdTZ(d=new Date()) {
   }
 }
 
-// ---------- filters (leagues/teams) ----------
+// ---------- exclusions ----------
 function isExcludedLeagueOrTeam(fx) {
   const ln = String(fx?.league?.name || "").toLowerCase();
   const hn = String(fx?.teams?.home?.name || "").toLowerCase();
   const an = String(fx?.teams?.away?.name || "").toLowerCase();
-  const bad = /(women|femenin|femmin|ladies|u19|u21|u23|youth|reserve|res\.?)/i;
+  const bad = /(women|femenin|femmin|ladies|u19|u20|u21|u23|youth|reserve|res\.?)/i;
   return bad.test(ln) || bad.test(hn) || bad.test(an);
 }
 
-// ---------- Poisson math ----------
+// ---------- Poisson ----------
 function poissonPMF(lambda, k) {
   if (lambda <= 0) return (k === 0) ? 1 : 0;
   let logP = -lambda, term = 0;
@@ -102,11 +101,10 @@ function probBTTS(lambdaH, lambdaA) {
   return 1 - pH0 - pA0 + (pH0*pA0);
 }
 function probBTTS1H(lambdaH, lambdaA) {
-  // Aproks: 1H ≈ 0.5 * FT intenzitet po timu
   return probBTTS(lambdaH*0.5, lambdaA*0.5);
 }
 
-// ---------- model rates from L5 ----------
+// ---------- model rates ----------
 function avgGoalsFor(list, teamId) {
   if (!Array.isArray(list) || !list.length) return 1.2;
   let gf = 0, n=0;
@@ -145,20 +143,10 @@ function deriveLambdas(hLast, aLast, homeId, awayId) {
   return { lambdaH, lambdaA };
 }
 
-// ---------- odds & consensus ----------
-function median(values) {
-  if (!values.length) return null;
-  const arr = values.slice().sort((a,b)=>a-b);
-  const mid = Math.floor(arr.length/2);
-  return arr.length % 2 ? arr[mid] : (arr[mid-1] + arr[mid]) / 2;
-}
-function spreadRatio(values) {
-  if (!values.length) return null;
-  const mx = Math.max(...values), mn = Math.min(...values);
-  if (mn <= 0) return null;
-  return (mx / mn) - 1; // e.g. 0.12 = 12%
-}
+// ---------- odds consensus ----------
 const norm = s => String(s||"").trim().toLowerCase();
+function median(values){ if(!values.length)return null; const a=values.slice().sort((x,y)=>x-y); const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; }
+function spreadRatio(values){ if(!values.length)return null; const mx=Math.max(...values), mn=Math.min(...values); if(mn<=0)return null; return (mx/mn)-1; }
 
 function collectOddsFromAF(oddsResponse) {
   const out = {
@@ -166,7 +154,6 @@ function collectOddsFromAF(oddsResponse) {
     bttsYes: [],
     btts1hYes: [],
     over25: [],
-    htft: { "H/H":[], "H/D":[], "H/A":[], "D/H":[], "D/D":[], "D/A":[], "A/H":[], "A/D":[], "A/A":[] }
   };
   for (const item of oddsResponse) {
     const bms = item?.bookmakers || [];
@@ -199,7 +186,7 @@ function collectOddsFromAF(oddsResponse) {
           }
         }
 
-        // BTTS 1st Half YES
+        // BTTS 1H YES
         if (name.includes("both") && name.includes("score") && (name.includes("first half") || name.includes("1st"))) {
           for (const v of values) {
             const val = String(v?.value || "").toUpperCase();
@@ -209,7 +196,7 @@ function collectOddsFromAF(oddsResponse) {
           }
         }
 
-        // OU Over 2.5 (FT) — striktno linija 2.5
+        // OU Over 2.5 (strict line 2.5)
         if (name.includes("over/under") || name.includes("goals over/under")) {
           for (const v of values) {
             const label = norm(v?.value || v?.label);
@@ -221,29 +208,11 @@ function collectOddsFromAF(oddsResponse) {
             }
           }
         }
-
-        // HTFT
-        if (name.includes("half time/full time") || name.includes("ht/ft")) {
-          for (const v of values) {
-            const odd = Number(v?.odd || v?.odds || v?.price);
-            if (!Number.isFinite(odd) || odd <= 1) continue;
-            let key = String(v?.value || "").toUpperCase().replace(/\s+/g,"");
-            key = key
-              .replace(/^HOME/,"H").replace(/\/HOME/,"/H")
-              .replace(/^AWAY/,"A").replace(/\/AWAY/,"/A")
-              .replace(/^DRAW/,"D").replace(/\/DRAW/,"/D")
-              .replace(/^1/,"H").replace(/\/1/,"/H")
-              .replace(/^2/,"A").replace(/\/2/,"/A")
-              .replace(/^X/,"D").replace(/\/X/,"/D");
-            if (out.htft[key]) out.htft[key].push({book, odds: odd});
-          }
-        }
       }
     }
   }
   return out;
 }
-
 function pickConsensusOdds(list) {
   const all = list.map(x=>x.odds);
   if (!all.length) return null;
@@ -252,7 +221,6 @@ function pickConsensusOdds(list) {
   const trustedCount = trusted.length;
   const allSpread = spreadRatio(all);
 
-  // A) trusted >= 2
   if (trustedCount >= 2) {
     const tSpread = spreadRatio(trusted);
     if (tSpread != null && tSpread <= TRUSTED_SPREAD_MAX) {
@@ -261,20 +229,18 @@ function pickConsensusOdds(list) {
       const capped = Math.min(tMax, tMed * (1 + TRUSTED_UPLIFT_CAP));
       return { odds: capped, src: "trusted≥2", bookmakers_count: all.length, bookmakers_count_trusted: trustedCount };
     }
-    return null; // trusted ali preširok spread → nepouzdano
+    return null;
   }
 
-  // B) trusted == 1
   if (trustedCount === 1) {
     const tOnly = trusted[0];
     const aMed = median(all);
     if (aMed && Math.abs(aMed - tOnly) / tOnly <= ONE_TRUSTED_TOL) {
       return { odds: aMed, src: "trusted=1+all", bookmakers_count: all.length, bookmakers_count_trusted: 1 };
     }
-    return null; // predaleko od jedinog trusted-a
+    return null;
   }
 
-  // C) trusted == 0
   if (all.length >= 6 && allSpread != null && allSpread <= ALL_SPREAD_MAX) {
     return { odds: median(all), src: "all-median", bookmakers_count: all.length, bookmakers_count_trusted: 0 };
   }
@@ -293,13 +259,13 @@ function withConfidence(basePct, bookmakersCount, trustedCount, overlayPP=0) {
   if (bookmakersCount >= 10) c += 1;
   if (trustedCount >= 2) c += 1;
   if (trustedCount >= 4) c += 1;
-  c += Math.max(-3, Math.min(3, Math.round(overlayPP))); // learning overlay ±3pp
+  c += Math.max(-3, Math.min(3, Math.round(overlayPP)));
   if (c < 35) c = 35;
   if (c > 85) c = 85;
   return c;
 }
 
-// ---------- learning overlay (opciono, ako postoji u KV) ----------
+// ---------- learning overlay ----------
 const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 async function kvGET(key){
@@ -322,13 +288,58 @@ async function loadOverlay(){
 function overlayFor(overlay, leagueId, market){
   try{
     const o = overlay?.[String(leagueId)]?.[market];
-    if (typeof o === "number") return o; // pp delta
+    if (typeof o === "number") return o;
   }catch{}
   return 0;
 }
 
+// ---------- "Zašto" tekst ----------
+function formWDL(list, teamId){
+  let W=0,D=0,L=0, GF=0, GA=0;
+  for (const fx of (list||[]).slice(0,5)){
+    const sc = fx.score?.fulltime || fx.score || {};
+    const h = Number(sc.home ?? fx.goals?.home ?? 0);
+    const a = Number(sc.away ?? fx.goals?.away ?? 0);
+    const hid = fx.teams?.home?.id, aid = fx.teams?.away?.id;
+    if (hid==null || aid==null) continue;
+    const my   = (hid===teamId)? h : a;
+    const opp  = (hid===teamId)? a : h;
+    GF += my; GA += opp;
+    if (my>opp) W++; else if (my===opp) D++; else L++;
+  }
+  return { W,D,L, GF,GA };
+}
+function h2hWDL(list, homeId){
+  let W=0,D=0,L=0, GF=0, GA=0; // W for home team
+  for (const fx of (list||[]).slice(0,5)){
+    const sc = fx.score?.fulltime || fx.score || {};
+    const h = Number(sc.home ?? fx.goals?.home ?? 0);
+    const a = Number(sc.away ?? fx.goals?.away ?? 0);
+    const hid = fx.teams?.home?.id, aid = fx.teams?.away?.id;
+    if (hid==null || aid==null) continue;
+    GF += (hid===homeId)? h : a;
+    GA += (hid===homeId)? a : h;
+    const homeRes = (h>a) ? "W" : (h===a) ? "D" : "L";
+    if (homeRes==="W") W++; else if (homeRes==="D") D++; else L++;
+  }
+  return { W,D,L, GF,GA };
+}
+function buildWhy({home, away, hForm, aForm, h2h, market, selection, modelProb}){
+  const f1 = `Forma: ${home} ${hForm.W}-${hForm.D}-${hForm.L} (GF:${hForm.GF}:GA:${hForm.GA}) · ${away} ${aForm.W}-${aForm.D}-${aForm.L} (GF:${aForm.GF}:GA:${aForm.GA})`;
+  const f2 = h2h ? `H2H (L5): ${h2h.W}-${h2h.D}-${h2h.L} (GF:${h2h.GF}:GA:${h2h.GA})` : null;
+  const concl = (()=> {
+    const mp = Math.round(modelProb*1000)/10;
+    if (market==="OU" && /OVER/i.test(selection)) return `Tempo i napad sugerišu **Over 2.5**; model ${mp}% vs tržište.`;
+    if (market==="BTTS") return `Obe ekipe daju gol dovoljno često; model ${mp}% za **BTTS YES**.`;
+    if (market==="BTTS 1H") return `Rani gol(ovi) česti; model ${mp}% za **BTTS 1H YES**.`;
+    if (market==="1X2") return `Balans snaga daje prednost izboru **${selection}**; model ${mp}%.`;
+    return `Model ${mp}% za odabrani market.`;
+  })();
+  return [f1, f2, concl].filter(Boolean);
+}
+
 // ---------- build pick ----------
-function buildPick({fixture, market, selection, modelProb, consensus, overlayPP}) {
+function buildPick({fixture, market, selection, modelProb, consensus, overlayPP, explainLines}) {
   if (!consensus || !Number.isFinite(consensus.odds)) return null;
   const odds = Number(consensus.odds);
   if (odds < MIN_ODDS) return null;
@@ -346,7 +357,7 @@ function buildPick({fixture, market, selection, modelProb, consensus, overlayPP}
     fixture_id: fixture?.fixture?.id,
     teams: {
       home: { id: fixture?.teams?.home?.id, name: fixture?.teams?.home?.name },
-    away: { id: fixture?.teams?.away?.id, name: fixture?.teams?.away?.name },
+      away: { id: fixture?.teams?.away?.id, name: fixture?.teams?.away?.name },
     },
     league: {
       id: fixture?.league?.id, name: fixture?.league?.name,
@@ -369,38 +380,44 @@ function buildPick({fixture, market, selection, modelProb, consensus, overlayPP}
     confidence_pct: conf,
     bookmakers_count: Number(consensus.bookmakers_count || 0),
     bookmakers_count_trusted: Number(consensus.bookmakers_count_trusted || 0),
-    explain: { summary: `Model ${mp}% vs ${ip}% · EV ${evp}% · Bookies ${consensus.bookmakers_count} (trusted ${consensus.bookmakers_count_trusted})`, bullets: [] }
+    explain: {
+      summary: `Model ${mp}% vs ${ip}% · EV ${evp}% · Bookies ${consensus.bookmakers_count} (trusted ${consensus.bookmakers_count_trusted})`,
+      bullets: explainLines || []
+    }
   };
 }
 
 // ---------- handler ----------
 export default async function handler(req, res) {
   try {
-    const overlay = await loadOverlay(); // može biti prazan {}
-
+    const overlay = await loadOverlay(); // {}
     const date = ymdTZ(); // današnji dan po TZ
+
     const fixtures = await afGet(`/fixtures?date=${date}`);
-    const candidates = fixtures.filter(fx => {
+    const candidatesAll = fixtures.filter(fx => {
       const st = String(fx?.fixture?.status?.short || "").toUpperCase();
-      if (["NS","TBD","PST","SUSP","CANC"].includes(st)) return !isExcludedLeagueOrTeam(fx);
-      return false;
+      return (["NS","TBD"].includes(st)) && !isExcludedLeagueOrTeam(fx);
     });
 
     const outCandidatesByFixture = new Map();
     let calls_used = 1;
 
-    const MAX_FIX = Math.min(candidates.length, VB_CANDIDATE_MAX);
+    const MAX_FIX = Math.min(candidatesAll.length, VB_CANDIDATE_MAX);
 
     for (let idx=0; idx<MAX_FIX; idx++) {
-      const fx = candidates[idx];
+      const fx = candidatesAll[idx];
       const homeId = fx?.teams?.home?.id;
       const awayId = fx?.teams?.away?.id;
       if (!homeId || !awayId) continue;
 
-      // L5
+      // L5 (2 poziva)
       let hLast=[], aLast=[];
       try { hLast = await afGet(`/fixtures?team=${homeId}&last=5`); calls_used++; } catch {}
       try { aLast = await afGet(`/fixtures?team=${awayId}&last=5`); calls_used++; } catch {}
+
+      // H2H (1 poziv, best-effort)
+      let h2h=[], h2hOk=false;
+      try { h2h = await afGet(`/fixtures/headtohead?h2h=${homeId}-${awayId}&last=5`); h2hOk = true; calls_used++; } catch {}
 
       const { lambdaH, lambdaA } = deriveLambdas(hLast, aLast, homeId, awayId);
       const { pHome, pDraw, pAway } = prob1X2(lambdaH, lambdaA);
@@ -408,89 +425,99 @@ export default async function handler(req, res) {
       const pBTTS = probBTTS(lambdaH, lambdaA);
       const pBTTS_H1 = probBTTS1H(lambdaH, lambdaA);
 
-      // HT approximations (za HT-FT)
-      const { pHome: pHT_H, pDraw: pHT_D, pAway: pHT_A } = prob1X2(lambdaH*0.5, lambdaA*0.5);
-
-      // Odds
+      // Odds (1 poziv)
       let oddsRaw = [];
       try { oddsRaw = await afGet(`/odds?fixture=${fx?.fixture?.id}`); calls_used++; } catch {}
       const perBook = collectOddsFromAF(oddsRaw);
 
-      // Kandidati po marketu (sa konsenzusom)
+      // "Zašto"
+      const hForm = formWDL(hLast, homeId);
+      const aForm = formWDL(aLast, awayId);
+      const hh2h  = h2hOk ? h2hWDL(h2h, homeId) : null;
+
       const cands = [];
 
-      // 1X2 (uz guard EV≥0 ili SAFE prag)
+      // 1X2 (EV guard sa SAFE izuzetkom)
       const oneX2Parts = [
         { sel: "1", prob: pHome, list: perBook.oneX2.H },
         { sel: "X", prob: pDraw, list: perBook.oneX2.D },
         { sel: "2", prob: pAway, list: perBook.oneX2.A },
-      ].map(x => ({ sel: x.sel, prob: x.prob, consensus: pickConsensusOdds(x.list) }))
+      ].map(x => ({ ...x, consensus: pickConsensusOdds(x.list) }))
        .filter(x => x.consensus && Number.isFinite(x.consensus.odds))
        .map(x => ({ ...x, ev: edgeRatio(x.prob, impliedFromOdds(x.consensus.odds)) }))
        .filter(x => x.ev != null);
 
       if (oneX2Parts.length) {
-        // biramo najbolji po EV (ali kasnije će "jedan po meču" odlučiti globalno)
         oneX2Parts.sort((a,b)=> b.ev - a.ev);
         const best = oneX2Parts[0];
-
-        // 1X2 guard
         const SAFE = (best.prob >= 0.65 && best.consensus.odds >= MIN_ODDS && best.ev >= -0.005);
         if (best.ev >= 0 || SAFE) {
           const overlayPP = overlayFor(overlay, fx?.league?.id, "1X2");
-          const pick = buildPick({ fixture: fx, market: "1X2", selection: best.sel, modelProb: best.prob, consensus: best.consensus, overlayPP });
+          const why = buildWhy({
+            home: fx?.teams?.home?.name, away: fx?.teams?.away?.name,
+            hForm, aForm, h2h: hh2h, market: "1X2", selection: best.sel, modelProb: best.prob
+          });
+          const pick = buildPick({ fixture: fx, market: "1X2", selection: best.sel, modelProb: best.prob, consensus: best.consensus, overlayPP, explainLines: why });
           if (pick) cands.push({ pick, SAFE });
         }
       }
 
-      // BTTS YES (FT)
+      // BTTS YES (FT) — EV≥0 + high-odds garde
       const bttsCns = pickConsensusOdds(perBook.bttsYes);
       if (bttsCns) {
-        const overlayPP = overlayFor(overlay, fx?.league?.id, "BTTS");
-        const pick = buildPick({ fixture: fx, market: "BTTS", selection: "YES", modelProb: pBTTS, consensus: bttsCns, overlayPP });
-        if (pick) cands.push({ pick, SAFE: (pBTTS >= 0.60 && bttsCns.odds >= MIN_ODDS && pick.bookmakers_count >= 6) });
+        const implied = impliedFromOdds(bttsCns.odds);
+        const ev = edgeRatio(pBTTS, implied);
+        let ok = (ev != null && ev >= 0);
+        if (ok && bttsCns.odds > 2.60) ok = ((pBTTS - implied) * 100 >= HIGH_ODDS_BUFFER_PP);
+        if (ok && bttsCns.odds > HIGH_ODDS_STRICT_AT) ok = ((bttsCns.bookmakers_count_trusted||0) >= 3 && (bttsCns.bookmakers_count||0) >= 10);
+        if (ok) {
+          const overlayPP = overlayFor(overlay, fx?.league?.id, "BTTS");
+          const why = buildWhy({
+            home: fx?.teams?.home?.name, away: fx?.teams?.away?.name,
+            hForm, aForm, h2h: hh2h, market: "BTTS", selection: "YES", modelProb: pBTTS
+          });
+          const pick = buildPick({ fixture: fx, market: "BTTS", selection: "YES", modelProb: pBTTS, consensus: bttsCns, overlayPP, explainLines: why });
+          if (pick) cands.push({ pick, SAFE: (pBTTS >= 0.60 && bttsCns.odds >= MIN_ODDS && pick.bookmakers_count >= 6) });
+        }
       }
 
-      // BTTS 1st Half YES
+      // BTTS 1H YES — EV≥0
       const btts1hCns = pickConsensusOdds(perBook.btts1hYes);
       if (btts1hCns) {
-        const overlayPP = overlayFor(overlay, fx?.league?.id, "BTTS1H");
-        const pick = buildPick({ fixture: fx, market: "BTTS 1H", selection: "YES", modelProb: pBTTS_H1, consensus: btts1hCns, overlayPP });
-        if (pick) cands.push({ pick, SAFE: (pBTTS_H1 >= 0.55 && btts1hCns.odds >= MIN_ODDS && pick.bookmakers_count >= 6) });
+        const implied = impliedFromOdds(btts1hCns.odds);
+        const ev = edgeRatio(pBTTS_H1, implied);
+        if (ev != null && ev >= 0) {
+          const overlayPP = overlayFor(overlay, fx?.league?.id, "BTTS1H");
+          const why = buildWhy({
+            home: fx?.teams?.home?.name, away: fx?.teams?.away?.name,
+            hForm, aForm, h2h: hh2h, market: "BTTS 1H", selection: "YES", modelProb: pBTTS_H1
+          });
+          const pick = buildPick({ fixture: fx, market: "BTTS 1H", selection: "YES", modelProb: pBTTS_H1, consensus: btts1hCns, overlayPP, explainLines: why });
+          if (pick) cands.push({ pick, SAFE: (pBTTS_H1 >= 0.55 && btts1hCns.odds >= MIN_ODDS && pick.bookmakers_count >= 6) });
+        }
       }
 
-      // OU Over 2.5 (FT) — striktno linija 2.5
+      // OU Over 2.5 — EV≥0 + high-odds garde
       const ouCns = pickConsensusOdds(perBook.over25);
       if (ouCns) {
-        const overlayPP = overlayFor(overlay, fx?.league?.id, "OU");
-        const pick = buildPick({ fixture: fx, market: "OU", selection: "OVER 2.5", modelProb: pOver25, consensus: ouCns, overlayPP });
-        if (pick) cands.push({ pick, SAFE: (pOver25 >= 0.60 && ouCns.odds >= MIN_ODDS && pick.bookmakers_count >= 6) });
-      }
-
-      // (Opciono) HT-FT — uključi samo kad postoji jasan trusted konsenzus
-      const htftKeys = ["H/H","H/D","H/A","D/H","D/D","D/A","A/H","A/D","A/A"];
-      const combos = htftKeys.map(k => {
-        const cns = pickConsensusOdds(perBook.htft[k]);
-        if (!cns || (cns.bookmakers_count_trusted||0) < 2) return null;
-        const modelHT = { H: pHT_H, D: pHT_D, A: pHT_A };
-        const modelFT = { H: pHome,  D: pDraw,  A: pAway };
-        const [ht, ft] = k.split("/");
-        const prob = (modelHT[ht]||0) * (modelFT[ft]||0);
-        return { k, prob, consensus: cns };
-      }).filter(Boolean)
-        .map(x => ({ ...x, ev: edgeRatio(x.prob, impliedFromOdds(x.consensus.odds)) }))
-        .filter(x => x.ev != null)
-        .sort((a,b)=> b.ev - a.ev);
-      if (combos.length && combos[0].ev > 0.02) {
-        const best = combos[0];
-        const overlayPP = overlayFor(overlay, fx?.league?.id, "HT-FT");
-        const pick = buildPick({ fixture: fx, market: "HT-FT", selection: best.k, modelProb: best.prob, consensus: best.consensus, overlayPP });
-        if (pick) cands.push({ pick, SAFE: (best.prob >= 0.60 && pick.bookmakers_count_trusted >= 2) });
+        const implied = impliedFromOdds(ouCns.odds);
+        const ev = edgeRatio(pOver25, implied);
+        let ok = (ev != null && ev >= 0);
+        if (ok && ouCns.odds > 2.60) ok = ((pOver25 - implied) * 100 >= HIGH_ODDS_BUFFER_PP);
+        if (ok && ouCns.odds > HIGH_ODDS_STRICT_AT) ok = ((ouCns.bookmakers_count_trusted||0) >= 3 && (ouCns.bookmakers_count||0) >= 10);
+        if (ok) {
+          const overlayPP = overlayFor(overlay, fx?.league?.id, "OU");
+          const why = buildWhy({
+            home: fx?.teams?.home?.name, away: fx?.teams?.away?.name,
+            hForm, aForm, h2h: hh2h, market: "OU", selection: "OVER 2.5", modelProb: pOver25
+          });
+          const pick = buildPick({ fixture: fx, market: "OU", selection: "OVER 2.5", modelProb: pOver25, consensus: ouCns, overlayPP, explainLines: why });
+          if (pick) cands.push({ pick, SAFE: (pOver25 >= 0.60 && ouCns.odds >= MIN_ODDS && pick.bookmakers_count >= 6) });
+        }
       }
 
       // ---- Jedan predlog po meču (globalno) ----
       if (cands.length) {
-        // Rang: SAFE → viši confidence → veći EV → skoriji kickoff
         cands.sort((a,b)=>{
           if ((b.SAFE?1:0) !== (a.SAFE?1:0)) return (b.SAFE?1:0) - (a.SAFE?1:0);
           if (b.pick.confidence_pct !== a.pick.confidence_pct) return b.pick.confidence_pct - a.pick.confidence_pct;
@@ -506,10 +533,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // Finalni output (jedan po meču)
     const out = Array.from(outCandidatesByFixture.values());
-
-    // Globalno sortiranje radi lepšeg prikaza
     out.sort((a, b) => {
       if (b.confidence_pct !== a.confidence_pct) return b.confidence_pct - a.confidence_pct;
       const eva = Number.isFinite(a.ev) ? a.ev : -Infinity;
