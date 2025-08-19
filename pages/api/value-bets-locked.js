@@ -1,6 +1,6 @@
 // pages/api/value-bets-locked.js
 // Čita zaključani snapshot iz KV i pravi finalnu stabilnu listu za UI.
-// Uklonjeni hard-capovi za OU/BTTS – sada se oslanjamo na trusted-consensus iz generatora.
+// OU/BTTS capovi uklonjeni; oslanjamo se na trusted-consensus iz generatora.
 // Filteri: prozor 72h, freeze 30min, league cap, min kvota, isključenja.
 
 export const config = { api: { bodyParser: false } };
@@ -13,12 +13,7 @@ const VB_LIMIT   = parseInt(process.env.VB_LIMIT || "25", 10);
 const LEAGUE_CAP = parseInt(process.env.VB_MAX_PER_LEAGUE || "2", 10);
 const WINDOW_HOURS      = parseInt(process.env.VB_WINDOW_HOURS || "72", 10);
 const FREEZE_MIN_BEFORE = parseInt(process.env.VB_FREEZE_MIN || "30", 10);
-
 const MIN_ODDS = parseFloat(process.env.MIN_ODDS || "1.5");
-
-// opcioni fallback za nekoliko MODEL pickova bez kvote (default: off)
-const ALLOW_MODEL_FALLBACK = Number(process.env.ALLOW_MODEL_FALLBACK || "0") === 1;
-const MODEL_FALLBACK_CAP   = parseInt(process.env.MODEL_FALLBACK_CAP || "5", 10);
 
 const isoNow = () => new Date().toISOString();
 function ymdInTZ(d=new Date(), tz=TZ) {
@@ -37,14 +32,9 @@ async function kvGETraw(key){
     headers: { Authorization: `Bearer ${KV_TOKEN}` }
   });
   if (!r.ok) return null;
-  const ct = r.headers.get("content-type") || "";
-  if (ct.includes("application/json")) {
-    const j = await r.json().catch(()=>null);
-    return (j && typeof j==="object" && "result" in j) ? j.result : j;
-  }
-  return await r.text().catch(()=>null);
+  const js = await r.json().catch(()=>null);
+  return (js && typeof js==="object" && "result" in js) ? js.result : js;
 }
-
 function normalizeSnapshot(raw) {
   try {
     let v = raw;
@@ -104,7 +94,6 @@ export default async function handler(req, res){
     const byLeague = new Map();
     const nowMs = +now;
     const endMs = nowMs + WINDOW_HOURS*3600*1000;
-    let modelFallbackUsed = 0;
 
     for (const p0 of arr) {
       try {
@@ -125,15 +114,7 @@ export default async function handler(req, res){
 
         // kvota/logika
         let odds = Number(p?.market_odds);
-        if (!Number.isFinite(odds)) {
-          if (ALLOW_MODEL_FALLBACK && modelFallbackUsed < MODEL_FALLBACK_CAP) {
-            modelFallbackUsed++;
-          } else {
-            continue;
-          }
-        } else if (odds < MIN_ODDS) {
-          continue;
-        }
+        if (!Number.isFinite(odds) || odds < MIN_ODDS) continue;
 
         const ip = impliedFromOdds(odds);
         const ev = edgePP(Number(p?.model_prob||0), ip);
@@ -151,7 +132,7 @@ export default async function handler(req, res){
 
         out.push({
           ...p,
-          market_odds: Number.isFinite(odds) ? Number(odds.toFixed(2)) : null,
+          market_odds: Number(odds.toFixed(2)),
           implied_prob: ip,
           edge_pp: ev,
           explain
