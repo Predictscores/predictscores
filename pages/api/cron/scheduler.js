@@ -1,9 +1,8 @@
-// FILE: pages/api/cron/scheduler.js
 export const config = { api: { bodyParser: false } };
 
 // Minimalni, robustan scheduler za 2 crona (08:00 i 13:00 UTC):
 // - kada se pozove, UVEK poziva rebuild, pa odmah insights.
-// - bez slot-računanja i prozora, jer poziv tačno u 10:00/15:00 dolazi iz Vercel crona.
+// - bez slot-računanja, jer poziv tačno u 10:00/15:00 dolazi iz Vercel crona.
 
 async function triggerInternal(req, path) {
   try {
@@ -24,7 +23,7 @@ export default async function handler(req, res) {
     // 1) Rebuild (lock feed)
     const r1 = await triggerInternal(req, "/api/cron/rebuild");
 
-    // 2) Insights odmah nakon lock-a (nema trećeg crona, nema :05 slotova)
+    // 2) Insights odmah nakon lock-a
     const r2 = await triggerInternal(req, "/api/insights-build");
 
     // 3) (opciono) Floats/Smart – best-effort; ignoriši ako nema rute
