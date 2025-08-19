@@ -1,0 +1,15 @@
+name: Odds Watcher (every 10m)
+
+on:
+  schedule:
+    - cron: '*/10 6-22 * * *'  # svakih 10 min, 06–22 UTC
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call refresh-odds
+        run: |
+          set -e
+          curl -fsS https://predictscores.vercel.app/api/cron/refresh-odds
