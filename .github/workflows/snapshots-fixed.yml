@@ -1,15 +1,33 @@
-name: Snapshots (10:00 & 15:00 & 19:00 local)
+name: Snapshots (AM/PM/LATE)
 
 on:
   schedule:
-    - cron: '0 8,13,17 * * *' # 08:00, 13:00, 17:00 UTC  ≈ 10:00, 15:00, 19:00 u Beogradu (letnje vreme)
+    - cron: '0 8 * * *'   # 10:00 lokalno → AM
+    - cron: '0 13 * * *'  # 15:00 lokalno → PM
+    - cron: '0 22 * * *'  # 00:00 lokalno → LATE
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Call rebuild
+      - name: Pick slot (AM/PM/LATE)
+        id: pick
         run: |
-          set -e
-          curl -fsS https://predictscores.vercel.app/api/cron/rebuild
+          S="${{ github.event.schedule }}"
+          if [ "$S" = "0 8 * * *" ]; then SLOT=am;
+          elif [ "$S" = "0 13 * * *" ]; then SLOT=pm;
+          elif [ "$S" = "0 22 * * *" ]; then SLOT=late;
+          else
+            # fallback ako se startuje ručno (UTC sat)
+            H=$(date -u +%H)
+            if   [ "$H" -ge 8  ] && [ "$H" -lt 9  ]; then SLOT=am;
+            elif [ "$H" -ge 13 ] && [ "$H" -lt 14 ]; then SLOT=pm;
+            elif [ "$H" -ge 22 ] && [ "$H" -lt 23 ]; then SLOT=late;
+            else SLOT=pm; fi
+          fi
+          echo "slot=$SLOT" >> $GITHUB_OUTPUT
+
+      - name: Call rebuild for slot
+        run: |
+          curl -fsS "https://predictscores.vercel.app/api/cron/rebuild?slot=${{ steps.pick.outputs.slot }}"
