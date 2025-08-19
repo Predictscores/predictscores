@@ -14,16 +14,18 @@ function ymdInTZ(d=new Date(), tz=TZ) {
     return `${y}-${m}-${dd}`;
   }
 }
+
 async function kvSET(key, value){
-  const body = typeof value === "string" ? value : JSON.stringify(value);
+  // FIX: Upstash/Vercel KV očekuje { value: "<JSON string>" }
   const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
-    body
+    body: JSON.stringify({ value: JSON.stringify(value) })
   });
   let js=null; try{ js=await r.json(); }catch{}
   return { ok:r.ok, js };
 }
+
 export default async function handler(req, res){
   try {
     const proto = req.headers["x-forwarded-proto"] || "https";
@@ -37,7 +39,7 @@ export default async function handler(req, res){
     const arr = Array.isArray(j?.value_bets) ? j.value_bets : [];
     const count = arr.length;
 
-    // 2) UPIS u KV — CET i UTC ključevi, direktno :last + jedan :rev timestamp (ne zavisimo od brojača)
+    // 2) UPIS u KV — CET i UTC ključevi, :last + :rev
     const now = new Date();
     const dayCET = ymdInTZ(now, TZ);
     const dayUTC = ymdInTZ(now, "UTC");
