@@ -1,0 +1,15 @@
+name: Snapshots (10:00 & 15:00 & 19:00 local)
+
+on:
+  schedule:
+    - cron: '0 8,13,17 * * *' # 08:00, 13:00, 17:00 UTC  ≈ 10:00, 15:00, 19:00 u Beogradu (letnje vreme)
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call rebuild
+        run: |
+          set -e
+          curl -fsS https://predictscores.vercel.app/api/cron/rebuild
