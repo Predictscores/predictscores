@@ -1,7 +1,7 @@
 // pages/api/cron/refresh-odds.js
-// Osvežava kvote/EV/confidence za AM/PM/LATE slotove (mečevi koji startuju ≤3h).
-// Histereza: update ako promjena >2% ili promjena broja bookija ≥2.
-// Idempotent guard: min razmak 60s.
+// Osvežava kvote/EV/confidence za AM/PM/LATE (mečevi koji startuju ≤3h).
+// Histereza: >2% normalno; ≤60' prag 1%; ≤15' uvek osveži.
+// Idempotent guard: 60s.
 
 export const config = { api: { bodyParser: false } };
 
@@ -19,7 +19,6 @@ const ALL_SPREAD_MAX     = parseFloat(process.env.ALL_SPREAD_MAX || "0.12");
 const ONE_TRUSTED_TOL    = parseFloat(process.env.ONE_TRUSTED_TOL || "0.05");
 
 const REFRESH_WINDOW_HOURS = 3;
-const CHANGE_THRESHOLD = 0.02; // 2%
 
 function ymdInTZ(d=new Date(), tz=TZ) {
   try {
@@ -109,7 +108,7 @@ function pickConsensusOdds(list){
   return null;
 }
 function collectOddsFromAF(oddsResponse){
-  const out = { oneX2:{H:[],D:[],A:[]}, bttsYes:[], btts1hYes:[], over25:[], htft:{ "H/H":[], "H/D":[], "H/A":[], "D/H":[], "D/D":[], "D/A":[], "A/H":[], "A/D":[], "A/A":[] } };
+  const out = { oneX2:{H:[],D:[],A:[]}, bttsYes:[], btts1hYes:[], over25:[] };
   for (const item of oddsResponse||[]){
     const bms = item?.bookmakers || [];
     for (const bm of bms){
@@ -151,19 +150,6 @@ function collectOddsFromAF(oddsResponse){
             }
           }
         }
-        if (name.includes("half time/full time") || name.includes("ht/ft")){
-          for (const v of values){
-            const odd = Number(v?.odd||v?.odds||v?.price); if (!Number.isFinite(odd)||odd<=1) continue;
-            let key = String(v?.value||"").toUpperCase().replace(/\s+/g,"");
-            key = key.replace(/^HOME/,"H").replace(/\/HOME/,"/H")
-                     .replace(/^AWAY/,"A").replace(/\/AWAY/,"/A")
-                     .replace(/^DRAW/,"D").replace(/\/DRAW/,"/D")
-                     .replace(/^1/,"H").replace(/\/1/,"/H")
-                     .replace(/^2/,"A").replace(/\/2/,"/A")
-                     .replace(/^X/,"D").replace(/\/X/,"/D");
-            if (out.htft[key]) out.htft[key].push({book,odds:odd});
-          }
-        }
       }
     }
   }
@@ -171,9 +157,25 @@ function collectOddsFromAF(oddsResponse){
 }
 function impliedFromOdds(o){ return (Number(o)>0)?(1/Number(o)):null; }
 
+async function afGet(path) {
+  const key =
+    process.env.NEXT_PUBLIC_API_FOOTBALL_KEY ||
+    process.env.API_FOOTBALL_KEY ||
+    process.env.API_FOOTBALL_KEY_1 ||
+    process.env.API_FOOTBALL_KEY_2;
+  if (!key) throw new Error("API_FOOTBALL_KEY missing");
+  const r = await fetch(`${BASE}${path}`, {
+    headers: { "x-apisports-key": key, "x-rapidapi-key": key },
+    cache: "no-store",
+  });
+  if (!r.ok) throw new Error(`AF ${path} ${r.status}`);
+  const j = await r.json();
+  return Array.isArray(j?.response) ? j.response : [];
+}
+
 export default async function handler(req, res){
   try{
-    // idempotent guard (60s)
+    // guard 60s
     const lastRunRaw = await kvGET(`vb:jobs:last:refresh-odds`);
     const nowMs = Date.now();
     try{
@@ -185,15 +187,10 @@ export default async function handler(req, res){
 
     const day = ymdInTZ(new Date(), TZ);
 
-    // učitaj sve slotove
-    const am  = parseArray(await kvGET(`vb:day:${day}:am`));
-    const pm  = parseArray(await kvGET(`vb:day:${day}:pm`));
-    const lt  = parseArray(await kvGET(`vb:day:${day}:late`));
-
-    const slots = [
-      { key:`vb:day:${day}:am`,   arr: am  },
-      { key:`vb:day:${day}:pm`,   arr: pm  },
-      { key:`vb:day:${day}:late`, arr: lt  },
+    const slotKeys = [
+      `vb:day:${day}:am`,
+      `vb:day:${day}:pm`,
+      `vb:day:${day}:late`
     ];
 
     const now = new Date();
@@ -202,18 +199,20 @@ export default async function handler(req, res){
 
     let updatedTotal = 0;
 
-    for (const S of slots){
-      if (!S.arr || !S.arr.length) continue;
+    for (const key of slotKeys){
+      const arr = parseArray(await kvGET(key));
+      if (!arr.length) continue;
 
       let updated = 0;
-      for (let i=0;i<S.arr.length;i++){
-        const p = S.arr[i];
+      for (let i=0;i<arr.length;i++){
+        const p = arr[i];
         const t = String(p?.datetime_local?.starting_at?.date_time || "").replace(" ","T");
         const ms = +new Date(t);
         if (!ms || ms > endMs) continue;
         if (ms < nowTime) continue;
 
-        // nova cena
+        const mins = Math.round((ms - nowTime)/60000);
+
         const oddsRaw = await afGet(`/odds?fixture=${p.fixture_id}`);
         const ob = collectOddsFromAF(oddsRaw);
 
@@ -227,8 +226,8 @@ export default async function handler(req, res){
           list = ob.btts1hYes;
         } else if (p.market === "OU" && String(p.selection).toUpperCase().includes("OVER")){
           list = ob.over25;
-        } else if (p.market === "HT-FT"){
-          list = ob.htft[p.selection] || [];
+        } else {
+          continue;
         }
 
         const cns = pickConsensusOdds(list);
@@ -236,9 +235,13 @@ export default async function handler(req, res){
 
         const oldOdds = Number(p.market_odds);
         if (!Number.isFinite(oldOdds) || oldOdds<=0) continue;
+
+        // histereza: 2% default, 1% ≤60', uvek ≤15'
         const rel = Math.abs(cns.odds - oldOdds) / oldOdds;
         const bkDelta = Math.abs(Number(p.bookmakers_count||0) - Number(cns.bookmakers_count||0));
-        if (rel <= CHANGE_THRESHOLD && bkDelta < 2) continue;
+        const th = (mins <= 15) ? -1 : (mins <= 60) ? 0.01 : 0.02;
+
+        if (th >= 0 && rel <= th && bkDelta < 2) continue;
 
         const implied = impliedFromOdds(cns.odds);
         const mp = Number(p?.model_prob || 0);
@@ -259,12 +262,12 @@ export default async function handler(req, res){
       }
 
       if (updated>0){
-        await kvSET(S.key, S.arr);
+        await kvSET(key, arr);
         updatedTotal += updated;
       }
     }
 
-    // upiši kombinovani ":last"
+    // UNION update
     const union = dedupeUnion(
       parseArray(await kvGET(`vb:day:${day}:am`)),
       parseArray(await kvGET(`vb:day:${day}:pm`)),
@@ -280,20 +283,4 @@ export default async function handler(req, res){
   } catch (e){
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
-}
-
-async function afGet(path) {
-  const key =
-    process.env.NEXT_PUBLIC_API_FOOTBALL_KEY ||
-    process.env.API_FOOTBALL_KEY ||
-    process.env.API_FOOTBALL_KEY_1 ||
-    process.env.API_FOOTBALL_KEY_2;
-  if (!key) throw new Error("API_FOOTBALL_KEY missing");
-  const r = await fetch(`${BASE}${path}`, {
-    headers: { "x-apisports-key": key, "x-rapidapi-key": key },
-    cache: "no-store",
-  });
-  if (!r.ok) throw new Error(`AF ${path} ${r.status}`);
-  const j = await r.json();
-  return Array.isArray(j?.response) ? j.response : [];
 }
