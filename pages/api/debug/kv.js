@@ -15,46 +15,40 @@ function ymdInTZ(d=new Date(), tz=TZ) {
   }
 }
 
-async function kvGET(key){
+async function kvGETraw(key){
   const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
     headers: { Authorization: `Bearer ${KV_TOKEN}` }
   });
-  if (!r.ok) return { ok:false, status:r.status, len:0, type:"", sample:null };
   const ct = r.headers.get("content-type") || "";
   const body = ct.includes("application/json") ? await r.json().catch(()=>null) : await r.text().catch(()=>null);
-  let raw = body;
-  if (body && typeof body==="object" && "result" in body) raw = body.result;
-
-  let parsed = null;
-  try { parsed = (typeof raw==="string") ? JSON.parse(raw) : raw; } catch {}
-  let arr = [];
-  if (Array.isArray(parsed)) arr = parsed;
-  else if (parsed && typeof parsed==="object") {
-    if (Array.isArray(parsed.value_bets)) arr = parsed.value_bets;
-    else if (Array.isArray(parsed.arr)) arr = parsed.arr;
-    else if (Array.isArray(parsed.data)) arr = parsed.data;
+  return (body && typeof body==="object" && "result" in body) ? body.result : body;
+}
+function normalizeSnapshot(raw) {
+  let v = raw;
+  try { if (typeof v === "string") v = JSON.parse(v); } catch { return { len:0, note:"parse-failed", preview:String(raw||"").slice(0,180) }; }
+  let arr=[];
+  if (Array.isArray(v)) arr=v;
+  else if (v && typeof v==="object") {
+    if (Array.isArray(v.value_bets)) arr=v.value_bets;
+    else if (Array.isArray(v.arr)) arr=v.arr;
+    else if (Array.isArray(v.data)) arr=v.data;
   }
-
-  return {
-    ok:true,
-    status:r.status,
-    len: arr.length,
-    type: Array.isArray(parsed) ? "array" : typeof parsed,
-    sample: arr[0] || null,
-    rawType: typeof raw
-  };
+  return { len:arr.length, type:Array.isArray(v)?"array":typeof v, sample:arr[0]||null, preview:String(raw||"").slice(0,180) };
 }
 
 export default async function handler(req, res){
   const now = new Date();
   const dayCET = ymdInTZ(now, TZ);
   const dayUTC = ymdInTZ(now, "UTC");
-  const k1 = `vb:day:${dayCET}:last`;
-  const k2 = `vb:day:${dayUTC}:last`;
+  const k = `vb:day:${dayCET}:last`;
+  const kAlt = `vb:day:${dayUTC}:last`;
+  const raw  = await kvGETraw(k);
+  const raw2 = await kvGETraw(kAlt);
 
-  const r1 = await kvGET(k1);
-  const r2 = await kvGET(k2);
-
-  res.setHeader("Cache-Control", "no-store");
-  return res.status(200).json({ dayCET, dayUTC, k1, k2, k1_info: r1, k2_info: r2 });
+  return res.status(200).json({
+    dayCET, dayUTC,
+    cet_key:k, utc_key:kAlt,
+    cet_info: normalizeSnapshot(raw),
+    utc_info: normalizeSnapshot(raw2)
+  });
 }
