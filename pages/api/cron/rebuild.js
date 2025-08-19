@@ -91,9 +91,9 @@ function parseArray(raw){
 function dedupeUnion(...lists){
   const map = new Map();
   for (const L of lists){
-    for (const p of (L||[])){
-      const id = p?.fixture_id ?? `${p?.league?.id||""}-${p?.teams?.home?.name||""}-${p?.teams?.away?.name||""}`;
-      if (!map.has(id)) map.set(id, p);
+    for (const pick of (L||[])){
+      const id = pick?.fixture_id ?? `${pick?.league?.id||""}-${pick?.teams?.home?.name||""}-${pick?.teams?.away?.name||""}`;
+      if (!map.has(id)) map.set(id, pick);
     }
   }
   return Array.from(map.values());
@@ -108,9 +108,9 @@ function groupOf(leagueNameRaw){
   return "TIER3";
 }
 
-// Slot window
+// Slot window (FIX: koristimo 'pick', ne 'p')
 function inSlotWindow(pick, dayCET, slot){
-  const t = String(p?.datetime_local?.starting_at?.date_time || "").replace(" ","T");
+  const t = String(pick?.datetime_local?.starting_at?.date_time || "").replace(" ","T");
   const tz = toTZParts(t, TZ);
   if (tz.ymd !== dayCET) return false;
   if (slot === "am")   return tz.hour >= 10 && tz.hour < 15;
@@ -172,7 +172,7 @@ export default async function handler(req, res){
     const arr = Array.isArray(j?.value_bets) ? j.value_bets : [];
 
     // filtriraj po slot prozoru
-    const dayArr = arr.filter(p => inSlotWindow(p, dayCET, slot));
+    const dayArr = arr.filter(pick => inSlotWindow(pick, dayCET, slot));
 
     // slot budžet (radni/ vikend)
     const isWE = isWeekendInTZ(now, TZ);
@@ -189,7 +189,7 @@ export default async function handler(req, res){
 
     // rangiraj pre miksa
     dayArr.sort((a,b)=>{
-      if ((b?.confidence_pct||0)!==(a?.confidence_pct||0)) return (b.confidence_pct||0)-(a.confidence_pct||0);
+      if ((b?.confidence_pct||0)!==(a?.confidence_pct||0)) return (b.confidence_pct||0)-(a?.confidence_pct||0);
       const eva = Number.isFinite(a?.ev) ? a.ev : -Infinity;
       const evb = Number.isFinite(b?.ev) ? b.ev : -Infinity;
       if (evb!==eva) return evb-eva;
@@ -200,9 +200,9 @@ export default async function handler(req, res){
 
     // pripremi buckets
     const buckets = { UEFA:[], TIER1:[], TIER2:[], TIER3:[] };
-    for (const p of dayArr){
-      const g = groupOf(p?.league?.name);
-      (buckets[g] || buckets.TIER3).push(p);
+    for (const pick of dayArr){
+      const g = groupOf(pick?.league?.name);
+      (buckets[g] || buckets.TIER3).push(pick);
     }
     const order = ["UEFA","TIER1","TIER2","TIER3"];
     const idx = { UEFA:0, TIER1:0, TIER2:0, TIER3:0 };
@@ -274,7 +274,7 @@ export default async function handler(req, res){
       const existing = parseArray(await kvGET(histKey));
       if (!existing || existing.length === 0) {
         const topN = (slot === "late") ? 1 : 3;
-        const top = picked.slice(0, topN).map(p => toHistoryRecord(slot, p));
+        const top = picked.slice(0, topN).map(pick => toHistoryRecord(slot, pick));
         if (top.length) {
           await kvSET(histKey, top);
           // indeks dana i trim >14d
@@ -309,6 +309,6 @@ export default async function handler(req, res){
       persisted: true
     });
   } catch (e) {
-    return res.status(200).json({ ok:false, error:String(e?.message||e) });
+    return res.status(200).json({ ok:false, error:String(e?.message || e) });
   }
 }
