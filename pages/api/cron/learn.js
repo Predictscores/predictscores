@@ -141,6 +141,8 @@ export default async function handler(req,res){
     // overlay i ev prag po bucketu
     const overlay = {};
     const evmin = {};
+    const bucketN = {};
+    const clvavg  = {};
     for (const [key,b] of buckets){
       const winRate = b.n ? b.won/b.n : 0;
       const roi = b.n ? b.pnl/b.n : 0;
@@ -160,12 +162,16 @@ export default async function handler(req,res){
       if (delta < -3) delta = -3;
 
       overlay[key] = delta;
-      evmin[key] = evReq;
+      evmin[key]   = evReq;
+      bucketN[key] = b.n;
+      clvavg[key]  = b.clvN ? +(clv.toFixed(2)) : null;
     }
 
     const today = new Intl.DateTimeFormat("sv-SE",{ timeZone: TZ, year:"numeric", month:"2-digit", day:"2-digit"}).format(new Date());
     await kvSet(`learn:overlay:v1`, overlay);
     await kvSet(`learn:evmin:v1`, evmin);
+    await kvSet(`learn:bucketN:v1`, bucketN);
+    await kvSet(`learn:clvavg:v1`, clvavg);
     await kvSet(`learn:report:${today}`, {
       daysUsed: ymds,
       buckets: Array.from(buckets.entries()).map(([k,b])=>({
