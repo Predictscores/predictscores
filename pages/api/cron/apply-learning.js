@@ -76,30 +76,71 @@ function tierHeuristic(league){
 export default async function handler(req,res){
   try{
     const STICKY_DELTA_PP = Number(process.env.STICKY_DELTA_PP ?? 3); // koliko bolje mora “novi” da bude
-    const FREEZE_MIN = Number(process.env.FREEZE_MINUTES ?? 30);
+    const FREEZE_MIN     = Number(process.env.FREEZE_MINUTES ?? 30);
 
     const targetAM   = Number(process.env.SLOT_AM_COUNT   || 15);
     const targetPM   = Number(process.env.SLOT_PM_COUNT   || 15);
     const targetLATE = Number(process.env.SLOT_LATE_COUNT || 5);
+
+    const SOFT_FLOOR_ENABLE   = String(process.env.SOFT_FLOOR_ENABLE ?? "1")==="1";
+    const EV_RELAX            = Number(process.env.EV_FLOOR_RELAXED ?? -0.02);
+    const LEARN_MIN_N         = Number(process.env.LEARN_MIN_N ?? 50);
+    const SAFETY_MIN          = Number(process.env.SAFETY_MIN ?? 5);
+    const MAX_TIER2_ODDS      = Number(process.env.MAX_TIER2_ODDS ?? 2.50);
+    const HIGH_ODDS_BTTS      = Number(process.env.HIGH_ODDS_BTTS ?? 2.80);
+    const HIGH_ODDS_OU        = Number(process.env.HIGH_ODDS_OU   ?? 3.00);
 
     const ymd = new Intl.DateTimeFormat("sv-SE",{ timeZone: TZ, year:"numeric", month:"2-digit", day:"2-digit"}).format(new Date());
     const unionKey = `vb:day:${ymd}:last`;
     const union = toArray(await kvGet(unionKey));
     if (!union.length) return res.status(200).json({ ok:true, updated:false, note:"no union" });
 
+    // learning maps
     const overlayMap = toJSON(await kvGet(`learn:overlay:v1`)) || {};
     const evMinMap   = toJSON(await kvGet(`learn:evmin:v1`))   || {};
+    const bucketNMap = toJSON(await kvGet(`learn:bucketN:v1`)) || {};
+    const clvAvgMap  = toJSON(await kvGet(`learn:clvavg:v1`))  || {};
 
-    const TRUSTED_MIN = 2;
-    const HIGH_ODDS_BTTS = Number(process.env.HIGH_ODDS_BTTS ?? 2.80);
-    const HIGH_ODDS_OU   = Number(process.env.HIGH_ODDS_OU   ?? 3.00);
-
-    // raniji final (radi stickiness)
+    // prethodni final (radi stickiness u okviru slota)
     const prevFinal = toArray(await kvGet(unionKey));
     const prevByFixture = new Map();
     for (const p of prevFinal){
       if (p?.fixture_id) prevByFixture.set(p.fixture_id, p);
     }
+
+    function learnOverlayFor(bkey){
+      const n = Number(bucketNMap[bkey]||0);
+      if (n < LEARN_MIN_N) return 0; // gating
+      const d = Number(overlayMap[bkey] ?? 0);
+      if (!Number.isFinite(d)) return 0;
+      if (d > 3) return 3;
+      if (d < -3) return -3;
+      return d;
+    }
+    function learnEvMinFor(bkey){
+      const n = Number(bucketNMap[bkey]||0);
+      if (n < LEARN_MIN_N) return 0; // gating
+      const v = Number(evMinMap[bkey] ?? 0);
+      return Number.isFinite(v) ? v : 0;
+    }
+    function clvPositive(bkey){
+      const v = Number(clvAvgMap[bkey]);
+      return Number.isFinite(v) && v > 0;
+    }
+
+    function calcScore(p){
+      const ko = parseKO(p);
+      const odds = Number(p?.market_odds||p?.odds||0);
+      const bkey = bucketKey(p?.market, odds, bandTTKOFromNow(ko));
+      const delta = learnOverlayFor(bkey);
+      const conf = Number(p?.confidence_pct||0) + delta;
+      const penalty = odds>=3.0 ? 2 : odds>=2.5 ? 1 : 0;
+      const tier = tierHeuristic(p?.league);
+      const bonusTier = tier===1 ? 1 : tier===2 ? 0.5 : 0;
+      return { confAdj: conf, score: conf - penalty + bonusTier, bkey, evReq: learnEvMinFor(bkey), ko, odds, tier };
+    }
+
+    const TRUSTED_MIN = 2;
 
     // grupiši po fixtureu
     const byFixture = new Map();
@@ -110,19 +151,10 @@ export default async function handler(req,res){
       byFixture.set(fid, list);
     }
 
-    function calcScore(p){
-      const ko = parseKO(p);
-      const odds = Number(p?.market_odds||p?.odds||0);
-      const bkey = bucketKey(p?.market, odds, bandTTKOFromNow(ko));
-      const delta = Number(overlayMap[bkey] ?? 0);
-      const conf = Number(p?.confidence_pct||0) + delta;
-      const penalty = odds>=3.0 ? 2 : odds>=2.5 ? 1 : 0;
-      const tier = tierHeuristic(p?.league);
-      const bonusTier = tier===1 ? 1 : tier===2 ? 0.5 : 0;
-      return { confAdj: conf, score: conf - penalty + bonusTier, bkey, evReq: Number(evMinMap[bkey] ?? 0), ko };
-    }
+    // bazni izbor (strogi filteri)
+    const baseSelected = [];
+    const tried = new Set();
 
-    const selected = [];
     for (const [fid, arr] of byFixture){
       const candidates = [];
       for (const p of arr){
@@ -141,7 +173,7 @@ export default async function handler(req,res){
         const ev = Number(p?.ev||0);
         if (!(Number.isFinite(ev) && ev >= evReq)) continue;
 
-        candidates.push({ p, score, confAdj, ev, koTs: ko ? +ko : Number.MAX_SAFE_INTEGER, bkey, evReq });
+        candidates.push({ p, score, confAdj, ev, koTs: ko ? +ko : Number.MAX_SAFE_INTEGER, bkey });
       }
       if (!candidates.length) continue;
 
@@ -153,39 +185,29 @@ export default async function handler(req,res){
         const nowTs    = Date.now();
         const minsToKO = prevCalc.ko ? Math.round((+prevCalc.ko - nowTs)/60000) : 99999;
 
-        // ako smo u freeze zoni, zadrži prethodni bezuslovno
-        if (minsToKO <= FREEZE_MIN){
-          selected.push(prev);
-          continue;
-        }
+        if (minsToKO <= FREEZE_MIN){ baseSelected.push(prev); tried.add(fid); continue; }
 
-        // da li prev i dalje prolazi EV prag (uz malu toleranciju −0.03)?
         const stillEVok = Number.isFinite(prevEV) && prevEV >= (Number(prevCalc.evReq)||0) - 0.03;
 
-        // najbolji novi kandidat
         candidates.sort((a,b)=> b.score - a.score || b.ev - a.ev || a.koTs - b.koTs);
         const best = candidates[0];
 
         if (stillEVok){
-          // zadrži ako novi nije “STICKY_DELTA_PP” bolji po konf. skoru
-          if (best.score < (prevCalc.score + STICKY_DELTA_PP)){
-            selected.push(prev);
-            continue;
-          }
+          if (best.score < (prevCalc.score + STICKY_DELTA_PP)){ baseSelected.push(prev); tried.add(fid); continue; }
         }
-        // inače dozvoli zamenu
-        selected.push(best.p);
+        baseSelected.push(best.p);
+        tried.add(fid);
         continue;
       }
 
-      // bez prethodnog izbora: izaberi najboljeg
-      candidates.sort((a,b)=> b.score - a.score || b.ev - a.ev || a.koTs - b.koTs);
-      selected.push(candidates[0].p);
+      candidates.sort((a,b)=> b.score - a.score || b.ev - a.ev || a.koTs - a.koTs);
+      baseSelected.push(candidates[0].p);
+      tried.add(fid);
     }
 
-    // Sortiranje: conf desc → EV desc → kickoff asc
+    // sortiranje i target po slotu
     function parseKOts(p){ const d=parseKO(p); return d? +d : Number.MAX_SAFE_INTEGER; }
-    selected.sort((a,b)=>{
+    baseSelected.sort((a,b)=>{
       const ca=Number(a?.confidence_pct||0), cb=Number(b?.confidence_pct||0);
       if (cb!==ca) return cb-ca;
       const ea=Number(a?.ev||0), eb=Number(b?.ev||0);
@@ -193,18 +215,148 @@ export default async function handler(req,res){
       return parseKOts(a)-parseKOts(b);
     });
 
-    // Trim po slotu (po lokalnom satu)
     const hour = Number(new Intl.DateTimeFormat("en-GB",{ timeZone: TZ, hour:"2-digit", hour12:false }).format(new Date()));
-    const weekday = Number(new Intl.DateTimeFormat("en-GB",{ timeZone: TZ, weekday:"short"}).format(new Date()).toLowerCase().startsWith("s")); // 1 vikend? (ne koristimo, ali ostavljeno)
     const target = (hour>=15) ? targetPM : (hour<3 ? targetLATE : targetAM);
-    const finalList = selected.slice(0, Math.max(1, target));
+
+    let finalList = baseSelected.slice(0, Math.max(1, target));
+
+    // ---------- SOFT FLOOR (ako nema dovoljno)
+    if (SOFT_FLOOR_ENABLE && finalList.length < target){
+      const selectedIds = new Set(finalList.map(x=>x.fixture_id));
+
+      // Helper: može li p da prođe OU i high-odds guard (blaže re-uses)
+      function baseSanity(p, trustedMin=2, limitTier2Odds=false){
+        const trusted = Number(p?.bookmakers_count_trusted||0);
+        if (trusted < trustedMin) return false;
+
+        if (String(p?.market||"").toUpperCase()==="OU"){
+          if (!/2\.5/.test(String(p?.selection||""))) return false;
+        }
+        const odds = Number(p?.market_odds||p?.odds||0);
+        if (String(p?.market||"").toUpperCase()==="BTTS" && odds>HIGH_ODDS_BTTS && trusted<trustedMin+1) return false;
+        if (String(p?.market||"").toUpperCase()==="OU"   && odds>HIGH_ODDS_OU   && trusted<trustedMin+1) return false;
+        if (limitTier2Odds && odds>MAX_TIER2_ODDS) return false;
+        return true;
+      }
+
+      // STEP 1: EV relaksacija (EV ≥ EV_RELAX) za buckete sa pozitivnim CLV
+      const step1 = [];
+      for (const p of union){
+        if (selectedIds.has(p.fixture_id)) continue;
+        const ko = parseKO(p);
+        const odds = Number(p?.market_odds||p?.odds||0);
+        const bkey = bucketKey(p?.market, odds, bandTTKOFromNow(ko));
+        if (!clvPositive(bkey)) continue;
+
+        if (!baseSanity(p, 2, false)) continue;
+
+        const ev = Number(p?.ev||0);
+        if (!(Number.isFinite(ev) && ev >= EV_RELAX)) continue;
+
+        step1.push(p);
+      }
+      step1.sort((a,b)=>{
+        const ca=Number(a?.confidence_pct||0), cb=Number(b?.confidence_pct||0);
+        if (cb!==ca) return cb-ca;
+        const ea=Number(a?.ev||0), eb=Number(b?.ev||0);
+        if (eb!==ea) return eb-ea;
+        return parseKOts(a)-parseKOts(b);
+      });
+      for (const p of step1){
+        if (finalList.length>=target) break;
+        finalList.push(p); selectedIds.add(p.fixture_id);
+      }
+
+      // STEP 2: Tier-1 fallback (trusted ≥1), zadrži bazne sanity uslove
+      if (finalList.length < target){
+        const step2=[];
+        for (const p of union){
+          if (selectedIds.has(p.fixture_id)) continue;
+          if (tierHeuristic(p?.league)!==1) continue;
+          if (!baseSanity(p, 1, false)) continue;
+          const ev = Number(p?.ev||0);
+          if (!(Number.isFinite(ev) && ev >= EV_RELAX)) continue;
+          step2.push(p);
+        }
+        step2.sort((a,b)=>{
+          const ca=Number(a?.confidence_pct||0), cb=Number(b?.confidence_pct||0);
+          if (cb!==ca) return cb-ca;
+          const ea=Number(a?.ev||0), eb=Number(b?.ev||0);
+          if (eb!==ea) return eb-ea;
+          return parseKOts(a)-parseKOts(b);
+        });
+        for (const p of step2){
+          if (finalList.length>=target) break;
+          finalList.push(p); selectedIds.add(p.fixture_id);
+        }
+      }
+
+      // STEP 3: Tier-2 fallback (trusted ≥1, odds ≤ MAX_TIER2_ODDS)
+      if (finalList.length < target){
+        const step3=[];
+        for (const p of union){
+          if (selectedIds.has(p.fixture_id)) continue;
+          if (tierHeuristic(p?.league)!==2) continue;
+          if (!baseSanity(p, 1, true)) continue;
+          const ev = Number(p?.ev||0);
+          if (!(Number.isFinite(ev) && ev >= EV_RELAX)) continue;
+          step3.push(p);
+        }
+        step3.sort((a,b)=>{
+          const ca=Number(a?.confidence_pct||0), cb=Number(b?.confidence_pct||0);
+          if (cb!==ca) return cb-ca;
+          const ea=Number(a?.ev||0), eb=Number(b?.ev||0);
+          if (eb!==ea) return eb-ea;
+          return parseKOts(a)-parseKOts(b);
+        });
+        for (const p of step3){
+          if (finalList.length>=target) break;
+          finalList.push(p); selectedIds.add(p.fixture_id);
+        }
+      }
+    }
+
+    // Nikad prazno: minimum SAFETY_MIN (blagi uslovi, fokus na conf)
+    if (finalList.length < SAFETY_MIN){
+      const selectedIds = new Set(finalList.map(x=>x.fixture_id));
+      const pool = union.filter(p=>{
+        if (selectedIds.has(p.fixture_id)) return false;
+        const conf = Number(p?.confidence_pct||0);
+        const odds = Number(p?.market_odds||p?.odds||0);
+        // bazni limiti
+        if (String(p?.market||"").toUpperCase()==="OU" && !/2\.5/.test(String(p?.selection||""))) return false;
+        if (odds<1.5 || odds>2.8) return false;
+        return conf>=70;
+      });
+      pool.sort((a,b)=>{
+        const ca=Number(a?.confidence_pct||0), cb=Number(b?.confidence_pct||0);
+        if (cb!==ca) return cb-ca;
+        const ea=Number(a?.ev||0), eb=Number(b?.ev||0);
+        if (eb!==ea) return eb-ea;
+        return parseKOts(a)-parseKOts(b);
+      });
+      for (const p of pool){
+        if (finalList.length>=SAFETY_MIN) break;
+        finalList.push(p);
+      }
+    }
+
+    // Final sort (stabilno)
+    finalList.sort((a,b)=>{
+      const ca=Number(a?.confidence_pct||0), cb=Number(b?.confidence_pct||0);
+      if (cb!==ca) return cb-ca;
+      const ea=Number(a?.ev||0), eb=Number(b?.ev||0);
+      if (eb!==ea) return eb-ea;
+      return parseKOts(a)-parseKOts(b);
+    });
 
     await kvSet(unionKey, finalList);
 
     return res.status(200).json({
       ok:true, updated:true,
       n_in: union.length, n_out: finalList.length,
-      slot_target: target
+      gating_minN: LEARN_MIN_N,
+      used_soft_floor: finalList.length < Math.max(1, (hour>=15)?targetPM: (hour<3?targetLATE:targetAM)) ? 1 : 0
     });
   }catch(e){
     return res.status(500).json({ ok:false, error: String(e?.message||e) });
