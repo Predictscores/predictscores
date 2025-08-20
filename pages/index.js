@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import Head from "next/head";
 import dynamic from "next/dynamic";
 
@@ -35,7 +35,7 @@ function useDarkMode() {
 
 // --------- helperi
 async function safeJson(url) {
-  const res = await fetch(url);
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`${url} -> ${res.status}`);
   return res.json();
 }
@@ -78,6 +78,24 @@ function todayYMD() {
     month: "2-digit",
     day: "2-digit",
   }).format(now);
+}
+function beogradHH() {
+  const now = new Date();
+  return Number(
+    new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Europe/Belgrade",
+      hour: "2-digit",
+      hour12: false,
+    }).format(now)
+  );
+}
+function pickSlotForNow() {
+  // slot po lokalnom (Europe/Belgrade) satu
+  const h = beogradHH();
+  if (h >= 0 && h < 3) return "late";
+  if (h >= 15 && h < 24) return "pm";
+  // sve ostalo (uklj. jutro pre 10h) vodi u am, da se “probudi” dnevni snapshot
+  return "am";
 }
 
 // --------- Export CSV (bez mreže, iz keša)
@@ -155,12 +173,59 @@ function HeaderBar() {
   const [now, setNow] = useState(Date.now());
   const [nextKickoffAt, setNextKickoffAt] = useState(null); // ISO string
   const [cryptoNextAt, setCryptoNextAt] = useState(null); // timestamp (ms)
+  const ensuredOnceRef = useRef(false); // da ne spamujemo rebuild
 
   // tikanje tajmera
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
+
+  async function ensureSnapshotIfEmpty(currentList, currentDay) {
+    if (ensuredOnceRef.current) return;
+    const today = todayYMD();
+
+    const listEmpty = !Array.isArray(currentList) || currentList.length === 0;
+    const dayMismatch = (currentDay && currentDay !== today) || !currentDay;
+
+    if (!listEmpty && !dayMismatch) return;
+
+    ensuredOnceRef.current = true; // pokušaj samo jednom po učitavanju
+
+    try {
+      // 1) prvo probaj AUTOMATSKI rebuild bez slota (backend odlučuje)
+      await fetch(`/api/cron/rebuild`, { cache: "no-store" }).catch(() => {});
+
+      // 2) (noću) pokupi FT rezultate za istoriju
+      const hh = beogradHH();
+      if (hh >= 0 && hh < 4) {
+        await fetch(`/api/history-check?days=2`, { cache: "no-store" }).catch(() => {});
+      }
+
+      // 3) Re-fetch value-bets-locked i osveži UI + LS
+      let fb2 = await safeJson("/api/value-bets-locked");
+      let list2 = Array.isArray(fb2?.value_bets) ? fb2.value_bets : [];
+      let lockedDay2 = typeof fb2?.day === "string" ? fb2.day : null;
+
+      // 4) Fallback: ako backend nije odlučio slot (ili nije pogodio),
+      // pokušaj još jednom sa eksplicitnim slotom po lokalnom satu.
+      if ((!Array.isArray(list2) || list2.length === 0) || (lockedDay2 && lockedDay2 !== today)) {
+        const slot = pickSlotForNow();
+        await fetch(`/api/cron/rebuild?slot=${slot}`, { cache: "no-store" }).catch(() => {});
+        fb2 = await safeJson("/api/value-bets-locked");
+        list2 = Array.isArray(fb2?.value_bets) ? fb2.value_bets : [];
+        lockedDay2 = typeof fb2?.day === "string" ? fb2.day : null;
+      }
+
+      setNextKickoffAt(nearestFutureKickoff(list2));
+      try {
+        const ymd = todayYMD();
+        localStorage.setItem(`valueBetsLocked_${ymd}`, JSON.stringify(list2));
+      } catch {}
+    } catch {
+      // tiho — UI ostaje stabilan
+    }
+  }
 
   // inicijalno pokupi podatke za tajmere (NE koristi DataContext)
   useEffect(() => {
@@ -170,17 +235,26 @@ function HeaderBar() {
           safeJson("/api/value-bets-locked"),
           safeJson("/api/crypto"),
         ]);
+
         if (fb.status === "fulfilled") {
           const list = Array.isArray(fb.value?.value_bets)
             ? fb.value.value_bets
             : [];
+          const lockedDay =
+            typeof fb.value?.day === "string" ? fb.value.day : null;
+
           setNextKickoffAt(nearestFutureKickoff(list));
+
           // keširaj u LS da Export ima iz čega da izveze
           try {
             const ymd = todayYMD();
             localStorage.setItem(`valueBetsLocked_${ymd}`, JSON.stringify(list));
           } catch {}
+
+          // fallback: ako nema snapshota za danas (ili je prazan), pokušaj rebuild (auto → slot)
+          await ensureSnapshotIfEmpty(list, lockedDay);
         }
+
         if (cr.status === "fulfilled") {
           // sledeći refresh ~10 min posle uspešnog poziva
           setCryptoNextAt(Date.now() + 10 * 60 * 1000);
