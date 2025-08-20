@@ -1,15 +1,15 @@
-name: Odds Watcher (every 10m)
+# FILE: .github/workflows/odds-watcher.yml
+name: Odds watcher (refresh prices)
 
 on:
   schedule:
-    - cron: '*/10 6-22 * * *'  # svakih 10 min, 06–22 UTC
+    - cron: "*/10 * * * *"   # svakih 10 min (UTC) tokom dana
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Call refresh-odds
+      - name: Refresh odds once
         run: |
-          set -e
-          curl -fsS https://predictscores.vercel.app/api/cron/refresh-odds
+          curl -fsS "https://predictscores.vercel.app/api/cron/refresh-odds" || true
