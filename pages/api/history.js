@@ -34,9 +34,24 @@ function toArray(raw){
   }catch{}
   return [];
 }
-function toJSON(raw){
-  try{ return typeof raw === "string" ? JSON.parse(raw) : raw; }catch{ return null; }
+
+// unwrap {value:"…"} i/ili string -> object
+function normalizeScore(raw){
+  try{
+    let v = raw;
+    if (typeof v === "string") v = JSON.parse(v);
+
+    if (v && typeof v === "object" && "value" in v){
+      let inner = v.value;
+      if (typeof inner === "string") {
+        try { inner = JSON.parse(inner); } catch { /* ignore */ }
+      }
+      if (inner && typeof inner === "object") return inner;
+    }
+    return (v && typeof v === "object") ? v : null;
+  }catch{ return null; }
 }
+
 function lastDays(n){
   const out=[], now=new Date();
   for (let i=0;i<n;i++){ const d=new Date(now); d.setDate(d.getDate()-i); out.push(d.toISOString().slice(0,10)); }
@@ -44,10 +59,20 @@ function lastDays(n){
 }
 
 // --- outcome
-function computeWon(entry, score){
-  if (!score || score.ft == null) return null;
-  const [h,a] = String(score.ft).split(":").map(Number);
+function computeWon(entry, scoreObj){
+  // scoreObj može imati ft (string "H:A") ili ftH/ftA brojeve
+  if (!scoreObj) return null;
+
+  const ftStr =
+    (typeof scoreObj.ft === "string" ? scoreObj.ft : null) ??
+    (Number.isFinite(scoreObj.ftH) && Number.isFinite(scoreObj.ftA)
+      ? `${scoreObj.ftH}:${scoreObj.ftA}` : null);
+
+  if (!ftStr) return null;
+
+  const [h,a] = String(ftStr).split(":").map(Number);
   if (!Number.isFinite(h) || !Number.isFinite(a)) return null;
+
   const m = String(entry.market||"").toUpperCase();
   const s = String(entry.selection||"").toUpperCase();
 
@@ -59,13 +84,18 @@ function computeWon(entry, score){
     return (h>=1 && a>=1);
   }
   if (m === "OU"){
-    if (/OVER/.test(s)) return (h+a) > 2;   // OVER 2.5
-    if (/UNDER/.test(s)) return (h+a) < 3;  // UNDER 2.5
+    // pretpostavka: OU 2.5 OVER/UNDER
+    if (/OVER/.test(s)) return (h+a) > 2;
+    if (/UNDER/.test(s)) return (h+a) < 3;
     return null;
   }
   if (m === "BTTS 1H"){
-    if (!score.ht) return null;
-    const [hh,ha] = String(score.ht).split(":").map(Number);
+    const htStr =
+      (typeof scoreObj.ht === "string" ? scoreObj.ht : null) ??
+      (Number.isFinite(scoreObj.htH) && Number.isFinite(scoreObj.htA)
+        ? `${scoreObj.htH}:${scoreObj.htA}` : null);
+    if (!htStr) return null;
+    const [hh,ha] = String(htStr).split(":").map(Number);
     if (!Number.isFinite(hh) || !Number.isFinite(ha)) return null;
     return (hh>=1 && ha>=1);
   }
@@ -89,13 +119,24 @@ export default async function handler(req,res){
       const am = toArray(await kvGet(`hist:${ymd}:am`));
       const pm = toArray(await kvGet(`hist:${ymd}:pm`));
       const lt = toArray(await kvGet(`hist:${ymd}:late`));
+
       for (const e of [...am, ...pm, ...lt]){
-        const score = toJSON(await kvGet(`vb:score:${e?.fixture_id}`)) || null;
+        const rawScore = await kvGet(`vb:score:${e?.fixture_id}`);
+        const score = normalizeScore(rawScore);
         const won = computeWon(e, score);
+
+        // final/ht score string fallback
+        const final_score =
+          (score && (score.ft || (Number.isFinite(score.ftH)&&Number.isFinite(score.ftA) ? `${score.ftH}:${score.ftA}` : null))) ??
+          e.final_score ?? null;
+        const ht_score =
+          (score && (score.ht || (Number.isFinite(score.htH)&&Number.isFinite(score.htA) ? `${score.htH}:${score.htA}` : null))) ??
+          e.ht_score ?? null;
+
         all.push({
           ...e,
-          final_score: score?.ft ?? e.final_score ?? null,
-          ht_score: score?.ht ?? e.ht_score ?? null,
+          final_score,
+          ht_score,
           won: (won==null) ? (e.won ?? null) : won
         });
       }
