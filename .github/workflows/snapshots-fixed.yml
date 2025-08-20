@@ -1,3 +1,4 @@
+# FILE: .github/workflows/snapshots-fixed.yml
 name: Snapshots (AM/PM/LATE)
 
 on:
@@ -19,7 +20,6 @@ jobs:
           elif [ "$S" = "0 13 * * *" ]; then SLOT=pm;
           elif [ "$S" = "0 22 * * *" ]; then SLOT=late;
           else
-            # fallback ako se startuje ručno (UTC sat)
             H=$(date -u +%H)
             if   [ "$H" -ge 8  ] && [ "$H" -lt 9  ]; then SLOT=am;
             elif [ "$H" -ge 13 ] && [ "$H" -lt 14 ]; then SLOT=pm;
@@ -28,6 +28,10 @@ jobs:
           fi
           echo "slot=$SLOT" >> $GITHUB_OUTPUT
 
-      - name: Call rebuild for slot
+      - name: Rebuild snapshot for slot
         run: |
           curl -fsS "https://predictscores.vercel.app/api/cron/rebuild?slot=${{ steps.pick.outputs.slot }}"
+
+      - name: Apply learning (tighten list)
+        run: |
+          curl -fsS "https://predictscores.vercel.app/api/cron/apply-learning"
