@@ -1,11 +1,11 @@
 // FILE: pages/api/cron/apply-learning.js
 // Selektuje finalnu, "zaključanu" listu iz union pool-a za današnji dan.
-// - Pojačan prioritet za Tier-1 (top lige + UEFA), BEZ kvota/ograničenja po broju.
-// - I dalje važe guard-ovi: trusted konsenzus, EV (sa CLV-relaksacijom), OU tačno 2.5, 1 pick po meču,
-//   high-odds zaštita za BTTS/OU, stickiness i freeze.
-// - Nakon selekcije, listu snima nazad u `vb:day:<YYYY-MM-DD>:last`.
+// NOVO: BTTS 1st Half (poseban market) — trusted ≥3, EV ≥ 0 (bez relaksa), izuzet iz high-odds guarda.
+// Pojačan prioritet za Tier-1 (top lige + UEFA), BEZ ikakvih kvota/ograničenja po broju.
+// Guard-ovi: trusted konsenzus, EV (sa CLV-relaksacijom), OU tačno 2.5 (full-time OU), 1 pick po meču,
+// high-odds zaštita za BTTS/OU (full-time), stickiness i freeze.
 //
-// ENV knobs (svi opciono, imaju podrazumevane vrednosti):
+// ENV knobs (opciono; svi imaju podrazumevane vrednosti):
 //   STICKY_DELTA_PP=3
 //   FREEZE_MINUTES=30
 //   SLOT_AM_COUNT=15
@@ -16,11 +16,11 @@
 //   LEARN_MIN_N=50
 //   SAFETY_MIN=5
 //   MAX_TIER2_ODDS=2.50
-//   HIGH_ODDS_BTTS=2.80
+//   HIGH_ODDS_BTTS=2.80        // ne važi za BTTS 1H (poseban market)
 //   HIGH_ODDS_OU=3.00
-//   TIER1_BONUS_PP=1.5   // dodatni rang bonus za Tier-1
-//   TIER2_BONUS_PP=0.5   // blaži bonus za Tier-2
-//   TRUSTED_MIN=2        // min broj trusted bukija za osnovni prolaz
+//   TIER1_BONUS_PP=1.5
+//   TIER2_BONUS_PP=0.5
+//   TRUSTED_MIN=2
 //   TZ_DISPLAY=Europe/Belgrade
 
 export const config = { api: { bodyParser: false } };
@@ -89,6 +89,22 @@ function bandTTKOFromNow(ko){
 function bucketKey(market, odds, ttkoBand){
   return `${String(market||"").toUpperCase()}|${bandOdds(odds)}|${ttkoBand}`;
 }
+
+// ---- market canonicalization & heuristics ----
+function norm(str){ return String(str||"").trim().toUpperCase(); }
+function getMarket(p){
+  const m = norm(p?.market_label || p?.market);
+  // Mapiraj moguće varijante BTTS 1st Half
+  if (m.includes("BTTS") && (m.includes("1H") || m.includes("FIRST HALF") || m.includes("1ST HALF") || m.includes("FH"))) {
+    return "BTTS 1H";
+  }
+  if (m === "BOTH TEAMS TO SCORE 1ST HALF") return "BTTS 1H";
+  return m;
+}
+function isBTTS1H(p){ return getMarket(p) === "BTTS 1H"; }
+function isBTTS_FT(p){ return getMarket(p) === "BTTS"; }
+function isOU_FT(p){ return getMarket(p) === "OU"; } // radimo samo full-time OU
+
 function tierHeuristic(league){
   const name = String(league?.name||"").toLowerCase();
   const country = String(league?.country||"").toLowerCase();
@@ -163,27 +179,18 @@ export default async function handler(req,res){
     function calcScore(p){
       const ko = parseKO(p);
       const odds = Number(p?.market_odds||p?.odds||0);
-      const bkey = bucketKey(p?.market, odds, bandTTKOFromNow(ko));
+      const mkt  = getMarket(p);
+      const bkey = bucketKey(mkt, odds, bandTTKOFromNow(ko));
       const delta = learnOverlayFor(bkey);
       let conf = Number(p?.confidence_pct||0) + delta;
 
-      // Pojačan prioritet za Tier-1, blaži za Tier-2 (nema gornjeg limita: ako ih ima 9 — svi mogu da prođu)
+      // Pojačan prioritet za Tier-1, blaži za Tier-2
       const tier = tierHeuristic(p?.league);
       if (tier===1) conf += TIER1_BONUS_PP;
       else if (tier===2) conf += TIER2_BONUS_PP;
 
-      // Lagani "penal" za baš visoke kvote na generički način
       const penalty = odds>=3.0 ? 2 : odds>=2.5 ? 1 : 0;
-
-      return {
-        confAdj: conf,
-        score: conf - penalty,   // što veći — bolje
-        bkey,
-        evReq: learnEvMinFor(bkey),
-        ko,
-        odds,
-        tier
-      };
+      return { confAdj: conf, score: conf - penalty, bkey, evReq: learnEvMinFor(bkey), ko, odds, tier, mkt };
     }
 
     // grupiši po fixtureu
@@ -200,32 +207,48 @@ export default async function handler(req,res){
     for (const [fid, arr] of byFixture){
       const candidates = [];
       for (const p of arr){
-        // Trusted konsenzus
         const trusted = Number(p?.bookmakers_count_trusted||0);
-        if (trusted < TRUSTED_MIN) continue;
+        const odds = Number(p?.market_odds||p?.odds||0);
+        const mkt  = getMarket(p);
 
-        // OU mora biti 2.5 (ista linija)
-        if (String(p?.market||"").toUpperCase()==="OU"){
+        // ---- Sanity po marketu ----
+        // OU (full-time) mora biti 2.5 (ista linija u selection opisu)
+        if (isOU_FT(p)) {
           if (!/2\.5/.test(String(p?.selection||""))) continue;
         }
 
-        // High-odds guard (ako baš visoka kvota, zahtevamo više trusted bukija)
-        const odds = Number(p?.market_odds||p?.odds||0);
-        if (String(p?.market||"").toUpperCase()==="BTTS" && odds>HIGH_ODDS_BTTS && trusted<3) continue;
-        if (String(p?.market||"").toUpperCase()==="OU"   && odds>HIGH_ODDS_OU   && trusted<3) continue;
-
-        // Tier-2 opcioni "odds clamp" (lakša disciplina u srednjim ligama)
-        if (tierHeuristic(p?.league)===2 && odds>MAX_TIER2_ODDS) continue;
-
-        // EV guard po bucketu (kalibrisan učenjem)
-        const { confAdj, score, bkey, evReq, ko } = calcScore(p);
-        const ev = Number(p?.ev||0);
-        if (!(Number.isFinite(ev) && ev >= evReq)) {
-          // ako je bucket istorijski pozitivan, dopusti blagi relax (EV_RELAX) — ali ne forsiramo
-          if (!(clvPositive(bkey) && Number.isFinite(ev) && ev >= EV_RELAX)) continue;
+        // BTTS 1H — POSEBAN MARKET:
+        // - izuzet iz generičkog high-odds guarda (1H kvote su prirodno više)
+        // - stroži konsenzus i EV: trusted ≥3 i EV ≥ 0 (bez relaksa)
+        if (isBTTS1H(p)) {
+          if (trusted < 3) continue;
+          const ev = Number(p?.ev||0);
+          if (!Number.isFinite(ev) || ev < 0) continue; // BEZ relaksa
+          // ostalo (stickiness, freeze, rang) radi isto
+          const calc = calcScore(p);
+          candidates.push({ p, score: calc.score, confAdj: calc.confAdj, ev, koTs: calc.ko ? +calc.ko : Number.MAX_SAFE_INTEGER });
+          continue;
         }
 
-        candidates.push({ p, score, confAdj, ev, koTs: ko ? +ko : Number.MAX_SAFE_INTEGER });
+        // Ostali marketi: generički high-odds guard (ne primenjuje se na BTTS 1H)
+        if (isBTTS_FT(p) && odds>HIGH_ODDS_BTTS && trusted<3) continue;
+        if (isOU_FT(p)    && odds>HIGH_ODDS_OU   && trusted<3) continue;
+
+        // Trusted konsenzus (osnovni)
+        if (trusted < TRUSTED_MIN) continue;
+
+        // Tier-2 odds "clamp" (disciplinuje srednje lige)
+        if (tierHeuristic(p?.league)===2 && odds>MAX_TIER2_ODDS) continue;
+
+        // EV guard po bucketu (sa učenjem)
+        const calc = calcScore(p);
+        const ev   = Number(p?.ev||0);
+        if (!(Number.isFinite(ev) && ev >= calc.evReq)) {
+          // relaks samo ako je bucket istorijski pozitivan
+          if (!(clvPositive(calc.bkey) && Number.isFinite(ev) && ev >= EV_RELAX)) continue;
+        }
+
+        candidates.push({ p, score: calc.score, confAdj: calc.confAdj, ev, koTs: calc.ko ? +calc.ko : Number.MAX_SAFE_INTEGER });
       }
       if (!candidates.length) continue;
 
@@ -259,7 +282,7 @@ export default async function handler(req,res){
       baseSelected.push(candidates[0].p);
     }
 
-    // sortiranje i sečenje na cilj po slotu (AM/PM/LATE) — Tier-1 NISU kvotirani: ako su kvalitetni, prirodno će ući više njih
+    // sortiranje i sečenje na cilj po slotu (AM/PM/LATE) — Tier-1 nisu kvotirani: ako ih ima 9 dobrih, proći će 9
     function parseKOts(p){ const d=parseKO(p); return d? +d : Number.MAX_SAFE_INTEGER; }
     baseSelected.sort((a,b)=>{
       const ca=Number(a?.confidence_pct||0), cb=Number(b?.confidence_pct||0);
@@ -274,36 +297,52 @@ export default async function handler(req,res){
 
     let finalList = baseSelected.slice(0, Math.max(1, target));
 
-    // SOFT-FLOOR dopuna (ako nema dovoljno) — NE uvodi Tier-1 kvote, samo puni prema istim pravilima, relaks EV uz pozitivan CLV
+    // SOFT-FLOOR dopuna (ako nema dovoljno) — relaks EV uz pozitivan CLV, važe isti sanity uslovi
+    const SOFT_FLOOR_ENABLE = String(process.env.SOFT_FLOOR_ENABLE ?? "1")==="1";
+    const EV_RELAX          = Number(process.env.EV_FLOOR_RELAXED ?? -0.02);
     if (SOFT_FLOOR_ENABLE && finalList.length < target){
       const selectedIds = new Set(finalList.map(x=>x.fixture_id));
 
       function baseSanity(p, trustedMin=TRUSTED_MIN, limitTier2Odds=false){
         const trusted = Number(p?.bookmakers_count_trusted||0);
-        if (trusted < trustedMin) return false;
-        if (String(p?.market||"").toUpperCase()==="OU"){
-          if (!/2\.5/.test(String(p?.selection||""))) return false;
-        }
         const odds = Number(p?.market_odds||p?.odds||0);
-        if (String(p?.market||"").toUpperCase()==="BTTS" && odds>HIGH_ODDS_BTTS && trusted<trustedMin+1) return false;
-        if (String(p?.market||"").toUpperCase()==="OU"   && odds>HIGH_ODDS_OU   && trusted<trustedMin+1) return false;
+
+        // OU FT mora biti 2.5
+        if (isOU_FT(p) && !/2\.5/.test(String(p?.selection||""))) return false;
+
+        // BTTS 1H: poseban sanity — zadržavamo prethodna pravila
+        if (isBTTS1H(p)) {
+          if (trusted < 3) return false;
+          const ev = Number(p?.ev||0);
+          if (!Number.isFinite(ev) || ev < 0) return false; // bez relaksa
+          return true;
+        }
+
+        // generički high-odds guard (ne važi za BTTS 1H)
+        if (isBTTS_FT(p) && odds>HIGH_ODDS_BTTS && trusted<trustedMin+1) return false;
+        if (isOU_FT(p)    && odds>HIGH_ODDS_OU   && trusted<trustedMin+1) return false;
+
+        if (trusted < trustedMin) return false;
         if (limitTier2Odds && tierHeuristic(p?.league)===2 && odds>MAX_TIER2_ODDS) return false;
         return true;
       }
 
-      const clv = toJSON(await kvGet(`learn:clvavg:v1`)) || {};
+      const clvAvgMap2 = toJSON(await kvGet(`learn:clvavg:v1`)) || {};
 
-      // Step: relaks EV ako je bucket CLV pozitivan
       const pool = [];
       for (const p of union){
         if (selectedIds.has(p.fixture_id)) continue;
         if (!baseSanity(p, TRUSTED_MIN, false)) continue;
+
+        // BTTS 1H već ima stroge uslove i EV≥0 — već prošao
+        if (isBTTS1H(p)) { pool.push(p); continue; }
+
         const ko = parseKO(p);
         const odds = Number(p?.market_odds||p?.odds||0);
-        const bkey = bucketKey(p?.market, odds, bandTTKOFromNow(ko));
+        const bkey = bucketKey(getMarket(p), odds, bandTTKOFromNow(ko));
         const ev   = Number(p?.ev||0);
-        const clvAvg = Number(clv[bkey]);
         const evReq = learnEvMinFor(bkey);
+        const clvAvg = Number(clvAvgMap2[bkey]);
         const pass = (Number.isFinite(ev) && ev >= evReq) || (Number.isFinite(clvAvg) && clvAvg>0 && Number.isFinite(ev) && ev >= EV_RELAX);
         if (!pass) continue;
         pool.push(p);
@@ -323,14 +362,15 @@ export default async function handler(req,res){
       }
     }
 
-    // Nikad totalno prazno: minimum SAFETY_MIN (konzervativno, mid-odds + viši confidence)
+    // Nikad totalno prazno: minimum SAFETY_MIN (konzervativno)
+    const SAFETY_MIN = Number(process.env.SAFETY_MIN ?? 5);
     if (finalList.length < SAFETY_MIN){
       const selectedIds = new Set(finalList.map(x=>x.fixture_id));
       const pool = union.filter(p=>{
         if (selectedIds.has(p.fixture_id)) return false;
         const conf = Number(p?.confidence_pct||0);
         const odds = Number(p?.market_odds||p?.odds||0);
-        if (String(p?.market||"").toUpperCase()==="OU" && !/2\.5/.test(String(p?.selection||""))) return false;
+        if (isOU_FT(p) && !/2\.5/.test(String(p?.selection||""))) return false;
         if (odds<1.5 || odds>2.8) return false;
         return conf>=70;
       });
@@ -361,7 +401,7 @@ export default async function handler(req,res){
     return res.status(200).json({
       ok:true, updated:true,
       n_pool: union.length, n_out: finalList.length,
-      note: "Tier-1 favorizovan bonusom; bez kvota po broju. Guard-ovi i stickiness aktivni."
+      note: "Tier-1 bonus + BTTS 1H (trusted≥3, EV≥0, no high-odds guard). Guard-ovi i stickiness aktivni."
     });
   }catch(e){
     return res.status(500).json({ ok:false, error: String(e?.message||e) });
