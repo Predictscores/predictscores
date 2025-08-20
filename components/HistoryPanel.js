@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 
 async function fetchJSON(url) {
   const r = await fetch(url, { cache: "no-store" });
@@ -86,11 +86,38 @@ function Row({ it }) {
 export default function HistoryPanel({ label = "History", days = 14, refreshMs = 60000 }) {
   const [data, setData] = useState({ items: [], aggregates: {} });
   const [err, setErr] = useState(null);
+  const settleOnceRef = useRef(false);
 
   async function load() {
+    const j = await fetchJSON(`/api/history?days=${days}`);
+    setData(j || { items: [], aggregates: {} });
+    return j;
+  }
+
+  // Jednokratni "kick" ako ima starih a nesettlovanih stavki (kickoff < now-6h)
+  async function maybeAutoSettle(j) {
+    if (settleOnceRef.current) return;
+    const arr = Array.isArray(j?.items) ? j.items : [];
+    const now = Date.now();
+    const stale = arr.some((it) => {
+      if (it?.final_score) return false;
+      const t = it?.kickoff ? new Date(it.kickoff).getTime() : NaN;
+      return Number.isFinite(t) && t < now - 6 * 60 * 60 * 1000; // 6h
+    });
+    if (!stale) return;
+
+    settleOnceRef.current = true;
     try {
-      const j = await fetchJSON(`/api/history?days=${days}`);
-      setData(j || { items: [], aggregates: {} });
+      await fetch(`/api/history-check?days=2`, { cache: "no-store" });
+      const j2 = await fetchJSON(`/api/history?days=${days}`);
+      setData(j2 || { items: [], aggregates: {} });
+    } catch { /* no-op */ }
+  }
+
+  async function tick() {
+    try {
+      const j = await load();
+      await maybeAutoSettle(j);
       setErr(null);
     } catch (e) {
       setErr(String(e && e.message) || "Error");
@@ -98,12 +125,12 @@ export default function HistoryPanel({ label = "History", days = 14, refreshMs =
   }
 
   useEffect(() => {
-    load();
+    tick(); // initial
     if (refreshMs > 0) {
-      const t = setInterval(load, refreshMs);
+      const t = setInterval(tick, refreshMs);
       return () => clearInterval(t);
     }
-  }, []);
+  }, [days, refreshMs]);
 
   const items = Array.isArray(data.items) ? data.items : [];
   const ag7 = data?.aggregates?.["7d"];
