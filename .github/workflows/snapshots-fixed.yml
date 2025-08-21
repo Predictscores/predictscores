@@ -1,42 +1,48 @@
-# FILE: .github/workflows/snapshots-fixed.yml
 name: Snapshots (AM/PM/LATE)
 
 on:
   schedule:
-    - cron: '0 8 * * *'   # 10:00 lokalno (Europe/Belgrade) → AM
-    - cron: '0 13 * * *'  # 15:00 lokalno → PM
-    - cron: '0 22 * * *'  # 00:00 lokalno → LATE
+    - cron: '0 8 * * *'   # 10:00 lokalno (CET/CEST)
+    - cron: '0 13 * * *'  # 15:00 lokalno
+    - cron: '0 22 * * *'  # 00:00 lokalno
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      BASE: https://predictscores.vercel.app
     steps:
       - name: Pick slot (AM/PM/LATE)
         id: pick
         run: |
-          S="${{ github.event.schedule }}"
-          if [ "$S" = "0 8 * * *" ]; then SLOT=am;
+          S="${{ github.event.schedule || '' }}"
+          if   [ "$S" = "0 8 * * *" ];  then SLOT=am;
           elif [ "$S" = "0 13 * * *" ]; then SLOT=pm;
           elif [ "$S" = "0 22 * * *" ]; then SLOT=late;
           else
-            # fallback za ručni start (po UTC satu)
             H=$(date -u +%H)
-            if   [ "$H" -ge 8  ] && [ "$H" -lt 9  ]; then SLOT=am;
+            if   [ "$H" -ge 8  ] && [ "$H" -lt 9  ];  then SLOT=am;
             elif [ "$H" -ge 13 ] && [ "$H" -lt 14 ]; then SLOT=pm;
             elif [ "$H" -ge 22 ] && [ "$H" -lt 23 ]; then SLOT=late;
             else SLOT=pm; fi
           fi
           echo "slot=$SLOT" >> $GITHUB_OUTPUT
 
-      - name: Rebuild snapshot for slot
+      - name: Rebuild snapshot for ${{ steps.pick.outputs.slot }}
         run: |
-          curl -fsS "https://predictscores.vercel.app/api/cron/rebuild?slot=${{ steps.pick.outputs.slot }}"
+          curl -fsS "$BASE/api/cron/rebuild?slot=${{ steps.pick.outputs.slot }}"
 
-      - name: Apply learning (overlay + finalize)
+      - name: Warm odds (2x)
         run: |
-          curl -fsS "https://predictscores.vercel.app/api/cron/apply-learning" || true
+          curl -fsS "$BASE/api/cron/refresh-odds" || true
+          sleep 5
+          curl -fsS "$BASE/api/cron/refresh-odds" || true
 
-      - name: Prewarm insights (Forma + H2H)
+      - name: Build insights (Zašto: forma + H2H)
         run: |
-          curl -fsS "https://predictscores.vercel.app/api/insights-build" || true
+          curl -fsS "$BASE/api/insights-build" || true
+
+      - name: Apply learning to union
+        run: |
+          curl -fsS "$BASE/api/cron/apply-learning" || true
