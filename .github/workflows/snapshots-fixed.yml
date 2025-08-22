@@ -15,6 +15,7 @@ jobs:
     steps:
       - name: Pick slot (AM/PM/LATE)
         id: pick
+        shell: bash
         run: |
           S="${{ github.event.schedule }}"
           if [ -z "$S" ]; then S="manual"; fi
@@ -23,10 +24,9 @@ jobs:
           elif [ "$S" = "0 22 * * *" ]; then SLOT=late;
           else
             H=$(date -u +%H)
-            if   [ "$H" -ge 8  ] && [ "$H" -lt 9  ];  then SLOT=am;
-            elif [ "$H" -ge 13 ] && [ "$H" -lt 14 ]; then SLOT=pm;
-            elif [ "$H" -ge 22 ] && [ "$H" -lt 23 ]; then SLOT=late;
-            else SLOT=pm; fi
+            if   [ "$H" -ge 22 ]; then SLOT=late;
+            elif [ "$H" -ge 13 ]; then SLOT=pm;
+            else SLOT=am; fi
           fi
           echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
 
@@ -40,7 +40,7 @@ jobs:
           sleep 5
           curl -fsS "$BASE/api/cron/refresh-odds" || true
 
-      - name: "Build insights (Zasto: forma + H2H)"
+      - name: "Build insights (Zasto / forma + H2H)"
         run: |
           curl -fsS "$BASE/api/insights-build" || true
 
