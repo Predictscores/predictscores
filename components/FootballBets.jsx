@@ -70,9 +70,8 @@ function evPct(p) {
   return null;
 }
 function whyFallback(p) {
-  // ako nema explain.* složi kratak “Zašto” iz model/odds/EV + broj kladionica
   const mp = pct(p?.model_prob);
-  const ip = pct(p?.implied_prob ?? (p?.market_odds ? 100 / p.market_odds : null));
+  const ip = pct(p?.implied_prob ?? impliedFromOdds(p?.market_odds));
   const ev = evPct(p);
   const bookAll = Number.isFinite(p?.bookmakers_count) ? p.bookmakers_count : null;
   const bookTr  = Number.isFinite(p?.bookmakers_count_trusted) ? p.bookmakers_count_trusted : null;
@@ -111,10 +110,14 @@ function formatWhyAndForm(p) {
   return [zasto, forma].filter(Boolean).join("\n");
 }
 
-/* ---------------- Tickets (3×) ---------------- */
+/* ---------------- Ticketi (3×) ---------------- */
 function buildTickets(items) {
   const top = [...(Array.isArray(items) ? items : [])]
-    .sort((a, b) => (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0) || (b?.ev ?? 0) - (a?.ev ?? 0))
+    .sort(
+      (a, b) =>
+        (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0) ||
+        (b?.ev ?? 0) - (a?.ev ?? 0)
+    )
     .slice(0, 3);
   return [
     { label: "Ticket A", picks: top.slice(0, 1) },
@@ -160,7 +163,20 @@ function TicketsBlock({ items }) {
   );
 }
 
-/* ---------------- Card ---------------- */
+/* ---------------- Karte ---------------- */
+function ConfidenceBadge({ conf }) {
+  const lvl =
+    conf >= 75 ? "High" : conf >= 50 ? "Moderate" : "Low";
+  const dot =
+    conf >= 75 ? "bg-emerald-400" : conf >= 50 ? "bg-sky-400" : "bg-amber-400";
+  return (
+    <span className="inline-flex items-center gap-2 text-xs opacity-80">
+      <span className={`inline-block w-2.5 h-2.5 rounded-full ${dot}`} />
+      {lvl}
+    </span>
+  );
+}
+
 function Card({ p }) {
   const league = p?.league?.name || p?.league_name || "";
   const ko = p?.datetime_local?.starting_at?.date_time || p?.ko || "";
@@ -175,12 +191,15 @@ function Card({ p }) {
 
   return (
     <div className="rounded-2xl p-4 shadow bg-neutral-900/60 border border-neutral-800">
-      <div className="text-xs opacity-70 mb-1">
-        {league} • {ko}
+      <div className="flex items-center justify-between text-xs opacity-70 mb-1">
+        <div>{league} • {ko}</div>
+        <ConfidenceBadge conf={conf} />
       </div>
+
       <div className="text-lg font-semibold mb-1">
         {home} vs {away}
       </div>
+
       <div className="text-sm mb-2">
         {market}: <b>{sel}</b> {price ? <span>({price})</span> : null}
       </div>
@@ -220,7 +239,69 @@ function TabsInline({ active, onChange }) {
     <div className="flex items-center gap-2 mb-3">
       {Btn("kick", "Kick-Off")}
       {Btn("conf", "Confidence")}
-      {Btn("hist", "History (14d)")}
+      {Btn("hist", "History")}
+    </div>
+  );
+}
+
+/* ---------------- Top lige (desni panel) ---------------- */
+function bucketLabel(p) {
+  const m = String(p?.market_label || p?.market || "").toUpperCase();
+  if (m.includes("BTTS")) return "BTTS";
+  if (m.includes("OU") || m.includes("OVER") || m.includes("UNDER")) return "OU 2.5";
+  if (m.includes("HT-FT") || m.includes("HTFT")) return "HT-FT";
+  return "1X2";
+}
+function groupTopLeagues(items) {
+  const groups = { "BTTS": [], "OU 2.5": [], "HT-FT": [], "1X2": [] };
+  for (const p of items || []) {
+    const k = bucketLabel(p);
+    groups[k].push(p);
+  }
+  const sorter = (a, b) =>
+    (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0) ||
+    (b?.ev ?? 0) - (a?.ev ?? 0);
+  for (const k of Object.keys(groups)) {
+    groups[k].sort(sorter);
+    groups[k] = groups[k].slice(0, 3);
+  }
+  return groups;
+}
+function SidePanelTopLeagues({ items }) {
+  const G = useMemo(() => groupTopLeagues(items), [items]);
+  const Section = ({ title, arr }) => (
+    <div className="mb-5">
+      <div className="font-semibold mb-2">{title} ({arr.length})</div>
+      {arr.length === 0 && (
+        <div className="text-sm opacity-70">Nema dovoljno kandidata.</div>
+      )}
+      <div className="space-y-3">
+        {arr.map((p, i) => (
+          <div key={`${title}-${p?.fixture_id ?? i}`} className="rounded-xl p-3 bg-neutral-900/60 border border-neutral-800">
+            <div className="text-xs opacity-70 mb-1">
+              {(p?.league?.name || "")} • {(p?.datetime_local?.starting_at?.date_time || "")}
+            </div>
+            <div className="text-sm font-medium mb-0.5">
+              {(p?.teams?.home?.name || p?.teams?.home || p?.home || "")} vs {(p?.teams?.away?.name || p?.teams?.away || p?.away || "")}
+            </div>
+            <div className="text-sm mb-1">
+              {(p?.market_label || p?.market || "")}: <b>{p?.selection || ""}</b>
+            </div>
+            <div className="text-xs opacity-80">
+              {formatWhyAndForm(p).split("\n")[0] /* prva linija “Zašto …” */}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+  return (
+    <div className="rounded-2xl p-4 shadow bg-neutral-900/60 border border-neutral-800">
+      <div className="text-lg font-semibold mb-3">Top lige</div>
+      <Section title="BTTS"  arr={G["BTTS"]} />
+      <Section title="OU 2.5" arr={G["OU 2.5"]} />
+      <Section title="HT-FT" arr={G["HT-FT"]} />
+      <Section title="1X2"   arr={G["1X2"]} />
     </div>
   );
 }
@@ -246,37 +327,33 @@ export default function FootballBets({ limit, layout = "full" }) {
     return list;
   }, [items]);
 
-  // u Combined layoutu: bez tiketa i bez tabova, uzmi top N po confidence
-  const combinedTop = useMemo(() => {
-    const base = byConfidence;
-    return typeof limit === "number" ? base.slice(0, limit) : base.slice(0, 3);
-  }, [byConfidence, limit]);
-
-  if (loading) return <div className="opacity-70">Učitavanje…</div>;
-  if (error)
-    return <div className="text-red-400">Greška: {String(error)}</div>;
-
-  // COMBINED layout
+  // COMBINED: bez tiketa, bez tabova, bez desnog panela; samo Top N
   if (layout === "combined") {
+    const combinedTop =
+      typeof limit === "number" ? byConfidence.slice(0, limit) : byConfidence.slice(0, 3);
+    if (loading) return <div className="opacity-70">Učitavanje…</div>;
+    if (error) return <div className="text-red-400">Greška: {String(error)}</div>;
     return (
-      <div className="space-y-4">
-        <div className="grid grid-cols-1 gap-4">
-          {combinedTop.map((p, i) => (
-            <Card key={`${p?.fixture_id ?? p?.id ?? i}`} p={p} />
-          ))}
-        </div>
+      <div className="grid grid-cols-1 gap-4">
+        {combinedTop.map((p, i) => (
+          <Card key={`${p?.fixture_id ?? p?.id ?? i}`} p={p} />
+        ))}
       </div>
     );
   }
 
-  // FULL layout (Football tab): tiketi + tabovi
+  // FULL (Football tab): tiketi + tabovi + desna kolona “Top lige”
   const listKick =
     typeof limit === "number" ? byKickoff.slice(0, limit) : byKickoff;
   const listConf =
     typeof limit === "number" ? byConfidence.slice(0, limit) : byConfidence;
 
+  if (loading) return <div className="opacity-70">Učitavanje…</div>;
+  if (error) return <div className="text-red-400">Greška: {String(error)}</div>;
+
   return (
     <div className="space-y-4">
+      {/* 3× tiketa — NA VRHU Football taba */}
       {Array.isArray(items) && items.length > 0 && (
         <TicketsBlock items={items} />
       )}
@@ -287,27 +364,35 @@ export default function FootballBets({ limit, layout = "full" }) {
         <div className="opacity-70">Nema dostupnih predloga.</div>
       )}
 
-      {tab === "kick" && (
-        <div className="grid lg:grid-cols-2 gap-4">
-          {listKick.map((p, i) => (
-            <Card key={`${p?.fixture_id ?? p?.id ?? i}`} p={p} />
-          ))}
+      <div className="grid lg:grid-cols-3 gap-4">
+        {/* leve 2 kolone: liste po tabu */}
+        <div className="lg:col-span-2 space-y-4">
+          {tab === "kick" && (
+            <div className="grid md:grid-cols-2 gap-4">
+              {listKick.map((p, i) => (
+                <Card key={`${p?.fixture_id ?? p?.id ?? i}`} p={p} />
+              ))}
+            </div>
+          )}
+          {tab === "conf" && (
+            <div className="grid md:grid-cols-2 gap-4">
+              {listConf.map((p, i) => (
+                <Card key={`${p?.fixture_id ?? p?.id ?? i}`} p={p} />
+              ))}
+            </div>
+          )}
+          {tab === "hist" && (
+            <div className="rounded-2xl p-4 border border-neutral-800 bg-neutral-900/60 text-sm opacity-80">
+              History (14d) će se puniti iz nightly procesa.
+            </div>
+          )}
         </div>
-      )}
 
-      {tab === "conf" && (
-        <div className="grid lg:grid-cols-2 gap-4">
-          {listConf.map((p, i) => (
-            <Card key={`${p?.fixture_id ?? p?.id ?? i}`} p={p} />
-          ))}
+        {/* desna 1 kolona: Top lige */}
+        <div className="lg:col-span-1">
+          <SidePanelTopLeagues items={items} />
         </div>
-      )}
-
-      {tab === "hist" && (
-        <div className="rounded-2xl p-4 border border-neutral-800 bg-neutral-900/60 text-sm opacity-80">
-          History (14d) će se puniti iz nightly procesa.
-        </div>
-      )}
+      </div>
     </div>
   );
 }
