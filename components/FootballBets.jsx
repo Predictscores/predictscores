@@ -3,29 +3,29 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-/* ---------------- data hook: value-bets-locked ---------------- */
+/* ===================== VALUE BETS (LOCKED) ===================== */
 function useLockedValueBets() {
   const [items, setItems] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+  const [loading,   setLoading] = useState(true);
+  const [error,     setError]   = useState(null);
 
   async function load() {
     try {
       setLoading(true);
       setError(null);
+
       const r = await fetch("/api/value-bets-locked", { cache: "no-store" });
       const ct = r.headers.get("content-type") || "";
-      if (!ct.includes("application/json")) throw new Error("API returned non-JSON");
-      const js = await r.json();
+      if (!ct.includes("application/json")) throw new Error("value-bets-locked non-JSON");
 
-      // podrži oba formata: items (novo) i value_bets (staro)
+      const js = await r.json();
+      // podrži oba formata: {items: []} i {value_bets: []}
       const arr = Array.isArray(js?.items)
         ? js.items
         : Array.isArray(js?.value_bets)
         ? js.value_bets
         : [];
-
-      setItems(arr);
+      setItems(arr || []);
     } catch (e) {
       setError(String(e?.message || e));
       setItems([]);
@@ -36,19 +36,19 @@ function useLockedValueBets() {
 
   useEffect(() => {
     load();
-    const id = setInterval(load, 60_000);
+    const id = setInterval(load, 60_000); // 60s
     return () => clearInterval(id);
   }, []);
 
-  return { items, loading, error, reload: load };
+  return { items, loading, error };
 }
 
-/* ---------------- data hook: history ---------------- */
+/* ===================== HISTORY (14d) ===================== */
 function useHistory(days = 14) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
 
-  async function tryFetch(url) {
+  async function j(url) {
     try {
       const r = await fetch(url, { cache: "no-store" });
       if (!r.ok) return null;
@@ -68,8 +68,8 @@ function useHistory(days = 14) {
       "/api/history-locked",
     ];
     let data = null;
-    for (const t of tries) {
-      data = await tryFetch(t);
+    for (const u of tries) {
+      data = await j(u);
       if (data) break;
     }
     const arr =
@@ -82,14 +82,14 @@ function useHistory(days = 14) {
 
   useEffect(() => {
     load();
-    const id = setInterval(load, 60 * 60 * 1000); // 60min
+    const id = setInterval(load, 60 * 60 * 1000); // 60 min
     return () => clearInterval(id);
   }, [days]);
 
   return { rows, loading };
 }
 
-/* ---------------- helpers ---------------- */
+/* ===================== HELPERS ===================== */
 function parseKO(p) {
   const iso =
     p?.datetime_local?.starting_at?.date_time ||
@@ -111,7 +111,6 @@ function impliedFromOdds(odds) {
   return o > 0 ? 100 / o : null;
 }
 function oneLineExplain(p) {
-  // prioritet: explain.summary; zatim prvi red iz explain.text/bullets; zatim fallback iz model/odds/EV
   const summary = typeof p?.explain?.summary === "string" ? p.explain.summary.trim() : "";
   if (summary) return `Zašto: ${summary}`;
 
@@ -133,7 +132,28 @@ function oneLineExplain(p) {
   return parts.length ? `Zašto: ${parts.join(" · ")}` : "";
 }
 
-/* ---------------- UI komponente ---------------- */
+/* ---- group for side panel ---- */
+function bucketLabel(p) {
+  const m = String(p?.market_label || p?.market || "").toUpperCase();
+  if (m.includes("BTTS")) return "BTTS";
+  if (m.includes("OU") || m.includes("OVER") || m.includes("UNDER")) return "OU 2.5";
+  if (m.includes("HT-FT") || m.includes("HTFT")) return "HT-FT";
+  return "1X2";
+}
+function groupTop(items) {
+  const groups = { "BTTS": [], "OU 2.5": [], "HT-FT": [], "1X2": [] };
+  for (const p of items || []) groups[bucketLabel(p)].push(p);
+  const sorter = (a, b) =>
+    (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0) ||
+    (b?.ev ?? 0) - (a?.ev ?? 0);
+  for (const k of Object.keys(groups)) {
+    groups[k].sort(sorter);
+    groups[k] = groups[k].slice(0, 3);
+  }
+  return groups;
+}
+
+/* ===================== UI: SHARED PIECES ===================== */
 function ConfBadge({ conf }) {
   const lvl = conf >= 75 ? "High" : conf >= 50 ? "Moderate" : "Low";
   const dot =
@@ -156,8 +176,6 @@ function Card({ p }) {
   const price = p?.market_odds ?? p?.odds ?? p?.price;
   const conf = p?.confidence_pct ?? p?.confidence ?? 0;
 
-  const explain = oneLineExplain(p);
-
   return (
     <div className="rounded-2xl p-4 shadow bg-[#131722] border border-[#252b3b]">
       <div className="flex items-center justify-between text-xs opacity-80 mb-1">
@@ -173,9 +191,7 @@ function Card({ p }) {
         {market}: <b>{sel}</b> {price ? <span>({price})</span> : null}
       </div>
 
-      {explain && (
-        <div className="text-sm opacity-90 mb-3">{explain}</div>
-      )}
+      <div className="text-sm opacity-90 mb-3">{oneLineExplain(p)}</div>
 
       <div className="text-xs opacity-80 mb-1">Confidence</div>
       <div className="h-2 rounded bg-slate-700">
@@ -188,7 +204,6 @@ function Card({ p }) {
   );
 }
 
-/* -------- Tabs -------- */
 function TabsInline({ active, onChange }) {
   const Btn = (k, label) => (
     <button
@@ -213,26 +228,6 @@ function TabsInline({ active, onChange }) {
   );
 }
 
-/* -------- Top lige (desni panel) -------- */
-function bucketLabel(p) {
-  const m = String(p?.market_label || p?.market || "").toUpperCase();
-  if (m.includes("BTTS")) return "BTTS";
-  if (m.includes("OU") || m.includes("OVER") || m.includes("UNDER")) return "OU 2.5";
-  if (m.includes("HT-FT") || m.includes("HTFT")) return "HT-FT";
-  return "1X2";
-}
-function groupTop(items) {
-  const groups = { "BTTS": [], "OU 2.5": [], "HT-FT": [], "1X2": [] };
-  for (const p of items || []) groups[bucketLabel(p)].push(p);
-  const sorter = (a, b) =>
-    (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0) ||
-    (b?.ev ?? 0) - (a?.ev ?? 0);
-  for (const k of Object.keys(groups)) {
-    groups[k].sort(sorter);
-    groups[k] = groups[k].slice(0, 3);
-  }
-  return groups;
-}
 function SidePanelTopLeagues({ items }) {
   const G = useMemo(() => groupTop(items), [items]);
   const Section = ({ title, want = 3, arr }) => (
@@ -272,18 +267,118 @@ function SidePanelTopLeagues({ items }) {
   );
 }
 
-/* ---------------- Main ---------------- */
+/* ===================== HISTORY RENDER ===================== */
+function fmtPct(n) {
+  if (n == null || !Number.isFinite(n)) return "—";
+  return `${(n * 100).toFixed(1)}%`;
+}
+function computeStats(rows, days) {
+  const now = Date.now();
+  const ms = days * 86400000;
+  const take = (dt) => (dt ? new Date(dt).getTime() : null);
+  const inRange = (r) => {
+    const dt =
+      r?.datetime_local?.starting_at?.date_time ||
+      r?.datetime_local?.date_time ||
+      r?.ko ||
+      r?.date;
+    const t = take(dt);
+    return Number.isFinite(t) ? now - t <= ms : true; // ako nema datum, ne odbacuj
+  };
+  const subset = (rows || []).filter(inRange);
+
+  let n = 0, wins = 0, profit = 0, stake = 0;
+  for (const r of subset) {
+    const odds = Number(r?.odds ?? r?.market_odds ?? r?.price);
+    const won =
+      r?.won === true ||
+      String(r?.outcome || r?.status || r?.result || "").toLowerCase().startsWith("win");
+    if (!Number.isFinite(odds)) continue;
+    n += 1;
+    stake += 1;
+    profit += won ? (odds - 1) : -1;
+    if (won) wins += 1;
+  }
+  const hit = n ? wins / n : null;
+  const roi = stake ? profit / stake : null;
+  return { hit, roi, n };
+}
+
+function HistoryHeader({ rows }) {
+  const s7  = computeStats(rows, 7);
+  const s14 = computeStats(rows, 14);
+  const roiFmt = (x) =>
+    x == null ? "—" : `${x >= 0 ? "+" : ""}${x.toFixed(2)}`;
+  return (
+    <div className="rounded-2xl p-4 bg-[#151a2a] border border-[#252b3b] mb-3">
+      <div className="font-semibold">History — učinak</div>
+      <div className="mt-2 flex flex-wrap gap-6 text-sm opacity-90">
+        <span>7d: <b>{fmtPct(s7.hit)}</b> • ROI <b>{roiFmt(s7.roi)}</b> (N={s7.n})</span>
+        <span>14d: <b>{fmtPct(s14.hit)}</b> • ROI <b>{roiFmt(s14.roi)}</b> (N={s14.n})</span>
+      </div>
+    </div>
+  );
+}
+
+function OutcomeBadge({ won }) {
+  if (won == null) return null;
+  return won ? (
+    <span className="px-3 py-1 rounded-full text-sm bg-emerald-600/80 text-white">✅ Pogodak</span>
+  ) : (
+    <span className="px-3 py-1 rounded-full text-sm bg-rose-600/80 text-white">❌ Promašaj</span>
+  );
+}
+
+function HistoryRow({ h }) {
+  const league = h?.league?.name || h?.league || "";
+  const home   = h?.teams?.home?.name || h?.home || "";
+  const away   = h?.teams?.away?.name || h?.away || "";
+  const dt     = h?.datetime_local?.starting_at?.date_time || h?.ko || h?.date || "";
+  const slot   = h?.slot || h?.time_slot || h?.window || "";
+  const mk     = h?.market_label || h?.market || "";
+  const sel    = h?.selection || "";
+  const odds   = h?.odds ?? h?.market_odds ?? h?.price;
+  const tipTxt = mk ? `${mk}: ${sel}` : sel;
+
+  const won =
+    h?.won === true ||
+    String(h?.outcome || h?.status || h?.result || "").toLowerCase().startsWith("win");
+
+  const score =
+    h?.tr || h?.score || h?.result_score || h?.ft || "";
+
+  return (
+    <div className="rounded-2xl bg-[#151a2a] border border-[#252b3b] px-4 py-3 flex items-center justify-between">
+      <div className="min-w-0">
+        <div className="text-base font-semibold truncate">
+          {home} vs {away}
+        </div>
+        <div className="text-xs opacity-80">{league} • {dt} • Slot: {slot || "—"}</div>
+      </div>
+
+      <div className="flex items-center gap-4 pl-4 shrink-0">
+        <div className="text-sm whitespace-nowrap">
+          <b>{tipTxt}</b>{odds ? ` (${Number(odds).toFixed(2)})` : ""}
+          {score ? <div className="text-xs opacity-80 text-right">TR: {String(score)}</div> : null}
+        </div>
+        <OutcomeBadge won={won} />
+      </div>
+    </div>
+  );
+}
+
+/* ===================== MAIN ===================== */
 export default function FootballBets({ limit, layout = "full" }) {
   const { items, loading, error } = useLockedValueBets();
   const { rows: historyRows, loading: historyLoading } = useHistory(14);
   const [tab, setTab] = useState("kick");
 
-  // sortiranja
   const byKickoff = useMemo(() => {
     const list = Array.isArray(items) ? [...items] : [];
     list.sort((a, b) => (parseKO(a) ?? 9e15) - (parseKO(b) ?? 9e15));
     return list;
   }, [items]);
+
   const byConfidence = useMemo(() => {
     const list = Array.isArray(items) ? [...items] : [];
     list.sort(
@@ -294,14 +389,14 @@ export default function FootballBets({ limit, layout = "full" }) {
     return list;
   }, [items]);
 
-  // COMBINED: bez tiketa, bez tabova, samo Top N
+  /* -------- Combined: samo top N kartica (bez tabova, bez side panela) -------- */
   if (layout === "combined") {
     const combinedTop =
       typeof limit === "number" ? byConfidence.slice(0, limit) : byConfidence.slice(0, 3);
     if (loading) return <div className="opacity-70">Učitavanje…</div>;
-    if (error) return <div className="text-red-400">Greška: {String(error)}</div>;
+    if (error)   return <div className="text-red-400">Greška: {String(error)}</div>;
     return (
-      <div className="grid grid-cols-1 gap-4">
+      <div className="grid md:grid-cols-2 gap-4">
         {combinedTop.map((p, i) => (
           <Card key={`${p?.fixture_id ?? p?.id ?? i}`} p={p} />
         ))}
@@ -309,8 +404,9 @@ export default function FootballBets({ limit, layout = "full" }) {
     );
   }
 
+  /* -------- Football tab (1:1 kao na screenshotu) -------- */
   if (loading) return <div className="opacity-70">Učitavanje…</div>;
-  if (error) return <div className="text-red-400">Greška: {String(error)}</div>;
+  if (error)   return <div className="text-red-400">Greška: {String(error)}</div>;
 
   const listKick =
     typeof limit === "number" ? byKickoff.slice(0, limit) : byKickoff;
@@ -321,12 +417,12 @@ export default function FootballBets({ limit, layout = "full" }) {
     <div className="space-y-4">
       <TabsInline active={tab} onChange={setTab} />
 
-      {!items?.length && (
+      {!items?.length && tab !== "hist" && (
         <div className="opacity-70">Nema dostupnih predloga.</div>
       )}
 
       <div className="grid lg:grid-cols-3 gap-4">
-        {/* leve 2 kolone: liste po tabu */}
+        {/* leve 2 kolone */}
         <div className="lg:col-span-2 space-y-4">
           {tab === "kick" && (
             <div className="grid md:grid-cols-2 gap-4">
@@ -345,36 +441,26 @@ export default function FootballBets({ limit, layout = "full" }) {
           )}
 
           {tab === "hist" && (
-            <div className="rounded-2xl p-4 border border-[#252b3b] bg-[#131722] text-sm">
-              <div className="text-lg font-semibold mb-3">History (14d)</div>
-              {historyLoading && <div className="opacity-70">Učitavanje…</div>}
-              {!historyLoading && (!historyRows || historyRows.length === 0) && (
-                <div className="opacity-70">Nema istorije za prikaz.</div>
+            <div>
+              <HistoryHeader rows={historyRows} />
+              {historyLoading && (
+                <div className="opacity-70">Učitavanje…</div>
               )}
               {!historyLoading && historyRows?.length > 0 && (
-                <div className="grid md:grid-cols-2 gap-3">
-                  {historyRows.slice(0, 30).map((h, i) => {
-                    const league = h?.league?.name || h?.league || "";
-                    const home = h?.teams?.home?.name || h?.home || "";
-                    const away = h?.teams?.away?.name || h?.away || "";
-                    const sel = h?.selection || "";
-                    const res = h?.result ?? h?.score ?? "";
-                    const dt  = h?.datetime_local?.starting_at?.date_time || h?.ko || h?.date || "";
-                    return (
-                      <div key={i} className="rounded-xl p-3 bg-[#0f1320] border border-[#252b3b]">
-                        <div className="text-xs opacity-70 mb-1">{league} • {dt}</div>
-                        <div className="text-sm font-medium mb-0.5">{home} vs {away}</div>
-                        <div className="text-xs opacity-80">Pick: <b>{sel}</b> • Result: {String(res)}</div>
-                      </div>
-                    );
-                  })}
+                <div className="space-y-3">
+                  {historyRows.map((h, i) => (
+                    <HistoryRow key={i} h={h} />
+                  ))}
                 </div>
+              )}
+              {!historyLoading && (!historyRows || historyRows.length === 0) && (
+                <div className="opacity-70">Nema istorije za prikaz.</div>
               )}
             </div>
           )}
         </div>
 
-        {/* desna 1 kolona: Top lige */}
+        {/* desna kolona: Top lige */}
         <div className="lg:col-span-1">
           <SidePanelTopLeagues items={items} />
         </div>
