@@ -19,7 +19,6 @@ function useLockedValueBets() {
       if (!ct.includes("application/json")) throw new Error("value-bets-locked non-JSON");
 
       const js = await r.json();
-      // podrži oba formata: {items: []} i {value_bets: []}
       const arr = Array.isArray(js?.items)
         ? js.items
         : Array.isArray(js?.value_bets)
@@ -36,7 +35,7 @@ function useLockedValueBets() {
 
   useEffect(() => {
     load();
-    const id = setInterval(load, 60_000); // 60s
+    const id = setInterval(load, 60_000);
     return () => clearInterval(id);
   }, []);
 
@@ -82,7 +81,7 @@ function useHistory(days = 14) {
 
   useEffect(() => {
     load();
-    const id = setInterval(load, 60 * 60 * 1000); // 60 min
+    const id = setInterval(load, 60 * 60 * 1000);
     return () => clearInterval(id);
   }, [days]);
 
@@ -111,91 +110,88 @@ function impliedFromOdds(odds) {
   return o > 0 ? 100 / o : null;
 }
 
-/* ---------- two-line explain builder (tačno 2 reda) ---------- */
+/* ---------- two-line explain builder (pametniji “Zašto” + pregledna “Forma”) ---------- */
 function twoLineExplain(p) {
-  // pokušaj da pročita bullets iz insights-a
   const bullets = Array.isArray(p?.explain?.bullets) ? p.explain.bullets : [];
 
-  let formLine = null;
-  let h2hLine  = null;
-
-  // Nađi "Forma:" i "H2H"
+  // Parsiranje “Forma” i “H2H”
   const formaBullet = bullets.find((b) => typeof b === "string" && b.trim().toLowerCase().startsWith("forma"));
   const h2hBullet   = bullets.find((b) => typeof b === "string" && b.toLowerCase().includes("h2h"));
 
-  // Regex za: "Forma: Home W-D-L (GF:x:GA:y) · Away W-D-L (GF:x:GA:y)"
+  // npr: "Forma: TeamA 2-1-2 (GF:8:GA:11) · TeamB 2-1-2 (GF:9:GA:5)"
   const reForma = /Forma:\s*.+?\s(\d+)-(\d+)-(\d+)\s*\(GF:(\d+):GA:(\d+)\)\s*·\s*.+?\s(\d+)-(\d+)-(\d+)\s*\(GF:(\d+):GA:(\d+)\)/i;
-  // Regex za: "H2H (L5): W-D-L (GF:x:GA:y)"
+  // npr: "H2H (L5): 3-1-1 (GF:13:GA:9)"
   const reH2H   = /H2H.*?:\s*(\d+)-(\d+)-(\d+)\s*\(GF:(\d+):GA:(\d+)\)/i;
 
   let wH, dH, lH, gfH, gaH, wA, dA, lA, gfA, gaA;
   let w2=0, d2=0, l2=0, gf2=0, ga2=0;
+  const TOTAL = 5; // pretpostavka L5
 
   if (typeof formaBullet === "string") {
     const m = formaBullet.match(reForma);
     if (m) {
-      wH = Number(m[1]); dH = Number(m[2]); lH = Number(m[3]);
-      gfH = Number(m[4]); gaH = Number(m[5]);
-      wA = Number(m[6]); dA = Number(m[7]); lA = Number(m[8]);
-      gfA = Number(m[9]); gaA = Number(m[10]);
+      wH = +m[1]; dH = +m[2]; lH = +m[3];
+      gfH = +m[4]; gaH = +m[5];
+      wA = +m[6]; dA = +m[7]; lA = +m[8];
+      gfA = +m[9]; gaA = +m[10];
     }
   }
   if (typeof h2hBullet === "string") {
     const m2 = h2hBullet.match(reH2H);
     if (m2) {
-      w2 = Number(m2[1]); d2 = Number(m2[2]); l2 = Number(m2[3]);
-      gf2 = Number(m2[4]); ga2 = Number(m2[5]);
+      w2 = +m2[1]; d2 = +m2[2]; l2 = +m2[3];
+      gf2 = +m2[4]; ga2 = +m2[5];
     }
   }
 
-  // 1. red — kratko objašnjenje
-  let line1 = null;
+  // -------- 1. red: najviše 2 relevantna razloga --------
+  const reasons = [];
   if (wH != null && wA != null) {
     const ptsH = wH * 3 + dH;
     const ptsA = wA * 3 + dA;
+    if (ptsH - ptsA >= 2) reasons.push("Domaćin u boljoj formi");
+    else if (ptsA - ptsH >= 2) reasons.push("Gost u boljoj formi");
 
+    const avgGA_H = TOTAL ? gaH / TOTAL : 0;
+    const avgGA_A = TOTAL ? gaA / TOTAL : 0;
+    if (avgGA_A >= 1.8) reasons.push("Gost prima dosta golova");
+    if (avgGA_H >= 1.8) reasons.push("Domaćin prima dosta golova");
+
+    const grH = gfH - gaH;
+    const grA = gfA - gaA;
+    if (grH - grA >= 3) reasons.push("Bolja gol-razlika domaćina");
+    else if (grA - grH >= 3) reasons.push("Bolja gol-razlika gosta");
+  }
+  if (w2 - l2 >= 2) reasons.push("H2H prednost domaćina");
+  else if (l2 - w2 >= 2) reasons.push("H2H prednost gosta");
+
+  const ev = pct(p?.ev);
+  if (ev != null && ev >= 10) reasons.push("Visok EV");
+  if ((p?.confidence_pct ?? 0) >= 75) reasons.push("High confidence");
+  if ((p?.bookmakers_count_trusted ?? 0) >= 8) reasons.push("Širok konsenzus kladionica");
+
+  // Fallback ako baš ništa nije “uhvatilo”
+  if (reasons.length === 0) {
+    const mp = pct(p?.model_prob);
+    const ip = pct(p?.implied_prob ?? impliedFromOdds(p?.market_odds));
     const parts = [];
-    if (ptsH >= ptsA + 1) parts.push("Domaćin u boljoj formi.");
-    else if (ptsA >= ptsH + 1) parts.push("Gost u boljoj formi.");
-
-    // ko "prima dosta golova"
-    if (gaA != null && gaH != null) {
-      const manyA = gaA >= 9 || gaA - gaH >= 3; // ~1.8+ po meču ili znatno više od domaćina
-      const manyH = gaH >= 9 || gaH - gaA >= 3;
-      if (manyA) parts.push("Gost prima dosta golova.");
-      else if (manyH) parts.push("Domaćin prima dosta golova.");
-    }
-
-    // fallback ako ništa nije upalo
-    if (parts.length === 0) {
-      const sel = p?.selection ? `izboru **${p.selection}**` : "izboru";
-      parts.push(`Model daje prednost ${sel}.`);
-    }
-    line1 = `Zašto: ${parts.join(" ")}`;
+    if (mp != null && ip != null) parts.push(`Model ${mp}% vs ${ip}%`);
+    if (ev != null) parts.push(`EV ${ev}%`);
+    if (parts.length) reasons.push(parts.join(" · "));
   }
 
-  // 2. red — fiksni format
-  if (wH != null && wA != null) {
-    formLine =
-      `Forma: D W${wH} D${dH} L${lH}  G W${wA} D${dA} L${lA}`;
-  } else {
-    formLine = "Forma: —  G —";
-  }
-  if (h2hBullet) {
-    h2hLine = `H2H: W${w2} D${d2} L${l2}  GD: ${gf2}:${ga2}`;
-  } else {
-    h2hLine = "H2H: —  GD: —";
-  }
+  const line1 = `Zašto: ${reasons.slice(0, 2).join(". ")}.`.replace(/\.\.$/, ".");
 
-  if (!line1) {
-    // nema forma bullet-a → upotrebi summary/text
-    const summary = typeof p?.explain?.summary === "string" ? p.explain.summary.trim() : "";
-    const text = typeof p?.explain?.text === "string" ? p.explain.text.trim() : "";
-    const fallback = summary || text || "";
-    line1 = fallback ? `Zašto: ${fallback}` : "Zašto: —";
-  }
+  // -------- 2. red: pregledna “Forma” u jednoj liniji --------
+  // Primjer: "Forma: D W2-D2-L1 • G W1-D1-L3 • H2H W3-D1-L1 • GD 13:9"
+  const segD = (wH!=null) ? `D W${wH}-D${dH}-L${lH}` : "D —";
+  const segG = (wA!=null) ? `G W${wA}-D${dA}-L${lA}` : "G —";
+  const segH = (wH!=null && wA!=null) ? `${segD} • ${segG}` : `${segD}${segD && segG ? " • " : ""}${segG}`;
+  const seg2 = (w2||d2||l2) ? `H2H W${w2}-D${d2}-L${l2}` : "H2H —";
+  const segGD = (gf2||ga2) ? `GD ${gf2}:${ga2}` : "GD —";
 
-  const line2 = `${formLine}  ${h2hLine}`;
+  const line2 = `Forma: ${segH} • ${seg2} • ${segGD}`;
+
   return { line1, line2 };
 }
 
@@ -243,7 +239,6 @@ function Card({ p }) {
   const price = p?.market_odds ?? p?.odds ?? p?.price;
   const conf = p?.confidence_pct ?? p?.confidence ?? 0;
 
-  // >>> dva reda, 1:1 format
   const { line1, line2 } = twoLineExplain(p);
 
   return (
@@ -321,8 +316,8 @@ function SidePanelTopLeagues({ items }) {
               {(p?.market_label || p?.market || "")}: <b>{p?.selection || ""}</b>
             </div>
             <div className="text-xs opacity-80">
-              {/* skraćeno, bez “Zašto:” prefiksa */}
-              {(twoLineExplain(p).line1 || "").replace(/^Zašto:\s*/,'')}
+              {/* prikaži sažeti razlog bez prefiksa “Zašto:” */}
+              {twoLineExplain(p).line1.replace(/^Zašto:\s*/,'')}
             </div>
           </div>
         ))}
@@ -462,7 +457,6 @@ export default function FootballBets({ limit, layout = "full" }) {
     return list;
   }, [items]);
 
-  // Combined: samo top N kartica
   if (layout === "combined") {
     const combinedTop =
       typeof limit === "number" ? byConfidence.slice(0, limit) : byConfidence.slice(0, 3);
@@ -477,7 +471,6 @@ export default function FootballBets({ limit, layout = "full" }) {
     );
   }
 
-  // Football tab (Kick-Off / Confidence / History) + desni panel
   if (loading) return <div className="opacity-70">Učitavanje…</div>;
   if (error)   return <div className="text-red-400">Greška: {String(error)}</div>;
 
@@ -495,7 +488,6 @@ export default function FootballBets({ limit, layout = "full" }) {
       )}
 
       <div className="grid lg:grid-cols-3 gap-4">
-        {/* leve 2 kolone */}
         <div className="lg:col-span-2 space-y-4">
           {tab === "kick" && (
             <div className="grid md:grid-cols-2 gap-4">
@@ -516,9 +508,7 @@ export default function FootballBets({ limit, layout = "full" }) {
           {tab === "hist" && (
             <div>
               <HistoryHeader rows={historyRows} />
-              {historyLoading && (
-                <div className="opacity-70">Učitavanje…</div>
-              )}
+              {historyLoading && <div className="opacity-70">Učitavanje…</div>}
               {!historyLoading && historyRows?.length > 0 && (
                 <div className="space-y-3">
                   {historyRows.map((h, i) => (
@@ -533,7 +523,6 @@ export default function FootballBets({ limit, layout = "full" }) {
           )}
         </div>
 
-        {/* desna kolona: Top lige */}
         <div className="lg:col-span-1">
           <SidePanelTopLeagues items={items} />
         </div>
