@@ -1,5 +1,4 @@
-"use client";
-
+// components/FootballBets.jsx
 import { useEffect, useState, useMemo } from "react";
 
 function useLockedValueBets() {
@@ -15,11 +14,10 @@ function useLockedValueBets() {
       const ct = r.headers.get("content-type") || "";
       if (!ct.includes("application/json")) throw new Error("API returned non-JSON");
       const js = await r.json();
-      const list = Array.isArray(js?.items) ? js.items : [];
-      setItems(list);
+      setItems(Array.isArray(js?.items) ? js.items : []);
     } catch (e) {
       setError(String(e?.message || e));
-      setItems([]); // ne ruši render
+      setItems([]); // nikad ne ruši render
     } finally {
       setLoading(false);
     }
@@ -49,6 +47,7 @@ function buildTickets(items) {
 
 function TicketsBlock({ items }) {
   const tickets = useMemo(() => buildTickets(items), [items]);
+  if (!tickets.length) return null;
   return (
     <div className="grid md:grid-cols-3 gap-3 mb-4">
       {tickets.map((t) => (
@@ -87,10 +86,11 @@ function Card({ p }) {
   const price  = p?.odds || p?.price;
   const conf   = p?.confidence_pct ?? p?.confidence ?? 0;
 
-  // Novi blok: Zašto + Forma (H2H) — spaja ih backend u explain.text
-  const whyText = typeof p?.explain?.text === "string"
+  // “Zašto + Forma” – backend sada garantuje explain.text;
+  // ako ipak izostane, ipak nešto prikaži.
+  const whyText = (typeof p?.explain?.text === "string" && p.explain.text.trim())
     ? p.explain.text
-    : (typeof p?.explain?.summary === "string" ? p.explain.summary : "");
+    : (typeof p?.explain?.summary === "string" ? `Zašto: ${p.explain.summary}` : "");
 
   return (
     <div className="rounded-2xl p-4 shadow bg-neutral-900/60 border border-neutral-800">
@@ -119,7 +119,7 @@ export default function FootballBets() {
 
   return (
     <div className="space-y-4">
-      {/* 3× tiketa na vrhu Football taba */}
+      {/* 3× tiketa NA VRHU Football taba */}
       {Array.isArray(items) && items.length > 0 && <TicketsBlock items={items} />}
 
       {error && <div className="text-red-400">Greška: {error}</div>}
