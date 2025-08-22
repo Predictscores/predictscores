@@ -5,25 +5,23 @@ const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const TZ       = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
-async function kvGetRaw(key) {
+async function kvGetJSON(key) {
   if (!KV_URL || !KV_TOKEN) return null;
   const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
     headers: { Authorization: `Bearer ${KV_TOKEN}` }
   });
   if (!r.ok) return null;
   const js = await r.json().catch(() => null);
-  return js && typeof js === "object" && "result" in js ? js.result : js;
+  const val = js && "result" in js ? js.result : js;
+  try { return typeof val === "string" ? JSON.parse(val) : val; } catch { return null; }
 }
-async function kvGetJSON(key) {
-  const raw = await kvGetRaw(key);
-  try { return typeof raw === "string" ? JSON.parse(raw) : raw; } catch { return null; }
-}
-async function kvSetJSON(key, val) {
+async function kvSetJSON(key, value) {
   if (!KV_URL || !KV_TOKEN) return false;
+  const body = typeof value === "string" ? value : JSON.stringify(value);
   const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify(val)
+    body
   });
   return r.ok;
 }
@@ -34,52 +32,44 @@ function ymdInTZ(d = new Date(), tz = TZ) {
 }
 function hhmmInTZ(d = new Date(), tz = TZ) {
   const fmt = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false });
-  return fmt.format(d); // "HH:MM"
+  return fmt.format(d);
 }
 function slotForNow(d = new Date(), tz = TZ) {
-  const time = hhmmInTZ(d, tz);
-  if (time >= "00:00" && time < "12:00") return "AM";     // jutarnji (10:00 u praksi)
-  if (time >= "12:00" && time < "18:00") return "PM";     // popodnevni (15:00)
-  return "LATE";                                          // kasni
+  const t = hhmmInTZ(d, tz);
+  if (t >= "00:00" && t < "12:00") return "AM";
+  if (t >= "12:00" && t < "18:00") return "PM";
+  return "LATE";
 }
 
-function applyLearnWeights(items, weights) {
-  if (!weights) return items;
+function applyWeights(items, weights) {
+  if (!Array.isArray(items) || !weights) return items || [];
   return items.map(p => {
     let adj = 0;
-    const mk = p.market || p.market_label || "";
-    if (weights.markets && typeof weights.markets[mk] === "number") adj += weights.markets[mk];
-    if (typeof weights.global === "number") adj += weights.global;
-    const conf = Math.max(0, Math.min(100, (p.confidence_pct ?? p.confidence ?? 0) + adj));
+    const mk = p?.market_label || p?.market || "";
+    if (weights?.markets && typeof weights.markets[mk] === "number") adj += weights.markets[mk];
+    if (typeof weights?.global === "number") adj += weights.global;
+    const base = p?.confidence_pct ?? p?.confidence ?? 0;
+    const conf = Math.max(0, Math.min(100, base + adj));
     return { ...p, confidence_pct: conf };
   });
 }
 
 export default async function handler(req, res) {
   try {
-    const now = new Date();
-    const ymd = ymdInTZ(now);
+    const now  = new Date();
+    const ymd  = ymdInTZ(now);
     const slot = slotForNow(now);
 
-    // 1) Uzmi dnevni union
-    const union = (await kvGetJSON(`vb:day:${ymd}:union`)) || [];
-    // (opcionalno: filtriraj po slotu ako u objektima postoji p.slot === slot)
+    const union   = (await kvGetJSON(`vb:day:${ymd}:union`)) || [];
+    const weights = (await kvGetJSON(`vb:learn:weights`)) || null;
 
-    // 2) Učitaj naučene težine (ako postoje)
-    const weights = await kvGetJSON(`vb:learn:weights`) || null;
+    const boosted = applyWeights(union, weights)
+      .sort((a, b) => (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0));
 
-    // 3) Primeni umeren boost na confidence i sortiraj
-    const boosted = applyLearnWeights(union, weights);
-    boosted.sort((a, b) => (b.confidence_pct ?? 0) - (a.confidence_pct ?? 0));
-
-    // 4) Upisi zaključan feed
-    await kvSetJSON(`vb:day:${ymd}:last`, boosted);
-    await kvSetJSON(`vb:meta:${ymd}:last_meta`, {
-      ymd,
-      slot,
-      built_at: new Date().toISOString(),
-      source: "union"
-    });
+    await kvSetJSON(`vb:day:${ymd}:last`, JSON.stringify(boosted));
+    await kvSetJSON(`vb:meta:${ymd}:last_meta`, JSON.stringify({
+      ymd, slot, built_at: new Date().toISOString(), source: "union"
+    }));
 
     return res.status(200).json({ ok: true, count: boosted.length, slot, ymd });
   } catch (e) {
