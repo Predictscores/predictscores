@@ -1,4 +1,4 @@
-// FILE: pages/api/cron/learn.js
+// pages/api/cron/learn.js
 export const config = { api: { bodyParser: false } };
 
 const TZ = "Europe/Belgrade";
@@ -45,14 +45,18 @@ function minutesDiff(a,b){ return Math.round((a.getTime()-b.getTime())/60000); }
 
 // --- won from score + market/selection
 function computeWon(entry, score){
-  const m = String(entry.market||"").toUpperCase();
-  const s = String(entry.selection||"").toUpperCase();
+  if (!score) return null;
+
   const ftStr =
-    (typeof score?.ft === "string" ? score.ft : null) ??
-    (Number.isFinite(score?.ftH)&&Number.isFinite(score?.ftA) ? `${score.ftH}:${score.ftA}` : null);
+    (typeof score.ft === "string" ? score.ft : null) ??
+    (Number.isFinite(score.ftH) && Number.isFinite(score.ftA) ? `${score.ftH}:${score.ftA}` : null);
   if (!ftStr) return null;
-  const [h,a] = ftStr.split(":").map(Number);
+
+  const [h,a] = String(ftStr).split(":").map(Number);
   if (!Number.isFinite(h)||!Number.isFinite(a)) return null;
+
+  const m = String(entry?.market||"").toUpperCase();
+  const s = String(entry?.selection||"").toUpperCase();
 
   if (m==="1X2"){ const r=(h>a)?"1":(h===a)?"X":"2"; return r===s; }
   if (m==="BTTS"){ return (h>=1 && a>=1); }
@@ -117,8 +121,6 @@ export default async function handler(req,res){
           items.push({
             market: e?.market || null,
             oddsOpen, oddsClose,
-            clvPct: (Number.isFinite(oddsOpen) && Number.isFinite(oddsClose) && oddsOpen>0)
-              ? ((oddsClose/oddsOpen - 1)*100) : null,
             ttko,
             won
           });
@@ -134,7 +136,10 @@ export default async function handler(req,res){
       b.n++;
       if (it.won===true){ b.won++; b.pnl += (it.oddsOpen-1); }
       else if (it.won===false){ b.pnl -= 1; }
-      if (Number.isFinite(it.clvPct)){ b.clvSum += it.clvPct; b.clvN++; }
+      const clvPct = (Number.isFinite(it.oddsOpen) && Number.isFinite(it.oddsClose) && it.oddsOpen>0 && it.oddsClose>0)
+        ? ((it.oddsClose - it.oddsOpen) / it.oddsOpen) * 100
+        : null;
+      if (Number.isFinite(clvPct)){ b.clvSum += clvPct; b.clvN++; }
       buckets.set(key,b);
     }
 
@@ -172,6 +177,10 @@ export default async function handler(req,res){
     await kvSet(`learn:evmin:v1`, evmin);
     await kvSet(`learn:bucketN:v1`, bucketN);
     await kvSet(`learn:clvavg:v1`, clvavg);
+    // aliases for legacy readers
+    await kvSet(`vb:learn:weights`, { global: 0, markets: overlay });
+    await kvSet(`vb:learn:evmin`, evmin);
+
     await kvSet(`learn:report:${today}`, {
       daysUsed: ymds,
       buckets: Array.from(buckets.entries()).map(([k,b])=>({
