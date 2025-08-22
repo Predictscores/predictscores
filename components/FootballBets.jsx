@@ -6,8 +6,8 @@ import { useEffect, useMemo, useState } from "react";
 /* ===================== VALUE BETS (LOCKED) ===================== */
 function useLockedValueBets() {
   const [items, setItems] = useState([]);
-  const [loading,   setLoading] = useState(true);
-  const [error,     setError]   = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
   async function load() {
     try {
@@ -61,11 +61,7 @@ function useHistory(days = 14) {
 
   async function load() {
     setLoading(true);
-    const tries = [
-      `/api/history?days=${days}`,
-      "/api/history",
-      "/api/history-locked",
-    ];
+    const tries = [`/api/history?days=${days}`, "/api/history", "/api/history-locked"];
     let data = null;
     for (const u of tries) {
       data = await j(u);
@@ -110,41 +106,59 @@ function impliedFromOdds(odds) {
   return o > 0 ? 100 / o : null;
 }
 
-/* ---------- two-line explain builder (pametniji “Zašto” + pregledna “Forma”) ---------- */
+/* ---------- two-line explain builder (pametniji “Zašto” + kompaktna “Forma”) ---------- */
 function twoLineExplain(p) {
   const bullets = Array.isArray(p?.explain?.bullets) ? p.explain.bullets : [];
 
   // Parsiranje “Forma” i “H2H”
-  const formaBullet = bullets.find((b) => typeof b === "string" && b.trim().toLowerCase().startsWith("forma"));
-  const h2hBullet   = bullets.find((b) => typeof b === "string" && b.toLowerCase().includes("h2h"));
+  const formaBullet = bullets.find(
+    (b) => typeof b === "string" && b.trim().toLowerCase().startsWith("forma")
+  );
+  const h2hBullet = bullets.find(
+    (b) => typeof b === "string" && b.toLowerCase().includes("h2h")
+  );
 
   // npr: "Forma: TeamA 2-1-2 (GF:8:GA:11) · TeamB 2-1-2 (GF:9:GA:5)"
-  const reForma = /Forma:\s*.+?\s(\d+)-(\d+)-(\d+)\s*\(GF:(\d+):GA:(\d+)\)\s*·\s*.+?\s(\d+)-(\d+)-(\d+)\s*\(GF:(\d+):GA:(\d+)\)/i;
+  const reForma =
+    /Forma:\s*.+?\s(\d+)-(\d+)-(\d+)\s*\(GF:(\d+):GA:(\d+)\)\s*·\s*.+?\s(\d+)-(\d+)-(\d+)\s*\(GF:(\d+):GA:(\d+)\)/i;
   // npr: "H2H (L5): 3-1-1 (GF:13:GA:9)"
-  const reH2H   = /H2H.*?:\s*(\d+)-(\d+)-(\d+)\s*\(GF:(\d+):GA:(\d+)\)/i;
+  const reH2H = /H2H.*?:\s*(\d+)-(\d+)-(\d+)\s*\(GF:(\d+):GA:(\d+)\)/i;
 
   let wH, dH, lH, gfH, gaH, wA, dA, lA, gfA, gaA;
-  let w2=0, d2=0, l2=0, gf2=0, ga2=0;
-  const TOTAL = 5; // pretpostavka L5
+  let w2 = 0,
+    d2 = 0,
+    l2 = 0,
+    gf2 = 0,
+    ga2 = 0;
+  const TOTAL = 5; // L5
 
   if (typeof formaBullet === "string") {
     const m = formaBullet.match(reForma);
     if (m) {
-      wH = +m[1]; dH = +m[2]; lH = +m[3];
-      gfH = +m[4]; gaH = +m[5];
-      wA = +m[6]; dA = +m[7]; lA = +m[8];
-      gfA = +m[9]; gaA = +m[10];
+      wH = +m[1];
+      dH = +m[2];
+      lH = +m[3];
+      gfH = +m[4];
+      gaH = +m[5];
+      wA = +m[6];
+      dA = +m[7];
+      lA = +m[8];
+      gfA = +m[9];
+      gaA = +m[10];
     }
   }
   if (typeof h2hBullet === "string") {
     const m2 = h2hBullet.match(reH2H);
     if (m2) {
-      w2 = +m2[1]; d2 = +m2[2]; l2 = +m2[3];
-      gf2 = +m2[4]; ga2 = +m2[5];
+      w2 = +m2[1];
+      d2 = +m2[2];
+      l2 = +m2[3];
+      gf2 = +m2[4];
+      ga2 = +m2[5];
     }
   }
 
-  // -------- 1. red: najviše 2 relevantna razloga --------
+  // -------- 1. red: do 2 najrelevantnija razloga --------
   const reasons = [];
   if (wH != null && wA != null) {
     const ptsH = wH * 3 + dH;
@@ -170,7 +184,7 @@ function twoLineExplain(p) {
   if ((p?.confidence_pct ?? 0) >= 75) reasons.push("High confidence");
   if ((p?.bookmakers_count_trusted ?? 0) >= 8) reasons.push("Širok konsenzus kladionica");
 
-  // Fallback ako baš ništa nije “uhvatilo”
+  // Fallback ako baš ništa ne “uhvati”
   if (reasons.length === 0) {
     const mp = pct(p?.model_prob);
     const ip = pct(p?.implied_prob ?? impliedFromOdds(p?.market_odds));
@@ -182,15 +196,12 @@ function twoLineExplain(p) {
 
   const line1 = `Zašto: ${reasons.slice(0, 2).join(". ")}.`.replace(/\.\.$/, ".");
 
-  // -------- 2. red: pregledna “Forma” u jednoj liniji --------
-  // Primjer: "Forma: D W2-D2-L1 • G W1-D1-L3 • H2H W3-D1-L1 • GD 13:9"
-  const segD = (wH!=null) ? `D W${wH}-D${dH}-L${lH}` : "D —";
-  const segG = (wA!=null) ? `G W${wA}-D${dA}-L${lA}` : "G —";
-  const segH = (wH!=null && wA!=null) ? `${segD} • ${segG}` : `${segD}${segD && segG ? " • " : ""}${segG}`;
-  const seg2 = (w2||d2||l2) ? `H2H W${w2}-D${d2}-L${l2}` : "H2H —";
-  const segGD = (gf2||ga2) ? `GD ${gf2}:${ga2}` : "GD —";
-
-  const line2 = `Forma: ${segH} • ${seg2} • ${segGD}`;
+  // -------- 2. red: kompaktna forma u jednom redu (bez "Forma:") --------
+  const segD = wH != null ? `D W${wH}-D${dH}-L${lH}` : "D —";
+  const segG = wA != null ? `G W${wA}-D${dA}-L${lA}` : "G —";
+  const segH2 = w2 || d2 || l2 ? `H2H W${w2}-D${d2}-L${l2}` : "H2H —";
+  const segGD = gf2 || ga2 ? `${gf2}:${ga2}` : "—";
+  const line2 = `${segD} • ${segG} • ${segH2} • ${segGD}`;
 
   return { line1, line2 };
 }
@@ -204,11 +215,10 @@ function bucketLabel(p) {
   return "1X2";
 }
 function groupTop(items) {
-  const groups = { "BTTS": [], "OU 2.5": [], "HT-FT": [], "1X2": [] };
+  const groups = { BTTS: [], "OU 2.5": [], "HT-FT": [], "1X2": [] };
   for (const p of items || []) groups[bucketLabel(p)].push(p);
   const sorter = (a, b) =>
-    (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0) ||
-    (b?.ev ?? 0) - (a?.ev ?? 0);
+    (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0) || (b?.ev ?? 0) - (a?.ev ?? 0);
   for (const k of Object.keys(groups)) {
     groups[k].sort(sorter);
     groups[k] = groups[k].slice(0, 3);
@@ -219,8 +229,7 @@ function groupTop(items) {
 /* ===================== UI: SHARED PIECES ===================== */
 function ConfBadge({ conf }) {
   const lvl = conf >= 75 ? "High" : conf >= 50 ? "Moderate" : "Low";
-  const dot =
-    conf >= 75 ? "bg-emerald-400" : conf >= 50 ? "bg-sky-400" : "bg-amber-400";
+  const dot = conf >= 75 ? "bg-emerald-400" : conf >= 50 ? "bg-sky-400" : "bg-amber-400";
   return (
     <span className="inline-flex items-center gap-2 text-xs">
       <span className={`inline-block w-2.5 h-2.5 rounded-full ${dot}`} />
@@ -244,7 +253,9 @@ function Card({ p }) {
   return (
     <div className="rounded-2xl p-4 shadow bg-[#131722] border border-[#252b3b]">
       <div className="flex items-center justify-between text-xs opacity-80 mb-1">
-        <div>{league} • {ko}</div>
+        <div>
+          {league} • {ko}
+        </div>
         <ConfBadge conf={conf} />
       </div>
 
@@ -256,9 +267,13 @@ function Card({ p }) {
         {market}: <b>{sel}</b> {price ? <span>({price})</span> : null}
       </div>
 
-      {/* tačno 2 reda */}
+      {/* 1. red objašnjenja */}
       <div className="text-sm opacity-90">{line1}</div>
-      <div className="text-sm opacity-90 mb-3">{line2}</div>
+
+      {/* 2. red — uvek jedan red (nowrap + elipsa) */}
+      <div className="text-sm opacity-90 mb-3 whitespace-nowrap overflow-hidden text-ellipsis">
+        {line2}
+      </div>
 
       <div className="text-xs opacity-80 mb-1">Confidence</div>
       <div className="h-2 rounded bg-slate-700">
@@ -277,9 +292,7 @@ function TabsInline({ active, onChange }) {
       key={k}
       onClick={() => onChange(k)}
       className={`px-3 py-1.5 rounded-full text-sm border ${
-        active === k
-          ? "bg-white text-black border-white"
-          : "border-neutral-700 text-neutral-300"
+        active === k ? "bg-white text-black border-white" : "border-neutral-700 text-neutral-300"
       }`}
       type="button"
     >
@@ -299,25 +312,28 @@ function SidePanelTopLeagues({ items }) {
   const G = useMemo(() => groupTop(items), [items]);
   const Section = ({ title, want = 3, arr }) => (
     <div className="mb-5">
-      <div className="font-semibold mb-2">{title} ({want})</div>
-      {arr.length === 0 && (
-        <div className="text-sm opacity-70">Nema dovoljno kandidata.</div>
-      )}
+      <div className="font-semibold mb-2">
+        {title} ({want})
+      </div>
+      {arr.length === 0 && <div className="text-sm opacity-70">Nema dovoljno kandidata.</div>}
       <div className="space-y-3">
         {arr.map((p, i) => (
-          <div key={`${title}-${p?.fixture_id ?? i}`} className="rounded-xl p-3 bg-[#131722] border border-[#252b3b]">
+          <div
+            key={`${title}-${p?.fixture_id ?? i}`}
+            className="rounded-xl p-3 bg-[#131722] border border-[#252b3b]"
+          >
             <div className="text-xs opacity-70 mb-1">
               {(p?.league?.name || "")} • {(p?.datetime_local?.starting_at?.date_time || "")}
             </div>
             <div className="text-sm font-medium mb-0.5">
-              {(p?.teams?.home?.name || p?.teams?.home || p?.home || "")} vs {(p?.teams?.away?.name || p?.teams?.away || p?.away || "")}
+              {(p?.teams?.home?.name || p?.teams?.home || p?.home || "")} vs{" "}
+              {(p?.teams?.away?.name || p?.teams?.away || p?.away || "")}
             </div>
             <div className="text-sm mb-1">
               {(p?.market_label || p?.market || "")}: <b>{p?.selection || ""}</b>
             </div>
             <div className="text-xs opacity-80">
-              {/* prikaži sažeti razlog bez prefiksa “Zašto:” */}
-              {twoLineExplain(p).line1.replace(/^Zašto:\s*/,'')}
+              {twoLineExplain(p).line1.replace(/^Zašto:\s*/, "")}
             </div>
           </div>
         ))}
@@ -327,10 +343,10 @@ function SidePanelTopLeagues({ items }) {
   return (
     <div className="rounded-2xl p-4 shadow bg-[#131722] border border-[#252b3b]">
       <div className="text-lg font-semibold mb-3">Top lige</div>
-      <Section title="BTTS"  arr={G["BTTS"]} />
+      <Section title="BTTS" arr={G["BTTS"]} />
       <Section title="OU 2.5" arr={G["OU 2.5"]} />
       <Section title="HT-FT" arr={G["HT-FT"]} />
-      <Section title="1X2"   arr={G["1X2"]} />
+      <Section title="1X2" arr={G["1X2"]} />
     </div>
   );
 }
@@ -355,7 +371,10 @@ function computeStats(rows, days) {
   };
   const subset = (rows || []).filter(inRange);
 
-  let n = 0, wins = 0, profit = 0, stake = 0;
+  let n = 0,
+    wins = 0,
+    profit = 0,
+    stake = 0;
   for (const r of subset) {
     const odds = Number(r?.odds ?? r?.market_odds ?? r?.price);
     const won =
@@ -364,7 +383,7 @@ function computeStats(rows, days) {
     if (!Number.isFinite(odds)) continue;
     n += 1;
     stake += 1;
-    profit += won ? (odds - 1) : -1;
+    profit += won ? odds - 1 : -1;
     if (won) wins += 1;
   }
   const hit = n ? wins / n : null;
@@ -373,16 +392,19 @@ function computeStats(rows, days) {
 }
 
 function HistoryHeader({ rows }) {
-  const s7  = computeStats(rows, 7);
+  const s7 = computeStats(rows, 7);
   const s14 = computeStats(rows, 14);
-  const roiFmt = (x) =>
-    x == null ? "—" : `${x >= 0 ? "+" : ""}${x.toFixed(2)}`;
+  const roiFmt = (x) => (x == null ? "—" : `${x >= 0 ? "+" : ""}${x.toFixed(2)}`);
   return (
     <div className="rounded-2xl p-4 bg-[#151a2a] border border-[#252b3b] mb-3">
       <div className="font-semibold">History — učinak</div>
       <div className="mt-2 flex flex-wrap gap-6 text-sm opacity-90">
-        <span>7d: <b>{fmtPct(s7.hit)}</b> • ROI <b>{roiFmt(s7.roi)}</b> (N={s7.n})</span>
-        <span>14d: <b>{fmtPct(s14.hit)}</b> • ROI <b>{roiFmt(s14.roi)}</b> (N={s14.n})</span>
+        <span>
+          7d: <b>{fmtPct(s7.hit)}</b> • ROI <b>{roiFmt(s7.roi)}</b> (N={s7.n})
+        </span>
+        <span>
+          14d: <b>{fmtPct(s14.hit)}</b> • ROI <b>{roiFmt(s14.roi)}</b> (N={s14.n})
+        </span>
       </div>
     </div>
   );
@@ -391,29 +413,32 @@ function HistoryHeader({ rows }) {
 function OutcomeBadge({ won }) {
   if (won == null) return null;
   return won ? (
-    <span className="px-3 py-1 rounded-full text-sm bg-emerald-600/80 text-white">✅ Pogodak</span>
+    <span className="px-3 py-1 rounded-full text-sm bg-emerald-600/80 text-white">
+      ✅ Pogodak
+    </span>
   ) : (
-    <span className="px-3 py-1 rounded-full text-sm bg-rose-600/80 text-white">❌ Promašaj</span>
+    <span className="px-3 py-1 rounded-full text-sm bg-rose-600/80 text-white">
+      ❌ Promašaj
+    </span>
   );
 }
 
 function HistoryRow({ h }) {
   const league = h?.league?.name || h?.league || "";
-  const home   = h?.teams?.home?.name || h?.home || "";
-  const away   = h?.teams?.away?.name || h?.away || "";
-  const dt     = h?.datetime_local?.starting_at?.date_time || h?.ko || h?.date || "";
-  const slot   = h?.slot || h?.time_slot || h?.window || "";
-  const mk     = h?.market_label || h?.market || "";
-  const sel    = h?.selection || "";
-  const odds   = h?.odds ?? h?.market_odds ?? h?.price;
+  const home = h?.teams?.home?.name || h?.home || "";
+  const away = h?.teams?.away?.name || h?.away || "";
+  const dt = h?.datetime_local?.starting_at?.date_time || h?.ko || h?.date || "";
+  const slot = h?.slot || h?.time_slot || h?.window || "";
+  const mk = h?.market_label || h?.market || "";
+  const sel = h?.selection || "";
+  const odds = h?.odds ?? h?.market_odds ?? h?.price;
   const tipTxt = mk ? `${mk}: ${sel}` : sel;
 
   const won =
     h?.won === true ||
     String(h?.outcome || h?.status || h?.result || "").toLowerCase().startsWith("win");
 
-  const score =
-    h?.tr || h?.score || h?.result_score || h?.ft || "";
+  const score = h?.tr || h?.score || h?.result_score || h?.ft || "";
 
   return (
     <div className="rounded-2xl bg-[#151a2a] border border-[#252b3b] px-4 py-3 flex items-center justify-between">
@@ -421,12 +446,15 @@ function HistoryRow({ h }) {
         <div className="text-base font-semibold truncate">
           {home} vs {away}
         </div>
-        <div className="text-xs opacity-80">{league} • {dt} • Slot: {slot || "—"}</div>
+        <div className="text-xs opacity-80">
+          {league} • {dt} • Slot: {slot || "—"}
+        </div>
       </div>
 
       <div className="flex items-center gap-4 pl-4 shrink-0">
         <div className="text-sm whitespace-nowrap">
-          <b>{tipTxt}</b>{odds ? ` (${Number(odds).toFixed(2)})` : ""}
+          <b>{tipTxt}</b>
+          {odds ? ` (${Number(odds).toFixed(2)})` : ""}
           {score ? <div className="text-xs opacity-80 text-right">TR: {String(score)}</div> : null}
         </div>
         <OutcomeBadge won={won} />
@@ -451,8 +479,7 @@ export default function FootballBets({ limit, layout = "full" }) {
     const list = Array.isArray(items) ? [...items] : [];
     list.sort(
       (a, b) =>
-        (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0) ||
-        (b?.ev ?? 0) - (a?.ev ?? 0)
+        (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0) || (b?.ev ?? 0) - (a?.ev ?? 0)
     );
     return list;
   }, [items]);
@@ -461,7 +488,7 @@ export default function FootballBets({ limit, layout = "full" }) {
     const combinedTop =
       typeof limit === "number" ? byConfidence.slice(0, limit) : byConfidence.slice(0, 3);
     if (loading) return <div className="opacity-70">Učitavanje…</div>;
-    if (error)   return <div className="text-red-400">Greška: {String(error)}</div>;
+    if (error) return <div className="text-red-400">Greška: {String(error)}</div>;
     return (
       <div className="grid md:grid-cols-2 gap-4">
         {combinedTop.map((p, i) => (
@@ -472,12 +499,10 @@ export default function FootballBets({ limit, layout = "full" }) {
   }
 
   if (loading) return <div className="opacity-70">Učitavanje…</div>;
-  if (error)   return <div className="text-red-400">Greška: {String(error)}</div>;
+  if (error) return <div className="text-red-400">Greška: {String(error)}</div>;
 
-  const listKick =
-    typeof limit === "number" ? byKickoff.slice(0, limit) : byKickoff;
-  const listConf =
-    typeof limit === "number" ? byConfidence.slice(0, limit) : byConfidence;
+  const listKick = typeof limit === "number" ? byKickoff.slice(0, limit) : byKickoff;
+  const listConf = typeof limit === "number" ? byConfidence.slice(0, limit) : byConfidence;
 
   return (
     <div className="space-y-4">
@@ -488,6 +513,7 @@ export default function FootballBets({ limit, layout = "full" }) {
       )}
 
       <div className="grid lg:grid-cols-3 gap-4">
+        {/* leve 2 kolone */}
         <div className="lg:col-span-2 space-y-4">
           {tab === "kick" && (
             <div className="grid md:grid-cols-2 gap-4">
@@ -523,6 +549,7 @@ export default function FootballBets({ limit, layout = "full" }) {
           )}
         </div>
 
+        {/* desna kolona: Top lige */}
         <div className="lg:col-span-1">
           <SidePanelTopLeagues items={items} />
         </div>
