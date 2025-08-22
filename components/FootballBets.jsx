@@ -1,9 +1,9 @@
 import React, { useEffect, useMemo, useState } from "react";
 import Tabs from "./Tabs";
+import TicketSuggestions from "./TicketSuggestions";
 
-/* ================= helpers ================= */
+/* ============== helpers (isto kao ranije) ============== */
 function koISO(p) {
-  // pokušaj više polja (razne verzije backenda)
   const cands = [
     p?.kickoff,
     p?.ko,
@@ -12,7 +12,6 @@ function koISO(p) {
     p?.datetime?.starting_at?.date_time,
     p?.datetime?.date_time,
   ].filter(Boolean);
-
   for (const s of cands) {
     const iso = String(s).includes("T") ? String(s) : String(s).replace(" ", "T");
     const d = new Date(iso);
@@ -31,14 +30,14 @@ function todayYMD() {
 }
 
 /**
- * Ne budemo previše strogi:
- * - "combined": zadrži sve od -10min do +48h (da ne ostane prazno)
- * - "full":     zadrži od -240min do +48h (da vidiš skorije završene)
+ * Filter po vremenu:
+ * - "combined": −10min … +48h
+ * - "full":     −240min … +48h (da vidiš skorije završene; može se skratiti)
  */
 function filterByTime(items, mode) {
   const now = Date.now();
-  const minPast = mode === "combined" ? -10 : -240; // minute
-  const maxFuture = 48 * 60;                        // minute
+  const minPast = mode === "combined" ? -10 : -240;
+  const maxFuture = 48 * 60;
   return items.filter((p) => {
     const d = koDate(p);
     if (!d) return false;
@@ -47,7 +46,6 @@ function filterByTime(items, mode) {
   });
 }
 
-/* Zašto: preferiramo bullets (forma + H2H); fallback: summary */
 function Why({ p }) {
   const bullets = Array.isArray(p?.explain?.bullets) ? p.explain.bullets : [];
   const summary = p?.explain?.summary || "";
@@ -63,7 +61,6 @@ function Why({ p }) {
   return summary ? <div className="mt-1 text-slate-300">{summary}</div> : null;
 }
 
-/* Kartica meča — “Confidence” traka ispod */
 function Card({ p }) {
   const league = p?.league?.name || "";
   const country = p?.league?.country || "";
@@ -108,7 +105,7 @@ function Card({ p }) {
   );
 }
 
-/* History — /api/history, polling 60 min */
+/* History list (osveženje 60 min) */
 function HistoryList() {
   const [items, setItems] = useState([]);
   const [agg, setAgg] = useState(null);
@@ -183,12 +180,12 @@ function HistoryList() {
   );
 }
 
-/* ================= glavna ================= */
+/* ============== glavna ============== */
 export default function FootballBets({ limit = 25, layout = "full" }) {
   const [raw, setRaw] = useState([]);
   const [loadedOnce, setLoadedOnce] = useState(false);
 
-  // 1) pokušaj da povučeš iz LS (HeaderBar već snima dnevni snapshot)
+  // 1) LS fallback
   useEffect(() => {
     try {
       const key = `valueBetsLocked_${todayYMD()}`;
@@ -201,7 +198,7 @@ export default function FootballBets({ limit = 25, layout = "full" }) {
     } catch {}
   }, []);
 
-  // 2) redovan fetch sa cache-busterom; ne briši listu ako API vrati prazno
+  // 2) redovan fetch
   useEffect(() => {
     let alive = true;
     const load = async () => {
@@ -215,28 +212,22 @@ export default function FootballBets({ limit = 25, layout = "full" }) {
         const arr = Array.isArray(js?.value_bets) ? js.value_bets : [];
         if (arr.length) {
           setRaw(arr);
-          // osveži i LS da Combined/Export imaju iz čega
           try {
             const key = `valueBetsLocked_${todayYMD()}`;
             localStorage.setItem(key, JSON.stringify(arr));
           } catch {}
         } else if (!loadedOnce) {
-          // prvi put prazno → ne diraj state (zadrži fallback/LS)
+          // prvi put prazno → ne diraj state
         }
         setLoadedOnce(true);
-      } catch {
-        // ne diraj state
-      }
+      } catch {}
     };
     load();
-    const t = setInterval(load, 60000); // 60s
+    const t = setInterval(load, 60000);
     return () => { alive = false; clearInterval(t); };
   }, [loadedOnce]);
 
-  // 3) filter + sortiranja
   const filtered = useMemo(() => filterByTime(raw, layout), [raw, layout]);
-
-  // ako posle filtera nema ničeg, prikaži zadnjih 6 nefiltriranih da UI ne bude prazan
   const safeList = filtered.length ? filtered : raw.slice(-6);
 
   const byKickoff = useMemo(() => {
@@ -251,6 +242,7 @@ export default function FootballBets({ limit = 25, layout = "full" }) {
     return a.slice(0, limit);
   }, [safeList, limit]);
 
+  // ======= layout: combined (samo singlovi) =======
   if (layout === "combined") {
     return (
       <div className="grid grid-cols-1 gap-4">
@@ -261,27 +253,32 @@ export default function FootballBets({ limit = 25, layout = "full" }) {
     );
   }
 
+  // ======= layout: full (singlovi + 3x tiketa + tabovi) =======
   return (
-    <Tabs defaultLabel="Kick-Off">
-      <div label="Kick-Off">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {byKickoff.map((p) => (
-            <Card key={`${p.fixture_id}-${p.market}-${p.selection}`} p={p} />
-          ))}
-        </div>
-      </div>
+    <>
+      <TicketSuggestions items={safeList} />
 
-      <div label="Confidence">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {byConfidence.map((p) => (
-            <Card key={`${p.fixture_id}-${p.market}-${p.selection}`} p={p} />
-          ))}
+      <Tabs defaultLabel="Kick-Off">
+        <div label="Kick-Off">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {byKickoff.map((p) => (
+              <Card key={`${p.fixture_id}-${p.market}-${p.selection}`} p={p} />
+            ))}
+          </div>
         </div>
-      </div>
 
-      <div label="History">
-        <HistoryList />
-      </div>
-    </Tabs>
+        <div label="Confidence">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {byConfidence.map((p) => (
+              <Card key={`${p.fixture_id}-${p.market}-${p.selection}`} p={p} />
+            ))}
+          </div>
+        </div>
+
+        <div label="History">
+          <HistoryList />
+        </div>
+      </Tabs>
+    </>
   );
 }
