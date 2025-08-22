@@ -110,49 +110,73 @@ function formatWhyAndForm(p) {
   return [zasto, forma].filter(Boolean).join("\n");
 }
 
-/* ---------------- Ticketi (3×) ---------------- */
-function buildTickets(items) {
-  const top = [...(Array.isArray(items) ? items : [])]
+/* ---------------- Tickets (kros-market, UVEK NA VRHU Football taba) ---------------- */
+
+// prepoznaj kategoriju tržišta
+function marketBucket(p) {
+  const m = String(p?.market_label || p?.market || "").toUpperCase();
+  if (m.includes("BTTS")) return "BTTS";
+  if (m.includes("OU") || m.includes("OVER") || m.includes("UNDER")) return "OU";
+  if (m.includes("HT-FT") || m.includes("HTFT")) return "HTFT";
+  return "1X2";
+}
+
+// uzmi TOP po confidence unutar svake bucket grupe
+function pickTopByBucket(items, bucket) {
+  return [...(items || [])]
+    .filter((p) => marketBucket(p) === bucket)
     .sort(
       (a, b) =>
         (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0) ||
         (b?.ev ?? 0) - (a?.ev ?? 0)
-    )
-    .slice(0, 3);
+    )[0];
+}
+
+// napravi 3 tiketa: A (1 singl), B (2 selekcije), C (3 selekcije)
+function buildCrossMarketTickets(items) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+
+  const top1x2 = pickTopByBucket(items, "1X2");
+  const topOU  = pickTopByBucket(items, "OU");
+  const topBT  = pickTopByBucket(items, "BTTS");
+  const topHF  = pickTopByBucket(items, "HTFT");
+
+  // fallback-ovi ako nema OU/BTTS/HTFT
+  const poolByEV = [...items].sort((a,b)=> (b?.ev ?? 0)-(a?.ev ?? 0));
+  const nextBest = (exclude=[]) => poolByEV.find(p => !exclude.includes(p));
+
+  const A = [ top1x2 || nextBest([]) ].filter(Boolean);
+  const B = [ (top1x2 || nextBest([])), (topOU || topBT || nextBest([top1x2])) ].filter(Boolean);
+  const C = [ (top1x2 || nextBest([])), (topOU || topBT || nextBest([top1x2])), (topHF || nextBest([top1x2, topOU || topBT])) ].filter(Boolean);
+
   return [
-    { label: "Ticket A", picks: top.slice(0, 1) },
-    { label: "Ticket B", picks: top.slice(0, 2) },
-    { label: "Ticket C", picks: top.slice(0, 3) },
+    { label: "Ticket A", picks: A },
+    { label: "Ticket B", picks: B.slice(0,2) },
+    { label: "Ticket C", picks: C.slice(0,3) },
   ];
 }
+
 function TicketsBlock({ items }) {
-  const tickets = useMemo(() => buildTickets(items), [items]);
+  const tickets = useMemo(() => buildCrossMarketTickets(items), [items]);
   if (!tickets.length) return null;
   return (
     <div className="grid md:grid-cols-3 gap-3 mb-4">
       {tickets.map((t) => (
-        <div
-          key={t.label}
-          className="rounded-2xl p-4 shadow bg-neutral-900/60 border border-neutral-800"
-        >
+        <div key={t.label} className="rounded-2xl p-4 shadow bg-neutral-900/60 border border-neutral-800">
           <div className="text-sm opacity-80 mb-2">{t.label}</div>
           <ul className="space-y-2">
             {t.picks.map((p, idx) => {
-              if (!p) return null;
               const league = p?.league?.name || p?.league_name || "";
-              const home =
-                p?.teams?.home?.name || p?.teams?.home || p?.home || "";
-              const away =
-                p?.teams?.away?.name || p?.teams?.away || p?.away || "";
-              const mk = p?.market_label || p?.market || "";
-              const sel = p?.selection || "";
+              const home   = p?.teams?.home?.name || p?.teams?.home || p?.home || "";
+              const away   = p?.teams?.away?.name || p?.teams?.away || p?.away || "";
+              const mk     = p?.market_label || p?.market || "";
+              const sel    = p?.selection || "";
+              const odds   = p?.market_odds ?? p?.odds ?? p?.price;
               return (
                 <li key={idx} className="text-sm">
                   <span className="opacity-70">{league}</span>{" • "}
-                  <strong>
-                    {home} vs {away}
-                  </strong>{" "}
-                  — <span>{mk}: <b>{sel}</b></span>
+                  <strong>{home} vs {away}</strong>{" — "}
+                  <span>{mk}: <b>{sel}</b>{odds ? ` (${odds})` : ""}</span>
                 </li>
               );
             })}
@@ -254,10 +278,7 @@ function bucketLabel(p) {
 }
 function groupTopLeagues(items) {
   const groups = { "BTTS": [], "OU 2.5": [], "HT-FT": [], "1X2": [] };
-  for (const p of items || []) {
-    const k = bucketLabel(p);
-    groups[k].push(p);
-  }
+  for (const p of items || []) groups[bucketLabel(p)].push(p);
   const sorter = (a, b) =>
     (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0) ||
     (b?.ev ?? 0) - (a?.ev ?? 0);
@@ -288,7 +309,7 @@ function SidePanelTopLeagues({ items }) {
               {(p?.market_label || p?.market || "")}: <b>{p?.selection || ""}</b>
             </div>
             <div className="text-xs opacity-80">
-              {formatWhyAndForm(p).split("\n")[0] /* prva linija “Zašto …” */}
+              {formatWhyAndForm(p).split("\n")[0]}
             </div>
           </div>
         ))}
@@ -311,12 +332,12 @@ export default function FootballBets({ limit, layout = "full" }) {
   const { items, loading, error } = useLockedValueBets();
   const [tab, setTab] = useState("kick");
 
-  // sortiranja
   const byKickoff = useMemo(() => {
     const list = Array.isArray(items) ? [...items] : [];
     list.sort((a, b) => (parseKO(a) ?? 9e15) - (parseKO(b) ?? 9e15));
     return list;
   }, [items]);
+
   const byConfidence = useMemo(() => {
     const list = Array.isArray(items) ? [...items] : [];
     list.sort(
@@ -342,18 +363,18 @@ export default function FootballBets({ limit, layout = "full" }) {
     );
   }
 
+  if (loading) return <div className="opacity-70">Učitavanje…</div>;
+  if (error) return <div className="text-red-400">Greška: {String(error)}</div>;
+
   // FULL (Football tab): tiketi + tabovi + desna kolona “Top lige”
   const listKick =
     typeof limit === "number" ? byKickoff.slice(0, limit) : byKickoff;
   const listConf =
     typeof limit === "number" ? byConfidence.slice(0, limit) : byConfidence;
 
-  if (loading) return <div className="opacity-70">Učitavanje…</div>;
-  if (error) return <div className="text-red-400">Greška: {String(error)}</div>;
-
   return (
     <div className="space-y-4">
-      {/* 3× tiketa — NA VRHU Football taba */}
+      {/* 3× tiketa — UVEK NA VRHU Football taba */}
       {Array.isArray(items) && items.length > 0 && (
         <TicketsBlock items={items} />
       )}
