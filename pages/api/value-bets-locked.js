@@ -5,6 +5,7 @@ const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const TZ       = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
+// --- KV helpers ---
 async function kvGetRaw(key) {
   if (!KV_URL || !KV_TOKEN) return null;
   const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
@@ -27,22 +28,23 @@ function ymdInTZ(d = new Date(), tz = TZ) {
   return fmt.format(d);
 }
 
-// pomoæna: od bullets formira "Zašto" i "Forma" redove
+// spoji bullets/summary u traženi prikaz (“Zašto: …” / “Forma: …”)
 function buildExplainText(p) {
   const bullets = Array.isArray(p?.explain?.bullets) ? p.explain.bullets : [];
   const summary = typeof p?.explain?.summary === "string" ? p.explain.summary : "";
 
-  // bullets mogu imati razne linije; izdvoj "Forma:" i "H2H" u drugi red,
-  // ostalo (bez "Forma"/"H2H") ide u Zašto.
-  const formaLine = bullets.find(b => /^h2h|^h2h \(l5\)|^forma:/i.test(b?.trim?.() || "") ) || null;
-  const whyList   = bullets.filter(b => !/^h2h|^h2h \(l5\)|^forma:/i.test(b?.trim?.() || "") );
+  const formaLine = bullets.find(b => /^h2h|^h2h \(l5\)|^forma:/i.test((b?.trim?.()||""))) || null;
+  const whyList   = bullets.filter(b => !/^h2h|^h2h \(l5\)|^forma:/i.test((b?.trim?.()||"")));
 
   const zasto = whyList.length
     ? `Zašto: ${whyList.join(". ")}.`
     : (summary ? `Zašto: ${summary.replace(/\.$/,"")}.` : "");
 
   const forma = formaLine
-    ? `Forma: ${formaLine.replace(/^forma:\s*/i,"").replace(/^h2h\s*/i,"H2H ").replace(/^h2h \(l5\):\s*/i,"H2H (L5): ")}`
+    ? `Forma: ${formaLine
+        .replace(/^forma:\s*/i,"")
+        .replace(/^h2h\s*/i,"H2H ")
+        .replace(/^h2h \(l5\):\s*/i,"H2H (L5): ")}`
     : "";
 
   const parts = [zasto, forma].filter(Boolean);
@@ -59,7 +61,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, ymd, source: "last", built_at: null, items: [] });
     }
 
-    // popuni explain.text ako ga nema
     const items = last.map(p => {
       const explain = typeof p?.explain === "object" && p.explain ? { ...p.explain } : {};
       if (!explain.text || !explain.text.trim()) {
@@ -70,7 +71,9 @@ export default async function handler(req, res) {
     });
 
     return res.status(200).json({
-      ok: true, ymd, source: "last",
+      ok: true,
+      ymd,
+      source: "last",
       built_at: meta?.built_at || null,
       items
     });
