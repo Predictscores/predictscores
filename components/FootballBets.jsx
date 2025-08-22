@@ -110,9 +110,7 @@ function formatWhyAndForm(p) {
   return [zasto, forma].filter(Boolean).join("\n");
 }
 
-/* ---------------- Tickets (kros-market, UVEK NA VRHU Football taba) ---------------- */
-
-// prepoznaj kategoriju tržišta
+/* ---------------- Tickets (kros-market, NA VRHU Football taba) ---------------- */
 function marketBucket(p) {
   const m = String(p?.market_label || p?.market || "").toUpperCase();
   if (m.includes("BTTS")) return "BTTS";
@@ -120,8 +118,6 @@ function marketBucket(p) {
   if (m.includes("HT-FT") || m.includes("HTFT")) return "HTFT";
   return "1X2";
 }
-
-// uzmi TOP po confidence unutar svake bucket grupe
 function pickTopByBucket(items, bucket) {
   return [...(items || [])]
     .filter((p) => marketBucket(p) === bucket)
@@ -131,17 +127,14 @@ function pickTopByBucket(items, bucket) {
         (b?.ev ?? 0) - (a?.ev ?? 0)
     )[0];
 }
-
-// napravi 3 tiketa: A (1 singl), B (2 selekcije), C (3 selekcije)
 function buildCrossMarketTickets(items) {
   if (!Array.isArray(items) || items.length === 0) return [];
-
   const top1x2 = pickTopByBucket(items, "1X2");
   const topOU  = pickTopByBucket(items, "OU");
   const topBT  = pickTopByBucket(items, "BTTS");
   const topHF  = pickTopByBucket(items, "HTFT");
 
-  // fallback-ovi ako nema OU/BTTS/HTFT
+  // fallback-ovi
   const poolByEV = [...items].sort((a,b)=> (b?.ev ?? 0)-(a?.ev ?? 0));
   const nextBest = (exclude=[]) => poolByEV.find(p => !exclude.includes(p));
 
@@ -155,7 +148,6 @@ function buildCrossMarketTickets(items) {
     { label: "Ticket C", picks: C.slice(0,3) },
   ];
 }
-
 function TicketsBlock({ items }) {
   const tickets = useMemo(() => buildCrossMarketTickets(items), [items]);
   if (!tickets.length) return null;
@@ -189,10 +181,8 @@ function TicketsBlock({ items }) {
 
 /* ---------------- Karte ---------------- */
 function ConfidenceBadge({ conf }) {
-  const lvl =
-    conf >= 75 ? "High" : conf >= 50 ? "Moderate" : "Low";
-  const dot =
-    conf >= 75 ? "bg-emerald-400" : conf >= 50 ? "bg-sky-400" : "bg-amber-400";
+  const lvl = conf >= 75 ? "High" : conf >= 50 ? "Moderate" : "Low";
+  const dot = conf >= 75 ? "bg-emerald-400" : conf >= 50 ? "bg-sky-400" : "bg-amber-400";
   return (
     <span className="inline-flex items-center gap-2 text-xs opacity-80">
       <span className={`inline-block w-2.5 h-2.5 rounded-full ${dot}`} />
@@ -200,7 +190,6 @@ function ConfidenceBadge({ conf }) {
     </span>
   );
 }
-
 function Card({ p }) {
   const league = p?.league?.name || p?.league_name || "";
   const ko = p?.datetime_local?.starting_at?.date_time || p?.ko || "";
@@ -210,7 +199,6 @@ function Card({ p }) {
   const sel = p?.selection || "";
   const price = p?.market_odds ?? p?.odds ?? p?.price;
   const conf = p?.confidence_pct ?? p?.confidence ?? 0;
-
   const whyText = formatWhyAndForm(p);
 
   return (
@@ -219,25 +207,12 @@ function Card({ p }) {
         <div>{league} • {ko}</div>
         <ConfidenceBadge conf={conf} />
       </div>
-
-      <div className="text-lg font-semibold mb-1">
-        {home} vs {away}
-      </div>
-
-      <div className="text-sm mb-2">
-        {market}: <b>{sel}</b> {price ? <span>({price})</span> : null}
-      </div>
-
-      {!!whyText && (
-        <div className="text-sm opacity-90 mb-3 whitespace-pre-line">{whyText}</div>
-      )}
-
+      <div className="text-lg font-semibold mb-1">{home} vs {away}</div>
+      <div className="text-sm mb-2">{market}: <b>{sel}</b> {price ? <span>({price})</span> : null}</div>
+      {!!whyText && <div className="text-sm opacity-90 mb-3 whitespace-pre-line">{whyText}</div>}
       <div className="text-xs opacity-70 mb-1">Confidence</div>
       <div className="h-2 bg-neutral-800 rounded">
-        <div
-          className="h-2 rounded bg-yellow-500"
-          style={{ width: `${Math.max(0, Math.min(100, conf))}%` }}
-        />
+        <div className="h-2 rounded bg-yellow-500" style={{ width: `${Math.max(0, Math.min(100, conf))}%` }} />
       </div>
     </div>
   );
@@ -250,9 +225,7 @@ function TabsInline({ active, onChange }) {
       key={k}
       onClick={() => onChange(k)}
       className={`px-3 py-1.5 rounded-full text-sm border ${
-        active === k
-          ? "bg-white text-black border-white"
-          : "border-neutral-700 text-neutral-300"
+        active === k ? "bg-white text-black border-white" : "border-neutral-700 text-neutral-300"
       }`}
       type="button"
     >
@@ -293,9 +266,7 @@ function SidePanelTopLeagues({ items }) {
   const Section = ({ title, arr }) => (
     <div className="mb-5">
       <div className="font-semibold mb-2">{title} ({arr.length})</div>
-      {arr.length === 0 && (
-        <div className="text-sm opacity-70">Nema dovoljno kandidata.</div>
-      )}
+      {arr.length === 0 && <div className="text-sm opacity-70">Nema dovoljno kandidata.</div>}
       <div className="space-y-3">
         {arr.map((p, i) => (
           <div key={`${title}-${p?.fixture_id ?? i}`} className="rounded-xl p-3 bg-neutral-900/60 border border-neutral-800">
@@ -375,15 +346,11 @@ export default function FootballBets({ limit, layout = "full" }) {
   return (
     <div className="space-y-4">
       {/* 3× tiketa — UVEK NA VRHU Football taba */}
-      {Array.isArray(items) && items.length > 0 && (
-        <TicketsBlock items={items} />
-      )}
+      {Array.isArray(items) && items.length > 0 && <TicketsBlock items={items} />}
 
       <TabsInline active={tab} onChange={setTab} />
 
-      {!items?.length && (
-        <div className="opacity-70">Nema dostupnih predloga.</div>
-      )}
+      {!items?.length && <div className="opacity-70">Nema dostupnih predloga.</div>}
 
       <div className="grid lg:grid-cols-3 gap-4">
         {/* leve 2 kolone: liste po tabu */}
