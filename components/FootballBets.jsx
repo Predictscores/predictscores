@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import Tabs from "./Tabs";
 
-/* ---- helperi ---- */
+/** Helperi */
 function koISO(p) {
   return (
     p?.datetime_local?.starting_at?.date_time?.replace(" ", "T") ||
@@ -9,15 +9,23 @@ function koISO(p) {
     null
   );
 }
-function koDate(p) { const s = koISO(p); return s ? new Date(s) : null; }
-function conf(p) { const x = Number(p?.confidence_pct || 0); return Number.isFinite(x) ? x : 0; }
-function ev(p) { const x = Number(p?.ev || 0); return Number.isFinite(x) ? x : -999; }
+function koDate(p) {
+  const s = koISO(p);
+  return s ? new Date(s) : null;
+}
+function conf(p) {
+  const x = Number(p?.confidence_pct || 0);
+  return Number.isFinite(x) ? x : 0;
+}
+function ev(p) {
+  const x = Number(p?.ev || 0);
+  return Number.isFinite(x) ? x : -999;
+}
 function isFuture(p, marginMin = 0) {
-  const d = koDate(p); if (!d) return false;
+  const d = koDate(p);
+  if (!d) return false;
   return +d > Date.now() + marginMin * 60 * 1000;
 }
-
-/* “Zašto”: bullets (forma + H2H) ako postoje; fallback na summary */
 function Why({ p }) {
   const bullets = Array.isArray(p?.explain?.bullets) ? p.explain.bullets : [];
   const summary = p?.explain?.summary || "";
@@ -33,13 +41,17 @@ function Why({ p }) {
   return <div className="mt-1 text-slate-300">{summary}</div>;
 }
 
-/* Kartica meča (isti stil) */
+/** Kartica meča */
 function Card({ p }) {
   const league = `${p?.league?.name || ""}`;
   const country = p?.league?.country || "";
   const time = koISO(p)
-    ? new Date(koISO(p)).toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit" })
+    ? new Date(koISO(p)).toLocaleTimeString("sv-SE", {
+        hour: "2-digit",
+        minute: "2-digit",
+      })
     : "";
+
   const odds = Number(p?.market_odds || p?.odds || 0);
   const confPct = Math.max(0, Math.min(100, conf(p)));
 
@@ -48,7 +60,12 @@ function Card({ p }) {
       <div className="text-xs uppercase tracking-wide text-slate-400 flex items-center gap-2">
         <span>🏆 {league}</span>
         {country ? <span>• {country}</span> : null}
-        {time ? (<><span>•</span><span>{time}</span></>) : null}
+        {time ? (
+          <>
+            <span>•</span>
+            <span>{time}</span>
+          </>
+        ) : null}
       </div>
 
       <h3 className="mt-1 text-xl font-semibold">
@@ -60,11 +77,14 @@ function Card({ p }) {
         {Number.isFinite(odds) && <span className="text-slate-400">({odds.toFixed(2)})</span>}
       </div>
 
-      {/* Confidence (ispod – kao ranije) */}
+      {/* Confidence bar (ispod kao ranije) */}
       <div className="mt-2">
         <div className="text-xs text-slate-400">Confidence</div>
         <div className="h-2 bg-[#0f1424] rounded-full overflow-hidden">
-          <div style={{ width: `${confPct}%` }} className="h-2 bg-sky-400" />
+          <div
+            style={{ width: `${confPct}%` }}
+            className="h-2 bg-sky-400"
+          />
         </div>
       </div>
 
@@ -77,25 +97,28 @@ function Card({ p }) {
   );
 }
 
-/* History (14 dana, 60 min polling) */
+/** History lista */
 function HistoryList() {
   const [items, setItems] = useState([]);
   const [agg, setAgg] = useState(null);
 
   useEffect(() => {
-    let ok = true;
+    let alive = true;
     const load = async () => {
       try {
         const r = await fetch(`/api/history?days=14&_=${Date.now()}`, { cache: "no-store" });
         const js = await r.json();
-        if (!ok) return;
+        if (!alive) return;
         setItems(Array.isArray(js?.items) ? js.items : []);
         setAgg(js?.aggregates || null);
       } catch {}
     };
     load();
-    const t = setInterval(load, 60 * 60 * 1000);
-    return () => { ok = false; clearInterval(t); };
+    const t = setInterval(load, 60 * 60 * 1000); // 60 min, dovoljno retko
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
   }, []);
 
   return (
@@ -114,35 +137,56 @@ function HistoryList() {
         items.map((h) => {
           const ko = h?.kickoff ? new Date(h.kickoff) : null;
           const when = ko
-            ? `${ko.toLocaleDateString("sv-SE")} • ${ko.toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit" })}`
+            ? `${ko.toLocaleDateString("sv-SE")} • ${ko.toLocaleTimeString("sv-SE", {
+                hour: "2-digit",
+                minute: "2-digit",
+              })}`
             : "";
           const badge =
             h.won === true ? (
-              <span className="ml-2 px-2 py-0.5 rounded-full text-xs bg-emerald-600/20 text-emerald-300">✓ tačno</span>
+              <span className="ml-2 px-2 py-0.5 rounded-full text-xs bg-emerald-600/20 text-emerald-300">
+                ✓ tačno
+              </span>
             ) : h.won === false ? (
-              <span className="ml-2 px-2 py-0.5 rounded-full text-xs bg-rose-600/20 text-rose-300">✗ promašaj</span>
+              <span className="ml-2 px-2 py-0.5 rounded-full text-xs bg-rose-600/20 text-rose-300">
+                ✗ promašaj
+              </span>
             ) : (
-              <span className="ml-2 px-2 py-0.5 rounded-full text-xs bg-slate-600/20 text-slate-300">⏳ u toku</span>
+              <span className="ml-2 px-2 py-0.5 rounded-full text-xs bg-slate-600/20 text-slate-300">
+                ⏳ u toku
+              </span>
             );
 
           return (
-            <div key={`${h.fixture_id}-${h.market}-${h.selection}`} className="rounded-xl bg-[#14182a] p-4 text-slate-200">
+            <div
+              key={`${h.fixture_id}-${h.market}-${h.selection}`}
+              className="rounded-xl bg-[#14182a] p-4 text-slate-200"
+            >
               <div className="text-xs uppercase tracking-wide text-slate-400 flex items-center gap-2">
                 <span>🏆 {h?.league?.name}</span>
                 {h?.league?.country ? <span>• {h.league.country}</span> : null}
-                {when ? (<><span>•</span><span>{when}</span></>) : null}
+                {when ? (
+                  <>
+                    <span>•</span>
+                    <span>{when}</span>
+                  </>
+                ) : null}
                 <span>• Slot: {h?.slot || "-"}</span>
               </div>
+
               <div className="mt-1 font-semibold">
                 {h?.teams?.home} <span className="text-slate-400">vs</span> {h?.teams?.away}
               </div>
+
               <div className="mt-1 text-slate-300 flex items-center gap-2">
                 {h?.market}: {h?.selection}{" "}
                 {Number.isFinite(h?.odds) && <span className="text-slate-400">({h.odds.toFixed(2)})</span>}
                 {badge}
               </div>
+
               <div className="mt-1 text-sm text-slate-400">
-                TR: {h?.final_score ? h.final_score : "—"}{h?.ht_score ? ` · HT: ${h.ht_score}` : ""}
+                TR: {h?.final_score ? h.final_score : "—"}
+                {h?.ht_score ? ` · HT: ${h.ht_score}` : ""}
               </div>
             </div>
           );
@@ -152,59 +196,42 @@ function HistoryList() {
   );
 }
 
-/* Glavna komponenta */
-export default function FootballBets({ limit = 25, layout = "full" }) {
+export default function FootballBets({ limit = 25 }) {
   const [raw, setRaw] = useState([]);
 
-  // Povuci zaključane predloge; cache-buster i lagani polling
+  // učitaj zaključane predloge; bust cache i filtriraj prošle
   useEffect(() => {
-    let ok = true;
+    let alive = true;
     const load = async () => {
       try {
         const r = await fetch(`/api/value-bets-locked?_=${Date.now()}`, { cache: "no-store" });
         const js = await r.json();
-        if (!ok) return;
+        if (!alive) return;
         const arr = Array.isArray(js?.value_bets) ? js.value_bets : [];
-        setRaw(arr);
+        setRaw(arr.filter((p) => isFuture(p, -120))); // prikaži i do 120 min unazad u Football tabu (da ljudi vide šta je bilo), ali Combined filtrira strože
       } catch {}
     };
     load();
     const t = setInterval(load, 60000);
-    return () => { ok = false; clearInterval(t); };
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
   }, []);
 
-  // FILTER: u “combined” prikazujemo samo buduće (da jutarnje ne ostaju),
-  // u “full” dopuštamo i do 120min unazad (da se vide skoro završeni)
-  const filtered = useMemo(() => {
-    if (layout === "combined") return raw.filter((p) => isFuture(p, 5));
-    return raw.filter((p) => isFuture(p, -120));
-  }, [raw, layout]);
-
-  // Pogledi
+  // pogledi
   const byKickoff = useMemo(() => {
-    const a = [...filtered];
+    const a = [...raw];
     a.sort((x, y) => +koDate(x) - +koDate(y));
     return a.slice(0, limit);
-  }, [filtered, limit]);
+  }, [raw, limit]);
 
   const byConfidence = useMemo(() => {
-    const a = [...filtered];
+    const a = [...raw];
     a.sort((x, y) => conf(y) - conf(x) || ev(y) - ev(x) || +koDate(x) - +koDate(y));
     return a.slice(0, limit);
-  }, [filtered, limit]);
+  }, [raw, limit]);
 
-  if (layout === "combined") {
-    // samo lista kartica (Top 3) – leva kolona u Combined tabu
-    return (
-      <div className="grid grid-cols-1 gap-4">
-        {byConfidence.slice(0, 3).map((p) => (
-          <Card key={`${p.fixture_id}-${p.market}-${p.selection}`} p={p} />
-        ))}
-      </div>
-    );
-  }
-
-  // full: Kick-Off / Confidence / History
   return (
     <Tabs defaultLabel="Kick-Off">
       <div label="Kick-Off">
