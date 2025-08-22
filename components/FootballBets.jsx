@@ -1,244 +1,143 @@
-// FILE: components/FootballBets.jsx
-import React, { useMemo } from "react";
-import useValueBets from "../hooks/useValueBets";
-import TicketPanel from "./TicketPanel";
-import Tabs from "./Tabs";
-import HistoryPanel from "./HistoryPanel";
+// components/FootballBets.js
+// Prikaz LOCKED liste iz /api/value-bets-locked,
+// sa "Zašto" summary + bullets (Forma, H2H) — bez promene vizuelnog stila.
 
-/** Utils */
-function parseISO(it) {
-  try {
-    const dt =
-      it?.datetime_local?.starting_at?.date_time ||
-      it?.datetime_local?.date_time ||
-      it?.time?.starting_at?.date_time ||
-      null;
-    if (!dt) return null;
-    const s = dt.replace(" ", "T");
-    const hasTZ = /Z$|[+-]\d{2}:\d{2}$/.test(s);
-    return hasTZ ? s : `${s}Z`;
-  } catch {
-    return null;
-  }
-}
-function kickoffMs(it) {
-  const iso = parseISO(it);
-  const t = iso ? new Date(iso).getTime() : NaN;
-  return Number.isFinite(t) ? t : NaN;
-}
-function fmtTime(it) {
-  const iso = parseISO(it);
-  const d = iso ? new Date(iso) : null;
-  return d
-    ? d.toLocaleTimeString([], {
-        timeZone: "Europe/Belgrade",
-        hour: "2-digit",
-        minute: "2-digit",
-      })
-    : "—";
-}
-function confPct(n) {
-  if (Number.isFinite(n)) return `${Math.round(n)}%`;
-  if (Number.isFinite(n?.confidence_pct)) return `${Math.round(n.confidence_pct)}%`;
-  return "—";
-}
-function todayYMD() {
-  const now = new Date();
-  const y = new Intl.DateTimeFormat("sv-SE", {
-    timeZone: "Europe/Belgrade",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(now);
-  return y;
-}
-// simple country -> emoji (fallback UEFA trophy)
-const FLAG = new Map(Object.entries({
-  "world": "🏆", "uefa": "🏆",
-  "england":"🇬🇧","scotland":"🏴","wales":"🏴","northern ireland":"🏴",
-  "spain":"🇪🇸","france":"🇫🇷","germany":"🇩🇪","italy":"🇮🇹","portugal":"🇵🇹","netherlands":"🇳🇱",
-  "belgium":"🇧🇪","switzerland":"🇨🇭","austria":"🇦🇹","croatia":"🇭🇷","serbia":"🇷🇸","bosnia and herzegovina":"🇧🇦","slovenia":"🇸🇮","hungary":"🇭🇺","romania":"🇷🇴","bulgaria":"🇧🇬","greece":"🇬🇷","turkiye":"🇹🇷","turkey":"🇹🇷",
-  "russia":"🇷🇺","ukraine":"🇺🇦","poland":"🇵🇱","czech-republic":"🇨🇿","czech republic":"🇨🇿","slovakia":"🇸🇰",
-  "usa":"🇺🇸","united-states":"🇺🇸","united states":"🇺🇸","canada":"🇨🇦","mexico":"🇲🇽","brazil":"🇧🇷","argentina":"🇦🇷","uruguay":"🇺🇾","chile":"🇨🇱","colombia":"🇨🇴","peru":"🇵🇪",
-  "japan":"🇯🇵","south-korea":"🇰🇷","south korea":"🇰🇷","china":"🇨🇳","india":"🇮🇳","bhutan":"🇧🇹","egypt":"🇪🇬","morocco":"🇲🇦",
-}));
-function flagEmoji(country, leagueName="") {
-  const c = String(country||"").toLowerCase().trim();
-  if (!c || c==="null" || c==="undefined" || c==="world") {
-    if (/uefa|champions|europa|conference/i.test(leagueName||"")) return "🏆";
-    return "🌍";
-  }
-  return FLAG.get(c) || "🏳️";
+import React, { useEffect, useMemo, useState } from "react";
+
+function parseKO(p){
+  const iso = p?.datetime_local?.starting_at?.date_time
+           || p?.datetime_local?.date_time
+           || p?.time?.starting_at?.date_time
+           || null;
+  if (!iso) return null;
+  try { return new Date(String(iso).replace(" ", "T")); } catch { return null; }
 }
 
-// ---- badge za confidence
-function confBadge(conf) {
-  if (conf >= 90) return "🔥 Top Pick";
-  if (conf >= 75) return "🟢 High";
-  if (conf >= 50) return "🔵 Moderate";
-  return "🟡 Low";
+function fmtKO(p, tz="Europe/Belgrade"){
+  const d = parseKO(p);
+  if (!d) return "";
+  return d.toLocaleString("sv-SE", {
+    timeZone: tz,
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
-function shortWhy(p) {
-  const s = p?.explain?.summary;
-  if (s && typeof s === "string" && s.trim()) return s.trim();
-  const mk = p?.market_label || p?.market || "";
-  const sel = p?.selection || "";
-  return [mk && sel ? `${mk}: ${sel}` : null].filter(Boolean).join(" · ");
+async function fetchLocked(){
+  const r = await fetch("/api/value-bets-locked", { cache: "no-store" });
+  if (!r.ok) throw new Error("locked fetch failed");
+  return r.json();
 }
 
-/** Single card */
-function Card({ pick }) {
-  const market = pick.market_label || pick.market || "";
-  const sel = pick.selection || "";
-  const odds = Number.isFinite(pick.market_odds) && pick.market_odds > 0 ? pick.market_odds.toFixed(2) : null;
-  const conf = Number.isFinite(pick.confidence_pct) ? pick.confidence_pct : null;
+export default function FootballBets({ limit = 25, layout = "full" }){
+  const [items, setItems] = useState([]);
+  const [builtAt, setBuiltAt] = useState(null);
 
-  const leagueName = pick.league?.name || "—";
-  const country = pick.league?.country || pick.league?.cc || null;
-  const flag = flagEmoji(country, leagueName);
+  useEffect(() => {
+    let alive = true;
+
+    const load = async () => {
+      try{
+        const data = await fetchLocked();
+        const arr = Array.isArray(data?.value_bets) ? data.value_bets : [];
+        if (!alive) return;
+        setItems(arr);
+        setBuiltAt(data?.built_at || null);
+      } catch {}
+    };
+
+    load();
+
+    // lagani auto-refresh (svakih 60s) — ne troši Football API (samo naš endpoint)
+    const t = setInterval(load, 60_000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+
+  // Top N po confidence→EV→KO (za Combined), inače samo isečemo limit redom
+  const sorted = useMemo(() => {
+    const arr = [...items];
+    if (layout === "combined"){
+      arr.sort((a,b)=>{
+        const ca = Number(a?.confidence_pct||0), cb = Number(b?.confidence_pct||0);
+        if (cb!==ca) return cb-ca;
+        const ea = Number(a?.ev||0), eb = Number(b?.ev||0);
+        if (eb!==ea) return eb-ea;
+        const ta = parseKO(a)?.getTime() ?? 9e15;
+        const tb = parseKO(b)?.getTime() ?? 9e15;
+        return ta - tb;
+      });
+    }
+    return limit > 0 ? arr.slice(0, limit) : arr;
+  }, [items, limit, layout]);
 
   return (
-    <div className="bg-[#1f2339] rounded-2xl p-4 h-full flex flex-col">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-xs text-slate-400 truncate">
-            <span className="mr-1">{flag}</span>{leagueName} • {fmtTime(pick)}
+    <div className="grid grid-cols-1 gap-4">
+      {sorted.map((p) => {
+        const league = `${p?.league?.name || ""}`;
+        const country = p?.league?.country ? ` • ${p.league.country}` : "";
+        const ko = fmtKO(p);
+        const home = p?.teams?.home?.name || "";
+        const away = p?.teams?.away?.name || "";
+        const market = p?.market_label || p?.market || "";
+        const sel = p?.selection || "";
+        const odds = Number.isFinite(p?.market_odds) ? p.market_odds : null;
+        const conf = Number(p?.confidence_pct || 0);
+        const badge =
+          conf >= 90 ? "bg-emerald-500" :
+          conf >= 75 ? "bg-emerald-400" :
+          conf >= 50 ? "bg-sky-400" :
+          "bg-amber-400";
+
+        const summary = p?.explain?.summary || "";
+        const bullets = Array.isArray(p?.explain?.bullets) ? p.explain.bullets : [];
+
+        return (
+          <div key={`${p.fixture_id}-${market}-${sel}`} className="rounded-2xl p-4 bg-[#151830]">
+            <div className="text-slate-300 text-sm mb-1">
+              <span className="font-semibold">🏆 {league}</span>
+              <span className="opacity-80">{country}</span>
+              {ko ? <span className="ml-2">• {ko}</span> : null}
+            </div>
+
+            <div className="text-lg font-semibold">
+              {home} <span className="opacity-70">vs</span> {away}
+            </div>
+
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <div className="px-3 py-1 rounded-full bg-[#1f2339] text-slate-200 text-sm">
+                {market}: <span className="font-bold">{sel}</span>{odds ? ` (${odds})` : ""}
+              </div>
+              <div className={`px-3 py-1 rounded-full text-white text-sm ${badge}`}>
+                {conf >= 90 ? "🔥 Top Pick" :
+                 conf >= 75 ? "🟢 High" :
+                 conf >= 50 ? "🔵 Moderate" : "🟠 Low"}{" "}
+                <span className="opacity-90 ml-1">({conf}%)</span>
+              </div>
+            </div>
+
+            {/* Zašto: summary + bullets (Forma, H2H…) */}
+            {(summary || bullets.length) && (
+              <div className="mt-3 text-slate-300 text-sm">
+                <div><span className="font-semibold">Zašto:</span> {summary}</div>
+                {bullets.length > 0 && (
+                  <ul className="mt-1 list-disc list-inside space-y-0.5">
+                    {bullets.map((b, i) => (
+                      <li key={i} className="opacity-90">{b}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
           </div>
-          <div className="text-base font-semibold text-white leading-snug">
-            <span className="truncate block">
-              {pick.teams?.home?.name} vs {pick.teams?.away?.name}
-            </span>
-          </div>
+        );
+      })}
 
-          <div className="text-sm text-slate-200 mt-1">
-            <span className="font-semibold">{market}</span>: {sel}
-            {odds ? <span className="text-slate-400"> ({odds})</span> : null}
-          </div>
+      {/* sitna napomena o snapshotu */}
+      {builtAt && (
+        <div className="text-xs text-slate-500 mt-1">
+          Snapshot: {new Date(builtAt).toLocaleString("sv-SE", { hour12: false })}
         </div>
-
-        <div className="shrink-0 text-right">
-          <div className="text-xs text-slate-300">{confBadge(conf || 0)}</div>
-        </div>
-      </div>
-
-      <div className="mt-3 text-[13px] text-slate-300">
-        <span className="text-slate-400">Zašto: </span>
-        {shortWhy(pick) || "Povoljan odnos kvote i modela."}
-      </div>
-
-      {pick._insight_line ? (
-        <div className="mt-2 text-[12px] text-slate-400">
-          {pick._insight_line}
-        </div>
-      ) : null}
-
-      <div className="flex-1" />
-
-      <div className="mt-4">
-        <div className="flex items-center justify-between text-xs text-slate-400">
-          <span>Confidence</span>
-          <span className="text-white">{confPct(conf)}</span>
-        </div>
-        <div className="mt-1 w-full h-2 bg-white/10 rounded-full overflow-hidden">
-          <div
-            className={`h-2 ${
-              conf >= 90
-                ? "bg-orange-400"
-                : conf >= 75
-                ? "bg-emerald-400"
-                : conf >= 50
-                ? "bg-sky-400"
-                : "bg-amber-400"
-            }`}
-            style={{ width: `${Math.max(0, Math.min(100, conf || 0))}%` }}
-          />
-        </div>
-      </div>
+      )}
     </div>
-  );
-}
-
-export default function FootballBets({ limit = 10, layout = "full" }) {
-  const date = todayYMD();
-  const { bets = [], loading, error } = useValueBets(date);
-
-  // Pripremi dve sortirane varijante
-  const base = Array.isArray(bets) ? bets.slice() : [];
-
-  const byKickoff = useMemo(() => {
-    const arr = base.slice();
-    arr.sort((a, b) => kickoffMs(a) - kickoffMs(b));
-    return arr;
-  }, [base]);
-
-  const byConfidence = useMemo(() => {
-    const arr = base.slice();
-    arr.sort((a, b) => (b.confidence_pct || 0) - (a.confidence_pct || 0) || ((Number.isFinite(b.ev)?b.ev:-Infinity) - (Number.isFinite(a.ev)?a.ev:-Infinity)));
-    return arr;
-  }, [base]);
-
-  if (loading) return <div className="text-slate-400 text-sm">Loading football…</div>;
-  if (error) return <div className="text-amber-400 text-sm">Football feed error: {String(error)}</div>;
-
-  if (layout === "combined") {
-    // Combined ostaje isti — Top N po confidence
-    const topCombined = byConfidence.slice(0, limit);
-    return (
-      <div className="grid grid-cols-1 gap-4 items-stretch">
-        {topCombined.map((p) => (
-          <Card key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}`} pick={p} />
-        ))}
-        {topCombined.length === 0 && <div className="text-slate-400 text-sm">No football suggestions.</div>}
-      </div>
-    );
-  }
-
-  // FULL layout: tri taba — Kick-Off / Confidence / History
-  return (
-    <Tabs defaultLabel="Kick-Off">
-      {/* Kick-Off tab (Soonest) */}
-      <div label="Kick-Off">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-start">
-          {/* LEFT: Singles (Top N) */}
-          <div className="md:col-span-2">
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch">
-              {byKickoff.slice(0, limit).map((p) => (
-                <Card key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}`} pick={p} />
-              ))}
-              {byKickoff.length === 0 && <div className="text-slate-400 text-sm">No football suggestions.</div>}
-            </div>
-          </div>
-
-          {/* RIGHT: Tickets */}
-          <div className="md:col-span-1">
-            <TicketPanel bets={byKickoff} />
-          </div>
-        </div>
-      </div>
-
-      {/* Confidence tab (High → Low) */}
-      <div label="Confidence">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-start">
-          {/* LEFT: Singles (Top N) */}
-          <div className="md:col-span-2">
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch">
-              {byConfidence.slice(0, limit).map((p) => (
-                <Card key={p.fixture_id || `${p.league?.id}-${p.teams?.home?.name}`} pick={p} />
-              ))}
-              {byConfidence.length === 0 && <div className="text-slate-400 text-sm">No football suggestions.</div>}
-            </div>
-          </div>
-
-          {/* RIGHT: Tickets */}
-          <div className="md:col-span-1">
-            <TicketPanel bets={byConfidence} />
-          </div>
-        </div>
-      </div>
-
-      {/* History tab (Top pickovi po slotu sa FT ishodom) */}
-      <HistoryPanel label="History" />
-    </Tabs>
   );
 }
