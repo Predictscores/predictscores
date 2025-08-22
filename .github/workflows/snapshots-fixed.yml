@@ -5,7 +5,7 @@ on:
     - cron: '0 8 * * *'   # 10:00 lokalno (CET/CEST)
     - cron: '0 13 * * *'  # 15:00 lokalno
     - cron: '0 22 * * *'  # 00:00 lokalno
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
   run:
@@ -16,7 +16,8 @@ jobs:
       - name: Pick slot (AM/PM/LATE)
         id: pick
         run: |
-          S="${{ github.event.schedule || '' }}"
+          S="${{ github.event.schedule }}"
+          if [ -z "$S" ]; then S="manual"; fi
           if   [ "$S" = "0 8 * * *" ];  then SLOT=am;
           elif [ "$S" = "0 13 * * *" ]; then SLOT=pm;
           elif [ "$S" = "0 22 * * *" ]; then SLOT=late;
@@ -27,9 +28,9 @@ jobs:
             elif [ "$H" -ge 22 ] && [ "$H" -lt 23 ]; then SLOT=late;
             else SLOT=pm; fi
           fi
-          echo "slot=$SLOT" >> $GITHUB_OUTPUT
+          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
 
-      - name: Rebuild snapshot for ${{ steps.pick.outputs.slot }}
+      - name: Rebuild snapshot for slot
         run: |
           curl -fsS "$BASE/api/cron/rebuild?slot=${{ steps.pick.outputs.slot }}"
 
@@ -39,7 +40,7 @@ jobs:
           sleep 5
           curl -fsS "$BASE/api/cron/refresh-odds" || true
 
-      - name: Build insights (Zašto: forma + H2H)
+      - name: "Build insights (Zasto: forma + H2H)"
         run: |
           curl -fsS "$BASE/api/insights-build" || true
 
