@@ -1,10 +1,12 @@
+// components/CombinedBets.jsx
 import React from "react";
 import Tabs from "./Tabs";
 import FootballBets from "./FootballBets";
 import CryptoTopSignals from "./CryptoTopSignals";
 
 /**
- * Combined: levo Football (Top 3), desno Crypto (Top 3)
+ * Combined: levo Football (Top 3), desno Crypto (Top 3).
+ * VAŽNO: za combined layout FootballBets skriva tikete i tabove.
  */
 const CombinedBets = () => (
   <Tabs>
