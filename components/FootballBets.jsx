@@ -110,29 +110,96 @@ function impliedFromOdds(odds) {
   const o = Number(odds);
   return o > 0 ? 100 / o : null;
 }
-function oneLineExplain(p) {
-  const summary = typeof p?.explain?.summary === "string" ? p.explain.summary.trim() : "";
-  if (summary) return `Zašto: ${summary}`;
 
-  const text = typeof p?.explain?.text === "string" ? p.explain.text.trim() : "";
-  if (text) return `Zašto: ${text.split("\n")[0]}`;
-
+/* ---------- two-line explain builder (tačno 2 reda) ---------- */
+function twoLineExplain(p) {
+  // pokušaj da pročita bullets iz insights-a
   const bullets = Array.isArray(p?.explain?.bullets) ? p.explain.bullets : [];
-  if (bullets.length) return `Zašto: ${String(bullets[0]).trim()}`;
 
-  const mp = pct(p?.model_prob);
-  const ip = pct(p?.implied_prob ?? impliedFromOdds(p?.market_odds));
-  const ev = pct(p?.ev);
-  const bookAll = Number.isFinite(p?.bookmakers_count) ? p.bookmakers_count : null;
-  const bookTr  = Number.isFinite(p?.bookmakers_count_trusted) ? p.bookmakers_count_trusted : null;
-  const parts = [];
-  if (mp != null && ip != null) parts.push(`Model ${mp}% vs ${ip}%`);
-  if (ev != null) parts.push(`EV ${ev}%`);
-  if (bookAll != null) parts.push(`Bookies ${bookAll}${bookTr!=null?` (trusted ${bookTr})`:""}`);
-  return parts.length ? `Zašto: ${parts.join(" · ")}` : "";
+  let formLine = null;
+  let h2hLine  = null;
+
+  // Nađi "Forma:" i "H2H"
+  const formaBullet = bullets.find((b) => typeof b === "string" && b.trim().toLowerCase().startsWith("forma"));
+  const h2hBullet   = bullets.find((b) => typeof b === "string" && b.toLowerCase().includes("h2h"));
+
+  // Regex za: "Forma: Home W-D-L (GF:x:GA:y) · Away W-D-L (GF:x:GA:y)"
+  const reForma = /Forma:\s*.+?\s(\d+)-(\d+)-(\d+)\s*\(GF:(\d+):GA:(\d+)\)\s*·\s*.+?\s(\d+)-(\d+)-(\d+)\s*\(GF:(\d+):GA:(\d+)\)/i;
+  // Regex za: "H2H (L5): W-D-L (GF:x:GA:y)"
+  const reH2H   = /H2H.*?:\s*(\d+)-(\d+)-(\d+)\s*\(GF:(\d+):GA:(\d+)\)/i;
+
+  let wH, dH, lH, gfH, gaH, wA, dA, lA, gfA, gaA;
+  let w2=0, d2=0, l2=0, gf2=0, ga2=0;
+
+  if (typeof formaBullet === "string") {
+    const m = formaBullet.match(reForma);
+    if (m) {
+      wH = Number(m[1]); dH = Number(m[2]); lH = Number(m[3]);
+      gfH = Number(m[4]); gaH = Number(m[5]);
+      wA = Number(m[6]); dA = Number(m[7]); lA = Number(m[8]);
+      gfA = Number(m[9]); gaA = Number(m[10]);
+    }
+  }
+  if (typeof h2hBullet === "string") {
+    const m2 = h2hBullet.match(reH2H);
+    if (m2) {
+      w2 = Number(m2[1]); d2 = Number(m2[2]); l2 = Number(m2[3]);
+      gf2 = Number(m2[4]); ga2 = Number(m2[5]);
+    }
+  }
+
+  // 1. red — kratko objašnjenje
+  let line1 = null;
+  if (wH != null && wA != null) {
+    const ptsH = wH * 3 + dH;
+    const ptsA = wA * 3 + dA;
+
+    const parts = [];
+    if (ptsH >= ptsA + 1) parts.push("Domaćin u boljoj formi.");
+    else if (ptsA >= ptsH + 1) parts.push("Gost u boljoj formi.");
+
+    // ko "prima dosta golova"
+    if (gaA != null && gaH != null) {
+      const manyA = gaA >= 9 || gaA - gaH >= 3; // ~1.8+ po meču ili znatno više od domaćina
+      const manyH = gaH >= 9 || gaH - gaA >= 3;
+      if (manyA) parts.push("Gost prima dosta golova.");
+      else if (manyH) parts.push("Domaćin prima dosta golova.");
+    }
+
+    // fallback ako ništa nije upalo
+    if (parts.length === 0) {
+      const sel = p?.selection ? `izboru **${p.selection}**` : "izboru";
+      parts.push(`Model daje prednost ${sel}.`);
+    }
+    line1 = `Zašto: ${parts.join(" ")}`;
+  }
+
+  // 2. red — fiksni format
+  if (wH != null && wA != null) {
+    formLine =
+      `Forma: D W${wH} D${dH} L${lH}  G W${wA} D${dA} L${lA}`;
+  } else {
+    formLine = "Forma: —  G —";
+  }
+  if (h2hBullet) {
+    h2hLine = `H2H: W${w2} D${d2} L${l2}  GD: ${gf2}:${ga2}`;
+  } else {
+    h2hLine = "H2H: —  GD: —";
+  }
+
+  if (!line1) {
+    // nema forma bullet-a → upotrebi summary/text
+    const summary = typeof p?.explain?.summary === "string" ? p.explain.summary.trim() : "";
+    const text = typeof p?.explain?.text === "string" ? p.explain.text.trim() : "";
+    const fallback = summary || text || "";
+    line1 = fallback ? `Zašto: ${fallback}` : "Zašto: —";
+  }
+
+  const line2 = `${formLine}  ${h2hLine}`;
+  return { line1, line2 };
 }
 
-/* ---- group for side panel ---- */
+/* ---- side panel grupisanje ---- */
 function bucketLabel(p) {
   const m = String(p?.market_label || p?.market || "").toUpperCase();
   if (m.includes("BTTS")) return "BTTS";
@@ -176,6 +243,9 @@ function Card({ p }) {
   const price = p?.market_odds ?? p?.odds ?? p?.price;
   const conf = p?.confidence_pct ?? p?.confidence ?? 0;
 
+  // >>> dva reda, 1:1 format
+  const { line1, line2 } = twoLineExplain(p);
+
   return (
     <div className="rounded-2xl p-4 shadow bg-[#131722] border border-[#252b3b]">
       <div className="flex items-center justify-between text-xs opacity-80 mb-1">
@@ -191,7 +261,9 @@ function Card({ p }) {
         {market}: <b>{sel}</b> {price ? <span>({price})</span> : null}
       </div>
 
-      <div className="text-sm opacity-90 mb-3">{oneLineExplain(p)}</div>
+      {/* tačno 2 reda */}
+      <div className="text-sm opacity-90">{line1}</div>
+      <div className="text-sm opacity-90 mb-3">{line2}</div>
 
       <div className="text-xs opacity-80 mb-1">Confidence</div>
       <div className="h-2 rounded bg-slate-700">
@@ -249,7 +321,8 @@ function SidePanelTopLeagues({ items }) {
               {(p?.market_label || p?.market || "")}: <b>{p?.selection || ""}</b>
             </div>
             <div className="text-xs opacity-80">
-              {oneLineExplain(p).replace(/^Zašto:\s*/,'')}
+              {/* skraćeno, bez “Zašto:” prefiksa */}
+              {(twoLineExplain(p).line1 || "").replace(/^Zašto:\s*/,'')}
             </div>
           </div>
         ))}
@@ -283,7 +356,7 @@ function computeStats(rows, days) {
       r?.ko ||
       r?.date;
     const t = take(dt);
-    return Number.isFinite(t) ? now - t <= ms : true; // ako nema datum, ne odbacuj
+    return Number.isFinite(t) ? now - t <= ms : true;
   };
   const subset = (rows || []).filter(inRange);
 
@@ -389,7 +462,7 @@ export default function FootballBets({ limit, layout = "full" }) {
     return list;
   }, [items]);
 
-  /* -------- Combined: samo top N kartica (bez tabova, bez side panela) -------- */
+  // Combined: samo top N kartica
   if (layout === "combined") {
     const combinedTop =
       typeof limit === "number" ? byConfidence.slice(0, limit) : byConfidence.slice(0, 3);
@@ -404,7 +477,7 @@ export default function FootballBets({ limit, layout = "full" }) {
     );
   }
 
-  /* -------- Football tab (1:1 kao na screenshotu) -------- */
+  // Football tab (Kick-Off / Confidence / History) + desni panel
   if (loading) return <div className="opacity-70">Učitavanje…</div>;
   if (error)   return <div className="text-red-400">Greška: {String(error)}</div>;
 
