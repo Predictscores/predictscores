@@ -3,7 +3,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-/* ---------------- data hook ---------------- */
+/* ===================== data ===================== */
 function useLockedValueBets() {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -13,18 +13,29 @@ function useLockedValueBets() {
     try {
       setLoading(true);
       setError(null);
+
       const r = await fetch("/api/value-bets-locked", { cache: "no-store" });
       const ct = r.headers.get("content-type") || "";
-      const body = ct.includes("application/json") ? await r.json() : await r.text().then(t=>{ try{return JSON.parse(t);}catch{return {ok:false,error:"non-JSON"}}});
+      const body = ct.includes("application/json")
+        ? await r.json()
+        : await r.text().then((t) => {
+            try {
+              return JSON.parse(t);
+            } catch {
+              return { ok: false, error: "non-JSON" };
+            }
+          });
+
       const arr = Array.isArray(body?.items)
         ? body.items
         : Array.isArray(body?.value_bets)
         ? body.value_bets
         : [];
+
       setItems(arr);
     } catch (e) {
       setError(String(e?.message || e));
-      setItems([]); // nikad ne ruši render
+      setItems([]);
     } finally {
       setLoading(false);
     }
@@ -32,6 +43,7 @@ function useLockedValueBets() {
 
   useEffect(() => {
     load();
+    // periodični refresh samo 1x/min — bez ikakvih cron-ova
     const id = setInterval(load, 60_000);
     return () => clearInterval(id);
   }, []);
@@ -39,7 +51,7 @@ function useLockedValueBets() {
   return { items, loading, error, reload: load };
 }
 
-/* ---------------- helpers ---------------- */
+/* ===================== helpers ===================== */
 function getKOISO(p) {
   const raw =
     p?.datetime_local?.starting_at?.date_time ||
@@ -49,59 +61,57 @@ function getKOISO(p) {
   if (!raw) return null;
   return raw.includes("T") ? raw : raw.replace(" ", "T");
 }
-function koCET(p, withDate = true, tz = "Europe/Belgrade") {
+function parseKOms(p) {
   const iso = getKOISO(p);
-  if (!iso) return "";
-  const d = new Date(iso); // ulaz je UTC; render u CET
-  const opts = withDate
-    ? { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }
-    : { timeZone: tz, hour: "2-digit", minute: "2-digit" };
-  return new Intl.DateTimeFormat("sv-SE", opts).format(d);
+  const t = iso ? Date.parse(iso) : NaN;
+  return Number.isFinite(t) ? t : null;
+}
+function koCET(p, tz = "Europe/Belgrade") {
+  const t = parseKOms(p);
+  if (!t) return "";
+  const d = new Date(t);
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(d);
 }
 function pct(x) {
   if (!Number.isFinite(x)) return null;
   const v = x > 1 ? x : x * 100;
   return Math.round(v * 10) / 10;
 }
-function evPct(p) {
-  const ev = Number(p?.ev);
-  if (Number.isFinite(ev)) return pct(ev);
-  return null;
-}
-function whyFallback(p) {
-  const mp = pct(p?.model_prob);
-  const ip = pct(p?.implied_prob ?? (p?.market_odds ? 100 / p.market_odds : null));
-  const ev = evPct(p);
-  const bookAll = Number.isFinite(p?.bookmakers_count) ? p.bookmakers_count : null;
-  const bookTr  = Number.isFinite(p?.bookmakers_count_trusted) ? p.bookmakers_count_trusted : null;
-  const parts = [];
-  if (mp != null && ip != null) parts.push(`Model ${mp}% vs ${ip}%`);
-  if (ev != null) parts.push(`EV ${ev}%`);
-  if (bookAll != null) parts.push(`Bookies ${Math.max(0, bookAll)}${bookTr!=null?` (trusted ${Math.max(0, bookTr)})`:""}`);
-  return parts.length ? `Zašto: ${parts.join(" · ")}` : "";
-}
-function formatWhyAndForm(p) {
-  const summary = typeof p?.explain?.summary === "string" ? p.explain.summary.trim() : "";
+function whyText2lines(p) {
+  // 1) Zašto — ako ima bullets (osim Forma/H2H), koristi njih, inače fallback
   const bullets = Array.isArray(p?.explain?.bullets) ? p.explain.bullets : [];
-
-  // pokupi "forma/h2h" u jedan red
-  const formaLine =
-    bullets.find((b) => /^forma:/i.test((b?.trim?.() || ""))) || null;
-  const h2hLine =
-    bullets.find((b) => /^h2h/i.test((b?.trim?.() || ""))) || null;
-
-  // Zašto (kratko): uzmi sve osim forma/h2h ili koristi summary, pa fallback
   const whyList = bullets.filter(
-    (b) => !/^h2h|^h2h \(l5\)|^forma:/i.test((b?.trim?.() || ""))
+    (b) => !/^forma:|^h2h/i.test((b || "").trim())
   );
-
-  const zasto = whyList.length
+  let zasto = whyList.length
     ? `Zašto: ${whyList.join(". ").replace(/\.\s*$/, "")}.`
-    : summary
-    ? `Zašto: ${summary.replace(/\.\s*$/, "")}.`
-    : whyFallback(p);
+    : (() => {
+        const mp = pct(p?.model_prob);
+        const ip =
+          pct(p?.implied_prob ??
+            (p?.market_odds ? 100 / p.market_odds : undefined)) ?? null;
+        const ev = pct(p?.ev);
+        const parts = [];
+        if (mp != null && ip != null) parts.push(`Model ${mp}% vs ${ip}%`);
+        if (ev != null) parts.push(`EV ${ev}%`);
+        const ba = Number.isFinite(p?.bookmakers_count) ? p.bookmakers_count : null;
+        const bt = Number.isFinite(p?.bookmakers_count_trusted) ? p.bookmakers_count_trusted : null;
+        if (ba != null) parts.push(`Bookies ${ba}${bt!=null?` (trusted ${bt})`:""}`);
+        return parts.length ? `Zašto: ${parts.join(" · ")}.` : "";
+      })();
 
-  // Forma u jednom redu
+  // 2) Forma — sve u JEDAN red (Forma + H2H)
+  const formaLine =
+    bullets.find((b) => /^forma:/i.test((b || "").trim())) || null;
+  const h2hLine = bullets.find((b) => /^h2h/i.test((b || "").trim())) || null;
+
   let forma = "";
   if (formaLine || h2hLine) {
     const f = formaLine ? formaLine.replace(/^forma:\s*/i, "").trim() : "";
@@ -113,203 +123,216 @@ function formatWhyAndForm(p) {
 
   return [zasto, forma].filter(Boolean).join("\n");
 }
-function parseKOms(p) {
-  const iso = getKOISO(p);
-  const t = iso ? Date.parse(iso) : NaN;
-  return Number.isFinite(t) ? t : null;
+function flagFromLeague(league) {
+  // koristi league.flag ili league.country_code; fallback: nema zastave
+  const code =
+    league?.country_code ||
+    league?.flag?.replace(/.*\/([A-Z]{2})\.svg$/i, "$1") ||
+    null;
+  if (!code) return "";
+  const cc = code.toUpperCase();
+  // Regional indicator letters
+  const A = 0x1f1e6;
+  const Z = 0x1f1ff;
+  const a = cc.charCodeAt(0) - 65 + A;
+  const b = cc.charCodeAt(1) - 65 + A;
+  if (a < A || a > Z || b < A || b > Z) return "";
+  return String.fromCodePoint(a) + String.fromCodePoint(b);
 }
 
-/* ---------------- Tickets (3×) ---------------- */
-function buildTickets(items) {
-  const top = [...(Array.isArray(items) ? items : [])]
-    .sort((a, b) => (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0) || (b?.ev ?? 0) - (a?.ev ?? 0))
-    .slice(0, 3);
-  return [
-    { label: "Ticket A", picks: top.slice(0, 1) },
-    { label: "Ticket B", picks: top.slice(0, 2) },
-    { label: "Ticket C", picks: top.slice(0, 3) },
-  ];
-}
-function TicketsBlock({ items }) {
-  const tickets = useMemo(() => buildTickets(items), [items]);
-  if (!tickets.length) return null;
-  return (
-    <div className="grid md:grid-cols-3 gap-3 mb-4">
-      {tickets.map((t) => (
-        <div
-          key={t.label}
-          className="rounded-2xl p-4 shadow bg-neutral-900/60 border border-neutral-800"
-        >
-          <div className="text-sm opacity-80 mb-2">{t.label}</div>
-          <ul className="space-y-2">
-            {t.picks.map((p, idx) => {
-              if (!p) return null;
-              const league = p?.league?.name || p?.league_name || "";
-              const home = p?.teams?.home?.name || p?.teams?.home || p?.home || "";
-              const away = p?.teams?.away?.name || p?.teams?.away || p?.away || "";
-              const mk = p?.market_label || p?.market || "";
-              const sel = p?.selection || "";
-              return (
-                <li key={idx} className="text-sm">
-                  <span className="opacity-70">{league}</span>{" • "}
-                  <strong>{home} vs {away}</strong>{" "}
-                  — <span>{mk}: <b>{sel}</b></span>
-                </li>
-              );
-            })}
-          </ul>
-        </div>
-      ))}
-    </div>
+/* ===================== right panel: top by market ===================== */
+function groupTopByMarket(items, take = 3) {
+  const label = (p) => (p?.market_label || p?.market || "").toUpperCase();
+
+  const is1X2 = (p) => /^1X2\b/.test(label(p));
+  const isBTTS = (p) => /^BTTS\b(?!.*1H)/.test(label(p)); // ne BTTS 1H
+  const isOU25 = (p) => /^OU\s*2\.?5\b/i.test(label(p)) || /^O[UV]\s*2\.?5\b/i.test(label(p));
+  const isHTFT = (p) => /^HT[-\s]?FT\b/i.test(label(p));
+
+  const sorted = [...items].sort(
+    (a, b) =>
+      (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0) ||
+      (b?.ev ?? 0) - (a?.ev ?? 0)
   );
+
+  return {
+    BTTS: sorted.filter(isBTTS).slice(0, take),
+    "OU 2.5": sorted.filter(isOU25).slice(0, take),
+    "HT-FT": sorted.filter(isHTFT).slice(0, take),
+    "1X2": sorted.filter(is1X2).slice(0, take),
+  };
 }
 
-/* ---------------- Card ---------------- */
+/* ===================== UI ===================== */
 function Card({ p }) {
   const league = p?.league?.name || p?.league_name || "";
-  const ko = koCET(p, true, "Europe/Belgrade");
+  const ko = koCET(p);
   const home = p?.teams?.home?.name || p?.teams?.home || p?.home || "";
   const away = p?.teams?.away?.name || p?.teams?.away || p?.away || "";
   const market = p?.market_label || p?.market || "";
   const sel = p?.selection || "";
   const price = p?.market_odds ?? p?.odds ?? p?.price;
   const conf = p?.confidence_pct ?? p?.confidence ?? 0;
-
-  const whyText = formatWhyAndForm(p);
+  const flag = flagFromLeague(p?.league);
 
   return (
     <div className="rounded-2xl p-4 shadow bg-neutral-900/60 border border-neutral-800">
       <div className="text-xs opacity-70 mb-1">
+        {flag && <span className="mr-1">{flag}</span>}
         {league} • {ko}
       </div>
       <div className="text-lg font-semibold mb-1">
         {home} vs {away}
       </div>
-      <div className="text-sm mb-2">
+      <div className="text-sm mb-3">
         {market}: <b>{sel}</b> {price ? <span>({price})</span> : null}
       </div>
 
-      {!!whyText && (
-        <div className="text-sm opacity-90 mb-3 whitespace-pre-line">{whyText}</div>
-      )}
+      <div className="text-sm opacity-90 mb-3 whitespace-pre-line">
+        {whyText2lines(p)}
+      </div>
 
       <div className="text-xs opacity-70 mb-1">Confidence</div>
-      <div className="h-2 bg-neutral-800 rounded">
+      <div className="h-2 bg-neutral-800 rounded relative">
         <div
           className="h-2 rounded bg-yellow-500"
           style={{ width: `${Math.max(0, Math.min(100, conf))}%` }}
         />
+        <div className="absolute -top-5 right-0 text-xs opacity-80">{Math.round(conf)}%</div>
       </div>
     </div>
   );
 }
 
-/* ---------------- Tabs (lokalni) ---------------- */
-function TabsInline({ active, onChange }) {
-  const Btn = (k, label) => (
-    <button
-      key={k}
-      onClick={() => onChange(k)}
-      className={`px-3 py-1.5 rounded-full text-sm border ${
-        active === k
-          ? "bg-white text-black border-white"
-          : "border-neutral-700 text-neutral-300"
-      }`}
-      type="button"
-    >
-      {label}
-    </button>
+function RightPanel({ groups }) {
+  const Section = ({ title, rows }) => (
+    <div className="rounded-2xl p-4 shadow bg-neutral-900/60 border border-neutral-800">
+      <div className="font-semibold mb-3">{title}</div>
+      {!rows?.length ? (
+        <div className="text-sm opacity-70">Nema dovoljno kandidata.</div>
+      ) : (
+        <div className="space-y-3">
+          {rows.map((p, i) => {
+            const league = p?.league?.name || p?.league_name || "";
+            const home = p?.teams?.home?.name || p?.teams?.home || p?.home || "";
+            const away = p?.teams?.away?.name || p?.teams?.away || p?.away || "";
+            const ko = koCET(p);
+            const market = p?.market_label || p?.market || "";
+            const sel = p?.selection || "";
+            const price = p?.market_odds ?? p?.odds ?? p?.price;
+            return (
+              <div key={`${p?.fixture_id ?? p?.id ?? i}`} className="text-sm">
+                <div className="opacity-70 text-xs mb-0.5">{league} • {ko}</div>
+                <div className="font-medium">{home} vs {away}</div>
+                <div className="opacity-90">{market}: <b>{sel}</b>{price ? ` (${price})` : ""}</div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
+
   return (
-    <div className="flex items-center gap-2 mb-3">
-      {Btn("kick", "Kick-Off")}
-      {Btn("conf", "Confidence")}
-      {Btn("hist", "History (14d)")}
+    <div className="space-y-4">
+      <Section title="BTTS (3)" rows={groups["BTTS"]} />
+      <Section title="OU 2.5 (3)" rows={groups["OU 2.5"]} />
+      <Section title="HT-FT (3)" rows={groups["HT-FT"]} />
+      <Section title="1X2 (3)" rows={groups["1X2"]} />
     </div>
   );
 }
 
-/* ---------------- Main ---------------- */
-export default function FootballBets({ limit, layout = "full" }) {
+/* ===================== main ===================== */
+export default function FootballBets({ limit = 50, layout = "full" }) {
   const { items, loading, error } = useLockedValueBets();
   const [tab, setTab] = useState("kick");
 
-  // sortiranja
-  const byKickoff = useMemo(() => {
-    const list = Array.isArray(items) ? [...items] : [];
-    list.sort((a, b) => (parseKOms(a) ?? 9e15) - (parseKOms(b) ?? 9e15));
-    return list;
+  // baci prošle mečeve (ostavi malo tolerancije)
+  const future = useMemo(() => {
+    const now = Date.now() - 60_000; // −1 min tolerancije
+    return (Array.isArray(items) ? items : []).filter((p) => (parseKOms(p) ?? 0) >= now);
   }, [items]);
 
+  const byKickoff = useMemo(() => {
+    const list = [...future];
+    list.sort((a, b) => (parseKOms(a) ?? 9e15) - (parseKOms(b) ?? 9e15));
+    return list.slice(0, limit);
+  }, [future, limit]);
+
   const byConfidence = useMemo(() => {
-    const list = Array.isArray(items) ? [...items] : [];
+    const list = [...future];
     list.sort(
       (a, b) =>
         (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0) ||
         (b?.ev ?? 0) - (a?.ev ?? 0)
     );
-    return list;
-  }, [items]);
+    return list.slice(0, limit);
+  }, [future, limit]);
 
-  // u Combined layoutu: bez tiketa i bez tabova, uzmi top N po confidence
-  const combinedTop = useMemo(() => {
-    const base = byConfidence;
-    return typeof limit === "number" ? base.slice(0, limit) : base.slice(0, 3);
-  }, [byConfidence, limit]);
+  const marketGroups = useMemo(() => groupTopByMarket(future, 3), [future]);
 
   if (loading) return <div className="opacity-70">Učitavanje…</div>;
   if (error) return <div className="text-red-400">Greška: {String(error)}</div>;
 
-  // COMBINED layout
   if (layout === "combined") {
+    // u Combined: bez desnog panela, uzmi top 3 po confidence
+    const top3 = byConfidence.slice(0, 3);
     return (
-      <div className="space-y-4">
-        <div className="grid grid-cols-1 gap-4">
-          {combinedTop.map((p, i) => (
-            <Card key={`${p?.fixture_id ?? p?.id ?? i}`} p={p} />
-          ))}
-        </div>
+      <div className="grid grid-cols-1 gap-4">
+        {top3.map((p, i) => (
+          <Card key={`${p?.fixture_id ?? p?.id ?? i}`} p={p} />
+        ))}
       </div>
     );
   }
 
-  // FULL layout (Football tab): tiketi + tabovi
-  const listKick =
-    typeof limit === "number" ? byKickoff.slice(0, limit) : byKickoff;
-  const listConf =
-    typeof limit === "number" ? byConfidence.slice(0, limit) : byConfidence;
-
+  // FOOTBALL TAB: 2 kolone (levo kartice sa tabovima, desno 3× market liste)
   return (
-    <div className="space-y-4">
-      {Array.isArray(items) && items.length > 0 && <TicketsBlock items={items} />}
-
-      <TabsInline active={tab} onChange={setTab} />
-
-      {!items?.length && (
-        <div className="opacity-70">Nema dostupnih predloga.</div>
-      )}
-
-      {tab === "kick" && (
-        <div className="grid lg:grid-cols-2 gap-4">
-          {listKick.map((p, i) => (
-            <Card key={`${p?.fixture_id ?? p?.id ?? i}`} p={p} />
+    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <div className="lg:col-span-2 space-y-4">
+        <div className="flex items-center gap-2">
+          {["kick", "conf", "hist"].map((k) => (
+            <button
+              key={k}
+              onClick={() => setTab(k)}
+              className={
+                "px-4 py-2 rounded-full text-sm font-semibold transition " +
+                (tab === k
+                  ? "bg-white text-black"
+                  : "bg-[#1f2339] text-slate-300 hover:bg-[#202542]")
+              }
+              type="button"
+            >
+              {k === "kick" ? "Kick-Off" : k === "conf" ? "Confidence" : "History (14d)"}
+            </button>
           ))}
         </div>
-      )}
 
-      {tab === "conf" && (
-        <div className="grid lg:grid-cols-2 gap-4">
-          {listConf.map((p, i) => (
-            <Card key={`${p?.fixture_id ?? p?.id ?? i}`} p={p} />
-          ))}
-        </div>
-      )}
+        {tab === "kick" && (
+          <div className="grid md:grid-cols-2 gap-4">
+            {byKickoff.map((p, i) => (
+              <Card key={`${p?.fixture_id ?? p?.id ?? i}`} p={p} />
+            ))}
+          </div>
+        )}
+        {tab === "conf" && (
+          <div className="grid md:grid-cols-2 gap-4">
+            {byConfidence.map((p, i) => (
+              <Card key={`${p?.fixture_id ?? p?.id ?? i}`} p={p} />
+            ))}
+          </div>
+        )}
+        {tab === "hist" && (
+          <div className="rounded-2xl p-4 border border-neutral-800 bg-neutral-900/60 text-sm opacity-80">
+            History (14d) prikaz ostaje isti — puni se iz nightly procesa.
+          </div>
+        )}
+      </div>
 
-      {tab === "hist" && (
-        <div className="rounded-2xl p-4 border border-neutral-800 bg-neutral-900/60 text-sm opacity-80">
-          History (14d) će se puniti iz nightly procesa.
-        </div>
-      )}
+      <div className="lg:col-span-1">
+        <RightPanel groups={marketGroups} />
+      </div>
     </div>
   );
 }
