@@ -5,32 +5,30 @@ import FootballBets from "./FootballBets";
 import CryptoTopSignals from "./CryptoTopSignals";
 
 /**
- * Combined: levo Top 3 FOOTBALL, desno Top 3 CRYPTO.
- * NEMA tiketa u Combined.
+ * Combined: levo Football (Top 3), desno Crypto (Top 3).
+ * VAŽNO: za combined layout FootballBets skriva tikete i tabove.
  */
-export default function CombinedBets() {
-  return (
-    <Tabs>
-      <div label="Combined">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-stretch">
-          <div className="md:col-span-2">
-            {/* Football — samo Top N kartica, bez tabova i side panela */}
-            <FootballBets limit={3} layout="combined" />
-          </div>
-          <div className="md:col-span-1">
-            <CryptoTopSignals limit={3} />
-          </div>
+const CombinedBets = () => (
+  <Tabs>
+    <div label="Combined">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-stretch">
+        <div className="md:col-span-1">
+          <FootballBets limit={3} layout="combined" />
+        </div>
+        <div className="md:col-span-2">
+          <CryptoTopSignals limit={3} />
         </div>
       </div>
+    </div>
 
-      <div label="Football">
-        {/* Full football tab (tabovi + side panel), bez tiketa */}
-        <FootballBets limit={50} layout="full" />
-      </div>
+    <div label="Football">
+      <FootballBets limit={25} layout="full" />
+    </div>
 
-      <div label="Crypto">
-        <CryptoTopSignals limit={12} />
-      </div>
-    </Tabs>
-  );
-}
+    <div label="Crypto">
+      <CryptoTopSignals limit={10} />
+    </div>
+  </Tabs>
+);
+
+export default CombinedBets;
