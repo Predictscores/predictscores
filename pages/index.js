@@ -35,22 +35,17 @@ function useDarkMode() {
 
 // --------- helperi
 async function safeJson(url) {
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`${url} -> ${res.status}`);
-  return res.json();
-}
-function parseStartISO(item) {
   try {
-    const dt =
-      item?.datetime_local?.starting_at?.date_time ||
-      item?.datetime_local?.date_time ||
-      item?.time?.starting_at?.date_time ||
-      null;
-    if (!dt) return null;
-    return dt.replace(" ", "T");
-  } catch {
-    return null;
+    const r = await fetch(url, { cache: "no-store" });
+    const ct = r.headers.get("content-type") || "";
+    if (ct.includes("application/json")) return await r.json();
+    // Fallback: pokušaj da JSON.parse() tekstualni odgovor
+    const txt = await r.text();
+    try { return JSON.parse(txt); } catch { return { ok:false, error:"non-JSON", raw: txt }; }
+  } catch (e) {
+    return { ok:false, error: String(e?.message || e) };
   }
+}
 }
 function nearestFutureKickoff(items = []) {
   const now = Date.now();
