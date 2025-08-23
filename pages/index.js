@@ -39,14 +39,32 @@ async function safeJson(url) {
     const r = await fetch(url, { cache: "no-store" });
     const ct = r.headers.get("content-type") || "";
     if (ct.includes("application/json")) return await r.json();
-    // Fallback: pokušaj da JSON.parse() tekstualni odgovor
     const txt = await r.text();
-    try { return JSON.parse(txt); } catch { return { ok:false, error:"non-JSON", raw: txt }; }
+    try {
+      return JSON.parse(txt);
+    } catch {
+      return { ok: false, error: "non-JSON", raw: txt };
+    }
   } catch (e) {
-    return { ok:false, error: String(e?.message || e) };
+    return { ok: false, error: String(e?.message || e) };
   }
 }
+
+function parseStartISO(item) {
+  try {
+    const dt =
+      item?.datetime_local?.starting_at?.date_time ||
+      item?.datetime_local?.date_time ||
+      item?.time?.starting_at?.date_time ||
+      null;
+    if (!dt) return null;
+    // normalizuj na ISO; string već može imati +00:00 (UTC)
+    return String(dt).replace(" ", "T");
+  } catch {
+    return null;
+  }
 }
+
 function nearestFutureKickoff(items = []) {
   const now = Date.now();
   let best = null;
@@ -60,6 +78,7 @@ function nearestFutureKickoff(items = []) {
   }
   return best ? new Date(best).toISOString() : null;
 }
+
 function fmtCountdown(ms) {
   const m = Math.floor(ms / 60000);
   const s = Math.floor((ms % 60000) / 1000);
@@ -84,14 +103,6 @@ function beogradHH() {
     }).format(now)
   );
 }
-function pickSlotForNow() {
-  // slot po lokalnom (Europe/Belgrade) satu
-  const h = beogradHH();
-  if (h >= 0 && h < 3) return "late";
-  if (h >= 15 && h < 24) return "pm";
-  // sve ostalo (uklj. jutro pre 10h) vodi u am, da se “probudi” dnevni snapshot
-  return "am";
-}
 
 // --------- Export CSV (bez mreže, iz keša)
 function exportFootballCSV() {
@@ -105,8 +116,7 @@ function exportFootballCSV() {
     }
     const tz = "Europe/Belgrade";
     const rows = arr.map((p) => {
-      const iso =
-        p?.datetime_local?.starting_at?.date_time?.replace(" ", "T") || null;
+      const iso = parseStartISO(p);
       const dt = iso
         ? new Date(iso).toLocaleString("sv-SE", {
             timeZone: tz,
@@ -125,7 +135,9 @@ function exportFootballCSV() {
         market: p?.market_label || p?.market || "",
         selection: p?.selection || "",
         odds: Number.isFinite(p?.market_odds) ? p.market_odds : "",
-        confidence_pct: Number.isFinite(p?.confidence_pct) ? p.confidence_pct : "",
+        confidence_pct: Number.isFinite(p?.confidence_pct)
+          ? p.confidence_pct
+          : "",
         edge_pp: Number.isFinite(p?.edge_pp) ? p.edge_pp : "",
         ev: Number.isFinite(p?.ev) ? p.ev : "",
       };
@@ -161,14 +173,14 @@ function exportFootballCSV() {
   }
 }
 
-// --------- Header (bez DataContext-a)
+// --------- Header (bez client→cron poziva)
 function HeaderBar() {
   const { toggle } = useDarkMode();
 
   const [now, setNow] = useState(Date.now());
   const [nextKickoffAt, setNextKickoffAt] = useState(null); // ISO string
   const [cryptoNextAt, setCryptoNextAt] = useState(null); // timestamp (ms)
-  const ensuredOnceRef = useRef(false); // da ne spamujemo rebuild
+  const ensuredOnceRef = useRef(false);
 
   // tikanje tajmera
   useEffect(() => {
@@ -176,54 +188,10 @@ function HeaderBar() {
     return () => clearInterval(t);
   }, []);
 
-  async function ensureSnapshotIfEmpty(currentList, currentDay) {
-    if (ensuredOnceRef.current) return;
-    const today = todayYMD();
-
-    const listEmpty = !Array.isArray(currentList) || currentList.length === 0;
-    const dayMismatch = (currentDay && currentDay !== today) || !currentDay;
-
-    if (!listEmpty && !dayMismatch) return;
-
-    ensuredOnceRef.current = true; // pokušaj samo jednom po učitavanju
-
-    try {
-      // 1) prvo probaj AUTOMATSKI rebuild bez slota (backend odlučuje)
-      await fetch(`/api/cron/rebuild`, { cache: "no-store" }).catch(() => {});
-
-      // 2) (noću) pokupi FT rezultate za istoriju
-      const hh = beogradHH();
-      if (hh >= 0 && hh < 4) {
-        await fetch(`/api/history-check?days=2`, { cache: "no-store" }).catch(() => {});
-      }
-
-      // 3) Re-fetch value-bets-locked i osveži UI + LS
-      let fb2 = await safeJson("/api/value-bets-locked");
-      let list2 = Array.isArray(fb2?.value_bets) ? fb2.value_bets : [];
-      let lockedDay2 = typeof fb2?.day === "string" ? fb2.day : null;
-
-      // 4) Fallback: ako backend nije odlučio slot (ili nije pogodio),
-      // pokušaj još jednom sa eksplicitnim slotom po lokalnom satu.
-      if ((!Array.isArray(list2) || list2.length === 0) || (lockedDay2 && lockedDay2 !== today)) {
-        const slot = pickSlotForNow();
-        await fetch(`/api/cron/rebuild?slot=${slot}`, { cache: "no-store" }).catch(() => {});
-        fb2 = await safeJson("/api/value-bets-locked");
-        list2 = Array.isArray(fb2?.value_bets) ? fb2.value_bets : [];
-        lockedDay2 = typeof fb2?.day === "string" ? fb2.day : null;
-      }
-
-      setNextKickoffAt(nearestFutureKickoff(list2));
-      try {
-        const ymd = todayYMD();
-        localStorage.setItem(`valueBetsLocked_${ymd}`, JSON.stringify(list2));
-      } catch {}
-    } catch {
-      // tiho — UI ostaje stabilan
-    }
-  }
-
-  // inicijalno pokupi podatke za tajmere (NE koristi DataContext)
+  // inicijalno pokupi podatke (SAMO locked + crypto). Nema cron poziva ovde.
   useEffect(() => {
+    if (ensuredOnceRef.current) return;
+    ensuredOnceRef.current = true;
     (async () => {
       try {
         const [fb, cr] = await Promise.allSettled([
@@ -232,22 +200,23 @@ function HeaderBar() {
         ]);
 
         if (fb.status === "fulfilled") {
-          const list = Array.isArray(fb.value?.value_bets)
+          // podrži obe strukture: {items} i {value_bets}
+          const list = Array.isArray(fb.value?.items)
+            ? fb.value.items
+            : Array.isArray(fb.value?.value_bets)
             ? fb.value.value_bets
             : [];
-          const lockedDay =
-            typeof fb.value?.day === "string" ? fb.value.day : null;
 
           setNextKickoffAt(nearestFutureKickoff(list));
 
           // keširaj u LS da Export ima iz čega da izveze
           try {
             const ymd = todayYMD();
-            localStorage.setItem(`valueBetsLocked_${ymd}`, JSON.stringify(list));
+            localStorage.setItem(
+              `valueBetsLocked_${ymd}`,
+              JSON.stringify(list)
+            );
           } catch {}
-
-          // fallback: ako nema snapshota za danas (ili je prazan), pokušaj rebuild (auto → slot)
-          await ensureSnapshotIfEmpty(list, lockedDay);
         }
 
         if (cr.status === "fulfilled") {
