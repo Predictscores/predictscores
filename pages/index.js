@@ -42,16 +42,14 @@ export default function Index() {
 
   // Tabs
   const [tab, setTab] = useState("Combined"); // Combined | Football | Crypto
-  const [subTab, setSubTab] = useState("Kick-Off"); // Kick-Off | Confidence | History (važi za Football)
+  const [subTab, setSubTab] = useState("Kick-Off"); // Kick-Off | Confidence | History
 
   useEffect(() => setMounted(true), []);
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
-
   useEffect(() => {
-    // samo prikaz tajmera u headeru (ne trigeruje fetch)
     setCryptoNextAt(Date.now() + 10 * 60 * 1000);
   }, []);
 
@@ -154,4 +152,4 @@ export default function Index() {
       </main>
     </>
   );
-            }
+ }
