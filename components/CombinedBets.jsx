@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import HistoryPanel from "./HistoryPanel"; // ← History tab koristi baš ovaj panel
+import HistoryPanel from "./HistoryPanel"; // History tab koristi baš ovaj panel
 
 const TZ = "Europe/Belgrade";
 
@@ -81,7 +81,7 @@ function ConfidenceBar({ pct }) {
 }
 
 function WhyLine({ explain }) {
-  // Dva reda max: "Zašto: ..." i "Forma: ..." (ili H2H) — kompaktno
+  // Dva reda max: "Zašto: ..." i kompaktan "Forma/H2H ..."
   const bullets = Array.isArray(explain?.bullets) ? explain.bullets : [];
   const summary = explain?.summary || "";
 
@@ -89,11 +89,8 @@ function WhyLine({ explain }) {
     bullets.length > 0
       ? String(bullets[0]).replace(/^[-•]\s*/, "")
       : summary || "Model/EV balans.";
-  // Drugi red pokušaj da bude forma/H2H
   const formLine =
-    bullets.length > 1
-      ? String(bullets[1]).replace(/^[-•]\s*/, "")
-      : "";
+    bullets.length > 1 ? String(bullets[1]).replace(/^[-•]\s*/, "") : "";
 
   return (
     <div className="text-xs text-slate-300 leading-snug">
@@ -132,7 +129,7 @@ function MatchCard({ it }) {
         ) : null}
       </div>
 
-      {/* Zašto / Forma — tačno 2 reda kad postoji materijal */}
+      {/* Zašto / Forma — 2 reda */}
       <div className="mt-2">
         <WhyLine explain={it?.explain} />
       </div>
@@ -149,7 +146,7 @@ function MatchCard({ it }) {
   );
 }
 
-/* ---------------- tickets (desni panel u Football Kick-Off/Confidence) ---------------- */
+/* ---------------- tickets (samo u Football Kick-Off/Confidence) ---------------- */
 
 function TicketItem({ it }) {
   const home = teamName(it?.teams?.home || it?.home);
@@ -185,14 +182,12 @@ function TicketsPanel({ items }) {
       if (m === "1X2") res["1X2"].push(it);
       else if (m === "BTTS" || m === "BTTS 1H" || m === "BTTS2H") res["BTTS"].push(it);
       else if (m === "OU" || m === "OVER/UNDER" || m === "O/U") {
-        // zadrži samo 2.5
         const sel = String(it?.selection || "").toUpperCase();
         if (sel.includes("2.5")) res["OU 2.5"].push(it);
       } else if (m === "HT-FT" || m === "HT/FT" || m === "HALFTIME/FULLTIME") {
         res["HT-FT"].push(it);
       }
     }
-    // sort po confidence pa uzmi top 3
     for (const k of Object.keys(res)) {
       res[k].sort((a, b) => (Number(b?.confidence_pct || 0) - Number(a?.confidence_pct || 0)));
       res[k] = res[k].slice(0, 3);
@@ -220,7 +215,7 @@ function TicketsPanel({ items }) {
   );
 }
 
-/* ---------------- data hook ---------------- */
+/* ---------------- data hooks ---------------- */
 
 function useLockedFeed() {
   const [state, setState] = useState({ items: [], built_at: null, day: null, error: null });
@@ -247,14 +242,34 @@ function useLockedFeed() {
   return state;
 }
 
+function useCryptoTop3() {
+  const [state, setState] = useState({ items: [], error: null });
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const j = await safeJson("/api/crypto");
+      if (!alive) return;
+      if (j?.ok === false) setState({ items: [], error: j.error || "Greška" });
+      else {
+        const arr = Array.isArray(j?.items) ? j.items : Array.isArray(j) ? j : [];
+        setState({ items: arr.slice(0, 3), error: null });
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+  return state;
+}
+
 /* ---------------- main ---------------- */
 
 export default function CombinedBets() {
-  const [tab, setTab] = useState("Football"); // Football | Crypto
-  const [sub, setSub] = useState("Kick-Off"); // Kick-Off | Confidence | History
+  const [tab, setTab] = useState("Combined"); // Combined | Football | Crypto
+  const [sub, setSub] = useState("Kick-Off");  // Kick-Off | Confidence | History
 
   const { items, error } = useLockedFeed();
+  const cryptoTop = useCryptoTop3();
 
+  /* ---- Football lists ---- */
   const kickoffList = useMemo(() => {
     const arr = [...items];
     arr.sort((a, b) => {
@@ -269,6 +284,21 @@ export default function CombinedBets() {
     const arr = [...items];
     arr.sort((a, b) => (Number(b?.confidence_pct || 0) - Number(a?.confidence_pct || 0)));
     return arr;
+  }, [items]);
+
+  /* ---- Combined (Top-3 + Top-3) ---- */
+  const top3Football = useMemo(() => {
+    const sorted = [...items].sort(
+      (a, b) => Number(b?.confidence_pct || 0) - Number(a?.confidence_pct || 0)
+    );
+    // opcioni filter da izbegne mečeve koji su odavno prošli (npr. > 90 min)
+    const now = Date.now();
+    const filtered = sorted.filter((it) => {
+      const t = new Date(String(toISO(it) || 0).replace(" ", "T")).getTime();
+      if (!Number.isFinite(t)) return false;
+      return t > now - 90 * 60 * 1000; // zadrži one do 90 min unazad
+    });
+    return filtered.slice(0, 3);
   }, [items]);
 
   function FootballBody() {
@@ -293,7 +323,7 @@ export default function CombinedBets() {
         </div>
 
         {sub === "History" ? (
-          // ⬇⬇⬇ HISTORY tab — nema tiketa, nema "Zašto/Forma"
+          // HISTORY: renderuje samo završene mečeve iz /api/history, bez "Zašto/Forma" i bez tiketa
           <HistoryPanel label="Football — History" />
         ) : (
           // Kick-Off / Confidence: glavni grid + desni panel sa 4 tiketa
@@ -320,7 +350,7 @@ export default function CombinedBets() {
               )}
             </div>
 
-            {/* desni panel — 4 tiketa po marketima */}
+            {/* desni panel — 4 tiketa po marketima (samo u Football) */}
             <div className="lg:col-span-1">
               <TicketsPanel items={list} />
             </div>
@@ -331,43 +361,87 @@ export default function CombinedBets() {
   }
 
   function CryptoBody() {
-    // Minimalno: pročitaj /api/crypto i prikaži 3 top signala; ako endpoint ne postoji, pokaži poruku
-    const [crypto, setCrypto] = useState({ items: [], error: null });
-    useEffect(() => {
-      let alive = true;
-      (async () => {
-        const j = await safeJson("/api/crypto");
-        if (!alive) return;
-        if (j?.ok === false) setCrypto({ items: [], error: j.error || "Greška" });
-        else {
-          const arr = Array.isArray(j?.items) ? j.items : Array.isArray(j) ? j : [];
-          setCrypto({ items: arr.slice(0, 3), error: null });
-        }
-      })();
-      return () => { alive = false; };
-    }, []);
-
+    const { items: citems, error: cerr } = cryptoTop;
     return (
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-        {crypto.error ? (
+        {cerr ? (
           <div className="p-4 rounded-xl bg-[#1f2339] text-rose-300 text-sm md:col-span-3">
-            Greška: {crypto.error}
+            Greška: {cerr}
           </div>
-        ) : crypto.items.length === 0 ? (
+        ) : citems.length === 0 ? (
           <div className="p-4 rounded-xl bg-[#1f2339] text-slate-300 text-sm md:col-span-3">
             Nema kripto podataka.
           </div>
         ) : (
-          crypto.items.map((c, idx) => (
+          citems.map((c, idx) => (
             <div key={idx} className="p-4 rounded-xl bg-[#1f2339]">
               <div className="text-xs text-slate-400">{c?.symbol || "—"}</div>
               <div className="font-semibold">{c?.signal || "—"}</div>
               <div className="text-xs text-slate-300">
                 TP: {c?.tp ?? "—"} · SL: {c?.sl ?? "—"}
               </div>
+              {/* ovde može da ide i mali graf ako već postoji u tvom projektu */}
             </div>
           ))
         )}
+      </div>
+    );
+  }
+
+  function CombinedBody() {
+    const { items: citems, error: cerr } = cryptoTop;
+
+    return (
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Levo: Top-3 Football iz locked feed (nema tiketa) */}
+        <div>
+          <div className="text-sm text-slate-300 mb-2">Top 3 — Football</div>
+          {error ? (
+            <div className="p-4 rounded-xl bg-[#1f2339] text-rose-300 text-sm">
+              Greška: {error}
+            </div>
+          ) : top3Football.length === 0 ? (
+            <div className="p-4 rounded-xl bg-[#1f2339] text-slate-300 text-sm">
+              Trenutno nema predloga.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 gap-3">
+              {top3Football.map((it) => (
+                <MatchCard
+                  key={it.fixture_id || `${it.league?.id}-${it?.selection}-${toISO(it)}`}
+                  it={it}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Desno: Top-3 Crypto (isti izgled kao tvoj postojeći sažetak) */}
+        <div>
+          <div className="text-sm text-slate-300 mb-2">Top 3 — Crypto</div>
+          {cerr ? (
+            <div className="p-4 rounded-xl bg-[#1f2339] text-rose-300 text-sm">
+              Greška: {cerr}
+            </div>
+          ) : (citems || []).length === 0 ? (
+            <div className="p-4 rounded-xl bg-[#1f2339] text-slate-300 text-sm">
+              Nema kripto podataka.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 gap-3">
+              {citems.slice(0, 3).map((c, idx) => (
+                <div key={idx} className="p-4 rounded-xl bg-[#1f2339]">
+                  <div className="text-xs text-slate-400">{c?.symbol || "—"}</div>
+                  <div className="font-semibold">{c?.signal || "—"}</div>
+                  <div className="text-xs text-slate-300">
+                    TP: {c?.tp ?? "—"} · SL: {c?.sl ?? "—"}
+                  </div>
+                  {/* ako imaš mini chart komponentu, ubaci je ovde */}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     );
   }
@@ -376,7 +450,7 @@ export default function CombinedBets() {
     <div>
       {/* glavni tabovi */}
       <div className="flex items-center gap-2 mb-6">
-        {["Football", "Crypto"].map((name) => (
+        {["Combined", "Football", "Crypto"].map((name) => (
           <button
             key={name}
             onClick={() => setTab(name)}
@@ -390,7 +464,13 @@ export default function CombinedBets() {
         ))}
       </div>
 
-      {tab === "Football" ? <FootballBody /> : <CryptoBody />}
+      {tab === "Combined" ? (
+        <CombinedBody />
+      ) : tab === "Football" ? (
+        <FootballBody />
+      ) : (
+        <CryptoBody />
+      )}
     </div>
   );
-}
+      }
