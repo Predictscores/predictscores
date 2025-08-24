@@ -105,4 +105,4 @@ export default function CombinedBets() {
       </div>
     </div>
   );
-            }
+}
