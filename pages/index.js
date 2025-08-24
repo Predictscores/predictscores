@@ -40,15 +40,18 @@ export default function Index() {
   const [cryptoNextAt, setCryptoNextAt] = useState(null);
   const [mounted, setMounted] = useState(false);
 
-  useEffect(() => setMounted(true), []);
+  // Tabs
+  const [tab, setTab] = useState("Combined"); // Combined | Football | Crypto
+  const [subTab, setSubTab] = useState("Kick-Off"); // Kick-Off | Confidence | History (važi za Football)
 
+  useEffect(() => setMounted(true), []);
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
 
-  // Samo prikaz tajmera za kripto (10 min od prvog uspešnog poziva koji radi CombinedBets)
   useEffect(() => {
+    // samo prikaz tajmera u headeru (ne trigeruje fetch)
     setCryptoNextAt(Date.now() + 10 * 60 * 1000);
   }, []);
 
@@ -57,6 +60,18 @@ export default function Index() {
     const ms = Math.max(0, cryptoNextAt - now);
     return ms === 0 ? "—" : fmtCountdown(ms);
   }, [cryptoNextAt, now]);
+
+  const TabBtn = ({ active, children, onClick }) => (
+    <button
+      onClick={onClick}
+      className={`px-4 py-2 rounded-full text-sm font-semibold ${
+        active ? "bg-[#23304f] text-white" : "bg-[#151a2b] text-slate-300"
+      }`}
+      type="button"
+    >
+      {children}
+    </button>
+  );
 
   return (
     <>
@@ -67,6 +82,7 @@ export default function Index() {
 
       <main className="min-h-screen bg-[#0f1116] text-white">
         <div className="max-w-7xl mx-auto p-4 md:p-6">
+          {/* Header */}
           <div className="flex items-start justify-between gap-4">
             <h1 className="text-3xl md:text-4xl font-extrabold text-white">
               AI Top fudbalske i Kripto Prognoze
@@ -96,14 +112,32 @@ export default function Index() {
             </div>
           </div>
 
+          {/* Top tabs */}
+          <div className="flex items-center gap-3 mt-6">
+            <TabBtn active={tab === "Combined"} onClick={() => setTab("Combined")}>Combined</TabBtn>
+            <TabBtn active={tab === "Football"} onClick={() => setTab("Football")}>Football</TabBtn>
+            <TabBtn active={tab === "Crypto"} onClick={() => setTab("Crypto")}>Crypto</TabBtn>
+          </div>
+
+          {/* Football sub-tabs */}
+          {tab === "Football" && (
+            <div className="flex items-center gap-3 mt-4">
+              <TabBtn active={subTab === "Kick-Off"} onClick={() => setSubTab("Kick-Off")}>Kick-Off</TabBtn>
+              <TabBtn active={subTab === "Confidence"} onClick={() => setSubTab("Confidence")}>Confidence</TabBtn>
+              <TabBtn active={subTab === "History"} onClick={() => setSubTab("History")}>History</TabBtn>
+            </div>
+          )}
+
+          {/* Content */}
           <div className="mt-6">
             {mounted ? (
-              <CombinedBets />
+              <CombinedBets currentTab={tab} subTab={subTab} />
             ) : (
               <div className="text-slate-400 text-sm">Loading…</div>
             )}
           </div>
 
+          {/* Legenda */}
           <div className="mt-10 text-sm text-slate-300 flex flex-wrap items-center gap-4">
             <span>Confidence legend:</span>
             <span className="inline-flex items-center gap-1">
