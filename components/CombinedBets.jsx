@@ -1,389 +1,396 @@
-"use client";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import HistoryPanel from "./HistoryPanel"; // ← History tab koristi baš ovaj panel
 
-/* ================= helpers ================= */
 const TZ = "Europe/Belgrade";
-const GRACE_MS = 10 * 60 * 1000; // 10 min
 
-function emojiFlagByCountryName(name = "") {
-  const map = {
-    "England": "🏴", "UK": "🇬🇧", "United Kingdom": "🇬🇧",
-    "Scotland": "🏴", "Wales": "🏴", "Northern Ireland": "🏴",
-    "Serbia": "🇷🇸", "Croatia": "🇭🇷", "Bosnia and Herzegovina": "🇧🇦",
-    "Montenegro": "🇲🇪", "North Macedonia": "🇲🇰", "Slovenia": "🇸🇮",
-    "Spain": "🇪🇸", "France": "🇫🇷", "Germany": "🇩🇪", "Italy": "🇮🇹",
-    "Portugal": "🇵🇹", "Netherlands": "🇳🇱", "Belgium": "🇧🇪",
-    "Norway": "🇳🇴", "Sweden": "🇸🇪", "Denmark": "🇩🇰", "Finland": "🇫🇮",
-    "Poland": "🇵🇱", "Czech Republic": "🇨🇿", "Austria": "🇦🇹",
-    "Switzerland": "🇨🇭", "Greece": "🇬🇷", "Turkey": "🇹🇷",
-    "USA": "🇺🇸", "United States": "🇺🇸", "Brazil": "🇧🇷",
-    "Argentina": "🇦🇷", "Mexico": "🇲🇽", "Japan": "🇯🇵",
-    "South Korea": "🇰🇷", "China": "🇨🇳", "Australia": "🇦🇺",
-    "Saudi Arabia": "🇸🇦", "Qatar": "🇶🇦", "UAE": "🇦🇪",
-    "Russia": "🇷🇺", "Ukraine": "🇺🇦", "Romania": "🇷🇴",
-    "Bulgaria": "🇧🇬", "Hungary": "🇭🇺", "Ireland": "🇮🇪",
-    "Scotland": "🏴", "Wales": "🏴",
-  };
-  return map[name] || "🌍";
-}
-function fmtDate(isoish) {
-  if (!isoish) return "";
-  const d = new Date(isoish.replace(" ", "T"));
-  if (Number.isNaN(d.getTime())) return "";
-  const ymd = new Intl.DateTimeFormat("sv-SE", {
-    timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit",
-  }).format(d);
-  const hm = new Intl.DateTimeFormat("sv-SE", {
-    timeZone: TZ, hour: "2-digit", minute: "2-digit", hour12: false,
-  }).format(d);
-  return `${ymd} ${hm}`;
-}
-function parseKOISO(item) {
-  try {
-    const dt =
-      item?.datetime_local?.starting_at?.date_time ||
-      item?.datetime_local?.date_time ||
-      item?.time?.starting_at?.date_time ||
-      null;
-    if (!dt) return null;
-    return dt.replace(" ", "T");
-  } catch {
-    return null;
-  }
-}
+/* ---------------- helpers ---------------- */
+
 async function safeJson(url) {
   try {
     const r = await fetch(url, { cache: "no-store" });
     const ct = r.headers.get("content-type") || "";
     if (ct.includes("application/json")) return await r.json();
-    const txt = await r.text();
-    try { return JSON.parse(txt); } catch { return { ok:false, error:"non-JSON", raw: txt }; }
+    const t = await r.text();
+    try { return JSON.parse(t); } catch { return { ok:false, error:"non-JSON", raw:t }; }
   } catch (e) {
-    return { ok:false, error:String(e?.message || e) };
+    return { ok:false, error: String(e?.message || e) };
   }
 }
-const getTeams = (p, side) =>
-  (p?.teams?.[side]?.name ?? p?.teams?.[side] ?? "") || "";
 
-/* ============== tiket grupe (samo u Football: Kick-Off/Confidence) ============== */
-function splitTicketsByMarket(items = []) {
-  const val = (x) => (x?.market_label || x?.market || "").toUpperCase();
-  const isOU25 = (m) => m.startsWith("OU") && (m.includes("2.5") || m.includes("2,5"));
-
-  const g1 = items.filter((x) => val(x) === "1X2");
-  const g2 = items.filter((x) => val(x).includes("BTTS"));
-  const g3 = items.filter((x) => isOU25(val(x)));
-  const g4 = items.filter((x) => val(x).includes("HT-FT") || val(x).includes("HTFT"));
-
-  // ukloni duplikate između grupa (prioritet redom g1,g2,g3,g4)
-  const seen = new Set();
-  const uniq = (arr) => arr.filter((x) => {
-    const id = x.fixture_id ?? `${getTeams(x,"home")}-${getTeams(x,"away")}-${val(x)}`;
-    if (seen.has(id)) return false;
-    seen.add(id);
-    return true;
-  });
-
-  return {
-    "1X2": uniq(g1),
-    "BTTS": uniq(g2),
-    "OU 2.5": uniq(g3),
-    "HT-FT": uniq(g4),
+function toISO(x) {
+  return (
+    x?.datetime_local?.starting_at?.date_time ||
+    x?.datetime_local?.date_time ||
+    x?.time?.starting_at?.date_time ||
+    x?.kickoff ||
+    null
+  );
+}
+function fmtLocal(iso) {
+  if (!iso) return "—";
+  const d = new Date(String(iso).replace(" ", "T"));
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(d);
+}
+function teamName(side) {
+  if (!side) return "—";
+  if (typeof side === "string") return side || "—";
+  if (typeof side === "object") return side.name || "—";
+  return "—";
+}
+function flagEmoji(country = "") {
+  const map = {
+    Albania: "🇦🇱", Algeria: "🇩🇿", Argentina: "🇦🇷", Australia: "🇦🇺",
+    Austria: "🇦🇹", Belgium: "🇧🇪", Bosnia: "🇧🇦", Brazil: "🇧🇷",
+    Bulgaria: "🇧🇬", Chile: "🇨🇱", China: "🇨🇳", Colombia: "🇨🇴",
+    Croatia: "🇭🇷", Cyprus: "🇨🇾", Czech: "🇨🇿", Denmark: "🇩🇰",
+    Ecuador: "🇪🇨", England: "🏴", Estonia: "🇪🇪", Finland: "🇫🇮",
+    France: "🇫🇷", Georgia: "🇬🇪", Germany: "🇩🇪", Greece: "🇬🇷",
+    Hungary: "🇭🇺", Iceland: "🇮🇸", India: "🇮🇳", Iran: "🇮🇷",
+    Ireland: "🇮🇪", Israel: "🇮🇱", Italy: "🇮🇹", Japan: "🇯🇵",
+    Korea: "🇰🇷", Lithuania: "🇱🇹", Malaysia: "🇲🇾", Mexico: "🇲🇽",
+    Morocco: "🇲🇦", Netherlands: "🇳🇱", Norway: "🇳🇴", Poland: "🇵🇱",
+    Portugal: "🇵🇹", Romania: "🇷🇴", Russia: "🇷🇺", Saudi: "🇸🇦",
+    Scotland: "🏴", Serbia: "🇷🇸", Slovakia: "🇸🇰", Slovenia: "🇸🇮",
+    Spain: "🇪🇸", Sweden: "🇸🇪", Switzerland: "🇨🇭", Turkey: "🇹🇷",
+    USA: "🇺🇸", Ukraine: "🇺🇦", Uruguay: "🇺🇾", Wales: "🏴",
   };
+  const key = Object.keys(map).find((k) =>
+    country && country.toLowerCase().includes(k.toLowerCase())
+  );
+  return key ? map[key] : "";
 }
 
-/* ================= kartica ================= */
-function Card({ p }) {
-  const league = p?.league?.name || "";
-  const country = p?.league?.country || "";
-  const flag = emojiFlagByCountryName(country);
-  const iso = parseKOISO(p);
-  const dateText = iso ? fmtDate(iso) : "";
+function ConfidenceBar({ pct }) {
+  const v = Math.max(0, Math.min(100, Number(pct || 0)));
+  return (
+    <div className="h-2 w-full rounded bg-[#2a2f4a] overflow-hidden">
+      <div
+        className="h-2 bg-sky-400"
+        style={{ width: `${v}%`, transition: "width .3s ease" }}
+        aria-label={`Confidence ${v}%`}
+      />
+    </div>
+  );
+}
 
-  const home = getTeams(p, "home");
-  const away = getTeams(p, "away");
+function WhyLine({ explain }) {
+  // Dva reda max: "Zašto: ..." i "Forma: ..." (ili H2H) — kompaktno
+  const bullets = Array.isArray(explain?.bullets) ? explain.bullets : [];
+  const summary = explain?.summary || "";
 
-  const market = p?.market_label || p?.market || "";
-  const selection = p?.selection || "";
-  const odds = Number.isFinite(p?.market_odds) ? p.market_odds : null;
-  const conf = Number.isFinite(p?.confidence_pct) ? Math.round(p.confidence_pct) : null;
-
-  // Zašto/Forma (2 linije max)
-  const bullets = Array.isArray(p?.explain?.bullets) ? p.explain.bullets : [];
-  const whyText = p?.explain?.why || p?.explain?.summary || bullets[0] || "Model ~ Implied, EV u plusu.";
-  const whyLine = (whyText || "")
-    .replace(/\*\*/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 140);
-
-  // Forma u jednom redu
-  // Preferira zapis koji već stiže u bullets (npr. "Forma: ... · H2H ... · GD ...")
-  let formLine = "";
-  const formBullet = bullets.find((b) => b.toLowerCase().includes("forma"));
-  const h2hBullet = bullets.find((b) => b.toLowerCase().includes("h2h"));
-  if (formBullet) formLine += formBullet.replace(/^Forma:\s*/i, "").replace(/\s+/g, " ");
-  if (h2hBullet) {
-    const h2h = h2hBullet.replace(/^H2H.*?:\s*/i, "").replace(/\s+/g, " ");
-    formLine += (formLine ? " · " : "") + `H2H ${h2h}`;
-  }
-  // GD (ako postoji u H2H bulletu "GF:..:GA:..")
-  const mGD = /GF:?\s*([0-9]+)[:\s]+GA:?\s*([0-9]+)/i.exec(bullets.join(" · "));
-  if (mGD) {
-    formLine += (formLine ? " · " : "") + `GD ${mGD[1]}:${mGD[2]}`;
-  }
-  formLine = (formLine || "D W–D–L · G W–D–L · H2H W–D–L · GD n:n").slice(0, 140);
+  const why =
+    bullets.length > 0
+      ? String(bullets[0]).replace(/^[-•]\s*/, "")
+      : summary || "Model/EV balans.";
+  // Drugi red pokušaj da bude forma/H2H
+  const formLine =
+    bullets.length > 1
+      ? String(bullets[1]).replace(/^[-•]\s*/, "")
+      : "";
 
   return (
-    <div className="rounded-2xl bg-[#171a25] p-4 shadow-md">
-      {/* red 1: liga + zastava + datum CET */}
-      <div className="text-sm text-slate-300 flex items-center gap-2">
-        <span>{league}</span>
-        <span>{flag}</span>
-        {dateText && <span className="opacity-70">• {dateText}</span>}
+    <div className="text-xs text-slate-300 leading-snug">
+      <div>Zašto: {why}</div>
+      {formLine ? <div>{formLine}</div> : null}
+    </div>
+  );
+}
+
+/* ---------------- singl kartica ---------------- */
+
+function MatchCard({ it }) {
+  const league = it?.league?.name || "—";
+  const country = it?.league?.country || "";
+  const iso = toISO(it);
+  const home = teamName(it?.teams?.home || it?.home);
+  const away = teamName(it?.teams?.away || it?.away);
+  const market = it?.market_label || it?.market || "";
+  const sel = it?.selection || "";
+  const odds = Number.isFinite(it?.market_odds) ? it.market_odds : it?.odds;
+  const conf = Number(it?.confidence_pct || 0);
+
+  return (
+    <div className="p-4 rounded-xl bg-[#1f2339]">
+      <div className="text-xs text-slate-400">
+        {league}{country ? ` · ${flagEmoji(country)}` : ""} · {fmtLocal(iso)}
+      </div>
+      <div className="font-semibold mt-0.5">
+        {home} <span className="text-slate-400">vs</span> {away}
+      </div>
+      <div className="text-sm text-slate-200 mt-1">
+        <span className="font-semibold">{market}</span>
+        {market ? " → " : ""}{sel}
+        {Number.isFinite(odds) ? (
+          <span className="text-slate-300"> ({Number(odds).toFixed(2)})</span>
+        ) : null}
       </div>
 
-      {/* red 2: Home vs Away */}
-      <div className="mt-1 text-xl font-semibold">
-        {home} vs {away}
+      {/* Zašto / Forma — tačno 2 reda kad postoji materijal */}
+      <div className="mt-2">
+        <WhyLine explain={it?.explain} />
       </div>
 
-      {/* red 3: Market → Selection (odds) */}
-      <div className="mt-2 text-slate-200">
-        {market} → <span className="font-bold">{selection}</span>
-        {odds ? <> ({odds})</> : null}
-      </div>
-
-      {/* red 4: Zašto / Forma (2 linije max) */}
-      <div className="mt-3 text-sm text-slate-300 space-y-1">
-        <div className="line-clamp-1"><span className="text-slate-400">Zašto:</span> {whyLine}</div>
-        <div className="line-clamp-1">{formLine}</div>
-      </div>
-
-      {/* ispod: Confidence bar + NN% */}
-      <div className="mt-3 text-slate-300">
-        <div className="mb-1">Confidence: {conf !== null ? `${conf}%` : "—"}</div>
-        <div className="w-full h-3 rounded-full bg-[#0d1020] overflow-hidden">
-          <div
-            className={`h-3 ${conf >= 75 ? "bg-emerald-400" : conf >= 50 ? "bg-sky-400" : "bg-amber-400"}`}
-            style={{ width: `${Math.max(0, Math.min(conf || 0, 100))}%` }}
-          />
+      {/* Confidence sa procentom */}
+      <div className="mt-3">
+        <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
+          <span>Confidence</span>
+          <span className="font-mono">{conf.toFixed(0)}%</span>
         </div>
+        <ConfidenceBar pct={conf} />
       </div>
     </div>
   );
 }
 
-/* ================= main ================= */
-export default function CombinedBets() {
-  const [tab, setTab] = useState("combined");      // combined | football | crypto
-  const [sub, setSub] = useState("kickoff");       // kickoff | confidence | history
+/* ---------------- tickets (desni panel u Football Kick-Off/Confidence) ---------------- */
 
-  const [locked, setLocked] = useState([]);        // snapshot lista
-  const [crypto, setCrypto] = useState([]);        // kripto lista
-  const [history, setHistory] = useState(null);    // history sa API-ja (ako postoji)
-  const pulledRef = useRef(false);
+function TicketItem({ it }) {
+  const home = teamName(it?.teams?.home || it?.home);
+  const away = teamName(it?.teams?.away || it?.away);
+  const iso = toISO(it);
+  const sel = it?.selection || "";
+  const odds = Number.isFinite(it?.market_odds) ? it.market_odds : it?.odds;
+  return (
+    <div className="p-2.5 rounded-lg bg-[#1a1e33]">
+      <div className="text-[11px] text-slate-400">{fmtLocal(iso)}</div>
+      <div className="text-sm font-medium truncate">
+        {home} <span className="text-slate-400">vs</span> {away}
+      </div>
+      <div className="text-xs text-slate-300">
+        Pick: <span className="font-semibold">{sel}</span>
+        {Number.isFinite(odds) ? ` (${Number(odds).toFixed(2)})` : ""}
+      </div>
+    </div>
+  );
+}
+
+function TicketsPanel({ items }) {
+  // top 3 po svakom od 4 tržišta
+  const byMarket = useMemo(() => {
+    const res = {
+      "1X2": [],
+      "BTTS": [],
+      "OU 2.5": [],
+      "HT-FT": [],
+    };
+    for (const it of items) {
+      const m = String(it?.market || it?.market_label || "").toUpperCase();
+      if (m === "1X2") res["1X2"].push(it);
+      else if (m === "BTTS" || m === "BTTS 1H" || m === "BTTS2H") res["BTTS"].push(it);
+      else if (m === "OU" || m === "OVER/UNDER" || m === "O/U") {
+        // zadrži samo 2.5
+        const sel = String(it?.selection || "").toUpperCase();
+        if (sel.includes("2.5")) res["OU 2.5"].push(it);
+      } else if (m === "HT-FT" || m === "HT/FT" || m === "HALFTIME/FULLTIME") {
+        res["HT-FT"].push(it);
+      }
+    }
+    // sort po confidence pa uzmi top 3
+    for (const k of Object.keys(res)) {
+      res[k].sort((a, b) => (Number(b?.confidence_pct || 0) - Number(a?.confidence_pct || 0)));
+      res[k] = res[k].slice(0, 3);
+    }
+    return res;
+  }, [items]);
+
+  return (
+    <div className="space-y-4">
+      {Object.entries(byMarket).map(([title, arr]) => (
+        <div key={title} className="p-3 rounded-xl bg-[#1f2339]">
+          <div className="text-sm font-semibold mb-2">{title}</div>
+          {arr.length === 0 ? (
+            <div className="text-xs text-slate-400">Za sada nema preporuka za ovaj market.</div>
+          ) : (
+            <div className="grid grid-cols-1 gap-2">
+              {arr.map((it) => (
+                <TicketItem key={it.fixture_id || `${it.league?.id}-${it?.selection}-${toISO(it)}`} it={it} />
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ---------------- data hook ---------------- */
+
+function useLockedFeed() {
+  const [state, setState] = useState({ items: [], built_at: null, day: null, error: null });
 
   useEffect(() => {
-    if (pulledRef.current) return;
-    pulledRef.current = true;
+    let alive = true;
     (async () => {
-      const fb = await safeJson("/api/value-bets-locked");
-      const list = Array.isArray(fb?.items || fb?.value_bets)
-        ? (fb.items || fb.value_bets)
-        : [];
-      setLocked(list);
-
-      const cr = await safeJson("/api/crypto");
-      if (Array.isArray(cr?.crypto)) setCrypto(cr.crypto);
-
-      // History (ako endpoint postoji)
-      const h = await safeJson("/api/history?days=14");
-      if (h && h.ok !== false && (Array.isArray(h?.items) || Array.isArray(h?.history))) {
-        setHistory(h.items || h.history);
+      const j = await safeJson("/api/value-bets-locked");
+      if (!alive) return;
+      if (j?.ok === false) {
+        setState((s) => ({ ...s, error: j.error || "Greška", items: [] }));
+        return;
       }
+      const items = Array.isArray(j?.items) ? j.items
+        : Array.isArray(j?.value_bets) ? j.value_bets
+        : [];
+      const built_at = j?.built_at || j?.builtAt || null;
+      const day = j?.ymd || j?.day || null;
+      setState({ items, built_at, day, error: null });
     })();
+    return () => { alive = false; };
   }, []);
 
-  // filtriranje prošlih mečeva (grace 10 min)
-  const now = Date.now();
-  const futureOnly = (x) => {
-    const t = new Date(parseKOISO(x) || 0).getTime();
-    return Number.isFinite(t) && (t + GRACE_MS) >= now;
-  };
+  return state;
+}
 
-  // sortiranja
-  const byKOAsc = (a, b) => {
-    const ta = new Date(parseKOISO(a) || 0).getTime();
-    const tb = new Date(parseKOISO(b) || 0).getTime();
-    return ta - tb;
-  };
-  const byConfDesc = (a, b) => (b?.confidence_pct ?? -1) - (a?.confidence_pct ?? -1);
+/* ---------------- main ---------------- */
 
-  // liste po tabovima
-  const listKick = useMemo(() => [...locked].filter(futureOnly).sort(byKOAsc), [locked, now]);
-  const listConf = useMemo(() => [...locked].filter(futureOnly).sort(byConfDesc), [locked, now]);
+export default function CombinedBets() {
+  const [tab, setTab] = useState("Football"); // Football | Crypto
+  const [sub, setSub] = useState("Kick-Off"); // Kick-Off | Confidence | History
 
-  // history lista (API ili fallback: završeni danas)
-  const listHist = useMemo(() => {
-    if (Array.isArray(history)) return history;
-    // fallback: završeni (KO < now)
-    return [...locked]
-      .filter((x) => {
-        const t = new Date(parseKOISO(x) || 0).getTime();
-        return Number.isFinite(t) && t < now;
-      })
-      .sort(byConfDesc);
-  }, [history, locked, now]);
+  const { items, error } = useLockedFeed();
 
-  // tiket grupe za Football (Kick-Off/Confidence)
-  const ticketsKick = useMemo(() => splitTicketsByMarket(listKick), [listKick]);
-  const ticketsConf = useMemo(() => splitTicketsByMarket(listConf), [listConf]);
+  const kickoffList = useMemo(() => {
+    const arr = [...items];
+    arr.sort((a, b) => {
+      const ta = new Date(String(toISO(a) || 0).replace(" ", "T")).getTime();
+      const tb = new Date(String(toISO(b) || 0).replace(" ", "T")).getTime();
+      return ta - tb;
+    });
+    return arr;
+  }, [items]);
 
-  // UI helpers
-  const TabBtn = ({ active, children, onClick }) => (
-    <button
-      onClick={onClick}
-      className={`px-5 py-2 rounded-2xl ${active ? "bg-[#1f2740] text-white" : "bg-[#0f1324] text-slate-300"}`}
-      type="button"
-    >
-      {children}
-    </button>
-  );
+  const confidenceList = useMemo(() => {
+    const arr = [...items];
+    arr.sort((a, b) => (Number(b?.confidence_pct || 0) - Number(a?.confidence_pct || 0)));
+    return arr;
+  }, [items]);
 
-  const TicketGroup = ({ title, items }) => (
-    <div className="rounded-2xl bg-[#141824] p-4">
-      <div className="text-slate-300 mb-3 font-semibold">{title}</div>
-      {(!items || items.length === 0) && <div className="text-slate-400 text-sm">Nema kandidata.</div>}
-      <div className="space-y-3">
-        {items?.slice(0, 3).map((p, i) => <Card key={i} p={p} />)}
-      </div>
-    </div>
-  );
+  function FootballBody() {
+    const list = sub === "Kick-Off" ? kickoffList : confidenceList;
 
-  return (
-    <div className="space-y-6">
-      {/* Glavni tabovi */}
-      <div className="flex items-center gap-3">
-        <TabBtn active={tab === "combined"} onClick={() => setTab("combined")}>Combined</TabBtn>
-        <TabBtn active={tab === "football"} onClick={() => setTab("football")}>Football</TabBtn>
-        <TabBtn active={tab === "crypto"} onClick={() => setTab("crypto")}>Crypto</TabBtn>
-      </div>
-
-      {/* Football pod-tabovi */}
-      {tab === "football" && (
-        <div className="flex items-center gap-3">
-          <TabBtn active={sub === "kickoff"} onClick={() => setSub("kickoff")}>Kick-Off</TabBtn>
-          <TabBtn active={sub === "confidence"} onClick={() => setSub("confidence")}>Confidence</TabBtn>
-          <TabBtn active={sub === "history"} onClick={() => setSub("history")}>History</TabBtn>
+    return (
+      <div>
+        {/* sub tabovi */}
+        <div className="flex items-center gap-2 mb-4">
+          {["Kick-Off", "Confidence", "History"].map((name) => (
+            <button
+              key={name}
+              onClick={() => setSub(name)}
+              className={`px-3 py-1.5 rounded-lg text-sm ${
+                sub === name ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
+              }`}
+              type="button"
+            >
+              {name}
+            </button>
+          ))}
         </div>
-      )}
 
-      {/* COMBINED (bez tiketa) */}
-      {tab === "combined" && (
-        <div className="grid md:grid-cols-2 gap-6">
-          <div>
-            <h2 className="text-xl font-bold mb-2">Football</h2>
-            <div className="grid gap-4">
-              {listKick.slice(0, 8).map((p, i) => <Card key={i} p={p} />)}
-              {listKick.length === 0 && <div className="text-slate-400">Nema dostupnih predloga.</div>}
-            </div>
-          </div>
-          <div>
-            <h2 className="text-xl font-bold mb-2">Crypto</h2>
-            <div className="grid gap-4">
-              {Array.isArray(crypto) && crypto.length > 0 ? (
-                crypto.slice(0, 8).map((c, i) => (
-                  <div key={i} className="rounded-2xl bg-[#171a25] p-4 shadow-md">
-                    <div className="text-sm text-slate-300">{c.symbol}</div>
-                    <div className="mt-1 text-xl font-semibold">{c.signal}</div>
-                    <div className="mt-2 text-slate-200">
-                      Price: {c.price} {Number.isFinite(c?.confidence) ? ` • Conf ${c.confidence.toFixed(0)}%` : ""}
-                    </div>
-                  </div>
-                ))
+        {sub === "History" ? (
+          // ⬇⬇⬇ HISTORY tab — nema tiketa, nema "Zašto/Forma"
+          <HistoryPanel label="Football — History" />
+        ) : (
+          // Kick-Off / Confidence: glavni grid + desni panel sa 4 tiketa
+          <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+            {/* glavni grid (3 kolone na >=lg) */}
+            <div className="lg:col-span-3">
+              {error ? (
+                <div className="p-4 rounded-xl bg-[#1f2339] text-rose-300 text-sm">
+                  Greška: {error}
+                </div>
+              ) : list.length === 0 ? (
+                <div className="p-4 rounded-xl bg-[#1f2339] text-slate-300 text-sm">
+                  Trenutno nema predloga.
+                </div>
               ) : (
-                <div className="text-slate-400">Nema kripto signala.</div>
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                  {list.map((it) => (
+                    <MatchCard
+                      key={it.fixture_id || `${it.league?.id}-${it?.selection}-${toISO(it)}`}
+                      it={it}
+                    />
+                  ))}
+                </div>
               )}
             </div>
-          </div>
-        </div>
-      )}
 
-      {/* FOOTBALL: Kick-Off (sa 4 tiketa) */}
-      {tab === "football" && sub === "kickoff" && (
-        <>
-          {/* 4 grupe tiketa */}
-          <div className="grid md:grid-cols-4 gap-4">
-            <TicketGroup title="1X2" items={ticketsKick["1X2"]} />
-            <TicketGroup title="BTTS" items={ticketsKick["BTTS"]} />
-            <TicketGroup title="OU 2.5" items={ticketsKick["OU 2.5"]} />
-            <TicketGroup title="HT-FT" items={ticketsKick["HT-FT"]} />
-          </div>
-
-          {/* lista mečeva */}
-          <div className="mt-6">
-            <h2 className="text-xl font-bold mb-2">Kick-Off — svi predlozi</h2>
-            <div className="grid md:grid-cols-2 gap-4">
-              {listKick.map((p, i) => <Card key={i} p={p} />)}
-              {listKick.length === 0 && <div className="text-slate-400">Nema dostupnih predloga.</div>}
+            {/* desni panel — 4 tiketa po marketima */}
+            <div className="lg:col-span-1">
+              <TicketsPanel items={list} />
             </div>
           </div>
-        </>
-      )}
+        )}
+      </div>
+    );
+  }
 
-      {/* FOOTBALL: Confidence (sa 4 tiketa) */}
-      {tab === "football" && sub === "confidence" && (
-        <>
-          <div className="grid md:grid-cols-4 gap-4">
-            <TicketGroup title="1X2" items={ticketsConf["1X2"]} />
-            <TicketGroup title="BTTS" items={ticketsConf["BTTS"]} />
-            <TicketGroup title="OU 2.5" items={ticketsConf["OU 2.5"]} />
-            <TicketGroup title="HT-FT" items={ticketsConf["HT-FT"]} />
+  function CryptoBody() {
+    // Minimalno: pročitaj /api/crypto i prikaži 3 top signala; ako endpoint ne postoji, pokaži poruku
+    const [crypto, setCrypto] = useState({ items: [], error: null });
+    useEffect(() => {
+      let alive = true;
+      (async () => {
+        const j = await safeJson("/api/crypto");
+        if (!alive) return;
+        if (j?.ok === false) setCrypto({ items: [], error: j.error || "Greška" });
+        else {
+          const arr = Array.isArray(j?.items) ? j.items : Array.isArray(j) ? j : [];
+          setCrypto({ items: arr.slice(0, 3), error: null });
+        }
+      })();
+      return () => { alive = false; };
+    }, []);
+
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        {crypto.error ? (
+          <div className="p-4 rounded-xl bg-[#1f2339] text-rose-300 text-sm md:col-span-3">
+            Greška: {crypto.error}
           </div>
-
-          <div className="mt-6">
-            <h2 className="text-xl font-bold mb-2">Confidence — svi predlozi</h2>
-            <div className="grid md:grid-cols-2 gap-4">
-              {listConf.map((p, i) => <Card key={i} p={p} />)}
-              {listConf.length === 0 && <div className="text-slate-400">Nema dostupnih predloga.</div>}
+        ) : crypto.items.length === 0 ? (
+          <div className="p-4 rounded-xl bg-[#1f2339] text-slate-300 text-sm md:col-span-3">
+            Nema kripto podataka.
+          </div>
+        ) : (
+          crypto.items.map((c, idx) => (
+            <div key={idx} className="p-4 rounded-xl bg-[#1f2339]">
+              <div className="text-xs text-slate-400">{c?.symbol || "—"}</div>
+              <div className="font-semibold">{c?.signal || "—"}</div>
+              <div className="text-xs text-slate-300">
+                TP: {c?.tp ?? "—"} · SL: {c?.sl ?? "—"}
+              </div>
             </div>
-          </div>
-        </>
-      )}
+          ))
+        )}
+      </div>
+    );
+  }
 
-      {/* FOOTBALL: History (bez tiketa) */}
-      {tab === "football" && sub === "history" && (
-        <div>
-          <h2 className="text-xl font-bold mb-2">History — učinak</h2>
-          <div className="grid md:grid-cols-2 gap-4">
-            {listHist.map((p, i) => <Card key={i} p={p} />)}
-            {listHist.length === 0 && <div className="text-slate-400">Nema istorijskih predloga.</div>}
-          </div>
-        </div>
-      )}
+  return (
+    <div>
+      {/* glavni tabovi */}
+      <div className="flex items-center gap-2 mb-6">
+        {["Football", "Crypto"].map((name) => (
+          <button
+            key={name}
+            onClick={() => setTab(name)}
+            className={`px-3 py-1.5 rounded-lg text-sm ${
+              tab === name ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
+            }`}
+            type="button"
+          >
+            {name}
+          </button>
+        ))}
+      </div>
 
-      {/* CRYPTO (bez tiketa) */}
-      {tab === "crypto" && (
-        <div>
-          <h2 className="text-xl font-bold mb-2">Crypto</h2>
-          <div className="grid md:grid-cols-2 gap-4">
-            {Array.isArray(crypto) && crypto.length > 0 ? (
-              crypto.map((c, i) => (
-                <div key={i} className="rounded-2xl bg-[#171a25] p-4 shadow-md">
-                  <div className="text-sm text-slate-300">{c.symbol}</div>
-                  <div className="mt-1 text-xl font-semibold">{c.signal}</div>
-                  <div className="mt-2 text-slate-200">
-                    Price: {c.price} {Number.isFinite(c?.confidence) ? ` • Conf ${c.confidence.toFixed(0)}%` : ""}
-                  </div>
-                </div>
-              ))
-            ) : (
-              <div className="text-slate-400">Nema kripto signala.</div>
-            )}
-          </div>
-        </div>
-      )}
+      {tab === "Football" ? <FootballBody /> : <CryptoBody />}
     </div>
   );
 }
