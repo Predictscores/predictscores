@@ -1,84 +1,10 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 
-/** Izvor istorije — po tvom, ovde već dolazi Top-3 i samo završene stavke. */
-const HISTORY_URL = "/api/history?days=14";
-const TZ = "Europe/Belgrade";
-
-/* ---------------------------- helpers ---------------------------- */
-
-async function safeJson(url) {
-  try {
-    const r = await fetch(url, { cache: "no-store" });
-    const ct = r.headers.get("content-type") || "";
-    if (ct.includes("application/json")) return await r.json();
-    const txt = await r.text();
-    try { return JSON.parse(txt); } catch { return { ok:false, error:"non-JSON", raw: txt }; }
-  } catch (e) {
-    return { ok:false, error: String(e?.message || e) };
-  }
+async function fetchJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(`${url} -> ${r.status}`);
+  return r.json();
 }
-
-function fmtLocal(isoLike) {
-  try {
-    const d = new Date(isoLike);
-    return new Intl.DateTimeFormat("sv-SE", {
-      timeZone: TZ,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    }).format(d);
-  } catch {
-    return isoLike || "";
-  }
-}
-
-function dayKey(isoLike) {
-  try {
-    const d = new Date(isoLike);
-    return new Intl.DateTimeFormat("sv-SE", {
-      timeZone: TZ,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    }).format(d);
-  } catch {
-    return "—";
-  }
-}
-
-function flagEmoji(country = "") {
-  const map = {
-    Albania: "🇦🇱", Algeria: "🇩🇿", Argentina: "🇦🇷", Australia: "🇦🇺",
-    Austria: "🇦🇹", Belgium: "🇧🇪", Bosnia: "🇧🇦", Brazil: "🇧🇷",
-    Bulgaria: "🇧🇬", Chile: "🇨🇱", China: "🇨🇳", Colombia: "🇨🇴",
-    Croatia: "🇭🇷", Cyprus: "🇨🇾", Czech: "🇨🇿", Denmark: "🇩🇰",
-    Ecuador: "🇪🇨", England: "🏴", Estonia: "🇪🇪", Finland: "🇫🇮",
-    France: "🇫🇷", Georgia: "🇬🇪", Germany: "🇩🇪", Greece: "🇬🇷",
-    Hungary: "🇭🇺", Iceland: "🇮🇸", India: "🇮🇳", Iran: "🇮🇷",
-    Ireland: "🇮🇪", Israel: "🇮🇱", Italy: "🇮🇹", Japan: "🇯🇵",
-    Korea: "🇰🇷", Lithuania: "🇱🇹", Malaysia: "🇲🇾", Mexico: "🇲🇽",
-    Morocco: "🇲🇦", Netherlands: "🇳🇱", Norway: "🇳🇴", Poland: "🇵🇱",
-    Portugal: "🇵🇹", Romania: "🇷🇴", Russia: "🇷🇺", Saudi: "🇸🇦",
-    Scotland: "🏴", Serbia: "🇷🇸", Slovakia: "🇸🇰", Slovenia: "🇸🇮",
-    Spain: "🇪🇸", Sweden: "🇸🇪", Switzerland: "🇨🇭", Turkey: "🇹🇷",
-    USA: "🇺🇸", Ukraine: "🇺🇦", Uruguay: "🇺🇾", Wales: "🏴",
-  };
-  const key = Object.keys(map).find((k) =>
-    country && country.toLowerCase().includes(k.toLowerCase())
-  );
-  return key ? map[key] : "";
-}
-
-function teamName(side) {
-  if (!side) return "—";
-  if (typeof side === "string") return side || "—";
-  if (typeof side === "object") return side.name || "—";
-  return "—";
-}
-
-/* ---------------------------- subviews ---------------------------- */
 
 function Outcome({ won }) {
   if (won === true) {
@@ -95,154 +21,105 @@ function Outcome({ won }) {
       </span>
     );
   }
-  // History prikazuje samo završene; ako server ipak vrati bez won, ništa ne prikazujemo.
-  return null;
+  return null; // u History nema "u toku"
 }
 
 function Row({ it }) {
-  const ko =
-    it?.kickoff ||
-    it?.datetime_local?.starting_at?.date_time ||
-    it?.time?.starting_at?.date_time ||
-    "";
-
-  const home = teamName(it?.teams?.home || it?.teams?.Home || it?.home);
-  const away = teamName(it?.teams?.away || it?.teams?.Away || it?.away);
-
-  const leagueName = it?.league?.name || "—";
-  const country = it?.league?.country || "";
-  const flag = flagEmoji(country);
-
-  const market = it?.market_label || it?.market || "";
-  const selection = it?.selection || "";
-  const odds = Number.isFinite(it?.odds || it?.market_odds)
-    ? (it?.odds || it?.market_odds)
-    : null;
-
-  const score = it?.final_score || "";
-  const ht = it?.ht_score || "";
-  const won = it?.won;
-
   return (
     <div className="p-4 rounded-xl bg-[#1f2339]">
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-2">
         <div className="min-w-0">
           <div className="font-semibold">
-            {home} <span className="text-slate-400">vs</span> {away}
+            {it?.teams?.home || "—"}{" "}
+            <span className="text-slate-400">vs</span>{" "}
+            {it?.teams?.away || "—"}
           </div>
           <div className="text-xs text-slate-400">
-            {leagueName} {flag ? `· ${flag}` : ""} {" · "} {fmtLocal(ko)}
+            {(it?.league?.name || "—")}
+            {" · "}
+            {new Date(it.kickoff).toLocaleString("sv-SE", {
+              timeZone: "Europe/Belgrade",
+              year: "numeric",
+              month: "2-digit",
+              day: "2-digit",
+              hour: "2-digit",
+              minute: "2-digit",
+            })}
           </div>
         </div>
 
         <div className="flex flex-col items-start md:items-end gap-1">
           <div className="text-sm">
             <span className="font-semibold">
-              {market ? `${market} → ${selection}` : selection}
+              {it.market || ""} {it.selection || ""}
             </span>{" "}
-            {odds ? (
-              <span className="text-slate-300">({Number(odds).toFixed(2)})</span>
-            ) : null}
+            <span className="text-slate-300">
+              ({Number(it.odds || 0).toFixed(2)})
+            </span>
           </div>
 
-          {score ? (
-            <div className="text-xs text-slate-300">
-              TR: <span className="font-mono">{score}</span>
-              {ht ? <span className="text-slate-400"> (HT {ht})</span> : null}
-            </div>
-          ) : null}
+          <div className="text-xs text-slate-300">
+            Rezultat:{" "}
+            {it.final_score ? (
+              <span className="font-mono">{it.final_score}</span>
+            ) : (
+              <span className="text-slate-400">—</span>
+            )}
+          </div>
 
-          <Outcome won={won} />
+          <Outcome won={it.won} />
         </div>
       </div>
     </div>
   );
 }
 
-/* ---------------------------- main ---------------------------- */
-
-export default function HistoryPanel({ label = "History" }) {
+export default function HistoryPanel({ label = "History", days = 14 }) {
   const [items, setItems] = useState([]);
   const [err, setErr] = useState(null);
-  const [loadedOnce, setLoadedOnce] = useState(false);
+
+  async function load() {
+    try {
+      const j = await fetchJSON(`/api/history?days=${days}`);
+      const arr = Array.isArray(j?.items) ? j.items : [];
+
+      // filtriraj SAMO završene i SAMO top3 (proveri marker: top3/tracked/rank<=3)
+      const filtered = arr.filter(
+        (it) =>
+          (it.won === true || it.won === false) &&
+          (it.top3 === true ||
+            it.tracked === true ||
+            (typeof it.rank === "number" && it.rank <= 3))
+      );
+
+      setItems(filtered);
+      setErr(null);
+    } catch (e) {
+      setErr(String(e?.message || e));
+    }
+  }
 
   useEffect(() => {
-    (async () => {
-      const j = await safeJson(HISTORY_URL);
-      if (j && j.ok === false) {
-        if (!loadedOnce) setItems([]);
-        setErr(j.error || "Greška pri čitanju istorije.");
-        setLoadedOnce(true);
-        return;
-      }
-
-      // Endpoint već vraća ono što hoćemo; zadržavamo samo završene — defanzivno.
-      const arr = Array.isArray(j?.items) ? j.items : Array.isArray(j) ? j : [];
-      const finished = arr.filter(
-        (it) => typeof it?.won === "boolean" && !!it?.final_score
-      );
-
-      // Sort: najnovije prvo
-      finished.sort((a, b) => {
-        const ta = new Date(a?.kickoff || a?.datetime_local?.starting_at?.date_time || 0).getTime();
-        const tb = new Date(b?.kickoff || b?.datetime_local?.starting_at?.date_time || 0).getTime();
-        return tb - ta;
-      });
-
-      setItems(finished);
-      setErr(null);
-      setLoadedOnce(true);
-    })();
-  }, []);
-
-  // Grupisanje po danu (CET)
-  const groups = useMemo(() => {
-    const g = new Map();
-    for (const it of items) {
-      const key = dayKey(
-        it?.kickoff || it?.datetime_local?.starting_at?.date_time || ""
-      );
-      if (!g.has(key)) g.set(key, []);
-      g.get(key).push(it);
-    }
-    return Array.from(g.entries()); // [ [day, arr], ... ]
-  }, [items]);
+    load();
+  }, [days]);
 
   return (
     <div label={label}>
-      {/* jednostavno zaglavlje panela */}
-      <div className="mb-4 p-4 rounded-xl bg-[#1f2339] text-slate-200">
-        <div className="text-sm font-semibold">History — Top 3 (završene)</div>
-        <div className="text-xs text-slate-400">
-          Prikazuju se samo mečevi koji su bili u Top-3 Football (Combined) i koji su završeni.
-        </div>
-      </div>
-
       {err ? (
         <div className="p-4 rounded-xl bg-[#1f2339] text-rose-300 text-sm">
           Greška: {err}
         </div>
-      ) : groups.length === 0 ? (
+      ) : items.length === 0 ? (
         <div className="p-4 rounded-xl bg-[#1f2339] text-slate-300 text-sm">
-          Nema završених Top-3 mečeva za prikaz.
+          Još uvek nema istorije za prikaz.
         </div>
       ) : (
-        <div className="space-y-6">
-          {groups.map(([day, arr]) => (
-            <div key={day}>
-              <div className="text-slate-300 text-sm mb-2">{day}</div>
-              <div className="grid grid-cols-1 gap-3">
-                {arr.map((it) => (
-                  <Row
-                    key={`${it.fixture_id}-${it.locked_at || it.kickoff || it.final_score}`}
-                    it={it}
-                  />
-                ))}
-              </div>
-            </div>
+        <div className="grid grid-cols-1 gap-3">
+          {items.map((it) => (
+            <Row key={`${it.fixture_id}-${it.locked_at}`} it={it} />
           ))}
         </div>
       )}
     </div>
   );
-}
+  }
