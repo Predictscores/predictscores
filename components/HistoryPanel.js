@@ -1,13 +1,22 @@
 import React, { useEffect, useMemo, useState } from "react";
 
-/** 🔧 PODESI OVO: stavi tačan URL tvog endpointa koji već vraća SAMO završene Top-3 za 14 dana. */
-const HISTORY_URL = "/api/api14days"; 
-// Primer alternative ako ti je to zapravo ovo:
-// const HISTORY_URL = "/api/history?days=14";
-
-/* ───────────────── helpers ───────────────── */
-
+/** Izvor istorije — po tvom, ovde već dolazi Top-3 i samo završene stavke. */
+const HISTORY_URL = "/api/history?days=14";
 const TZ = "Europe/Belgrade";
+
+/* ---------------------------- helpers ---------------------------- */
+
+async function safeJson(url) {
+  try {
+    const r = await fetch(url, { cache: "no-store" });
+    const ct = r.headers.get("content-type") || "";
+    if (ct.includes("application/json")) return await r.json();
+    const txt = await r.text();
+    try { return JSON.parse(txt); } catch { return { ok:false, error:"non-JSON", raw: txt }; }
+  } catch (e) {
+    return { ok:false, error: String(e?.message || e) };
+  }
+}
 
 function fmtLocal(isoLike) {
   try {
@@ -57,24 +66,19 @@ function flagEmoji(country = "") {
     USA: "🇺🇸", Ukraine: "🇺🇦", Uruguay: "🇺🇾", Wales: "🏴",
   };
   const key = Object.keys(map).find((k) =>
-    country.toLowerCase().includes(k.toLowerCase())
+    country && country.toLowerCase().includes(k.toLowerCase())
   );
-  return key ? map[key] : "🏳️";
+  return key ? map[key] : "";
 }
 
-async function safeJson(url) {
-  try {
-    const r = await fetch(url, { cache: "no-store" });
-    const ct = r.headers.get("content-type") || "";
-    if (ct.includes("application/json")) return await r.json();
-    const txt = await r.text();
-    try { return JSON.parse(txt); } catch { return { ok:false, error:"non-JSON", raw: txt }; }
-  } catch (e) {
-    return { ok:false, error: String(e?.message || e) };
-  }
+function teamName(side) {
+  if (!side) return "—";
+  if (typeof side === "string") return side || "—";
+  if (typeof side === "object") return side.name || "—";
+  return "—";
 }
 
-/* ───────────────── UI dijelovi ───────────────── */
+/* ---------------------------- subviews ---------------------------- */
 
 function Outcome({ won }) {
   if (won === true) {
@@ -91,23 +95,23 @@ function Outcome({ won }) {
       </span>
     );
   }
-  // Po tvom zahtevu: u History nema "U toku" — ako endpoint slučajno vrati nešto nesettlovano, jednostavno ne prikazujemo badge.
+  // History prikazuje samo završene; ako server ipak vrati bez won, ništa ne prikazujemo.
   return null;
 }
 
 function Row({ it }) {
-  const leagueName = it?.league?.name || "—";
-  const country = it?.league?.country || "";
-  const flag = flagEmoji(country);
-
   const ko =
     it?.kickoff ||
     it?.datetime_local?.starting_at?.date_time ||
     it?.time?.starting_at?.date_time ||
     "";
 
-  const home = it?.teams?.home?.name || it?.teams?.home || "—";
-  const away = it?.teams?.away?.name || it?.teams?.away || "—";
+  const home = teamName(it?.teams?.home || it?.teams?.Home || it?.home);
+  const away = teamName(it?.teams?.away || it?.teams?.Away || it?.away);
+
+  const leagueName = it?.league?.name || "—";
+  const country = it?.league?.country || "";
+  const flag = flagEmoji(country);
 
   const market = it?.market_label || it?.market || "";
   const selection = it?.selection || "";
@@ -127,8 +131,7 @@ function Row({ it }) {
             {home} <span className="text-slate-400">vs</span> {away}
           </div>
           <div className="text-xs text-slate-400">
-            {leagueName} {country ? `· ${flag}` : ""} {" · "}
-            {fmtLocal(ko)}
+            {leagueName} {flag ? `· ${flag}` : ""} {" · "} {fmtLocal(ko)}
           </div>
         </div>
 
@@ -137,7 +140,9 @@ function Row({ it }) {
             <span className="font-semibold">
               {market ? `${market} → ${selection}` : selection}
             </span>{" "}
-            {odds ? <span className="text-slate-300">({Number(odds).toFixed(2)})</span> : null}
+            {odds ? (
+              <span className="text-slate-300">({Number(odds).toFixed(2)})</span>
+            ) : null}
           </div>
 
           {score ? (
@@ -154,7 +159,7 @@ function Row({ it }) {
   );
 }
 
-/* ───────────────── Glavni panel ───────────────── */
+/* ---------------------------- main ---------------------------- */
 
 export default function HistoryPanel({ label = "History" }) {
   const [items, setItems] = useState([]);
@@ -165,18 +170,19 @@ export default function HistoryPanel({ label = "History" }) {
     (async () => {
       const j = await safeJson(HISTORY_URL);
       if (j && j.ok === false) {
-        // ako endpoint vrati grešku, NE briši prethodni dobar state
         if (!loadedOnce) setItems([]);
         setErr(j.error || "Greška pri čitanju istorije.");
         setLoadedOnce(true);
         return;
       }
-      const arr = Array.isArray(j?.items) ? j.items : Array.isArray(j) ? j : [];
-      // Ako backend već vraća SAMO završene Top-3, ništa dodatno ne filtriramo.
-      // Za svaki slučaj (defenzivno): zadrži samo one sa konačnim ishodom.
-      const finished = arr.filter((it) => typeof it?.won === "boolean" && !!it?.final_score);
 
-      // Sortiraj po kickoff opadajuće (najnovije prvo)
+      // Endpoint već vraća ono što hoćemo; zadržavamo samo završene — defanzivno.
+      const arr = Array.isArray(j?.items) ? j.items : Array.isArray(j) ? j : [];
+      const finished = arr.filter(
+        (it) => typeof it?.won === "boolean" && !!it?.final_score
+      );
+
+      // Sort: najnovije prvo
       finished.sort((a, b) => {
         const ta = new Date(a?.kickoff || a?.datetime_local?.starting_at?.date_time || 0).getTime();
         const tb = new Date(b?.kickoff || b?.datetime_local?.starting_at?.date_time || 0).getTime();
@@ -189,12 +195,13 @@ export default function HistoryPanel({ label = "History" }) {
     })();
   }, []);
 
-  // Grupisanje po danu
+  // Grupisanje po danu (CET)
   const groups = useMemo(() => {
     const g = new Map();
     for (const it of items) {
-      const key =
-        dayKey(it?.kickoff || it?.datetime_local?.starting_at?.date_time || "");
+      const key = dayKey(
+        it?.kickoff || it?.datetime_local?.starting_at?.date_time || ""
+      );
       if (!g.has(key)) g.set(key, []);
       g.get(key).push(it);
     }
@@ -203,10 +210,12 @@ export default function HistoryPanel({ label = "History" }) {
 
   return (
     <div label={label}>
-      {/* zaglavlje panela (bez ROI/7d/14d jer tražiš čist top3 history) */}
+      {/* jednostavno zaglavlje panela */}
       <div className="mb-4 p-4 rounded-xl bg-[#1f2339] text-slate-200">
         <div className="text-sm font-semibold">History — Top 3 (završene)</div>
-        <div className="text-xs text-slate-400">Prikazuju se samo mečevi koji su bili u Top-3 Football (Combined) i koji su završeni.</div>
+        <div className="text-xs text-slate-400">
+          Prikazuju se samo mečevi koji su bili u Top-3 Football (Combined) i koji su završeni.
+        </div>
       </div>
 
       {err ? (
@@ -224,7 +233,10 @@ export default function HistoryPanel({ label = "History" }) {
               <div className="text-slate-300 text-sm mb-2">{day}</div>
               <div className="grid grid-cols-1 gap-3">
                 {arr.map((it) => (
-                  <Row key={`${it.fixture_id}-${it.locked_at || it.kickoff}`} it={it} />
+                  <Row
+                    key={`${it.fixture_id}-${it.locked_at || it.kickoff || it.final_score}`}
+                    it={it}
+                  />
                 ))}
               </div>
             </div>
