@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 
+/* ===================== helpers ===================== */
 async function safeJson(url) {
   try {
     const res = await fetch(url, { cache: "no-store" });
@@ -30,54 +31,10 @@ function parseKOISO(p) {
   return iso.replace(" ", "T");
 }
 
-export default function CombinedBets({ currentTab = "Combined", subTab = "Kick-Off" }) {
-  const [football, setFootball] = useState([]);
-  const [crypto, setCrypto] = useState([]);
-  const [err, setErr] = useState(null);
-  const [loading, setLoading] = useState(true);
-
-  async function load() {
-    setLoading(true);
-    setErr(null);
-    try {
-      const [fb, cr] = await Promise.all([safeJson("/api/value-bets-locked"), safeJson("/api/crypto")]);
-
-      if (fb?.ok === false && fb?.error) setErr(`Football feed error: ${fb.error}`);
-
-      const list = pickFootballList(fb);
-      setFootball(Array.isArray(list) ? list : []);
-
-      const c = Array.isArray(cr?.crypto) ? cr.crypto : [];
-      setCrypto(c);
-    } finally {
-      setLoading(false);
-    }
-  }
-  useEffect(() => {
-    load();
-  }, []);
-
-  const sortedFootball = useMemo(() => {
-    const arr = [...football];
-    if (subTab === "Confidence") {
-      return arr.sort((a, b) => (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0));
-    }
-    if (subTab === "Kick-Off") {
-      return arr.sort((a, b) => {
-        const ta = new Date(parseKOISO(a) || 0).getTime();
-        const tb = new Date(parseKOISO(b) || 0).getTime();
-        return ta - tb;
-      });
-    }
-    // History tab — UI placeholder (ne dira backend)
-    return arr;
-  }, [football, subTab]);
-
-  if (loading) return <div className="text-slate-400 text-sm">Loading…</div>;
-
-  const Card = ({ p }) => (
+/* ===================== card ===================== */
+function FootballCard({ p }) {
+  return (
     <div
-      key={p.fixture_id ?? `${p?.league?.id}-${p?.teams?.home?.name}-${p?.teams?.away?.name}`}
       className="p-4 rounded-xl bg-[#202542] mb-3 shadow"
     >
       <div className="text-xs opacity-80">
@@ -102,8 +59,63 @@ export default function CombinedBets({ currentTab = "Combined", subTab = "Kick-O
       </div>
     </div>
   );
+}
 
-  // RENDER PO TABOVIMA
+/* ===================== main ===================== */
+export default function CombinedBets({ currentTab = "Combined", subTab = "Kick-Off" }) {
+  const [football, setFootball] = useState([]);
+  const [crypto, setCrypto] = useState([]);
+  const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  async function load() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const [fb, cr] = await Promise.all([
+        safeJson("/api/value-bets-locked"),
+        safeJson("/api/crypto"),
+      ]);
+
+      if (fb?.ok === false && fb?.error) setErr(`Football feed error: ${fb.error}`);
+
+      const list = pickFootballList(fb);
+      setFootball(Array.isArray(list) ? list : []);
+
+      const c = Array.isArray(cr?.crypto) ? cr.crypto : [];
+      setCrypto(c);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const sortedFootball = useMemo(() => {
+    const arr = [...football];
+    if (subTab === "Confidence") {
+      return arr.sort(
+        (a, b) => (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0)
+      );
+    }
+    if (subTab === "Kick-Off") {
+      return arr.sort((a, b) => {
+        const ta = new Date(parseKOISO(a) || 0).getTime();
+        const tb = new Date(parseKOISO(b) || 0).getTime();
+        return ta - tb;
+      });
+    }
+    // History: za sada ista lista (poseban backend endpoint bi bio potreban)
+    return arr;
+  }, [football, subTab]);
+
+  if (loading) {
+    return <div className="text-slate-400 text-sm">Loading…</div>;
+  }
+
+  /* ===== Render: Crypto tab ===== */
   if (currentTab === "Crypto") {
     return (
       <div>
@@ -125,13 +137,21 @@ export default function CombinedBets({ currentTab = "Combined", subTab = "Kick-O
     );
   }
 
+  /* ===== Render: Football tab ===== */
   if (currentTab === "Football") {
     return (
       <div>
         <h2 className="text-xl font-bold mb-2">Football — {subTab}</h2>
         {err && <div className="mb-2 text-amber-300 text-sm">{err}</div>}
         {sortedFootball.length > 0 ? (
-          sortedFootball.slice(0, 20).map((p) => <Card key={p.fixture_id ?? `${p?.league?.id}-${p?.teams?.home?.name}-${p?.teams?.away?.name}`} p={p} />)
+          sortedFootball
+            .slice(0, 20)
+            .map((p, idx) => (
+              <FootballCard
+                key={p?.fixture_id ?? `${p?.league?.id}-${p?.teams?.home?.name}-${p?.teams?.away?.name}-${idx}`}
+                p={p}
+              />
+            ))
         ) : (
           <div className="text-slate-400 text-sm">Nema dostupnih predloga.</div>
         )}
@@ -139,6 +159,42 @@ export default function CombinedBets({ currentTab = "Combined", subTab = "Kick-O
     );
   }
 
-  // Combined
+  /* ===== Render: Combined tab ===== */
   return (
-    <div
+    <div className="grid md:grid-cols-2 gap-6">
+      <div>
+        <h2 className="text-xl font-bold mb-2">Football</h2>
+        {err && <div className="mb-2 text-amber-300 text-sm">{err}</div>}
+        {sortedFootball.length > 0 ? (
+          sortedFootball
+            .slice(0, 8)
+            .map((p, idx) => (
+              <FootballCard
+                key={p?.fixture_id ?? `${p?.league?.id}-${p?.teams?.home?.name}-${p?.teams?.away?.name}-${idx}`}
+                p={p}
+              />
+            ))
+        ) : (
+          <div className="text-slate-400 text-sm">Nema dostupnih predloga.</div>
+        )}
+      </div>
+
+      <div>
+        <h2 className="text-xl font-bold mb-2">Crypto</h2>
+        {crypto.length > 0 ? (
+          crypto.slice(0, 8).map((c, i) => (
+            <div key={`${c?.symbol}-${i}`} className="p-3 rounded-xl bg-[#202542] mb-2 shadow">
+              <div className="font-semibold">{c?.symbol}</div>
+              <div className="text-sm">
+                {c?.signal} @ {c?.price}{" "}
+                {Number.isFinite(c?.confidence) ? <> (Conf: {c.confidence.toFixed(1)}%)</> : null}
+              </div>
+            </div>
+          ))
+        ) : (
+          <div className="text-slate-400 text-sm">Nema dostupnih kripto signala.</div>
+        )}
+      </div>
+    </div>
+  );
+          }
