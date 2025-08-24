@@ -1,10 +1,80 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 
-async function fetchJSON(url) {
-  const r = await fetch(url, { cache: "no-store" });
-  if (!r.ok) throw new Error(`${url} -> ${r.status}`);
-  return r.json();
+/** 🔧 PODESI OVO: stavi tačan URL tvog endpointa koji već vraća SAMO završene Top-3 za 14 dana. */
+const HISTORY_URL = "/api/api14days"; 
+// Primer alternative ako ti je to zapravo ovo:
+// const HISTORY_URL = "/api/history?days=14";
+
+/* ───────────────── helpers ───────────────── */
+
+const TZ = "Europe/Belgrade";
+
+function fmtLocal(isoLike) {
+  try {
+    const d = new Date(isoLike);
+    return new Intl.DateTimeFormat("sv-SE", {
+      timeZone: TZ,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(d);
+  } catch {
+    return isoLike || "";
+  }
 }
+
+function dayKey(isoLike) {
+  try {
+    const d = new Date(isoLike);
+    return new Intl.DateTimeFormat("sv-SE", {
+      timeZone: TZ,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(d);
+  } catch {
+    return "—";
+  }
+}
+
+function flagEmoji(country = "") {
+  const map = {
+    Albania: "🇦🇱", Algeria: "🇩🇿", Argentina: "🇦🇷", Australia: "🇦🇺",
+    Austria: "🇦🇹", Belgium: "🇧🇪", Bosnia: "🇧🇦", Brazil: "🇧🇷",
+    Bulgaria: "🇧🇬", Chile: "🇨🇱", China: "🇨🇳", Colombia: "🇨🇴",
+    Croatia: "🇭🇷", Cyprus: "🇨🇾", Czech: "🇨🇿", Denmark: "🇩🇰",
+    Ecuador: "🇪🇨", England: "🏴", Estonia: "🇪🇪", Finland: "🇫🇮",
+    France: "🇫🇷", Georgia: "🇬🇪", Germany: "🇩🇪", Greece: "🇬🇷",
+    Hungary: "🇭🇺", Iceland: "🇮🇸", India: "🇮🇳", Iran: "🇮🇷",
+    Ireland: "🇮🇪", Israel: "🇮🇱", Italy: "🇮🇹", Japan: "🇯🇵",
+    Korea: "🇰🇷", Lithuania: "🇱🇹", Malaysia: "🇲🇾", Mexico: "🇲🇽",
+    Morocco: "🇲🇦", Netherlands: "🇳🇱", Norway: "🇳🇴", Poland: "🇵🇱",
+    Portugal: "🇵🇹", Romania: "🇷🇴", Russia: "🇷🇺", Saudi: "🇸🇦",
+    Scotland: "🏴", Serbia: "🇷🇸", Slovakia: "🇸🇰", Slovenia: "🇸🇮",
+    Spain: "🇪🇸", Sweden: "🇸🇪", Switzerland: "🇨🇭", Turkey: "🇹🇷",
+    USA: "🇺🇸", Ukraine: "🇺🇦", Uruguay: "🇺🇾", Wales: "🏴",
+  };
+  const key = Object.keys(map).find((k) =>
+    country.toLowerCase().includes(k.toLowerCase())
+  );
+  return key ? map[key] : "🏳️";
+}
+
+async function safeJson(url) {
+  try {
+    const r = await fetch(url, { cache: "no-store" });
+    const ct = r.headers.get("content-type") || "";
+    if (ct.includes("application/json")) return await r.json();
+    const txt = await r.text();
+    try { return JSON.parse(txt); } catch { return { ok:false, error:"non-JSON", raw: txt }; }
+  } catch (e) {
+    return { ok:false, error: String(e?.message || e) };
+  }
+}
+
+/* ───────────────── UI dijelovi ───────────────── */
 
 function Outcome({ won }) {
   if (won === true) {
@@ -21,161 +91,143 @@ function Outcome({ won }) {
       </span>
     );
   }
-  return (
-    <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-bold bg-slate-500/20 text-slate-300">
-      ⏳ U toku
-    </span>
-  );
+  // Po tvom zahtevu: u History nema "U toku" — ako endpoint slučajno vrati nešto nesettlovano, jednostavno ne prikazujemo badge.
+  return null;
 }
 
 function Row({ it }) {
-  const market = String(it.market || "").toUpperCase();
-  const sel = String(it.selection || "");
-  const marketLabel =
-    market === "OU" && /OVER|UNDER/.test(sel.toUpperCase())
-      ? `OU: ${sel}`
-      : (market === "BTTS 1H" ? "BTTS 1H" : market) + (market ? `: ${sel}` : "");
+  const leagueName = it?.league?.name || "—";
+  const country = it?.league?.country || "";
+  const flag = flagEmoji(country);
+
+  const ko =
+    it?.kickoff ||
+    it?.datetime_local?.starting_at?.date_time ||
+    it?.time?.starting_at?.date_time ||
+    "";
+
+  const home = it?.teams?.home?.name || it?.teams?.home || "—";
+  const away = it?.teams?.away?.name || it?.teams?.away || "—";
+
+  const market = it?.market_label || it?.market || "";
+  const selection = it?.selection || "";
+  const odds = Number.isFinite(it?.odds || it?.market_odds)
+    ? (it?.odds || it?.market_odds)
+    : null;
+
+  const score = it?.final_score || "";
+  const ht = it?.ht_score || "";
+  const won = it?.won;
 
   return (
     <div className="p-4 rounded-xl bg-[#1f2339]">
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-2">
         <div className="min-w-0">
           <div className="font-semibold">
-            {it?.teams?.home || "—"} <span className="text-slate-400">vs</span>{" "}
-            {it?.teams?.away || "—"}
+            {home} <span className="text-slate-400">vs</span> {away}
           </div>
           <div className="text-xs text-slate-400">
-            {(it?.league?.name || "—")}
-            {" · "}
-            {new Date(it.kickoff).toLocaleString("sv-SE", {
-              timeZone: "Europe/Belgrade",
-              year: "numeric",
-              month: "2-digit",
-              day: "2-digit",
-              hour: "2-digit",
-              minute: "2-digit",
-            })}
-            {" · "}Slot: {it.slot || "—"}
+            {leagueName} {country ? `· ${flag}` : ""} {" · "}
+            {fmtLocal(ko)}
           </div>
         </div>
 
         <div className="flex flex-col items-start md:items-end gap-1">
           <div className="text-sm">
-            <span className="font-semibold">{marketLabel}</span>{" "}
-            <span className="text-slate-300">
-              ({Number(it.odds || 0).toFixed(2)})
-            </span>
+            <span className="font-semibold">
+              {market ? `${market} → ${selection}` : selection}
+            </span>{" "}
+            {odds ? <span className="text-slate-300">({Number(odds).toFixed(2)})</span> : null}
           </div>
 
-          <div className="text-xs text-slate-300">
-            TR:{" "}
-            {it.final_score ? (
-              <span className="font-mono">{it.final_score}</span>
-            ) : (
-              <span className="text-slate-400">—</span>
-            )}
-          </div>
+          {score ? (
+            <div className="text-xs text-slate-300">
+              TR: <span className="font-mono">{score}</span>
+              {ht ? <span className="text-slate-400"> (HT {ht})</span> : null}
+            </div>
+          ) : null}
 
-          <Outcome won={it.won} />
+          <Outcome won={won} />
         </div>
       </div>
     </div>
   );
 }
 
-export default function HistoryPanel({ label = "History", days = 14, refreshMs = 60000 }) {
-  const [data, setData] = useState({ items: [], aggregates: {} });
+/* ───────────────── Glavni panel ───────────────── */
+
+export default function HistoryPanel({ label = "History" }) {
+  const [items, setItems] = useState([]);
   const [err, setErr] = useState(null);
-  const settleOnceRef = useRef(false);
-
-  async function load() {
-    const j = await fetchJSON(`/api/history?days=${days}`);
-    setData(j || { items: [], aggregates: {} });
-    return j;
-  }
-
-  // Jednokratni "kick" ako ima starih a nesettlovanih stavki (kickoff < now-6h)
-  async function maybeAutoSettle(j) {
-    if (settleOnceRef.current) return;
-    const arr = Array.isArray(j?.items) ? j.items : [];
-    const now = Date.now();
-    const stale = arr.some((it) => {
-      if (it?.final_score) return false;
-      const t = it?.kickoff ? new Date(it.kickoff).getTime() : NaN;
-      return Number.isFinite(t) && t < now - 6 * 60 * 60 * 1000; // 6h
-    });
-    if (!stale) return;
-
-    settleOnceRef.current = true;
-    try {
-      await fetch(`/api/history-check?days=2`, { cache: "no-store" });
-      const j2 = await fetchJSON(`/api/history?days=${days}`);
-      setData(j2 || { items: [], aggregates: {} });
-    } catch { /* no-op */ }
-  }
-
-  async function tick() {
-    try {
-      const j = await load();
-      await maybeAutoSettle(j);
-      setErr(null);
-    } catch (e) {
-      setErr(String(e && e.message) || "Error");
-    }
-  }
+  const [loadedOnce, setLoadedOnce] = useState(false);
 
   useEffect(() => {
-    tick(); // initial
-    if (refreshMs > 0) {
-      const t = setInterval(tick, refreshMs);
-      return () => clearInterval(t);
-    }
-  }, [days, refreshMs]);
+    (async () => {
+      const j = await safeJson(HISTORY_URL);
+      if (j && j.ok === false) {
+        // ako endpoint vrati grešku, NE briši prethodni dobar state
+        if (!loadedOnce) setItems([]);
+        setErr(j.error || "Greška pri čitanju istorije.");
+        setLoadedOnce(true);
+        return;
+      }
+      const arr = Array.isArray(j?.items) ? j.items : Array.isArray(j) ? j : [];
+      // Ako backend već vraća SAMO završene Top-3, ništa dodatno ne filtriramo.
+      // Za svaki slučaj (defenzivno): zadrži samo one sa konačnim ishodom.
+      const finished = arr.filter((it) => typeof it?.won === "boolean" && !!it?.final_score);
 
-  const items = Array.isArray(data.items) ? data.items : [];
-  const ag7 = data?.aggregates?.["7d"];
-  const ag14 = data?.aggregates?.["14d"];
+      // Sortiraj po kickoff opadajuće (najnovije prvo)
+      finished.sort((a, b) => {
+        const ta = new Date(a?.kickoff || a?.datetime_local?.starting_at?.date_time || 0).getTime();
+        const tb = new Date(b?.kickoff || b?.datetime_local?.starting_at?.date_time || 0).getTime();
+        return tb - ta;
+      });
+
+      setItems(finished);
+      setErr(null);
+      setLoadedOnce(true);
+    })();
+  }, []);
+
+  // Grupisanje po danu
+  const groups = useMemo(() => {
+    const g = new Map();
+    for (const it of items) {
+      const key =
+        dayKey(it?.kickoff || it?.datetime_local?.starting_at?.date_time || "");
+      if (!g.has(key)) g.set(key, []);
+      g.get(key).push(it);
+    }
+    return Array.from(g.entries()); // [ [day, arr], ... ]
+  }, [items]);
 
   return (
     <div label={label}>
-      {/* Mali agregat */}
+      {/* zaglavlje panela (bez ROI/7d/14d jer tražiš čist top3 history) */}
       <div className="mb-4 p-4 rounded-xl bg-[#1f2339] text-slate-200">
-        <div className="text-sm font-semibold mb-1">History — učinak</div>
-        <div className="text-sm text-slate-300 flex flex-wrap gap-x-6 gap-y-1">
-          <span>
-            7d: <strong>{ag7?.win_rate ?? 0}%</strong>
-            <span className="text-slate-400"> · ROI </span>
-            <strong>
-              {Number(ag7?.roi ?? 0) >= 0 ? "+" : ""}
-              {Number(ag7?.roi ?? 0).toFixed(2)}
-            </strong>
-            <span className="text-slate-400"> (N={ag7?.n ?? 0})</span>
-          </span>
-          <span>
-            14d: <strong>{ag14?.win_rate ?? 0}%</strong>
-            <span className="text-slate-400"> · ROI </span>
-            <strong>
-              {Number(ag14?.roi ?? 0) >= 0 ? "+" : ""}
-              {Number(ag14?.roi ?? 0).toFixed(2)}
-            </strong>
-            <span className="text-slate-400"> (N={ag14?.n ?? 0})</span>
-          </span>
-        </div>
+        <div className="text-sm font-semibold">History — Top 3 (završene)</div>
+        <div className="text-xs text-slate-400">Prikazuju se samo mečevi koji su bili u Top-3 Football (Combined) i koji su završeni.</div>
       </div>
 
-      {/* Lista */}
       {err ? (
         <div className="p-4 rounded-xl bg-[#1f2339] text-rose-300 text-sm">
           Greška: {err}
         </div>
-      ) : items.length === 0 ? (
+      ) : groups.length === 0 ? (
         <div className="p-4 rounded-xl bg-[#1f2339] text-slate-300 text-sm">
-          Još uvek nema istorije za prikaz.
+          Nema završених Top-3 mečeva za prikaz.
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-3">
-          {items.map((it) => (
-            <Row key={`${it.fixture_id}-${it.locked_at}`} it={it} />
+        <div className="space-y-6">
+          {groups.map(([day, arr]) => (
+            <div key={day}>
+              <div className="text-slate-300 text-sm mb-2">{day}</div>
+              <div className="grid grid-cols-1 gap-3">
+                {arr.map((it) => (
+                  <Row key={`${it.fixture_id}-${it.locked_at || it.kickoff}`} it={it} />
+                ))}
+              </div>
+            </div>
           ))}
         </div>
       )}
