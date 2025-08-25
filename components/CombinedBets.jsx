@@ -3,15 +3,10 @@ import React from 'react';
 
 const TZ = 'Europe/Belgrade';
 
-function safeISO(iso) {
-  const s = String(iso || '');
-  // Ako nema vremensku zonu u stringu, dodaj Z (UTC) da Date ne “pada” u lokalno.
-  return /Z$|[+-]\d{2}:\d{2}$/.test(s) ? s : s + 'Z';
-}
-
+// ---- Time helpers (bez dodavanja "Z"; koristimo kako god dođe iz API-ja) ----
 function fmtKO(iso) {
   try {
-    const dt = new Date(safeISO(iso));
+    const dt = new Date(String(iso || '').replace(' ', 'T'));
     return new Intl.DateTimeFormat('sr-RS', {
       timeZone: TZ,
       hour: '2-digit',
@@ -22,22 +17,27 @@ function fmtKO(iso) {
   }
 }
 
-function confColor(pct) {
+// ---- Confidence helpers (fiksne boje bez Tailwind klasa) ----
+function confidenceColor(pct) {
   const c = Number(pct || 0);
-  if (c < 50) return 'bg-amber-500';         // Low
-  if (c < 75) return 'bg-sky-500';           // Moderate
-  return 'bg-emerald-500';                   // High
+  if (c < 50) return '#f59e0b';   // amber-500
+  if (c < 75) return '#0ea5e9';   // sky-500
+  return '#10b981';               // emerald-500
 }
-
 function ConfidenceBar({ value }) {
   const pct = Math.max(0, Math.min(100, Number(value || 0)));
   return (
-    <div className="w-full rounded-md bg-gray-200 h-2 relative overflow-hidden">
+    <div style={{ width: '100%', height: 8, borderRadius: 6, background: '#e5e7eb', position: 'relative', overflow: 'hidden' }}>
       <div
-        className={`h-2 ${confColor(pct)}`}
-        style={{ width: `${pct}%` }}
+        style={{
+          width: `${pct}%`,
+          height: 8,
+          background: confidenceColor(pct),
+          borderRadius: 6,
+          transition: 'width .25s ease',
+        }}
       />
-      <div className="absolute -top-5 right-0 text-xs font-medium">{pct}%</div>
+      <div style={{ position: 'absolute', top: -18, right: 0, fontSize: 12, fontWeight: 600 }}>{pct}%</div>
     </div>
   );
 }
@@ -46,17 +46,20 @@ function Card({ item }) {
   const koIso =
     item?.datetime_local?.starting_at?.date_time ||
     item?.datetime_local?.date_time ||
-    item?.time?.starting_at?.date_time;
+    item?.time?.starting_at?.date_time ||
+    '';
   const ko = fmtKO(koIso);
+  const odds = Number(item?.market_odds || 0);
 
   return (
-    <div className="rounded-2xl shadow p-4 border border-gray-100 flex flex-col gap-2">
-      <div className="text-sm text-gray-500">{ko} • {item?.league?.name || ''}</div>
-      <div className="text-base font-semibold">
+    <div className="rounded-2xl shadow p-4 border border-gray-800/30 bg-[#111827] flex flex-col gap-2">
+      <div className="text-sm text-gray-400">{ko} • {item?.league?.name || ''}</div>
+      <div className="text-base font-semibold text-white">
         {item?.teams?.home?.name} vs {item?.teams?.away?.name}
       </div>
-      <div className="text-sm text-gray-600">
-        {item?.market} — {item?.selection} @ {Number(item?.market_odds || 0).toFixed(2)}
+      <div className="text-sm text-gray-300">
+        {item?.market} — {item?.selection}{' '}
+        {odds ? <span className="text-gray-200">@ {odds.toFixed(2)}</span> : null}
       </div>
       <ConfidenceBar value={item?.confidence_pct} />
     </div>
@@ -66,25 +69,36 @@ function Card({ item }) {
 export default function CombinedBets() {
   const [football, setFootball] = React.useState([]);
   const [crypto, setCrypto] = React.useState([]);
-  const [meta, setMeta] = React.useState({ slot: null, built_at: null });
+  const [meta, setMeta] = React.useState({ slot: null, built_at: null, nextKO: '—' });
 
   React.useEffect(() => {
     let mounted = true;
 
-    // FOOTBALL: koristi ISKLJUČIVO zaključani feed
+    // FOOTBALL: zaključani feed (bez fallback-a)
     fetch('/api/value-bets-locked', { cache: 'no-store' })
       .then(r => r.json())
       .then(j => {
         if (!mounted) return;
         const items = Array.isArray(j?.items) ? j.items : [];
         setFootball(items);
-        setMeta({ slot: j?.slot || null, built_at: j?.built_at || null });
+
+        // next kickoff (najmanji KO iz dobijenog seta)
+        const times = items
+          .map(it => it?.datetime_local?.starting_at?.date_time || it?.datetime_local?.date_time || it?.time?.starting_at?.date_time)
+          .filter(Boolean)
+          .map(s => new Date(String(s).replace(' ', 'T')))
+          .sort((a,b) => a - b);
+        const nextKO = times[0]
+          ? new Intl.DateTimeFormat('sr-RS', { timeZone: TZ, hour: '2-digit', minute: '2-digit' }).format(times[0])
+          : '—';
+
+        setMeta({ slot: j?.slot || null, built_at: j?.built_at || null, nextKO });
       })
       .catch(() => { /* ignore */ });
 
     // CRYPTO: ne ruši levu kolonu ako je prazno/greška
     fetch('/api/crypto-bets-locked', { cache: 'no-store' })
-      .then(r => r.ok ? r.json() : Promise.resolve({ items: [] }))
+      .then(r => (r.ok ? r.json() : Promise.resolve({ items: [] })))
       .then(j => {
         if (!mounted) return;
         setCrypto(Array.isArray(j?.items) ? j.items : []);
@@ -94,35 +108,45 @@ export default function CombinedBets() {
     return () => { mounted = false; };
   }, []);
 
-  const left = football.slice(0, 3);   // Top-3 Football iz aktivnog slota
-  const right = crypto.slice(0, 3);     // Top-3 Crypto (ako ima)
+  const left = football.slice(0, 3);
+  const right = crypto.slice(0, 3);
 
   return (
     <div className="grid md:grid-cols-2 gap-4">
+      {/* Football */}
       <div className="flex flex-col gap-3">
-        <div className="text-sm text-gray-500">
-          Football — slot: <b>{meta.slot || '—'}</b> {meta.built_at ? `· built ${new Date(meta.built_at).toLocaleTimeString('sr-RS')}` : ''}
+        <div className="text-sm text-gray-300">
+          Football — slot: <b>{meta.slot || '—'}</b>{' '}
+          {meta.built_at ? `· built ${new Date(meta.built_at).toLocaleTimeString('sr-RS')}` : ''}{' '}
+          · Next kickoff: <b>{meta.nextKO}</b>
         </div>
         {left.length === 0 ? (
-          <div className="text-sm text-gray-500">Nema stavki za trenutni slot.</div>
+          <div className="text-sm text-gray-400">Nema stavki za ovaj slot.</div>
         ) : (
           left.map((it) => <Card key={`${it.fixture_id}|${it.market}|${it.selection}`} item={it} />)
         )}
       </div>
 
+      {/* Crypto (ne blokira ništa ako je prazno) */}
       <div className="flex flex-col gap-3">
-        <div className="text-sm text-gray-500">Crypto</div>
+        <div className="text-sm text-gray-300">Crypto</div>
         {right.length === 0 ? (
-          <div className="text-sm text-gray-400">—</div>
+          <div className="text-sm text-gray-500">—</div>
         ) : (
           right.map((it, idx) => (
-            <div key={idx} className="rounded-2xl shadow p-4 border border-gray-100">
-              {/* prilagodi po tvom crypto obliku */}
-              <div className="text-base font-semibold">{it?.symbol || it?.name}</div>
-              <div className="text-sm text-gray-600">{it?.reason || ''}</div>
+            <div key={idx} className="rounded-2xl shadow p-4 border border-gray-800/30 bg-[#111827]">
+              <div className="text-base font-semibold text-white">{it?.symbol || it?.name}</div>
+              <div className="text-sm text-gray-300">{it?.reason || ''}</div>
             </div>
           ))
         )}
+      </div>
+
+      {/* Legenda */}
+      <div className="col-span-2 text-xs text-gray-400 mt-2">
+        Confidence legend: <span style={{ color: '#10b981' }}>High (≥75%)</span> ·{' '}
+        <span style={{ color: '#0ea5e9' }}>Moderate (50–75%)</span> ·{' '}
+        <span style={{ color: '#f59e0b' }}>Low (&lt;50%)</span>
       </div>
     </div>
   );
