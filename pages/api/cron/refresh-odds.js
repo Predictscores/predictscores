@@ -1,8 +1,4 @@
 // FILE: pages/api/cron/refresh-odds.js
-// Osvežava kvote/EV/confidence za AM/PM/LATE (mečevi koji startuju ≤3h).
-// Histereza: >2% normalno; ≤60' prag 1%; ≤15' uvek osveži.
-// Idempotent guard: 60s.
-
 export const config = { api: { bodyParser: false } };
 
 const TZ       = process.env.TZ_DISPLAY || "Europe/Belgrade";
@@ -39,14 +35,33 @@ async function kvSET(key, value){
   }).then(r=>r.ok);
 }
 
-/* ---------- time ---------- */
+/* ---------- utils ---------- */
+function parseMaybe(raw){
+  try{
+    let v = raw;
+    if (typeof v === "string") v = JSON.parse(v);
+    if (Array.isArray(v)) return v;
+    if (v && typeof v === "object"){
+      if (Array.isArray(v.value)) return v.value;
+      if (Array.isArray(v.arr)) return v.arr;
+      if (Array.isArray(v.data)) return v.data;
+      if ("value" in v){
+        const inner=v.value;
+        if (typeof inner==="string") return JSON.parse(inner);
+        if (Array.isArray(inner)) return inner;
+      }
+    }
+  }catch{}
+  return [];
+}
+async function arrOf(key){ return parseMaybe(await kvGET(key)); }
+
 function ymdInTZ(d=new Date(), tz=TZ) {
   const fmt = new Intl.DateTimeFormat("en-CA",{ timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
   return fmt.format(d);
 }
-
-/* ---------- odds helpers ---------- */
 const norm = s => String(s||"").trim().toLowerCase();
+
 function median(values){ if(!values.length)return null; const a=values.slice().sort((x,y)=>x-y); const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; }
 function impliedFromOdds(o){ return (Number(o)>0)?(1/Number(o)):null; }
 function spreadOfImplied(oddsList){
@@ -58,7 +73,6 @@ function spreadOfImplied(oddsList){
 }
 
 function pickConsensusOdds(pairs){
-  // pairs: [{book, odds}]
   if (!pairs || !pairs.length) return null;
   const all = pairs.map(p=>p.odds).filter(Number.isFinite);
   if (!all.length) return null;
@@ -71,12 +85,9 @@ function pickConsensusOdds(pairs){
   const allSpread = spreadOfImplied(all);
   const trSpread  = spreadOfImplied(trusted);
 
-  // 1) ≥3 trusted i mali spread -> median trusted
   if (trusted.length >= 3 && trSpread != null && trSpread <= TRUSTED_SPREAD_MAX) {
     return { odds: median(trusted), bookmakers_count: all.length, bookmakers_count_trusted: trusted.length, src:"trusted-median" };
   }
-
-  // 2) 1 trusted + ≥5 all, tolerancija prema median(all)
   if (trusted.length === 1 && all.length >= 5) {
     const aMed = median(all);
     const tOnly = trusted[0];
@@ -84,12 +95,9 @@ function pickConsensusOdds(pairs){
       return { odds:aMed, bookmakers_count:all.length, bookmakers_count_trusted:1, src:"trusted=1+all" };
     }
   }
-
-  // 3) fallback: ≥6 all i mali spread -> median(all)
   if (all.length >= 6 && allSpread != null && allSpread <= ALL_SPREAD_MAX){
     return { odds: median(all), bookmakers_count:all.length, bookmakers_count_trusted:0, src:"all-median" };
   }
-
   return null;
 }
 
@@ -190,30 +198,7 @@ export default async function handler(req, res){
     let updatedTotal = 0;
 
     for (const key of slotKeys){
-      const arr = (()=>{
-        const raw = parseMaybe(await kvGET(key));
-        return Array.isArray(raw) ? raw : [];
-      })();
-
-      function parseMaybe(raw){
-        try{
-          let v = raw;
-          if (typeof v === "string") v = JSON.parse(v);
-          if (Array.isArray(v)) return v;
-          if (v && typeof v === "object"){
-            if (Array.isArray(v.value)) return v.value;
-            if (Array.isArray(v.arr)) return v.arr;
-            if (Array.isArray(v.data)) return v.data;
-            if ("value" in v){
-              const inner = v.value;
-              if (typeof inner==="string") return JSON.parse(inner);
-              if (Array.isArray(inner)) return inner;
-            }
-          }
-        }catch{}
-        return [];
-      }
-
+      const arr = await arrOf(key);
       if (!arr.length) continue;
 
       let updated = 0;
@@ -221,7 +206,7 @@ export default async function handler(req, res){
         const p = arr[i];
         const t = String(p?.datetime_local?.starting_at?.date_time || "").replace(" ","T");
         const ms = +new Date(t);
-        if (!ms || ms > endMs) continue;   // daleko izvan prozora
+        if (!ms || ms > endMs) continue;   // izvan prozora
         if (ms < nowTime) continue;        // već krenulo
 
         const mins = Math.round((ms - nowTime)/60000);
@@ -283,41 +268,19 @@ export default async function handler(req, res){
     }
 
     // REBUILD :union (NE diramo :last!)
-    const union = (()=>{
-      function arrOf(k){ return parseMaybe(await kvGET(k)); }
-      function parseMaybe(raw){
-        try{
-          let v = raw;
-          if (typeof v === "string") v = JSON.parse(v);
-          if (Array.isArray(v)) return v;
-          if (v && typeof v === "object"){
-            if (Array.isArray(v.value)) return v.value;
-            if (Array.isArray(v.arr)) return v.arr;
-            if (Array.isArray(v.data)) return v.data;
-            if ("value" in v){
-              const inner = v.value;
-              if (typeof inner==="string") return JSON.parse(inner);
-              if (Array.isArray(inner)) return inner;
-            }
-          }
-        }catch{}
-        return [];
+    const union = (function dedupe(...lists){
+      const seen=new Set(); const out=[];
+      for (const L of lists) for (const it of (L||[])){
+        const k = `${it?.fixture_id||""}|${String(it?.market||"")}|${String(it?.selection||"")}`;
+        if (seen.has(k)) continue; seen.add(k); out.push(it);
       }
-      function dedupe(...lists){
-        const seen=new Set(); const out=[];
-        for (const L of lists) for (const it of (L||[])){
-          const k = `${it?.fixture_id||""}|${String(it?.market||"")}|${String(it?.selection||"")}`;
-          if (seen.has(k)) continue; seen.add(k); out.push(it);
-        }
-        return out;
-      }
-      return dedupe(
-        await arrOf(`vb:day:${day}:am`),
-        await arrOf(`vb:day:${day}:pm`),
-        await arrOf(`vb:day:${day}:late`)
-      );
-    })();
-    await kvSET(`vb:day:${day}:union`, await union);
+      return out;
+    })(
+      await arrOf(`vb:day:${day}:am`),
+      await arrOf(`vb:day:${day}:pm`),
+      await arrOf(`vb:day:${day}:late`)
+    );
+    await kvSET(`vb:day:${day}:union`, union);
 
     await kvSET(`vb:jobs:last:refresh-odds`, { ts: nowMs });
 
