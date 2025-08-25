@@ -1,119 +1,74 @@
-// FILE: pages/api/crypto.js
+// pages/api/crypto.js
+// Drop-in: CoinGecko markets -> čisti LONG/SHORT (bez NEUTRAL), stabilan JSON shape
 
-// Simple SMA helper
-function sma(values, period) {
-  if (values.length < period) return null;
-  const slice = values.slice(-period);
-  return slice.reduce((sum, v) => sum + v, 0) / period;
+const COINS = [
+  "bitcoin","ethereum","solana","binancecoin","ripple",
+  "dogecoin","cardano","tron","polkadot","chainlink",
+  "litecoin","uniswap","stellar","near","avalanche-2"
+];
+
+const CG_BASE = "https://api.coingecko.com/api/v3";
+
+async function safeJsonFetch(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  const ct = r.headers.get("content-type") || "";
+  if (!ct.includes("application/json")) {
+    const raw = await r.text();
+    return { ok: false, error: "non-JSON", status: r.status, raw };
+  }
+  const j = await r.json();
+  return { ok: r.ok, status: r.status, data: j };
+}
+
+function classifySignal(h1, d24) {
+  // Jednostavna, deterministička logika bez neutral:
+  // - LONG ako je 1h >= +0.25% i 24h nije katastrofa
+  // - u suprotnom SHORT
+  if ((h1 ?? 0) >= 0.25 && (d24 ?? 0) > -4.0) return "LONG";
+  return "SHORT";
+}
+
+function confidenceFrom(h1, d24) {
+  // 0–100: kombinacija 1h i 24h, ograničena
+  const a = Math.max(-5, Math.min(5, (h1 ?? 0) / 1.0));   // -5..+5 za 1h
+  const b = Math.max(-10, Math.min(10, (d24 ?? 0) / 2.0)); // -10..+10 za 24h
+  const score = 50 + a * 5 + b * 2.5; // težište na 1h
+  return Math.round(Math.max(1, Math.min(99, score)));
 }
 
 export default async function handler(req, res) {
-  const symbols = [
-    'BTC','ETH','BNB','SOL','XRP','ADA','DOGE','MATIC','DOT','AVAX',
-    'UNI','LINK','LTC','ATOM','ALGO','TRX','VET','ICP','FIL','EOS',
-    'AAVE','XTZ','SUSHI','MKR','SNX','ZEC','COMP','ENJ','KSM','OMG',
-    'CHZ','AXS','GRT','MANA','THETA','FTT','NEO','DASH','ZIL','QTUM',
-    'XLM','BAT','YFI','IBC','WAVES','KLAY','AR','IOST','REN','CELO'
-  ];
+  try {
+    const ids = COINS.join(",");
+    const url = `${CG_BASE}/coins/markets?vs_currency=usd&ids=${encodeURIComponent(ids)}&order=market_cap_desc&price_change_percentage=1h,24h`;
+    const r = await safeJsonFetch(url);
+    if (!r.ok) {
+      res.setHeader("Content-Type", "application/json");
+      return res.status(502).json({ ok:false, error:"coingecko failed", detail:r, signals: [] });
+    }
 
-  const results = await Promise.all(
-    symbols.map(async (symbol) => {
-      try {
-        // 1) Minute bars (15m aggregate)
-        let rMin = await fetch(
-          `https://min-api.cryptocompare.com/data/v2/histominute?fsym=${symbol}&tsym=USD&limit=96&aggregate=15`
-        );
-        let jMin = await rMin.json();
-        let bars = jMin.Data?.Data || [];
-        if (bars.length < 10) {
-          console.warn(`Few minute bars for ${symbol}, falling back to CG OHLC`);
-          const cg = await fetch(
-            `https://api.coingecko.com/api/v3/coins/${symbol.toLowerCase()}/ohlc?vs_currency=usd&days=1`
-          ).then((r) => r.json());
-          bars = cg.map(([t, o, h, l, c]) => ({
-            time: t / 1000,
-            open: o,
-            high: h,
-            low: l,
-            close: c,
-          }));
-        }
+    const arr = Array.isArray(r.data) ? r.data : [];
+    const signals = arr.map(c => {
+      const h1 = c?.price_change_percentage_1h_in_currency ?? null;
+      const d24 = c?.price_change_percentage_24h_in_currency ?? null;
+      const signal = classifySignal(h1, d24);
+      const confidence = confidenceFrom(h1, d24);
+      return {
+        symbol: (c?.symbol || "").toUpperCase() + "USDT",
+        name: c?.name || null,
+        price: c?.current_price ?? null,
+        h1_pct: h1,
+        d24_pct: d24,
+        signal,              // "LONG" | "SHORT"
+        confidence_pct: confidence,
+        source: "coingecko/markets",
+        updated_at: new Date().toISOString(),
+      };
+    }).sort((a,b) => b.confidence_pct - a.confidence_pct);
 
-        // 2) Hourly data for ATR
-        let hourlyData = [];
-        try {
-          const rHr = await fetch(
-            `https://min-api.cryptocompare.com/data/v2/histohour?fsym=${symbol}&tsym=USD&limit=24`
-          );
-          const jHr = await rHr.json();
-          hourlyData = jHr.Data?.Data || [];
-        } catch (e) {
-          console.warn(`CC histohour error for ${symbol}:`, e.message);
-        }
-        if (hourlyData.length < 5) {
-          console.warn(`Few hourly bars for ${symbol}, falling back to CG OHLC`);
-          const cgO = await fetch(
-            `https://api.coingecko.com/api/v3/coins/${symbol.toLowerCase()}/ohlc?vs_currency=usd&days=1`
-          ).then((r) => r.json());
-          hourlyData = cgO.map(([t, o, h, l, c]) => ({
-            high: h,
-            low: l,
-            close: c,
-          }));
-        }
-
-        // ATR calculation
-        const trueRanges = hourlyData.map((h, i, arr) => {
-          if (i === 0) return h.high - h.low;
-          const prev = arr[i - 1].close;
-          return Math.max(
-            h.high - h.low,
-            Math.abs(h.high - prev),
-            Math.abs(h.low - prev)
-          );
-        });
-        const atr = sma(trueRanges.slice(-14), 14) ?? 0;
-
-        // Signal logic (delta over 24h)
-        const latest = bars[bars.length - 1];
-        const first = bars[0];
-        const deltaPct = ((latest.close - first.open) / first.open) * 100;
-
-        const signal = deltaPct > 0 ? 'LONG' : 'SHORT';
-        const entryPrice = latest.close;
-        const sl = signal === 'LONG'
-          ? entryPrice - atr * 0.5
-          : entryPrice + atr * 0.5;
-        const tp = signal === 'LONG'
-          ? entryPrice + atr * 1
-          : entryPrice - atr * 1;
-        const expectedMove = (Math.abs(tp - entryPrice) / entryPrice) * 100;
-
-        return {
-          symbol,
-          price: entryPrice,
-          signal,
-          confidence: Math.min(Math.abs(deltaPct), 100),
-          change1h: bars.length > 5
-            ? ((latest.close - bars[bars.length - 5].open) / bars[bars.length - 5].open) * 100
-            : 0,
-          change24h: ((latest.close - first.open) / first.open) * 100,
-          entryPrice,
-          sl,
-          tp,
-          expectedMove,
-        };
-      } catch (err) {
-        console.error('Crypto signal failed for', symbol, err.message);
-        return null;
-      }
-    })
-  );
-
-  const filtered = results
-    .filter((x) => x !== null)
-    .sort((a, b) => b.confidence - a.confidence)
-    .slice(0, 10);
-
-  res.status(200).json({ crypto: filtered });
+    res.setHeader("Content-Type", "application/json");
+    return res.status(200).json({ ok:true, count: signals.length, signals });
+  } catch (e) {
+    res.setHeader("Content-Type", "application/json");
+    return res.status(500).json({ ok:false, error:String(e?.message||e), signals: [] });
+  }
 }
