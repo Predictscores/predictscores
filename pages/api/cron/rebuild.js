@@ -93,13 +93,11 @@ function isUEFA(name=""){
   const s = String(name).toLowerCase();
   return /uefa|champions|europa|conference|euro qualifiers|euro cup/.test(s);
 }
-
 function groupOf(p){
   const league = String(p?.league?.name || "");
   if (isUEFA(league)) return "UEFA";
   return "DOM";
 }
-
 function dedupeUnion(...lists){
   const seen = new Set();
   const out = [];
@@ -140,7 +138,7 @@ function toHistoryRecord(slot, pick){
     slot: String(slot || "").toUpperCase(),
     market: pick?.market,
     selection: pick?.selection,
-    odds: Number(pick?.market_odds),
+    odds: Number(p?.market_odds),
     locked_at: new Date().toISOString(),
     final_score: null,
     won: null,
@@ -265,7 +263,7 @@ export default async function handler(req, res){
     await kvSET(`vb:day:${dayCET}:union`, union);
 
     // marker za rebuild (bez :last!)
-    await kvSET(`vb:jobs:last:rebuild`, { ts: Date.now(), slot });
+    await kvSET(`vb:jobs:last:rebuild`, { ts: nowMs, slot });
 
     // HISTORY capture (Top-3 za AM/PM, Top-1 za LATE)
     if (FEATURE_HISTORY) {
@@ -303,4 +301,4 @@ export default async function handler(req, res){
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message || e) });
   }
-    }
+}
