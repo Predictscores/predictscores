@@ -49,5 +49,5 @@ jobs:
         run: curl -s "${{ secrets.BASE_URL }}/api/insights-build"
       - name: Apply learning (writes :last)
         run: curl -s "${{ secrets.BASE_URL }}/api/cron/apply-learning"
-      - name: History settle (once daily, after midnight SRB)
-        run: curl -s "${{ secrets.BASE_URL }}/api/cron/history-settle"
+      - name: History settle (after midnight SRB)
+        run: curl -s "${{ secrets.BASE_URL }}/api/history-check?days=3"
