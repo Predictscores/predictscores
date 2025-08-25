@@ -49,32 +49,31 @@ export default async function handler(req, res) {
       Array.isArray(payload) ? payload :
       [];
 
-    let builtAt = payload?.built_at ?? payload?.builtAt ?? null;
-    if (!builtAt) {
-      const metaRaw = await kvGetRaw(`vb:meta:${ymd}:last_meta`).catch(()=>null);
-      const meta = parseMaybeJSON(metaRaw);
-      if (meta && meta.built_at) builtAt = meta.built_at;
+    let builtAt = null, slot = null;
+    const metaRaw = await kvGetRaw(`vb:meta:${ymd}:last_meta`).catch(()=>null);
+    const meta = parseMaybeJSON(metaRaw);
+    if (meta) {
+      builtAt = meta.built_at || meta.builtAt || null;
+      slot = meta.slot || null;
     }
 
-    res.status(200).end(
-      JSON.stringify({
-        ok: true,
-        ymd,
-        source: "last",
-        built_at: builtAt,
-        items,
-      })
-    );
+    res.status(200).end(JSON.stringify({
+      ok: true,
+      ymd,
+      source: "last",
+      built_at: builtAt,
+      slot,
+      items,
+    }));
   } catch (e) {
-    res.status(200).end(
-      JSON.stringify({
-        ok: false,
-        error: String(e?.message || e),
-        ymd: null,
-        source: "last",
-        built_at: null,
-        items: [],
-      })
-    );
+    res.status(200).end(JSON.stringify({
+      ok: false,
+      error: String(e?.message || e),
+      ymd: null,
+      source: "last",
+      built_at: null,
+      slot: null,
+      items: [],
+    }));
   }
 }
