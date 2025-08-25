@@ -1,6 +1,7 @@
 // FILE: pages/api/value-bets-locked.js
-// Hard-fix: zaključani feed iz KV; ako nema validnih stavki za AKTIVNI slot (ili su sve u prošlosti),
-// fallback na generator (/api/value-bets) + strogi filter: samo AKTIVNI slot + KO > SADA (Europe/Belgrade).
+// Ceo slot: vraća SVE parove iz AKTIVNOG prozora (00–10 LATE, 10–15 AM, 15–24 PM) po Europe/Belgrade.
+// Redosled izvora: :last → :<slot> → :union → generator(/api/value-bets), uvek filtrirano na aktivni slot.
+// NEMA filtera "KO > sada" — prikazuje sve iz slota, i prošle i buduće.
 
 export const config = { api: { bodyParser: false } };
 
@@ -25,14 +26,6 @@ function hourInTZ(tz = TZ, d = new Date()){
     return parseInt(s, 10);
   } catch { return d.getHours(); }
 }
-function nowInTZ(tz = TZ) {
-  const now = new Date();
-  // “Trik” bez biblioteka: dobij ISO u toj zoni
-  const y = ymd(tz, now);
-  const h = String(hourInTZ(tz, now)).padStart(2,"0");
-  const m = String(now.getUTCMinutes()).padStart(2,"0"); // minut nije kritičan za slot, ali za KO>now je ok i UTC-minute
-  return { ymd: y, hour: parseInt(h,10), isoHint: `${y}T${h}:${m}:00` };
-}
 function activeSlot(now = new Date()){
   const h = hourInTZ(TZ, now);
   if (h >= 0  && h < 10) return "late"; // 00–10
@@ -55,16 +48,6 @@ function inSlotWindow(pick, day, slot){
   if (slot === "pm")   return p.hour >= 15 && p.hour < 24;
   if (slot === "late") return p.hour >= 0  && p.hour < 10;
   return true;
-}
-function isFutureKO(pick){
-  const iso = pick?.datetime_local?.starting_at?.date_time
-           || pick?.datetime_local?.date_time
-           || pick?.time?.starting_at?.date_time
-           || null;
-  if (!iso) return false;
-  const dt = new Date(String(iso).replace(" ","T"));
-  const now = new Date();
-  return dt.getTime() > now.getTime();
 }
 
 /* ---------- KV ---------- */
@@ -107,54 +90,50 @@ export default async function handler(req, res) {
   try {
     const day  = String(req.query.ymd || ymd());
     const slot = activeSlot();
-    const nowBits = nowInTZ(TZ);
 
-    // 1) PROBAJ PRAVI :last
-    let items = arr(await kvGet(`vb:day:${day}:last`));
+    // 1) PRAVI :last (+ filter na aktivni slot)
+    let items = arr(await kvGet(`vb:day:${day}:last`)).filter(p => inSlotWindow(p, day, slot));
+
+    // meta
     let metaRaw = await kvGet(`vb:meta:${day}:last_meta`).catch(()=>null);
     let meta = parseMaybe(metaRaw) || {};
     let builtAt = meta.built_at || meta.builtAt || null;
     let metaSlot = meta.slot || null;
     let source = "last";
 
-    // Validacija: mora biti AKTIVNI slot i KO u budućnosti
-    let valid = Array.isArray(items) && items.some(x => inSlotWindow(x, day, slot) && isFutureKO(x));
-    if (!valid) {
-      // 2) SLOT KEY (am/pm/late)
+    // 2) SLOT KEY (am/pm/late)
+    if (!items.length){
       const slotKey = `vb:day:${day}:${slot}`;
-      const slotArr = arr(await kvGet(slotKey)).filter(p => inSlotWindow(p, day, slot) && isFutureKO(p));
+      const slotArr = arr(await kvGet(slotKey)).filter(p => inSlotWindow(p, day, slot));
       if (slotArr.length){
         items = slotArr;
         builtAt = new Date().toISOString();
         metaSlot = slot;
         source = "slot";
-        valid = true;
       }
     }
 
-    if (!valid) {
-      // 3) UNION
-      const unionArr = arr(await kvGet(`vb:day:${day}:union`)).filter(p => inSlotWindow(p, day, slot) && isFutureKO(p));
+    // 3) UNION
+    if (!items.length){
+      const unionArr = arr(await kvGet(`vb:day:${day}:union`)).filter(p => inSlotWindow(p, day, slot));
       if (unionArr.length){
         items = unionArr;
         builtAt = new Date().toISOString();
         metaSlot = slot;
         source = "union";
-        valid = true;
       }
     }
 
-    if (!valid) {
-      // 4) GENERATOR (kraj priče: preseci bug sa 16:00 i praznim Combined-om)
+    // 4) GENERATOR (fallback ako KV nema ništa za aktivni slot)
+    if (!items.length){
       const gen = await localGet(req, `/api/value-bets`);
       const vb  = Array.isArray(gen?.value_bets) ? gen.value_bets : [];
-      const fil = vb.filter(p => inSlotWindow(p, day, slot) && isFutureKO(p));
+      const fil = vb.filter(p => inSlotWindow(p, day, slot));
       if (fil.length){
         items = fil;
         builtAt = new Date().toISOString();
         metaSlot = slot;
         source = "generator";
-        valid = true;
       }
     }
 
@@ -173,8 +152,8 @@ export default async function handler(req, res) {
       slot: metaSlot || slot,
       built_at: builtAt,
       items,
-      source,           // debug: odakle je došlo (last/slot/union/generator)
-      locked_version: "v4"
+      source,                 // last / slot / union / generator
+      locked_version: "v5-slot-all"
     }));
   } catch (e) {
     return res.status(200).end(JSON.stringify({
@@ -185,7 +164,7 @@ export default async function handler(req, res) {
       built_at: null,
       items: [],
       source: "error",
-      locked_version: "v4"
+      locked_version: "v5-slot-all"
     }));
   }
 }
