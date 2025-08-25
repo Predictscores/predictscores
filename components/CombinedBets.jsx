@@ -3,7 +3,6 @@ import React from 'react';
 
 const TZ = 'Europe/Belgrade';
 
-// ---- Time helpers (bez dodavanja "Z"; koristimo kako god dođe iz API-ja) ----
 function fmtKO(iso) {
   try {
     const dt = new Date(String(iso || '').replace(' ', 'T'));
@@ -17,26 +16,18 @@ function fmtKO(iso) {
   }
 }
 
-// ---- Confidence helpers (fiksne boje bez Tailwind klasa) ----
-function confidenceColor(pct) {
+// fiksne boje (bez Tailwind dinamike)
+function confColor(pct) {
   const c = Number(pct || 0);
-  if (c < 50) return '#f59e0b';   // amber-500
-  if (c < 75) return '#0ea5e9';   // sky-500
-  return '#10b981';               // emerald-500
+  if (c < 50) return '#f59e0b'; // Low
+  if (c < 75) return '#0ea5e9'; // Moderate
+  return '#10b981';             // High
 }
 function ConfidenceBar({ value }) {
   const pct = Math.max(0, Math.min(100, Number(value || 0)));
   return (
     <div style={{ width: '100%', height: 8, borderRadius: 6, background: '#e5e7eb', position: 'relative', overflow: 'hidden' }}>
-      <div
-        style={{
-          width: `${pct}%`,
-          height: 8,
-          background: confidenceColor(pct),
-          borderRadius: 6,
-          transition: 'width .25s ease',
-        }}
-      />
+      <div style={{ width: `${pct}%`, height: 8, background: confColor(pct), borderRadius: 6 }} />
       <div style={{ position: 'absolute', top: -18, right: 0, fontSize: 12, fontWeight: 600 }}>{pct}%</div>
     </div>
   );
@@ -52,7 +43,7 @@ function Card({ item }) {
   const odds = Number(item?.market_odds || 0);
 
   return (
-    <div className="rounded-2xl shadow p-4 border border-gray-800/30 bg-[#111827] flex flex-col gap-2">
+    <div className="rounded-2xl shadow p-4 border border-gray-800/30 bg-[#0f172a] flex flex-col gap-2">
       <div className="text-sm text-gray-400">{ko} • {item?.league?.name || ''}</div>
       <div className="text-base font-semibold text-white">
         {item?.teams?.home?.name} vs {item?.teams?.away?.name}
@@ -74,7 +65,6 @@ export default function CombinedBets() {
   React.useEffect(() => {
     let mounted = true;
 
-    // FOOTBALL: zaključani feed (bez fallback-a)
     fetch('/api/value-bets-locked', { cache: 'no-store' })
       .then(r => r.json())
       .then(j => {
@@ -82,7 +72,7 @@ export default function CombinedBets() {
         const items = Array.isArray(j?.items) ? j.items : [];
         setFootball(items);
 
-        // next kickoff (najmanji KO iz dobijenog seta)
+        // Next kickoff iz dobijenih stavki (bez buducnost filtera jer želiš ceo slot)
         const times = items
           .map(it => it?.datetime_local?.starting_at?.date_time || it?.datetime_local?.date_time || it?.time?.starting_at?.date_time)
           .filter(Boolean)
@@ -94,26 +84,21 @@ export default function CombinedBets() {
 
         setMeta({ slot: j?.slot || null, built_at: j?.built_at || null, nextKO });
       })
-      .catch(() => { /* ignore */ });
+      .catch(() => {});
 
-    // CRYPTO: ne ruši levu kolonu ako je prazno/greška
     fetch('/api/crypto-bets-locked', { cache: 'no-store' })
       .then(r => (r.ok ? r.json() : Promise.resolve({ items: [] })))
-      .then(j => {
-        if (!mounted) return;
-        setCrypto(Array.isArray(j?.items) ? j.items : []);
-      })
+      .then(j => { if (!mounted) return; setCrypto(Array.isArray(j?.items) ? j.items : []); })
       .catch(() => setCrypto([]));
 
     return () => { mounted = false; };
   }, []);
 
-  const left = football.slice(0, 3);
-  const right = crypto.slice(0, 3);
+  const left = football.slice(0, 3);   // Top-3 Football
+  const right = crypto.slice(0, 3);     // Top-3 Crypto
 
   return (
     <div className="grid md:grid-cols-2 gap-4">
-      {/* Football */}
       <div className="flex flex-col gap-3">
         <div className="text-sm text-gray-300">
           Football — slot: <b>{meta.slot || '—'}</b>{' '}
@@ -127,14 +112,13 @@ export default function CombinedBets() {
         )}
       </div>
 
-      {/* Crypto (ne blokira ništa ako je prazno) */}
       <div className="flex flex-col gap-3">
         <div className="text-sm text-gray-300">Crypto</div>
         {right.length === 0 ? (
           <div className="text-sm text-gray-500">—</div>
         ) : (
           right.map((it, idx) => (
-            <div key={idx} className="rounded-2xl shadow p-4 border border-gray-800/30 bg-[#111827]">
+            <div key={idx} className="rounded-2xl shadow p-4 border border-gray-800/30 bg-[#0f172a]">
               <div className="text-base font-semibold text-white">{it?.symbol || it?.name}</div>
               <div className="text-sm text-gray-300">{it?.reason || ''}</div>
             </div>
@@ -142,7 +126,6 @@ export default function CombinedBets() {
         )}
       </div>
 
-      {/* Legenda */}
       <div className="col-span-2 text-xs text-gray-400 mt-2">
         Confidence legend: <span style={{ color: '#10b981' }}>High (≥75%)</span> ·{' '}
         <span style={{ color: '#0ea5e9' }}>Moderate (50–75%)</span> ·{' '}
