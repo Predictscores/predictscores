@@ -33,10 +33,7 @@ function activeSlot(now = new Date()){
 }
 function toTZParts(iso, tz=TZ){
   const dt = new Date(String(iso||"").replace(" ","T"));
-  return {
-    ymd: ymd(tz, dt),
-    hour: hourInTZ(tz, dt),
-  };
+  return { ymd: ymd(tz, dt), hour: hourInTZ(tz, dt) };
 }
 function inSlotWindow(pick, day, slot){
   const iso = pick?.datetime_local?.starting_at?.date_time
@@ -122,7 +119,8 @@ export default async function handler(req, res) {
       source: "last",
       built_at: builtAt,
       slot: metaSlot,
-      items
+      items,
+      locked_version: "v3" // marker da znaš da je pravi handler
     }));
   } catch (e) {
     return res.status(200).end(JSON.stringify({
@@ -132,7 +130,8 @@ export default async function handler(req, res) {
       source: "last",
       built_at: null,
       slot: null,
-      items: []
+      items: [],
+      locked_version: "v3"
     }));
   }
 }
