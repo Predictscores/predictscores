@@ -2,47 +2,52 @@ name: Snapshots (AM/PM/LATE)
 
 on:
   schedule:
-    - cron: '0 8 * * *'    # 10:00 lokalno (CET/CEST)
-    - cron: '0 13 * * *'   # 15:00 lokalno
-    - cron: '0 22 * * *'   # 00:00 lokalno
-  workflow_dispatch: {}
+    # 10:00 Serbia (CEST, UTC+2) => 08:00 UTC
+    - cron: "0 8 * * *"
+    # 15:00 Serbia => 13:00 UTC
+    - cron: "0 13 * * *"
+    # 00:00 Serbia => 22:00 UTC (prethodni dan)
+    - cron: "0 22 * * *"
+  workflow_dispatch:
 
 jobs:
-  run:
+  run-am:
+    if: github.event.schedule == '0 8 * * *'
     runs-on: ubuntu-latest
-    env:
-      BASE: https://predictscores.vercel.app
     steps:
-      - name: Pick slot (AM/PM/LATE)
-        id: pick
-        run: |
-          S="${{ github.event.schedule }}"
-          if   [ "$S" = "0 8 * * *" ];  then SLOT=am;
-          elif [ "$S" = "0 13 * * *" ]; then SLOT=pm;
-          elif [ "$S" = "0 22 * * *" ]; then SLOT=late;
-          else
-            H=$(date -u +%H)
-            if   [ "$H" -ge 8  ] && [ "$H" -lt 9  ];  then SLOT=am;
-            elif [ "$H" -ge 13 ] && [ "$H" -lt 14 ]; then SLOT=pm;
-            elif [ "$H" -ge 22 ] && [ "$H" -lt 23 ]; then SLOT=late;
-            else SLOT=pm; fi
-          fi
-          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
+      - name: Rebuild (AM slot)
+        run: curl -s "${{ secrets.BASE_URL }}/api/cron/rebuild?slot=am"
+      - name: Refresh odds (window)
+        run: curl -s "${{ secrets.BASE_URL }}/api/cron/refresh-odds"
+      - name: Insights build
+        run: curl -s "${{ secrets.BASE_URL }}/api/insights-build"
+      - name: Apply learning (writes :last)
+        run: curl -s "${{ secrets.BASE_URL }}/api/cron/apply-learning"
 
-      - name: Rebuild snapshot for slot
-        run: |
-          curl -fsS "$BASE/api/cron/rebuild?slot=${{ steps.pick.outputs.slot }}"
+  run-pm:
+    if: github.event.schedule == '0 13 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rebuild (PM slot)
+        run: curl -s "${{ secrets.BASE_URL }}/api/cron/rebuild?slot=pm"
+      - name: Refresh odds (window)
+        run: curl -s "${{ secrets.BASE_URL }}/api/cron/refresh-odds"
+      - name: Insights build
+        run: curl -s "${{ secrets.BASE_URL }}/api/insights-build"
+      - name: Apply learning (writes :last)
+        run: curl -s "${{ secrets.BASE_URL }}/api/cron/apply-learning"
 
-      - name: Warm odds (2x)
-        run: |
-          curl -fsS "$BASE/api/cron/refresh-odds" || true
-          sleep 5
-          curl -fsS "$BASE/api/cron/refresh-odds" || true
-
-      - name: "Build insights (Zašto: forma + H2H)"
-        run: |
-          curl -fsS "$BASE/api/insights-build" || true
-
-      - name: Apply learning to union
-        run: |
-          curl -fsS "$BASE/api/cron/apply-learning" || true
+  run-late:
+    if: github.event.schedule == '0 22 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rebuild (LATE slot)
+        run: curl -s "${{ secrets.BASE_URL }}/api/cron/rebuild?slot=late"
+      - name: Refresh odds (window)
+        run: curl -s "${{ secrets.BASE_URL }}/api/cron/refresh-odds"
+      - name: Insights build
+        run: curl -s "${{ secrets.BASE_URL }}/api/insights-build"
+      - name: Apply learning (writes :last)
+        run: curl -s "${{ secrets.BASE_URL }}/api/cron/apply-learning"
+      - name: History settle (once daily, after midnight SRB)
+        run: curl -s "${{ secrets.BASE_URL }}/api/cron/history-settle"
