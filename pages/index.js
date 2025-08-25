@@ -1,3 +1,6 @@
+// pages/index.js
+// SSR fetch (HTTPS-safe) + prosleđivanje football/crypto u postojeći UI bez promene izgleda
+
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import Head from "next/head";
 import dynamic from "next/dynamic";
@@ -61,10 +64,12 @@ async function safeJson(url) {
 }
 
 // ---------- Header bar (nema cron poziva)
-function HeaderBar() {
+function HeaderBar({ initialFootball = [], initialCrypto = [] }) {
   const [now, setNow] = useState(Date.now());
-  const [kickoffAt, setKickoffAt] = useState(null);
-  const [cryptoNextAt, setCryptoNextAt] = useState(null);
+  const [kickoffAt, setKickoffAt] = useState(nearestFutureKickoff(initialFootball));
+  const [cryptoNextAt, setCryptoNextAt] = useState(
+    Array.isArray(initialCrypto) && initialCrypto.length > 0 ? Date.now() + 10 * 60 * 1000 : null
+  );
   const loadedOnceRef = useRef(false);
 
   useEffect(() => {
@@ -77,6 +82,7 @@ function HeaderBar() {
       if (loadedOnceRef.current) return;
       loadedOnceRef.current = true;
 
+      // Za CSV koristimo locked feed, ali i fallback za kickoff ako ga nema iz propsa
       const fb = await safeJson("/api/value-bets-locked");
       const list = Array.isArray(fb?.items || fb?.value_bets)
         ? (fb.items || fb.value_bets)
@@ -86,14 +92,16 @@ function HeaderBar() {
         localStorage.setItem(`valueBetsLocked_${toYMD()}`, JSON.stringify(list));
       } catch {}
 
-      setKickoffAt(nearestFutureKickoff(list));
+      if (!kickoffAt) {
+        setKickoffAt(nearestFutureKickoff(list));
+      }
 
-      const cr = await safeJson("/api/crypto");
-      if (cr && cr.ok !== false) {
-        setCryptoNextAt(Date.now() + 10 * 60 * 1000);
+      if (!cryptoNextAt) {
+        const cr = await safeJson("/api/crypto");
+        if (cr && cr.ok !== false) setCryptoNextAt(Date.now() + 10 * 60 * 1000);
       }
     })();
-  }, []);
+  }, [kickoffAt, cryptoNextAt]);
 
   const cryptoTL = useMemo(() => {
     if (!cryptoNextAt) return "—";
@@ -229,7 +237,7 @@ function Legend() {
   );
 }
 
-export default function IndexPage() {
+export default function IndexPage(props) {
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
   return (
@@ -244,11 +252,51 @@ export default function IndexPage() {
 
       <main className="min-h-screen bg-[#0f1116] text-white">
         <div className="max-w-7xl mx-auto p-4 md:p-6">
-          <HeaderBar />
-          <div className="mt-6">{mounted ? <CombinedBets /> : <div className="text-slate-400 text-sm">Loading…</div>}</div>
+          <HeaderBar initialFootball={props.football} initialCrypto={props.crypto} />
+          <div className="mt-6">
+            {mounted ? (
+              <CombinedBets
+                football={props.football}
+                crypto={props.crypto}
+                initialFootball={props.football}
+                initialCrypto={props.crypto}
+              />
+            ) : (
+              <div className="text-slate-400 text-sm">Loading…</div>
+            )}
+          </div>
           <Legend />
         </div>
       </main>
     </>
   );
+}
+
+// ---------- SSR fetch (HTTPS-safe) ----------
+export async function getServerSideProps(ctx) {
+  const proto = ctx.req.headers["x-forwarded-proto"] || "https";
+  const host = ctx.req.headers.host;
+  const origin = `${proto}://${host}`;
+
+  async function safe(url) {
+    try {
+      const r = await fetch(url, { cache: "no-store" });
+      const ct = r.headers.get("content-type") || "";
+      if (!ct.includes("application/json")) return { ok: false, data: null };
+      const j = await r.json();
+      return { ok: true, data: j };
+    } catch {
+      return { ok: false, data: null };
+    }
+  }
+
+  const [fb, cr] = await Promise.all([
+    safe(`${origin}/api/football?hours=4`),
+    safe(`${origin}/api/crypto`),
+  ]);
+
+  const football = Array.isArray(fb?.data?.football) ? fb.data.football : [];
+  const crypto   = Array.isArray(cr?.data?.signals)  ? cr.data.signals  : [];
+
+  return { props: { football, crypto } };
 }
