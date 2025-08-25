@@ -4,6 +4,7 @@ export const config = { api: { bodyParser: false } };
 const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const TZ       = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const FEATURE_HISTORY = process.env.FEATURE_HISTORY === "1";
 
 /* ---------- KV ---------- */
 async function kvGet(key) {
@@ -24,6 +25,12 @@ async function kvSet(key, value) {
     body: JSON.stringify({ value: JSON.stringify(value) }),
   });
   return r.ok;
+}
+async function kvDel(key){
+  await fetch(`${KV_URL}/del/${encodeURIComponent(key)}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${KV_TOKEN}` }
+  }).catch(()=>{});
 }
 
 /* ---------- time ---------- */
@@ -76,6 +83,24 @@ function applyWeights(items, weights) {
   });
 }
 
+/* ---------- history helpers ---------- */
+function toHistoryRecord(slot, pick){
+  return {
+    fixture_id: pick?.fixture_id,
+    teams: { home: pick?.teams?.home?.name, away: pick?.teams?.away?.name },
+    league: { id: pick?.league?.id, name: pick?.league?.name, country: pick?.league?.country },
+    kickoff: String(pick?.datetime_local?.starting_at?.date_time || "").replace(" ","T"),
+    slot: String(slot || "").toUpperCase(),
+    market: pick?.market,
+    selection: pick?.selection,
+    odds: Number(pick?.market_odds),
+    locked_at: new Date().toISOString(),
+    final_score: null,
+    won: null,
+    settled_at: null
+  };
+}
+
 /* ---------- handler ---------- */
 export default async function handler(req, res) {
   try {
@@ -106,6 +131,29 @@ export default async function handler(req, res) {
       count: boosted.length,
       source: `slot:${slot}`,
     });
+
+    // HISTORY CAPTURE (uvek iz boosted liste da odgovara Combined-u)
+    if (FEATURE_HISTORY) {
+      const topN = (slot === "late") ? 1 : 3;
+      const top = boosted.slice(0, topN).map(p => toHistoryRecord(slot, p));
+      const histKey = `hist:${ymd}:${slot}`;
+      await kvSet(histKey, top);
+
+      // indeks dana (max 14)
+      const idxKey = `hist:index`;
+      let days = await kvGet(idxKey);
+      try { days = Array.isArray(days) ? days : JSON.parse(days); } catch { /* ignore */ }
+      if (!Array.isArray(days)) days = [];
+      if (!days.includes(ymd)) days.push(ymd);
+      days.sort().reverse();
+      const keep = days.slice(0, 14);
+      await kvSet(idxKey, keep);
+      for (const d of days.slice(14)) {
+        await kvDel(`hist:${d}:am`);
+        await kvDel(`hist:${d}:pm`);
+        await kvDel(`hist:${d}:late`);
+      }
+    }
 
     res.status(200).json({ ok: true, ymd, slot, count: boosted.length });
   } catch (e) {
