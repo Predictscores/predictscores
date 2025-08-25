@@ -1,7 +1,5 @@
 // pages/api/value-bets-locked.js
-export const config = {
-  api: { bodyParser: false },
-};
+export const config = { api: { bodyParser: false } };
 
 function ymdToday(tz = "Europe/Belgrade") {
   const d = new Date();
@@ -24,7 +22,7 @@ async function kvGetRaw(key) {
   if (!r.ok) {
     throw new Error(`KV get ${key} -> ${r.status}`);
   }
-  const j = await r.json(); // Upstash: { result: "string|null" }
+  const j = await r.json();
   return j?.result ?? null;
 }
 
@@ -40,23 +38,23 @@ function parseMaybeJSON(v) {
 export default async function handler(req, res) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   try {
-    // Dozvoli ?ymd=YYYY-MM-DD, inače današnji (CET)
     const ymd = (req.query.ymd && String(req.query.ymd)) || ymdToday();
 
-    // Standardni ključ koji puni tvoj cron/apply-learning
-    const key = `vb:day:${ymd}:last`;
-
-    // Nikakav spoljašnji API se ovde ne zove — samo KV.
-    const raw = await kvGetRaw(key);
+    const keyLast = `vb:day:${ymd}:last`;
+    const raw = await kvGetRaw(keyLast);
     const payload = parseMaybeJSON(raw);
 
-    // Podrži i varijante strukture koje si imao ranije
     const items =
       Array.isArray(payload?.items) ? payload.items :
       Array.isArray(payload) ? payload :
       [];
 
-    const builtAt = payload?.built_at ?? payload?.builtAt ?? null;
+    let builtAt = payload?.built_at ?? payload?.builtAt ?? null;
+    if (!builtAt) {
+      const metaRaw = await kvGetRaw(`vb:meta:${ymd}:last_meta`).catch(()=>null);
+      const meta = parseMaybeJSON(metaRaw);
+      if (meta && meta.built_at) builtAt = meta.built_at;
+    }
 
     res.status(200).end(
       JSON.stringify({
@@ -68,7 +66,6 @@ export default async function handler(req, res) {
       })
     );
   } catch (e) {
-    // Nikad ne vraćamo HTML/tekst — uvek JSON, da UI ne puca.
     res.status(200).end(
       JSON.stringify({
         ok: false,
