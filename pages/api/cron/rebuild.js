@@ -1,7 +1,7 @@
 // pages/api/cron/rebuild.js
 // Slotovani snapshoti (AM/PM/LATE) sa per-slot budžetima i tier-miks selekcijom.
-// UEFA dnevni cap (preko svih slotova). UNION (AM∪PM∪LATE) upis u :last.
-// Idempotent guard: 60s. + HISTORY: snimi Top3/Top1 po slotu (ako FEATURE_HISTORY=1).
+// UEFA dnevni cap (preko svih slotova). UNION (AM∪PM∪LATE) upis u :union (bez :last).
+// Idempotent guard: 60s. + HISTORY: Top3/Top1 po slotu (ako FEATURE_HISTORY=1).
 
 export const config = { api: { bodyParser: false } };
 
@@ -11,14 +11,14 @@ const TZ       = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const FEATURE_HISTORY = process.env.FEATURE_HISTORY === "1";
 
 // Budžeti po slotu
-const SLOT_WEEKDAY_LIMIT = parseInt(process.env.SLOT_WEEKDAY_LIMIT || "15", 10);
-const SLOT_WEEKEND_LIMIT = parseInt(process.env.SLOT_WEEKEND_LIMIT || "25", 10);
-const SLOT_LATE_WEEKDAY_LIMIT = parseInt(process.env.SLOT_LATE_WEEKDAY_LIMIT || "3", 10);
-const SLOT_LATE_WEEKEND_LIMIT = parseInt(process.env.SLOT_LATE_WEEKEND_LIMIT || "5", 10);
+const SLOT_WEEKDAY_LIMIT      = parseInt(process.env.SLOT_WEEKDAY_LIMIT      || "15", 10);
+const SLOT_WEEKEND_LIMIT      = parseInt(process.env.SLOT_WEEKEND_LIMIT      || "25", 10);
+const SLOT_LATE_WEEKDAY_LIMIT = parseInt(process.env.SLOT_LATE_WEEKDAY_LIMIT || "3",  10);
+const SLOT_LATE_WEEKEND_LIMIT = parseInt(process.env.SLOT_LATE_WEEKEND_LIMIT || "5",  10);
 
 // Cap-ovi
 const LEAGUE_CAP_PER_SLOT = parseInt(process.env.VB_MAX_PER_LEAGUE || "2", 10);
-const UEFA_DAILY_CAP = parseInt(process.env.UEFA_DAILY_CAP || "6", 10);
+const UEFA_DAILY_CAP      = parseInt(process.env.UEFA_DAILY_CAP    || "6", 10);
 
 function ymdInTZ(d=new Date(), tz=TZ) {
   try {
@@ -108,7 +108,7 @@ function groupOf(leagueNameRaw){
   return "TIER3";
 }
 
-// Slot window (FIX: koristimo 'pick', ne 'p')
+// Slot window
 function inSlotWindow(pick, dayCET, slot){
   const t = String(pick?.datetime_local?.starting_at?.date_time || "").replace(" ","T");
   const tz = toTZParts(t, TZ);
@@ -165,7 +165,7 @@ export default async function handler(req, res){
       else slot = "late";
     }
 
-    // generator kandidata
+    // generator kandidata (interni endpoint)
     const r = await fetch(`${base}/api/value-bets`, { headers: { "cache-control":"no-store" } });
     if (!r.ok) return res.status(200).json({ ok:false, error:`generator ${r.status}` });
     const j = await r.json().catch(()=>null);
@@ -174,20 +174,20 @@ export default async function handler(req, res){
     // filtriraj po slot prozoru
     const dayArr = arr.filter(pick => inSlotWindow(pick, dayCET, slot));
 
-    // slot budžet (radni/ vikend)
+    // slot budžet
     const isWE = isWeekendInTZ(now, TZ);
     const slotLimit = (slot==="late")
       ? (isWE ? SLOT_LATE_WEEKEND_LIMIT : SLOT_LATE_WEEKDAY_LIMIT)
       : (isWE ? SLOT_WEEKEND_LIMIT : SLOT_WEEKDAY_LIMIT);
 
-    // pročitaj već postojeće slotove za UEFA dnevni cap
+    // već uzeti UEFA u danu
     const alreadyAM   = parseArray(await kvGET(`vb:day:${dayCET}:am`));
     const alreadyPM   = parseArray(await kvGET(`vb:day:${dayCET}:pm`));
     const alreadyLATE = parseArray(await kvGET(`vb:day:${dayCET}:late`));
     const uefaUsed = [...alreadyAM, ...alreadyPM, ...alreadyLATE].filter(p => groupOf(p?.league?.name)==="UEFA").length;
     const uefaLeft = Math.max(0, UEFA_DAILY_CAP - uefaUsed);
 
-    // rangiraj pre miksa
+    // rangiranje pre miksa
     dayArr.sort((a,b)=>{
       if ((b?.confidence_pct||0)!==(a?.confidence_pct||0)) return (b.confidence_pct||0)-(a?.confidence_pct||0);
       const eva = Number.isFinite(a?.ev) ? a.ev : -Infinity;
@@ -198,7 +198,7 @@ export default async function handler(req, res){
       return ta-tb;
     });
 
-    // pripremi buckets
+    // buckets
     const buckets = { UEFA:[], TIER1:[], TIER2:[], TIER3:[] };
     for (const pick of dayArr){
       const g = groupOf(pick?.league?.name);
@@ -207,7 +207,7 @@ export default async function handler(req, res){
     const order = ["UEFA","TIER1","TIER2","TIER3"];
     const idx = { UEFA:0, TIER1:0, TIER2:0, TIER3:0 };
 
-    // league-cap per slot (osim za UEFA)
+    // league-cap per slot (osim UEFA)
     const takenByLeague = new Map();
     let uefaTakenThisSlot = 0;
 
@@ -218,13 +218,11 @@ export default async function handler(req, res){
         if (picked.length >= slotLimit) break;
         const arrG = buckets[g]; if (!arrG || idx[g] >= arrG.length) continue;
 
-        // pronađi sledećeg koji prolazi cap-ove
         let i = idx[g];
         while (i < arrG.length) {
           const pick = arrG[i++];
           if (g === "UEFA") {
-            if (uefaLeft <= 0) break; // više nema dnevnog prostora za UEFA
-            // UEFA ne ograničavamo league-cap-om
+            if (uefaLeft <= 0) break;
             picked.push(pick);
             uefaTakenThisSlot++;
             took++;
@@ -232,7 +230,7 @@ export default async function handler(req, res){
           } else {
             const lkey = `${pick?.league?.id||""}`;
             const cnt = takenByLeague.get(lkey) || 0;
-            if (cnt >= LEAGUE_CAP_PER_SLOT) continue; // probaj sledećeg u grupi
+            if (cnt >= LEAGUE_CAP_PER_SLOT) continue;
             takenByLeague.set(lkey, cnt+1);
             picked.push(pick);
             took++;
@@ -241,34 +239,25 @@ export default async function handler(req, res){
         }
         idx[g] = i;
       }
-      if (!took) break; // nema više kandidata u krugu
-    }
-
-    // ako je UEFA cap ostao, a ima UEFA kandidata i prostora u slotu, popuni još malo
-    if (picked.length < slotLimit && uefaLeft > 0 && uefaTakenThisSlot < uefaLeft) {
-      while (picked.length < slotLimit && idx.UEFA < (buckets.UEFA?.length||0) && (uefaTakenThisSlot < uefaLeft)) {
-        picked.push(buckets.UEFA[idx.UEFA++]);
-        uefaTakenThisSlot++;
-      }
+      if (!took) break;
     }
 
     // upis slota
     const slotKey = `vb:day:${dayCET}:${slot}`;
     await kvSET(slotKey, picked);
 
-    // UNION (AM∪PM∪LATE) -> :last
+    // UNION (AM∪PM∪LATE) → OBAVEZNO pišemo :union (insights/apply-learning ovo čitaju)
     const union = dedupeUnion(
       parseArray(await kvGET(`vb:day:${dayCET}:am`)),
       parseArray(await kvGET(`vb:day:${dayCET}:pm`)),
       parseArray(await kvGET(`vb:day:${dayCET}:late`))
     );
-    const rev = Math.floor(nowMs/1000);
-    await kvSET(`vb:day:${dayCET}:rev:${rev}`, union);
-    await kvSET(`vb:day:${dayCET}:last`, union);
-    await kvSET(`vb:day:${ymdInTZ(now, "UTC")}:last`, union);
-    await kvSET(`vb:jobs:last:rebuild`, { ts: nowMs, slot });
+    await kvSET(`vb:day:${dayCET}:union`, union);
 
-    // ---------------- HISTORY: upiši Top3/Top1 po slotu (jednokratno) ----------------
+    // marker za rebuild (bez :last!)
+    await kvSET(`vb:jobs:last:rebuild`, { ts: Date.now(), slot });
+
+    // ---------------- HISTORY capture ----------------
     if (FEATURE_HISTORY) {
       const histKey = `hist:${dayCET}:${slot}`;
       const existing = parseArray(await kvGET(histKey));
@@ -277,16 +266,13 @@ export default async function handler(req, res){
         const top = picked.slice(0, topN).map(pick => toHistoryRecord(slot, pick));
         if (top.length) {
           await kvSET(histKey, top);
-          // indeks dana i trim >14d
           const idxKey = `hist:index`;
           let days = parseArray(await kvGET(idxKey));
           if (!Array.isArray(days)) days = [];
           if (!days.includes(dayCET)) days.push(dayCET);
-          // sort DESC i trim na 14
           days.sort().reverse();
           const keep = days.slice(0, 14);
           await kvSET(idxKey, keep);
-          // obriši starije ključeve
           for (const d of days.slice(14)) {
             await kvDEL(`hist:${d}:am`);
             await kvDEL(`hist:${d}:pm`);
@@ -295,7 +281,7 @@ export default async function handler(req, res){
         }
       }
     }
-    // -------------------------------------------------------------------------------
+    // -----------------------------------------------
 
     return res.status(200).json({
       ok: true,
@@ -305,10 +291,9 @@ export default async function handler(req, res){
       count_union: union.length,
       uefa_used_before: uefaUsed,
       uefa_added_this_slot: uefaTakenThisSlot,
-      rev,
       persisted: true
     });
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message || e) });
   }
-}
+    }
