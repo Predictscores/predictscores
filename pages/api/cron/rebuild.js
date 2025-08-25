@@ -138,7 +138,7 @@ function toHistoryRecord(slot, pick){
     slot: String(slot || "").toUpperCase(),
     market: pick?.market,
     selection: pick?.selection,
-    odds: Number(p?.market_odds),
+    odds: Number(pick?.market_odds), // <-- FIX
     locked_at: new Date().toISOString(),
     final_score: null,
     won: null,
