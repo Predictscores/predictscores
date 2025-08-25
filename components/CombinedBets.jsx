@@ -1,5 +1,7 @@
 // components/CombinedBets.jsx
-// Drop-in: povezuje UI na /api/football i /api/crypto (relativno, HTTPS-safe), bez promene izgleda.
+// Povezuje UI sa /api/football i /api/crypto relativno (HTTPS-safe).
+// Zadržava raspored: top-tabs (Combined / Football / Crypto) + sub-tabs u Football.
+// HistoryPanel ne sadrži ugnježdene tabove. Crypto kolona ne nestaje čak i kad je prazno.
 
 import React, { useEffect, useMemo, useState } from "react";
 import HistoryPanel from "./HistoryPanel";
@@ -7,7 +9,6 @@ import HistoryPanel from "./HistoryPanel";
 const TZ = "Europe/Belgrade";
 
 /* ---------------- helpers ---------------- */
-
 async function safeJson(url) {
   try {
     const r = await fetch(url, { cache: "no-store" });
@@ -19,7 +20,6 @@ async function safeJson(url) {
     return { ok:false, error: String(e?.message || e) };
   }
 }
-
 function toISO(x) {
   return (
     x?.datetime_local?.starting_at?.date_time ||
@@ -61,7 +61,6 @@ function nearestFutureKickoff(items = []) {
   return best ? new Date(best).toISOString() : null;
 }
 function scoreFootball(x) {
-  // Kompozit za rangiranje: edge i EV imaju prioritet, pa confidence.
   const edge = Number(x?.edge_pp) || 0;
   const ev   = Number(x?.ev_pct) || 0;
   const conf = Number(x?.confidence_pct) || 0;
@@ -84,10 +83,11 @@ export default function CombinedBets({
   const [football, setFootball] = useState(Array.isArray(initialFootball) ? initialFootball : []);
   const [crypto, setCrypto] = useState(Array.isArray(initialCrypto) ? initialCrypto : []);
   const [history, setHistory] = useState([]);
-  const [loading, setLoading] = useState({ fb: football.length === 0, cr: crypto.length === 0, hist: true });
-  const [err, setErr] = useState({ fb: null, cr: null });
+  const [loading, setLoading] = useState({
+    fb: football.length === 0, cr: crypto.length === 0, hist: true
+  });
 
-  // Fetch FOOTBALL (relativno, HTTPS-safe)
+  // FOOTBALL (relativno, bez BASE_URL)
   useEffect(() => {
     let stop = false;
     (async () => {
@@ -97,16 +97,13 @@ export default function CombinedBets({
       if (stop) return;
       if (r && r.ok !== false && Array.isArray(r?.football)) {
         setFootball(r.football);
-        setErr(s => ({ ...s, fb: null }));
-      } else {
-        setErr(s => ({ ...s, fb: r?.error || "football fetch failed" }));
       }
       setLoading(s => ({ ...s, fb: false }));
     })();
     return () => { stop = true; };
-  }, []); // jednom
+  }, []); // samo jednom
 
-  // Fetch CRYPTO (relativno)
+  // CRYPTO (relativno) — NE NESTAJE: čak i kad nema signala, renderuje praznu kolonu sa porukom
   useEffect(() => {
     let stop = false;
     (async () => {
@@ -114,18 +111,19 @@ export default function CombinedBets({
       setLoading(s => ({ ...s, cr: true }));
       const r = await safeJson("/api/crypto");
       if (stop) return;
-      if (r && r.ok !== false && Array.isArray(r?.signals)) {
-        setCrypto(r.signals);
-        setErr(s => ({ ...s, cr: null }));
-      } else {
-        setErr(s => ({ ...s, cr: r?.error || "crypto fetch failed" }));
-      }
+      // podrži razne oblike (signals, data.signals, arr)
+      const arr =
+        Array.isArray(r?.signals) ? r.signals :
+        Array.isArray(r?.data?.signals) ? r.data.signals :
+        Array.isArray(r) ? r :
+        [];
+      if (arr.length > 0) setCrypto(arr);
       setLoading(s => ({ ...s, cr: false }));
     })();
     return () => { stop = true; };
   }, []);
 
-  // Fetch HISTORY (zaključani dnevni feed)
+  // HISTORY — zaključani feed (za CSV i prikaz)
   useEffect(() => {
     let stop = false;
     (async () => {
@@ -139,23 +137,27 @@ export default function CombinedBets({
   }, []);
 
   // Derived lists
-  const fbByConfidence = useMemo(() => {
-    return [...football].sort((a, b) => scoreFootball(b) - scoreFootball(a));
-  }, [football]);
-
-  const fbByKickoff = useMemo(() => {
-    return [...football].sort(byKickoffAsc);
-  }, [football]);
-
+  const fbByConfidence = useMemo(() => [...football].sort((a, b) => scoreFootball(b) - scoreFootball(a)), [football]);
+  const fbByKickoff = useMemo(() => [...football].sort(byKickoffAsc), [football]);
   const fbTop3 = useMemo(() => fbByConfidence.slice(0, 3), [fbByConfidence]);
+
   const crTop3 = useMemo(() => {
     const arr = Array.isArray(crypto) ? crypto : [];
-    return [...arr].sort((a, b) => (b?.confidence_pct || 0) - (a?.confidence_pct || 0)).slice(0, 3);
+    // podrži i stare oblike polja (npr. name/coin)
+    return [...arr]
+      .map((c) => ({
+        key: c?.symbol || c?.pair || c?.name || c?.coin || "ASSET",
+        symbol: (c?.symbol || c?.pair || "").toString().toUpperCase(),
+        name: c?.name || c?.coin || c?.symbol || "",
+        signal: c?.signal || c?.side || "",
+        confidence_pct: Number.isFinite(c?.confidence_pct) ? c.confidence_pct : (Number.isFinite(c?.score) ? Math.round(c.score) : null),
+        price: Number.isFinite(c?.price) ? c.price : null,
+      }))
+      .sort((a, b) => (b?.confidence_pct || 0) - (a?.confidence_pct || 0))
+      .slice(0, 3);
   }, [crypto]);
 
-  const nextKick = useMemo(() => nearestFutureKickoff(football), [football]);
-
-  /* ---------------- UI helpers ---------------- */
+  /* ---------------- UI helpers (minimalni izgled) ---------------- */
 
   function Tabs() {
     return (
@@ -201,8 +203,8 @@ export default function CombinedBets({
   function FootballCard({ x }) {
     const when = fmtWhen(x);
     const league = x?.league?.name || "";
-    const h = x?.teams?.home || x?.teams?.home?.name || "";
-    const a = x?.teams?.away || x?.teams?.away?.name || "";
+    const h = x?.teams?.home?.name || x?.teams?.home || "";
+    const a = x?.teams?.away?.name || x?.teams?.away || "";
     const pick = x?.selection || "";
     const conf = Number.isFinite(x?.confidence_pct) ? x.confidence_pct : null;
     const edge = Number.isFinite(x?.edge_pp) ? x.edge_pp : null;
@@ -245,16 +247,16 @@ export default function CombinedBets({
 
   return (
     <div>
-      {/* Top tabs */}
+      {/* Glavni tabovi */}
       <Tabs />
 
-      {/* Football sub-tabs (only in Football) */}
+      {/* Sub-tabovi za Football */}
       <SubTabs />
 
-      {/* Content */}
       <div className="mt-6">
         {tab === "Combined" && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* Football Top 3 */}
             <div>
               <div className="mb-2 text-sm text-white/70">Football — Top 3</div>
               {loading.fb && football.length === 0 ? (
@@ -263,11 +265,14 @@ export default function CombinedBets({
                 <div className="text-slate-400 text-sm">Nema podataka.</div>
               ) : (
                 <div className="grid gap-3">
-                  {fbTop3.map((x, i) => <FootballCard key={x.fixture_id || i} x={x} />)}
+                  {fbTop3.map((x, i) => (
+                    <FootballCard key={x?.fixture_id || `${i}`} x={x} />
+                  ))}
                 </div>
               )}
             </div>
 
+            {/* Crypto Top 3 — kolona uvek postoji, ne nestaje vizuelno */}
             <div>
               <div className="mb-2 text-sm text-white/70">Crypto — Top 3</div>
               {loading.cr && crypto.length === 0 ? (
@@ -276,7 +281,7 @@ export default function CombinedBets({
                 <div className="text-slate-400 text-sm">Nema podataka.</div>
               ) : (
                 <div className="grid gap-3">
-                  {crTop3.map((c, i) => <CryptoCard key={c?.symbol || i} c={c} />)}
+                  {crTop3.map((c, i) => <CryptoCard key={c?.key || c?.symbol || `${i}`} c={c} />)}
                 </div>
               )}
             </div>
@@ -292,7 +297,7 @@ export default function CombinedBets({
                 ) : football.length === 0 ? (
                   <div className="text-slate-400 text-sm">Nema podataka.</div>
                 ) : (
-                  fbByKickoff.map((x, i) => <FootballCard key={x.fixture_id || i} x={x} />)
+                  fbByKickoff.map((x, i) => <FootballCard key={x?.fixture_id || `${i}`} x={x} />)
                 )}
               </div>
             )}
@@ -304,7 +309,7 @@ export default function CombinedBets({
                 ) : football.length === 0 ? (
                   <div className="text-slate-400 text-sm">Nema podataka.</div>
                 ) : (
-                  fbByConfidence.map((x, i) => <FootballCard key={x.fixture_id || i} x={x} />)
+                  fbByConfidence.map((x, i) => <FootballCard key={x?.fixture_id || `${i}`} x={x} />)
                 )}
               </div>
             )}
@@ -322,15 +327,10 @@ export default function CombinedBets({
             ) : crypto.length === 0 ? (
               <div className="text-slate-400 text-sm">Nema podataka.</div>
             ) : (
-              crypto.map((c, i) => <CryptoCard key={c?.symbol || i} c={c} />)
+              crypto.map((c, i) => <CryptoCard key={c?.symbol || `${i}`} c={c} />)
             )}
           </div>
         )}
-      </div>
-
-      {/* Optional: next kickoff info for debugging */}
-      <div className="mt-6 text-xs text-white/50">
-        {nextKick ? `Next kickoff: ${new Date(nextKick).toLocaleString("sv-SE", { timeZone: TZ })}` : "Next kickoff: —"}
       </div>
     </div>
   );
