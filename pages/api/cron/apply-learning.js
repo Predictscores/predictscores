@@ -66,9 +66,10 @@ export default async function handler(req, res) {
     const boosted = applyWeights(union, weights)
       .sort((a, b) => (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0));
 
+    // JEDINI pisac :last (sa meta)
     await kvSetJSON(`vb:day:${ymd}:last`, JSON.stringify(boosted));
     await kvSetJSON(`vb:meta:${ymd}:last_meta`, JSON.stringify({
-      ymd, slot, built_at: new Date().toISOString(), source: "union"
+      ymd, slot, built_at: new Date().toISOString(), source: "union+learning"
     }));
 
     return res.status(200).json({ ok: true, count: boosted.length, slot, ymd });
