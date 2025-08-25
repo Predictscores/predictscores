@@ -2,14 +2,9 @@
 const nextConfig = {
   reactStrictMode: true,
 
-  // Svi spoljašnji pozivi na /api/value-bets idu na zaključani endpoint
-  async rewrites() {
-    return [
-      { source: '/api/value-bets', destination: '/api/value-bets-locked' },
-    ];
-  },
+  // NEMA preusmeravanja /api/value-bets -> /api/value-bets-locked
+  // Front neka direktno zove /api/value-bets-locked
 
-  // HTML za početnu nek se ne kešira na CDN-u posle deploya
   async headers() {
     return [
       {
