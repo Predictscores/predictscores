@@ -1,8 +1,8 @@
 // pages/api/cron/closing-capture.js
-// "Closing" capture oko KO – povlači aktuelne mečeve i čuva samo validne/trusted kvote.
+// Povlači mečeve oko KO i filtrira kvote po BAN/Trusted/normalize
 
-const ROOT = "https://predictscores.vercel.app"; // hardkodovan base da ne zavisi od ENV
-const BAN_REGEX = /(U21|U23|Development|Youth|Women|Girls)/i;
+const ROOT = "https://predictscores.vercel.app";
+const BAN_REGEX = /(U21|U23|U19|U18|U17|Reserve|Reserves|B Team|B-Team|\bB$|\bII\b|Youth|Women|Girls|Development|Academy|U-\d{2}|\bU\d{2}\b)/i;
 
 function parseTrusted() {
   const list = (process.env.TRUSTED_BOOKIES || "")
@@ -24,36 +24,30 @@ export default async function handler(_req, res) {
   try {
     const trusted = parseTrusted();
 
-    // Uži prozor – oko KO (6h je dovoljno da uhvatimo pre/posle).
     const r = await fetch(`${ROOT}/api/football?hours=6`);
-    if (!r.ok) {
-      return res.status(502).json({ ok: false, error: `downstream ${r.status}` });
-    }
+    if (!r.ok) return res.status(502).json({ ok: false, error: `downstream ${r.status}` });
     const data = await r.json();
 
     let captured = 0;
     for (const m of data.football || []) {
       if (BAN_REGEX.test(m?.league?.name || "")) continue;
-
       const books = (m.books_used || []).map((b) => String(b).toLowerCase());
       if (books.length === 0) continue;
       if (!books.every((b) => trusted.has(b))) continue;
-
       const dec = normalizeOdds(m?.market_odds);
       if (!dec) continue;
 
       captured++;
-      // Ovde bi u tvojoj kompletnoj verziji išlo: upis u KV / DB kao "closing_odds_decimal"
-      // Pošto radimo "no-deps" i bez pristupa tvojoj bazi, ostavljamo kao validacijski capture.
+      // ovde bi išao upis closing_odds_decimal u KV/DB po tvojoj implementaciji
     }
 
-    return res.status(200).json({
+    res.status(200).json({
       ok: true,
       inspected: Array.isArray(data.football) ? data.football.length : 0,
       captured,
       note: "closing odds window processed",
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 }
