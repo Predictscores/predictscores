@@ -15,8 +15,8 @@ on:
         required: false
         default: 'auto'
 
+# Koristimo apsolutni URL. Ako BASE_URL secret ne postoji, koristimo fallback.
 env:
-  # Ako nema secreta, koristi produkcioni domen kao fallback (VAŽNO!)
   BASE: ${{ secrets.BASE_URL }}
   FALLBACK_BASE: https://predictscores.vercel.app
 
@@ -32,7 +32,6 @@ jobs:
           if [ -z "$BASE" ]; then BASE="$FALLBACK_BASE"; fi
           echo "base=$BASE" >> $GITHUB_OUTPUT
 
-          # Odredi SLOT: iz inputa (workflow_dispatch) ili iz rasporeda
           INP="${{ github.event.inputs.slot || '' }}"
           SCH="${{ github.event.schedule || '' }}"
           if [ -n "$INP" ] && [ "$INP" != "auto" ]; then
@@ -42,7 +41,7 @@ jobs:
               "0 8 * * *")  SLOT="am"  ;;
               "0 13 * * *") SLOT="pm"  ;;
               "0 22 * * *") SLOT="late";;
-              *)            SLOT="am"  ;; # default kad ručno pokreneš bez izbora
+              *)            SLOT="am"  ;; # default pri ručnom pokretanju bez izbora
             esac
           fi
           echo "slot=$SLOT" >> $GITHUB_OUTPUT
@@ -51,6 +50,7 @@ jobs:
       - name: Rebuild (${{ steps.ctx.outputs.slot }} slot)
         run: |
           set -euo pipefail
+          echo "CALL: ${{ steps.ctx.outputs.base }}/api/cron/rebuild?slot=${{ steps.ctx.outputs.slot }}"
           curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/rebuild?slot=${{ steps.ctx.outputs.slot }}"
 
       - name: Refresh odds (window)
@@ -61,8 +61,8 @@ jobs:
       - name: Insights build
         run: |
           set -euo pipefail
-          # pravilna ruta je /api/cron/insights-build
-          curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/insights-build"
+          # PRAVILAN endpoint (bez /cron)
+          curl -fsS "${{ steps.ctx.outputs.base }}/api/insights-build"
 
       - name: Apply learning (writes :last)
         run: |
