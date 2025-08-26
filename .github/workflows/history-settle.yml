@@ -2,13 +2,14 @@ name: History settle (scores)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"    # na 30 min
-  workflow_dispatch: {}
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Call history-check (last 2 days)
+      - name: Settle last 2 days
         run: |
-          curl -fsS "https://predictscores.vercel.app/api/history-check?days=2" || true
+          set -euo pipefail
+          curl -fsS "https://predictscores.vercel.app/api/history-check?days=2"
