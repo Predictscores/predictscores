@@ -9,21 +9,89 @@ on:
   workflow_dispatch:
 
 jobs:
-  run:
+  run-late:
     runs-on: ubuntu-latest
     steps:
-      - name: LATE/AM/PM snapshot pipeline
+      - name: Rebuild (LATE slot)
         run: |
           set -euo pipefail
           BASE="https://predictscores.vercel.app"
-          echo "[1/5] Rebuild..."
-          curl -fsS "$BASE/api/cron/rebuild"
-          echo "[2/5] Refresh odds..."
+          curl -fsS "$BASE/api/cron/rebuild?slot=late"
+      - name: Refresh odds (window)
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
           curl -fsS "$BASE/api/cron/refresh-odds"
-          echo "[3/5] Insights build..."
+      - name: Insights build
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
           curl -fsS "$BASE/api/cron/insights-build"
-          echo "[4/5] Apply learning..."
+      - name: Apply learning (writes :last)
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
           curl -fsS "$BASE/api/cron/apply-learning"
-          echo "[5/5] History settle (3d)..."
+      - name: History settle (3 days)
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
           curl -fsS "$BASE/api/history-check?days=3"
-          echo "Done."
+
+  run-am:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rebuild (AM slot)
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
+          curl -fsS "$BASE/api/cron/rebuild?slot=am"
+      - name: Refresh odds (window)
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
+          curl -fsS "$BASE/api/cron/refresh-odds"
+      - name: Insights build
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
+          curl -fsS "$BASE/api/cron/insights-build"
+      - name: Apply learning (writes :last)
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
+          curl -fsS "$BASE/api/cron/apply-learning"
+      - name: History settle (3 days)
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
+          curl -fsS "$BASE/api/history-check?days=3"
+
+  run-pm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rebuild (PM slot)
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
+          curl -fsS "$BASE/api/cron/rebuild?slot=pm"
+      - name: Refresh odds (window)
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
+          curl -fsS "$BASE/api/cron/refresh-odds"
+      - name: Insights build
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
+          curl -fsS "$BASE/api/cron/insights-build"
+      - name: Apply learning (writes :last)
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
+          curl -fsS "$BASE/api/cron/apply-learning"
+      - name: History settle (3 days)
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
+          curl -fsS "$BASE/api/history-check?days=3"
