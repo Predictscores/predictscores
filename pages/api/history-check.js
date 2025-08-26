@@ -5,46 +5,28 @@ export default async function handler(req, res) {
   try {
     const days = parseInt(req.query.days || "3", 10);
 
-    // Hardkodovan URL da ne puca
-    const raw = await fetch(`https://predictscores.vercel.app/api/history?days=${days}`).then((r) =>
-      r.json()
-    );
+    const r = await fetch(`https://predictscores.vercel.app/api/history?days=${days}`);
+    if (!r.ok) return res.status(502).json({ ok: false, error: `downstream ${r.status}` });
+    const raw = await r.json();
 
     const fixed = (raw.history || []).map((h) => {
       const out = { ...h };
 
-      // uvek imena timova (fallback varijante)
-      out.home_name =
-        h?.teams?.home?.name ||
-        h?.home_name ||
-        h?.home ||
-        "Unknown";
-      out.away_name =
-        h?.teams?.away?.name ||
-        h?.away_name ||
-        h?.away ||
-        "Unknown";
+      // imena timova – fallback varijante
+      out.home_name = h?.teams?.home?.name || h?.home_name || h?.home || "Unknown";
+      out.away_name = h?.teams?.away?.name || h?.away_name || h?.away || "Unknown";
 
-      // closing odds normalizacija
+      // closing odds decimal – u dozvoljenim granicama
       let odds =
-        h?.closing_odds_decimal ||
-        h?.closing_odds ||
-        h?.market_odds ||
-        h?.odds;
+        h?.closing_odds_decimal || h?.closing_odds || h?.market_odds || h?.odds;
       odds = Number(odds);
-      if (!isFinite(odds) || odds < 1.01 || odds > 20) {
-        odds = null;
-      }
+      if (!Number.isFinite(odds) || odds < 1.01 || odds > 20) odds = null;
       out.closing_odds_decimal = odds;
 
       return out;
     });
 
-    res.status(200).json({
-      ok: true,
-      days,
-      history: fixed,
-    });
+    res.status(200).json({ ok: true, days, history: fixed });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
