@@ -2,52 +2,28 @@ name: Snapshots (AM/PM/LATE)
 
 on:
   schedule:
-    # 10:00 Serbia (CEST, UTC+2) => 08:00 UTC
-    - cron: "0 8 * * *"
-    # 15:00 Serbia => 13:00 UTC
-    - cron: "0 13 * * *"
-    # 00:00 Serbia => 22:00 UTC (prethodni dan)
-    - cron: "0 22 * * *"
+    # UTC -> SRB: 22:00 -> 00:00 (LATE), 08:00 -> 10:00 (AM), 13:00 -> 15:00 (PM)
+    - cron: '0 22 * * *'
+    - cron: '0 8 * * *'
+    - cron: '0 13 * * *'
   workflow_dispatch:
 
 jobs:
-  run-am:
-    if: github.event.schedule == '0 8 * * *'
+  run:
     runs-on: ubuntu-latest
     steps:
-      - name: Rebuild (AM slot)
-        run: curl -s "${{ secrets.BASE_URL }}/api/cron/rebuild?slot=am"
-      - name: Refresh odds (window)
-        run: curl -s "${{ secrets.BASE_URL }}/api/cron/refresh-odds"
-      - name: Insights build
-        run: curl -s "${{ secrets.BASE_URL }}/api/insights-build"
-      - name: Apply learning (writes :last)
-        run: curl -s "${{ secrets.BASE_URL }}/api/cron/apply-learning"
-
-  run-pm:
-    if: github.event.schedule == '0 13 * * *'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Rebuild (PM slot)
-        run: curl -s "${{ secrets.BASE_URL }}/api/cron/rebuild?slot=pm"
-      - name: Refresh odds (window)
-        run: curl -s "${{ secrets.BASE_URL }}/api/cron/refresh-odds"
-      - name: Insights build
-        run: curl -s "${{ secrets.BASE_URL }}/api/insights-build"
-      - name: Apply learning (writes :last)
-        run: curl -s "${{ secrets.BASE_URL }}/api/cron/apply-learning"
-
-  run-late:
-    if: github.event.schedule == '0 22 * * *'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Rebuild (LATE slot)
-        run: curl -s "${{ secrets.BASE_URL }}/api/cron/rebuild?slot=late"
-      - name: Refresh odds (window)
-        run: curl -s "${{ secrets.BASE_URL }}/api/cron/refresh-odds"
-      - name: Insights build
-        run: curl -s "${{ secrets.BASE_URL }}/api/insights-build"
-      - name: Apply learning (writes :last)
-        run: curl -s "${{ secrets.BASE_URL }}/api/cron/apply-learning"
-      - name: History settle (after midnight SRB)
-        run: curl -s "${{ secrets.BASE_URL }}/api/history-check?days=3"
+      - name: LATE/AM/PM snapshot pipeline
+        run: |
+          set -euo pipefail
+          BASE="https://predictscores.vercel.app"
+          echo "[1/5] Rebuild..."
+          curl -fsS "$BASE/api/cron/rebuild"
+          echo "[2/5] Refresh odds..."
+          curl -fsS "$BASE/api/cron/refresh-odds"
+          echo "[3/5] Insights build..."
+          curl -fsS "$BASE/api/cron/insights-build"
+          echo "[4/5] Apply learning..."
+          curl -fsS "$BASE/api/cron/apply-learning"
+          echo "[5/5] History settle (3d)..."
+          curl -fsS "$BASE/api/history-check?days=3"
+          echo "Done."
