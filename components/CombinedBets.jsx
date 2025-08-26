@@ -1,13 +1,10 @@
 // components/CombinedBets.jsx
-// Prvo koristi zaključani slot (/api/value-bets-locked), pa fallback na /api/football?hours=24.
-// History vuče /api/history?days=14 (presuđeno). Crypto ostaje kao i ranije.
-
 import React, { useEffect, useMemo, useState } from "react";
 import HistoryPanel from "./HistoryPanel";
 
 const TZ = "Europe/Belgrade";
+const BAN_REGEX = /(U21|U23|U19|U18|U17|Reserve|Reserves|B Team|B-Team|\bB$|\bII\b|Youth|Women|Girls|Development|Academy|U-\d{2}|\bU\d{2}\b)/i;
 
-/* ------------ helpers ------------ */
 async function safeJson(url) {
   try {
     const r = await fetch(url, { cache: "no-store" });
@@ -52,38 +49,33 @@ function byKickoffAsc(a, b) {
   return ta - tb;
 }
 
-/* ------------ component ------------ */
-export default function CombinedBets({
-  initialFootball = [],
-  initialCrypto = [],
-}) {
-  const [tab, setTab] = useState("Combined");     // Combined | Football | Crypto
-  const [subTab, setSubTab] = useState("Kick-Off"); // Kick-Off | Confidence | History
-
+export default function CombinedBets({ initialFootball = [], initialCrypto = [] }) {
+  const [tab, setTab] = useState("Combined");
+  const [subTab, setSubTab] = useState("Kick-Off");
   const [football, setFootball] = useState(Array.isArray(initialFootball) ? initialFootball : []);
   const [crypto, setCrypto] = useState(Array.isArray(initialCrypto) ? initialCrypto : []);
   const [history, setHistory] = useState([]);
-
   const [loading, setLoading] = useState({ fb:true, cr:true, hist:true });
 
-  // FOOTBALL: 1) locked slot, 2) fallback na live 24h
+  // FOOTBALL — locked → fallback(24h) + BAN i u fallbacku
   useEffect(() => {
     let stop = false;
     (async () => {
-      // 1) locked feed
+      // 1) locked
       const locked = await safeJson("/api/value-bets-locked");
       if (stop) return;
-      const lockedList = Array.isArray(locked?.items || locked?.value_bets) ? (locked.items || locked.value_bets) : [];
-      if (lockedList.length > 0) {
-        setFootball(lockedList);
+      const list = Array.isArray(locked?.items || locked?.value_bets) ? (locked.items || locked.value_bets) : [];
+      if (list.length > 0) {
+        setFootball(list);
         setLoading(s => ({ ...s, fb:false }));
         return;
       }
-      // 2) fallback na live širi prozor
+      // 2) fallback (24h) + BAN na frontu da ne vidimo youth/rezervne/women
       const live = await safeJson("/api/football?hours=24");
       if (stop) return;
       const arr = Array.isArray(live?.football) ? live.football : [];
-      setFootball(arr);
+      const filtered = arr.filter(m => !BAN_REGEX.test(m?.league?.name || ""));
+      setFootball(filtered);
       setLoading(s => ({ ...s, fb:false }));
     })();
     return () => { stop = true; };
@@ -111,7 +103,6 @@ export default function CombinedBets({
     (async () => {
       let h = await safeJson("/api/history?days=14");
       if (stop) return;
-      // dozvoli i oblike: {history:[...]}, {items:[...]}, direktno []
       const list =
         Array.isArray(h) ? h :
         Array.isArray(h?.history) ? h.history :
@@ -123,12 +114,10 @@ export default function CombinedBets({
     return () => { stop = true; };
   }, []);
 
-  // DERIVED
   const fbByConfidence = useMemo(() => [...football].sort((a,b)=>scoreFootball(b)-scoreFootball(a)), [football]);
   const fbByKickoff = useMemo(() => [...football].sort(byKickoffAsc), [football]);
   const fbTop3 = useMemo(() => fbByConfidence.slice(0,3), [fbByConfidence]);
 
-  // UI helpers
   function Tabs() {
     return (
       <div className="flex gap-3">
@@ -155,8 +144,8 @@ export default function CombinedBets({
   function FootballCard({ x }) {
     const when = fmtWhen(x);
     const league = x?.league?.name || "";
-    const h = x?.teams?.home?.name || x?.teams?.home || "";
-    const a = x?.teams?.away?.name || x?.teams?.away || "";
+    const h = x?.teams?.home?.name || x?.home || x?.home_name || "";
+    const a = x?.teams?.away?.name || x?.away || x?.away_name || "";
     const pick = x?.selection || "";
     const conf = Number.isFinite(x?.confidence_pct) ? x.confidence_pct : null;
     const edge = Number.isFinite(x?.edge_pp) ? x.edge_pp : null;
@@ -165,7 +154,7 @@ export default function CombinedBets({
     return (
       <div className="rounded-2xl bg-white/5 border border-white/10 p-4">
         <div className="text-xs text-white/60">{league}</div>
-        <div className="text-sm font-semibold truncate">{h} — {a}</div>
+        <div className="text-sm font-semibold truncate">{h || "?"} — {a || "?"}</div>
         {when ? <div className="text-xs text-white/60">{when}</div> : null}
         <div className="mt-2 flex items-center justify-between text-sm">
           <div className="font-semibold">{pick}</div>
@@ -250,4 +239,4 @@ export default function CombinedBets({
       </div>
     </div>
   );
-  }
+}
