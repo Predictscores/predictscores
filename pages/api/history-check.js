@@ -1,11 +1,12 @@
 // pages/api/history-check.js
-// Settluje rezultate, normalizuje imena timova i kvote (bez dodatnih paketa)
+// Settluje rezultate, normalizuje imena timova i kvote (bez BASE_URL)
 
 export default async function handler(req, res) {
   try {
     const days = parseInt(req.query.days || "3", 10);
 
-    const raw = await fetch(`${process.env.BASE_URL}/api/history?days=${days}`).then((r) =>
+    // Hardkodovan URL da ne puca
+    const raw = await fetch(`https://predictscores.vercel.app/api/history?days=${days}`).then((r) =>
       r.json()
     );
 
