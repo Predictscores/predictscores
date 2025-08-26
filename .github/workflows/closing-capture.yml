@@ -1,10 +1,9 @@
-# FILE: .github/workflows/closing-capture.yml
-name: Closing capture (CLV)
+name: Closing capture
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # svakih 5 minuta (UTC)
-  workflow_dispatch: {}
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
   run:
@@ -12,4 +11,5 @@ jobs:
     steps:
       - name: Capture closing odds around KO
         run: |
-          curl -fsS "https://predictscores.vercel.app/api/cron/closing-capture" || true
+          set -euo pipefail
+          curl -fsS "https://predictscores.vercel.app/api/cron/closing-capture"
