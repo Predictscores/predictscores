@@ -5,6 +5,10 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
+env:
+  BASE: ${{ secrets.BASE_URL }}
+  FALLBACK_BASE: https://predictscores.vercel.app
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -12,4 +16,5 @@ jobs:
       - name: Capture closing odds around KO
         run: |
           set -euo pipefail
-          curl -fsS "https://predictscores.vercel.app/api/cron/closing-capture"
+          B="${BASE:-$FALLBACK_BASE}"
+          curl -fsS "$B/api/cron/closing-capture"
