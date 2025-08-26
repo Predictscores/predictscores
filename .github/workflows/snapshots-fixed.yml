@@ -2,87 +2,74 @@ name: Snapshots (AM/PM/LATE)
 
 on:
   schedule:
-    # UTC -> SRB: 22:00 -> 00:00 (LATE), 08:00 -> 10:00 (AM), 13:00 -> 15:00 (PM)
-    - cron: '0 22 * * *'
+    # SRB 10:00 -> 08:00 UTC
     - cron: '0 8 * * *'
+    # SRB 15:00 -> 13:00 UTC
     - cron: '0 13 * * *'
+    # SRB 00:00 -> 22:00 UTC (prethodni dan)
+    - cron: '0 22 * * *'
   workflow_dispatch:
+    inputs:
+      slot:
+        description: 'am | pm | late | auto'
+        required: false
+        default: 'auto'
 
 env:
-  BASE: https://predictscores.vercel.app
+  # Ako nema secreta, koristi produkcioni domen kao fallback (VAŽNO!)
+  BASE: ${{ secrets.BASE_URL }}
+  FALLBACK_BASE: https://predictscores.vercel.app
 
 jobs:
-  run-late:
+  run:
     runs-on: ubuntu-latest
     steps:
-      - name: Rebuild (LATE slot)
+      - name: Resolve BASE and SLOT
+        id: ctx
         run: |
           set -euo pipefail
-          echo "BASE=$BASE"
-          curl -fsS "$BASE/api/cron/rebuild?slot=late"
-      - name: Refresh odds (window)
-        run: |
-          set -euo pipefail
-          curl -fsS "$BASE/api/cron/refresh-odds"
-      - name: Insights build
-        run: |
-          set -euo pipefail
-          curl -fsS "$BASE/api/cron/insights-build"
-      - name: Apply learning (writes :last)
-        run: |
-          set -euo pipefail
-          curl -fsS "$BASE/api/cron/apply-learning"
-      - name: History settle (3 days)
-        run: |
-          set -euo pipefail
-          curl -fsS "$BASE/api/history-check?days=3"
+          BASE="${BASE:-}"
+          if [ -z "$BASE" ]; then BASE="$FALLBACK_BASE"; fi
+          echo "base=$BASE" >> $GITHUB_OUTPUT
 
-  run-am:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Rebuild (AM slot)
-        run: |
-          set -euo pipefail
-          echo "BASE=$BASE"
-          curl -fsS "$BASE/api/cron/rebuild?slot=am"
-      - name: Refresh odds (window)
-        run: |
-          set -euo pipefail
-          curl -fsS "$BASE/api/cron/refresh-odds"
-      - name: Insights build
-        run: |
-          set -euo pipefail
-          curl -fsS "$BASE/api/cron/insights-build"
-      - name: Apply learning (writes :last)
-        run: |
-          set -euo pipefail
-          curl -fsS "$BASE/api/cron/apply-learning"
-      - name: History settle (3 days)
-        run: |
-          set -euo pipefail
-          curl -fsS "$BASE/api/history-check?days=3"
+          # Odredi SLOT: iz inputa (workflow_dispatch) ili iz rasporeda
+          INP="${{ github.event.inputs.slot || '' }}"
+          SCH="${{ github.event.schedule || '' }}"
+          if [ -n "$INP" ] && [ "$INP" != "auto" ]; then
+            SLOT="$INP"
+          else
+            case "$SCH" in
+              "0 8 * * *")  SLOT="am"  ;;
+              "0 13 * * *") SLOT="pm"  ;;
+              "0 22 * * *") SLOT="late";;
+              *)            SLOT="am"  ;; # default kad ručno pokreneš bez izbora
+            esac
+          fi
+          echo "slot=$SLOT" >> $GITHUB_OUTPUT
+          echo "Resolved: BASE=$BASE, SLOT=$SLOT"
 
-  run-pm:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Rebuild (PM slot)
+      - name: Rebuild (${{ steps.ctx.outputs.slot }} slot)
         run: |
           set -euo pipefail
-          echo "BASE=$BASE"
-          curl -fsS "$BASE/api/cron/rebuild?slot=pm"
+          curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/rebuild?slot=${{ steps.ctx.outputs.slot }}"
+
       - name: Refresh odds (window)
         run: |
           set -euo pipefail
-          curl -fsS "$BASE/api/cron/refresh-odds"
+          curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/refresh-odds"
+
       - name: Insights build
         run: |
           set -euo pipefail
-          curl -fsS "$BASE/api/cron/insights-build"
+          # pravilna ruta je /api/cron/insights-build
+          curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/insights-build"
+
       - name: Apply learning (writes :last)
         run: |
           set -euo pipefail
-          curl -fsS "$BASE/api/cron/apply-learning"
-      - name: History settle (3 days)
+          curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/apply-learning"
+
+      - name: History settle (last 3 days)
         run: |
           set -euo pipefail
-          curl -fsS "$BASE/api/history-check?days=3"
+          curl -fsS "${{ steps.ctx.outputs.base }}/api/history-check?days=3"
