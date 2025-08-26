@@ -24,7 +24,8 @@ export default async function handler(req, res) {
     const { slot = "am" } = req.query;
     const trusted = parseTrusted();
 
-    const raw = await fetch(`${process.env.BASE_URL}/api/football?hours=24`).then((r) =>
+    // Hardkodovan BASE_URL da ne puca na undefined
+    const raw = await fetch("https://predictscores.vercel.app/api/football?hours=24").then((r) =>
       r.json()
     );
 
