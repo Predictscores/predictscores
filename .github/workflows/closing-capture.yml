@@ -2,19 +2,52 @@ name: Closing capture
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    # svake 5 min, ali pomereno na :02, :07, :12, ... da se ne sudara sa ostalim cronovima
+    - cron: '2-59/5 * * * *'
   workflow_dispatch:
 
 env:
   BASE: ${{ secrets.BASE_URL }}
   FALLBACK_BASE: https://predictscores.vercel.app
 
+concurrency:
+  group: closing-capture
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 6
     steps:
-      - name: Capture closing odds around KO
+      - name: Warmup (quick ping)
         run: |
           set -euo pipefail
           B="${BASE:-$FALLBACK_BASE}"
-          curl -fsS "$B/api/cron/closing-capture"
+          # kratko "buđenje" funkcije; ignoriši greške
+          curl -fsS --connect-timeout 5 --max-time 10 "$B/api/ping" || true
+
+      - name: Capture closing odds around KO (retry + backoff)
+        run: |
+          set -euo pipefail
+          B="${BASE:-$FALLBACK_BASE}"
+
+          tries=5
+          delay=3
+
+          for i in $(seq 1 $tries); do
+            echo "Attempt $i/$tries..."
+            # IPv4 može da pomogne kod čudnih DNS ruta; slobodno ukloni ako ne treba
+            if curl -fsS --ipv4 \
+              --connect-timeout 10 \
+              --max-time 120 \
+              "$B/api/cron/closing-capture"; then
+              echo "Done."
+              exit 0
+            fi
+            echo "Retrying in ${delay}s..."
+            sleep $delay
+            delay=$(( delay * 2 ))
+          done
+
+          echo "All attempts failed."
+          exit 1
