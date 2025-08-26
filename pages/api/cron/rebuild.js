@@ -1,8 +1,6 @@
 // pages/api/cron/rebuild.js
 // Kreira zaključane slotove (AM / PM / LATE) sa filtrima i ban listom
 
-import { DateTime } from "luxon";
-
 const BAN_REGEX = /(U21|U23|Development|Youth|Women|Girls)/i;
 
 function parseTrusted() {
@@ -26,8 +24,9 @@ export default async function handler(req, res) {
     const { slot = "am" } = req.query;
     const trusted = parseTrusted();
 
-    // simulacija – u praksi ovde ide fetch ka tvojoj DB ili value-bets generatoru
-    const raw = await fetch(`${process.env.BASE_URL}/api/football?hours=24`).then((r) => r.json());
+    const raw = await fetch(`${process.env.BASE_URL}/api/football?hours=24`).then((r) =>
+      r.json()
+    );
 
     let items = (raw.football || []).filter((m) => {
       // ban liste liga
@@ -46,8 +45,8 @@ export default async function handler(req, res) {
       // sanity check vremena
       const dt = m?.datetime_local?.starting_at?.date_time;
       if (!dt) return false;
-      const start = DateTime.fromSQL(dt, { zone: "Europe/Belgrade" });
-      if (!start.isValid) return false;
+      const t = new Date(dt);
+      if (isNaN(t.getTime())) return false;
 
       return true;
     });
