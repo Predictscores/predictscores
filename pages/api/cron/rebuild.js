@@ -1,14 +1,15 @@
 // FILE: pages/api/cron/rebuild.js
-// Kreira zaključane slotove (AM/PM/LATE) sa filtrima, ban listom i cap-ovima po ligi,
-// i upisuje u vbl:${YMD}:${slot}. Radi isključivo nad /api/value-bets (seed iz fixtures).
+// Zaključava slotove iz /api/value-bets?slot=… (seed) i snima u LOCKED + vb:day:<YMD>:<slot>
+// Pravila: BAN, min kvota (obavezna) ≥ MIN_ODDS (default 1.5), cap po ligi (UEFA=6, ostalo=2), Tier boost.
 
 import { _internalSetLocked as setLocked } from "../value-bets-locked";
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const MIN_ODDS = Number(process.env.MIN_ODDS || 1.5);
+const KV_URL = process.env.KV_REST_API_URL;
+const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 
-// BAN: Under/Uxx (uključuje U23s, U-21s...), Women/Girls, Reserves, Youth/Academy/Development
-// (NE banujemo “B Team”/“II” jer su seniorske ekipe u nekim ligama)
+// BAN regex — isti kao u seed-u
 const BAN_REGEX =
   /(?:^|[^A-Za-z0-9])U\s*-?\s*\d{1,2}s?(?:[^A-Za-z0-9]|$)|Under\s*\d{1,2}\b|Women|Girls|Reserves?|Youth|Academy|Development/i;
 
@@ -37,7 +38,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok:false, error:"invalid slot" });
     }
 
-    // Uzmi seed iz /api/value-bets?slot=...
+    // 1) Uzmi seed iz /api/value-bets
     const origin = getOrigin(req);
     const seedR = await fetch(`${origin}/api/value-bets?slot=${encodeURIComponent(slot)}`, {
       headers: { "cache-control":"no-store" }
@@ -46,35 +47,37 @@ export default async function handler(req, res) {
     const seedJ = seedCT.includes("application/json") ? await seedR.json() : {};
     const base = Array.isArray(seedJ?.value_bets) ? seedJ.value_bets : [];
 
-    // Ako nema ničega — zapiši prazan lock da UI ne visi
+    const ymd = ymdInTZ();
+
     if (!base.length) {
-      await setLocked?.(`vbl:${ymdInTZ()}:${slot}`, []);
+      // ipak očisti i zaključaj prazan (predvidivo ponašanje)
+      await setLocked?.(`vbl:${ymd}:${slot}`, []);
+      // i napiši prazan vb:day da apply-learning ne ruši last naslepo
+      await kvSet(`vb:day:${ymd}:${slot}`, []);
       return res.status(200).json({ ok:true, slot, count:0, football:[], source:"seed:empty" });
     }
 
-    // Filtriranje + bodovanje
+    // 2) Filtriranje + bodovanje + per-league cap
     const perLeagueCount = Object.create(null);
     const out = [];
+
     for (const x of base) {
-      // BAN na više polja (league.name + round + stage)
       const leagueName = str(x?.league?.name) || str(x?.league_name);
       if (!leagueName) continue;
+
       const round = str(x?.league?.round) || str(x?.round);
       const stage = str(x?.league?.stage) || str(x?.stage);
-      const banHaystack = `${leagueName} ${round} ${stage}`;
-      if (BAN_REGEX.test(banHaystack)) continue;
+      if (BAN_REGEX.test(`${leagueName} ${round} ${stage}`)) continue;
 
-      // min kvota (ako postoji vrednost)
+      // obavezna kvota: mora postojati i biti ≥ MIN_ODDS
       const odds = bestOdds(x);
-      if (odds !== null && odds < MIN_ODDS) continue;
+      if (!(Number.isFinite(odds) && odds >= MIN_ODDS)) continue;
 
-      // Per-league cap (UEFA 6, ostale 2)
       const leagueKey = leagueKeyOf(x);
       const cap = isUEFA(leagueName) ? 6 : 2;
       perLeagueCount[leagueKey] = (perLeagueCount[leagueKey] || 0);
       if (perLeagueCount[leagueKey] >= cap) continue;
 
-      // Tier prioritet (blagi boost)
       const tier = tierOf(leagueName);
       const tierBoost = tier === 1 ? 30 : tier === 2 ? 10 : 0;
 
@@ -85,12 +88,11 @@ export default async function handler(req, res) {
       perLeagueCount[leagueKey] += 1;
     }
 
-    // Sortiraj po rangu opadajuće
     out.sort((a,b) => num(b.__rank) - num(a.__rank));
 
-    // Upis u locked
-    const ymd = ymdInTZ();
+    // 3) Upisi u LOCKED + vb:day:<ymd>:<slot> (da learning ima ulaz)
     await setLocked?.(`vbl:${ymd}:${slot}`, out);
+    await kvSet(`vb:day:${ymd}:${slot}`, out);
 
     return res.status(200).json({ ok:true, slot, count: out.length, football: out, source:"rebuild" });
   } catch (e) {
@@ -112,14 +114,8 @@ function ymdInTZ(d=new Date(), tz=TZ){
 function str(x){ return (typeof x === "string" ? x : x==null ? "" : String(x)); }
 function num(x){ const n = Number(x); return Number.isFinite(n) ? n : null; }
 function makeSet(arr){ const s=new Set(); arr.forEach(v=>s.add(v)); return s; }
-function tierOf(leagueName){
-  if (TIER1.has(leagueName)) return 1;
-  if (TIER2.has(leagueName)) return 2;
-  return 3;
-}
-function isUEFA(leagueName){
-  return /UEFA/i.test(leagueName);
-}
+function tierOf(leagueName){ if (TIER1.has(leagueName)) return 1; if (TIER2.has(leagueName)) return 2; return 3; }
+function isUEFA(leagueName){ return /UEFA/i.test(leagueName); }
 function leagueKeyOf(x){
   const name = str(x?.league?.name) || str(x?.league_name);
   const country = str(x?.league?.country) || str(x?.country);
@@ -127,8 +123,7 @@ function leagueKeyOf(x){
 }
 function bestOdds(x){
   const cands = [
-    x?.closing_odds_decimal, x?.market_odds_decimal, x?.market_odds, x?.odds,
-    x?.odds?.best, x?.best_odds, x?.oddsBest,
+    x?.odds?.best, x?.best_odds, x?.market_odds_decimal, x?.market_odds, x?.odds,
     x?.odds?.home?.win, x?.odds?.match_winner?.best,
     x?.book?.best, x?.price, x?.odd, x?.odds_value
   ];
@@ -136,5 +131,17 @@ function bestOdds(x){
     const n = Number(c);
     if (Number.isFinite(n) && n > 1.0 && n < 100) return n;
   }
-  return null;
+  return NaN;
+}
+
+/* ----- Upstash KV (za vb:day feed) ----- */
+async function kvSet(key, val) {
+  if (!KV_URL || !KV_TOKEN) return;
+  try {
+    await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${KV_TOKEN}`, "content-type":"application/json" },
+      body: JSON.stringify({ value: val }),
+    });
+  } catch {}
 }
