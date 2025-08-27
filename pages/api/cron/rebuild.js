@@ -35,7 +35,6 @@ const TIER2 = makeSet([
 ]);
 const SERBIA_PRVA_KEYS = makeSet(["Prva Liga","Serbian Prva Liga","Prva liga Srbije"]);
 
-// helpers
 function makeSet(arr){ return new Set(arr.map(s => (s||"").toString().trim())); }
 function str(x){ return x==null ? "" : String(x); }
 function num(x){ const n = Number(x); return Number.isFinite(n)?n:0; }
@@ -49,7 +48,6 @@ function isWeekendInTZ(tz=TZ){
   const wd = d.getDay(); // 0=Sun .. 6=Sat
   return wd===0 || wd===6;
 }
-
 // tolerantno traži „best odds“ iz više polja
 function bestOdds(x){
   const cands = [
@@ -74,11 +72,12 @@ export default async function handler(req, res){
     const origin = process.env.NEXT_PUBLIC_BASE_URL || (req.headers?.host ? `https://${req.headers.host}` : "");
     if (!origin) return res.status(200).json({ ok:false, error:"no origin" });
 
-    // ❗️Bez spoljnih API poziva — uzmi bazu iz /api/value-bets?slot=…
-    const r = await fetch(`${origin}/api/value-bets?slot=${encodeURIComponent(slot)}`, { headers: { "cache-control":"no-store" }});
+    // ❗️Ne čitamo više value-bets direktno (da ne vuče externals).
+    // Uzimamo već spremnu bazu iz FOOTBALL, ali sa norebuild=1 da ne napravimo rekurziju.
+    const r = await fetch(`${origin}/api/football?slot=${encodeURIComponent(slot)}&norebuild=1`, { headers: { "cache-control":"no-store" }});
     const ct = (r.headers.get("content-type") || "").toLowerCase();
-    const base = ct.includes("application/json") ? await r.json() : {};
-    const raw = Array.isArray(base?.value_bets) ? base.value_bets : Array.isArray(base) ? base : [];
+    const baseJ = ct.includes("application/json") ? await r.json() : {};
+    const raw = Array.isArray(baseJ?.football) ? baseJ.football : [];
 
     // Ako nema ničega, upiši prazan slot i izađi (da UI dobije prazan ali validan lock)
     if (!raw.length){
@@ -95,9 +94,9 @@ export default async function handler(req, res){
 
       const country = str(m?.league?.country || m?.country).trim();
 
-      // Trusted bookies: tražimo bar JEDNOG trusted-a, ne sve
+      // Trusted bookies: ako books_used PRAZAN -> pusti; ako nije prazan -> traži bar jednog trusted
       const books = (m?.books_used || []).map((b) => String(b).toLowerCase());
-      if (TRUSTED_SET.size && !books.some((b) => TRUSTED_SET.has(b))) continue;
+      if (TRUSTED_SET.size && books.length && !books.some((b) => TRUSTED_SET.has(b))) continue;
 
       const odds = bestOdds(m);
       if (odds !== null && odds < 1.5) continue; // min kvota 1.50
@@ -135,11 +134,6 @@ export default async function handler(req, res){
         isUEFA,
         tier
       });
-    }
-
-    if (!cleaned.length){
-      await setLocked?.(`vbl:${ymdInTZ()}:${slot}`, []);
-      return res.status(200).json({ ok:true, slot, count:0, football: [] });
     }
 
     // Per-league cap: UEFA=6, ostalo=2  (po ključu country:league)
