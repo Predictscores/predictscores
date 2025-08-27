@@ -2,7 +2,8 @@
 // Osvežava window kvota; poštuje TRUSTED_BOOKIES i BAN_REGEX
 
 const ROOT = "https://predictscores.vercel.app";
-const BAN_REGEX = /(U21|U23|U19|U18|U17|Reserve|Reserves|B Team|B-Team|\bB$|\bII\b|Youth|Women|Girls|Development|Academy|U-\d{2}|\bU\d{2}\b)/i;
+const BAN_REGEX =
+  /(U-?\d{1,2}\b|\bU\d{1,2}\b|Under\s?\d{1,2}|Reserve|Reserves|B Team|B-Team|\bB$|\bII\b|Youth|Women|Girls|Development|Academy)/i;
 
 function parseTrusted() {
   const list = (process.env.TRUSTED_BOOKIES || "")
@@ -11,12 +12,18 @@ function parseTrusted() {
     .filter(Boolean);
   return new Set(list);
 }
-
+function toDecimal(x) {
+  if (x === null || x === undefined) return null;
+  let s = String(x).trim();
+  s = s.replace(",", ".").replace(/[^0-9.]/g, "");
+  if (!s) return null;
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
 function normalizeOdds(o) {
-  if (!o) return null;
-  const n = Number(o);
+  const n = toDecimal(o);
   if (!Number.isFinite(n)) return null;
-  if (n < 1.01 || n > 20) return null;
+  if (n < 1.5 || n > 20) return null; // MIN 1.50
   return n;
 }
 
@@ -34,8 +41,15 @@ export default async function handler(_req, res) {
       const books = (m.books_used || []).map((b) => String(b).toLowerCase());
       if (books.length === 0) continue;
       if (!books.every((b) => trusted.has(b))) continue;
-      const dec = normalizeOdds(m?.market_odds);
+
+      const dec =
+        normalizeOdds(m?.closing_odds_decimal) ??
+        normalizeOdds(m?.market_odds_decimal) ??
+        normalizeOdds(m?.market_odds) ??
+        normalizeOdds(m?.odds) ??
+        null;
       if (!dec) continue;
+
       okItems++;
     }
 
