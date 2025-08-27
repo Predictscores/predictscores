@@ -1,7 +1,7 @@
 // pages/api/value-bets-locked.js
 // Slot-aware locked storage: vbl:${YMD}:${slot}  (slot ∈ am|pm|late)
 
-const TZ = process.env.TZ || "Europe/Belgrade";
+const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
 // --- Upstash REST helpers (optional) ---
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
