@@ -1,14 +1,13 @@
 // FILE: pages/api/football.js
-// Vraća listu predloga po slotu (late/am/pm), pokušava: locked -> value-bets -> (opciono) rebuild.
-// Primena BAN (name+round+stage), min kvota 1.50, cap (UEFA=6, ostale=2), tier-prioritet.
-// Služi i za Combined tab (Top 3 se bira na UI strani).
+// Vraća listu predloga po slotu: prvo LOCKED, ako je prazno → /api/value-bets fallback.
+// Drži BAN, min kvotu, cap i tier-boost (za fallback slučaj).
+// UI čita odavde za Football tab; Combined koristi :last (learning job).
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const MIN_ODDS = Number(process.env.MIN_ODDS || 1.5);
 const WEEKDAY_CAP = intFrom(process.env.SLOT_WEEKDAY_CAP, 15);
 const WEEKEND_CAP = intFrom(process.env.SLOT_WEEKEND_CAP, 25);
 
-// isti BAN regex kao u rebuild-u
 const BAN_REGEX =
   /(?:^|[^A-Za-z0-9])U\s*-?\s*\d{1,2}s?(?:[^A-Za-z0-9]|$)|Under\s*\d{1,2}\b|Women|Girls|Reserves?|Youth|Academy|Development/i;
 
@@ -40,41 +39,40 @@ export default async function handler(req, res){
 
     const origin = getOrigin(req);
 
-    // fallback lanac
-    const urls = [
-      `${origin}/api/value-bets-locked?slot=${slot}`,
-      `${origin}/api/value-bets?slot=${slot}`,
-      ...(noRebuild ? [] : [`${origin}/api/cron/rebuild?slot=${slot}`]),
-    ];
+    // 1) pokušaj LOCKED
+    const lockedR = await fetch(`${origin}/api/value-bets-locked?slot=${slot}`, {
+      headers:{ "cache-control":"no-store" }
+    });
+    const lockedCT = (lockedR.headers.get("content-type")||"").toLowerCase();
+    const lockedJ = lockedCT.includes("application/json") ? await lockedR.json() : {};
+    let base =
+      Array.isArray(lockedJ?.items) ? lockedJ.items :
+      Array.isArray(lockedJ?.football) ? lockedJ.football : [];
 
-    let base = [], source = "miss";
-    for (let i=0;i<urls.length;i++){
-      const r = await fetch(urls[i], { headers:{ "cache-control":"no-store" }});
-      const ct = (r.headers.get("content-type")||"").toLowerCase();
-      const j = ct.includes("application/json") ? await r.json() : {};
-      const arr =
-        Array.isArray(j?.items) ? j.items
-      : Array.isArray(j?.football) ? j.football
-      : Array.isArray(j?.value_bets) ? j.value_bets
-      : [];
-      if (arr.length){
-        base = arr; source = i===0?"locked":i===1?"value-bets":"rebuild";
-        break;
-      }
+    let source = "locked";
+
+    // 2) fallback na seed (ako nema zaključanih)
+    if (!base.length) {
+      const seedR = await fetch(`${origin}/api/value-bets?slot=${slot}`, {
+        headers:{ "cache-control":"no-store" }
+      });
+      const seedCT = (seedR.headers.get("content-type")||"").toLowerCase();
+      const seedJ = seedCT.includes("application/json") ? await seedR.json() : {};
+      base = Array.isArray(seedJ?.value_bets) ? seedJ.value_bets : [];
+      source = "seed";
     }
 
     if (!base.length){
       return res.status(200).json({ ok:true, slot, tz: TZ, football: [], source });
     }
 
-    // weekday/weekend cap
     const nowLocal = new Date(new Date().toLocaleString("en-US",{ timeZone: TZ }));
     const isWeekend = [0,6].includes(nowLocal.getDay());
     const SLOT_LIST_CAP = isWeekend ? WEEKEND_CAP : WEEKDAY_CAP;
 
-    // Filtriranje + bodovanje + per-league cap
+    // Ako smo u seed fallback-u, primeni filtere (BAN/min kvota/cap/tier)
+    let cleaned = [];
     const perLeagueCount = Object.create(null);
-    const cleaned = [];
 
     for (const x of base){
       const leagueName = str(x?.league?.name) || str(x?.league_name);
@@ -82,14 +80,11 @@ export default async function handler(req, res){
 
       const round = str(x?.league?.round) || str(x?.round);
       const stage = str(x?.league?.stage) || str(x?.stage);
-      const banHaystack = `${leagueName} ${round} ${stage}`;
-      if (BAN_REGEX.test(banHaystack)) continue;
+      if (BAN_REGEX.test(`${leagueName} ${round} ${stage}`)) continue;
 
-      // odds
       const odds = bestOdds(x);
-      if (odds !== null && odds < MIN_ODDS) continue;
+      if (!(Number.isFinite(odds) && odds >= MIN_ODDS)) continue;
 
-      // teams (robustan fallback)
       const homeName =
         str(x?.teams?.home?.name) || str(x?.home) || str(x?.home_name) || str(x?.homeTeam);
       const awayName =
@@ -120,9 +115,13 @@ export default async function handler(req, res){
       perLeagueCount[leagueKey] += 1;
     }
 
+    // Ako je izvor bio LOCKED, pretpostavljamo da je filter već primenjen — ali ćemo ipak ograničiti dužinu liste za UI
+    if (source === "locked") {
+      cleaned = base.slice();
+    }
+
     cleaned.sort((a,b) => num(b.__rank) - num(a.__rank));
 
-    // ograniči ukupnu listu po slotu (da ne bude predugačko)
     const limited = cleaned.slice(0, SLOT_LIST_CAP);
 
     return res.status(200).json({ ok:true, slot, tz: TZ, football: limited, source });
@@ -149,17 +148,15 @@ function leagueKeyOf(x){
   const country = str(x?.league?.country) || str(x?.country);
   return `${country}:${name}`.toLowerCase();
 }
-// tolerantno izvlačenje kvote/best oddsa
 function bestOdds(x){
   const cands = [
-    x?.odds?.best, x?.best_odds, x?.market?.best, x?.oddsBest,
+    x?.odds?.best, x?.best_odds, x?.market_odds_decimal, x?.market_odds, x?.odds,
     x?.odds?.home?.win, x?.odds?.match_winner?.best,
-    x?.book?.best, x?.price, x?.odd, x?.odds_value,
-    x?.closing_odds_decimal, x?.market_odds_decimal, x?.market_odds, x?.odds
+    x?.book?.best, x?.price, x?.odd, x?.odds_value
   ];
   for (const c of cands){
     const n = Number(c);
     if (Number.isFinite(n) && n > 1.0 && n < 100) return n;
   }
-  return null;
+  return NaN;
 }
