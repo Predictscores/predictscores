@@ -55,7 +55,7 @@ export default async function handler(req, res) {
       let odds = null;
       if (fid) {
         const key = `odds:fixture:${ymd}:${fid}`;
-        odds = await kvGet(key); // traži KV, pa Upstash
+        odds = await kvGet(key); // KV, pa Upstash fallback
       }
 
       const best = Number(odds?.best) || null;
@@ -130,7 +130,7 @@ function inSlotWindow(iso, tz, slot){
 
 /* KV/Upstash GET (bez novih fajlova) */
 async function kvGet(key){
-  // 1) KV_REST_* (primarno – kompatibilno sa apply-learning)
+  // 1) KV_REST_* (primarno – kompatibilno sa apply-learning/history)
   if (KV_URL && KV_TOKEN) {
     try {
       const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${KV_TOKEN}` }, cache:"no-store" });
