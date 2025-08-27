@@ -1,14 +1,14 @@
 // pages/api/football.js
 // Izvor za Top predloge po slotu (late/am/pm) sa robustnim fallback-om:
-// 1) locked po slotu -> 2) value-bets po slotu -> 3) rebuild po slotu.
+// 1) locked po slotu -> 2) value-bets po slotu -> 3) rebuild po slotu (osim ako je norebuild=1).
 // Zatim: BAN (Uxx/Under, Women/Girls, Reserves, Youth/Academy/Development; NE ban "B Team"/"II"),
 // min kvota 1.50, per-league cap (UEFA=6, ostale=2) po ključu "country:leagueName",
 // Tier prioritet (T1/T2/T3), weekday/weekend shortlist cap (15 radni dan, 25 vikend).
-// Learning NE diramo — ako postoji learnScore u ulazu, koristi se kao plus.
 
 export default async function handler(req, res) {
   try {
     const slot = String(req.query?.slot || "am").toLowerCase();
+    const noRebuild = String(req.query?.norebuild || "").trim() === "1";
 
     // ENV i domen
     const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
@@ -24,26 +24,21 @@ export default async function handler(req, res) {
 
     // Tier mape (Serbia: SuperLiga je T1; Prva Liga je T3)
     const TIER1 = makeSet([
-      // UEFA
       "UEFA Champions League","UEFA Europa League","UEFA Europa Conference League",
       "UEFA Champions League Qualification","UEFA Europa League Qualification",
       "UEFA Europa Conference League Qualification",
-      // Top 5
       "Premier League","LaLiga","Serie A","Bundesliga","Ligue 1",
-      // jaki EU top nivoi
       "Eredivisie","Primeira Liga","Pro League","Süper Lig","Super Lig","Premiership",
       "Austrian Bundesliga","Swiss Super League","Russian Premier League",
-      // specijalno
       "SuperLiga","Serbian SuperLiga"
     ]);
     const TIER2 = makeSet([
-      "Super League","Superleague", // Greece varijante
+      "Super League","Superleague",
       "Danish Superliga","Superligaen","Fortuna Liga","HNL","Ekstraklasa",
       "Eliteserien","Allsvenskan","Ukrainian Premier League","Liga I","NB I",
       "Championship","LaLiga2","Serie B","2. Bundesliga","Ligue 2",
       "Scottish Championship","Czech Liga","Romania Liga I","Poland Ekstraklasa",
       "Croatia HNL","Norway Eliteserien","Sweden Allsvenskan",
-      // van Evrope po želji
       "MLS","Argentina Liga Profesional","Brazil Serie A"
     ]);
     const SERBIA_PRVA_KEYS = makeSet(["Prva Liga","Serbian Prva Liga","Prva liga Srbije"]);
@@ -58,7 +53,7 @@ export default async function handler(req, res) {
     const urls = [];
     if (origin) urls.push(`${origin}/api/value-bets-locked?slot=${encodeURIComponent(slot)}`);
     if (origin) urls.push(`${origin}/api/value-bets?slot=${encodeURIComponent(slot)}`);
-    if (origin) urls.push(`${origin}/api/cron/rebuild?slot=${encodeURIComponent(slot)}`);
+    if (!noRebuild && origin) urls.push(`${origin}/api/cron/rebuild?slot=${encodeURIComponent(slot)}`);
 
     let base = [];
     let source = "cache";
@@ -192,7 +187,8 @@ function bestOdds(x) {
   const cands = [
     x?.odds?.best, x?.best_odds, x?.market?.best, x?.oddsBest,
     x?.odds?.home?.win, x?.odds?.match_winner?.best,
-    x?.book?.best, x?.price, x?.odd, x?.odds_value
+    x?.book?.best, x?.price, x?.odd, x?.odds_value,
+    x?.closing_odds_decimal, x?.market_odds_decimal, x?.market_odds, x?.odds
   ];
   for (const c of cands) {
     const n = Number(c);
