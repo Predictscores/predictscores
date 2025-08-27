@@ -33,17 +33,30 @@ function outcomeOf(x) {
   if (["void","push","canceled","cancelled","abandoned"].includes(s)) return "V";
   return null;
 }
+function toDecimal(x) {
+  if (x === null || x === undefined) return null;
+  let s = String(x).trim();
+  s = s.replace(",", ".").replace(/[^0-9.]/g, "");
+  if (!s) return null;
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
 function decimalOdds(x) {
-  let o = x?.closing_odds_decimal ?? x?.closing_odds ?? x?.market_odds ?? x?.odds;
-  o = Number(o);
-  if (!Number.isFinite(o) || o < 1.01 || o > 20) return null;
-  return o;
+  const cand =
+    toDecimal(x?.closing_odds_decimal) ??
+    toDecimal(x?.closing_odds) ??
+    toDecimal(x?.market_odds_decimal) ??
+    toDecimal(x?.market_odds) ??
+    toDecimal(x?.odds) ??
+    null;
+  if (!Number.isFinite(cand) || cand < 1.5 || cand > 20) return null; // MIN 1.50
+  return cand;
 }
 function roiUnits(item) {
   const oc = outcomeOf(item);
   if (!oc || oc === "V") return 0;
   const odds = decimalOdds(item);
-  if (!Number.isFinite(odds) || odds <= 1) return oc === "W" ? 0 : -1;
+  if (!Number.isFinite(odds) || odds <= 1.5) return oc === "W" ? 0 : -1;
   return oc === "W" ? odds - 1 : -1; // stake=1
 }
 function OutcomeBadge({ oc }) {
@@ -97,7 +110,11 @@ export default function HistoryPanel({ history = [], note="History (14d)" }) {
         <ul className="space-y-2">
           {history.map((it, idx) => {
             const id = it?.id || it?.fixture_id || `${idx}`;
-            const when = fmtWhen(it);
+            const when = getDateISO(it)
+              ? new Date(getDateISO(it)).toLocaleString("sv-SE", {
+                  timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit",
+                  hour: "2-digit", minute: "2-digit",
+                }) : "";
             const home = teamName(it,"home") || "?";
             const away = teamName(it,"away") || "?";
             const market = it?.market_label || it?.market || "";
@@ -129,4 +146,4 @@ export default function HistoryPanel({ history = [], note="History (14d)" }) {
       </div>
     </div>
   );
-                      }
+}
