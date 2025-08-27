@@ -14,44 +14,55 @@ async function safeJson(url) {
 
 export default function HistoryPanel() {
   const [items, setItems] = useState([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    let mounted = true;
-    const load = async () => {
+    let abort = false;
+    (async () => {
       setLoading(true);
-      // normalizovani endpoint sa garantovanim imenima i poslednjih 14 dana
-      const r = await safeJson(`/api/history-check?days=14`);
-      const arr =
-        Array.isArray(r?.history) ? r.history :
-        Array.isArray(r?.items) ? r.items :
-        Array.isArray(r) ? r : [];
-      if (mounted) {
+      const j = await safeJson("/api/history?days=14");
+      if (!abort) {
+        const arr = Array.isArray(j?.items) ? j.items : [];
         setItems(arr);
         setLoading(false);
       }
-    };
-    load();
-    return () => { mounted = false; };
+    })();
+    return () => { abort = true; };
   }, []);
 
   return (
     <div>
       {loading && <div className="text-sm opacity-70 mb-2">Učitavanje istorije…</div>}
-      {!loading && items.length === 0 && <div className="text-sm opacity-70">Nema podataka za poslednjih 14 dana.</div>}
+      {!loading && items.length === 0 && (
+        <div className="text-sm opacity-70">Nema podataka za poslednjih 14 dana.</div>
+      )}
 
       <ul className="space-y-2">
         {items.map((x, i) => {
-          const home = x?.teams?.home?.name || x?.home || x?.home_name || "Unknown";
-          const away = x?.teams?.away?.name || x?.away || x?.away_name || "Unknown";
+          // Robustno čitanje imena (podržava i starije zapise gde su bili stringovi)
+          const home =
+            (typeof x?.teams?.home === "string" ? x.teams.home : x?.teams?.home?.name) ||
+            x?.home || x?.home_name || "Unknown";
+          const away =
+            (typeof x?.teams?.away === "string" ? x.teams.away : x?.teams?.away?.name) ||
+            x?.away || x?.away_name || "Unknown";
+
           const league = x?.league?.name || x?.league_name || "";
           const country = x?.league?.country || x?.country || "";
           const result = x?.result || x?.outcome || x?.status || "";
+          const kickoff = x?.kickoff || x?.datetime_local?.starting_at?.date_time || "";
+
           return (
             <li key={`h-${x?.fixture_id || x?.id || i}`} className="p-3 rounded border">
-              <div className="text-xs opacity-70">{country ? `${country} — ` : ""}{league}</div>
-              <div className="text-base">{home} vs {away}</div>
-              <div className="text-xs opacity-70">{result}</div>
+              <div className="text-xs opacity-70">
+                {country ? `${country} — ` : ""}{league}
+              </div>
+              <div className="font-medium">
+                {home} — {away}
+              </div>
+              <div className="text-xs opacity-70">
+                {kickoff?.replace("T"," ")} {result ? `• ${result}` : ""}
+              </div>
             </li>
           );
         })}
