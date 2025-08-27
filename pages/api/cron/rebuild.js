@@ -1,8 +1,11 @@
 // pages/api/cron/rebuild.js
 // Kreira zaključane slotove (AM / PM / LATE) sa filtrima i ban listom
 
-const BAN_REGEX = /(U21|U23|U19|U18|U17|Reserve|Reserves|B Team|B-Team|\bB$|\bII\b|Youth|Women|Girls|Development|Academy|U-\d{2}|\bU\d{2}\b)/i;
+// HVATA SVE UNDER/REZERVE/ŽENSKE/MLAĐE
+const BAN_REGEX =
+  /(U-?\d{1,2}\b|\bU\d{1,2}\b|Under\s?\d{1,2}|Reserve|Reserves|B Team|B-Team|\bB$|\bII\b|Youth|Women|Girls|Development|Academy)/i;
 
+// --- helpers ---
 function parseTrusted() {
   const list = (process.env.TRUSTED_BOOKIES || "")
     .split(",")
@@ -10,12 +13,20 @@ function parseTrusted() {
     .filter(Boolean);
   return new Set(list);
 }
-
+function toDecimal(x) {
+  if (x === null || x === undefined) return null;
+  let s = String(x).trim();
+  // zameni zarez tačkom i ukloni sve sem cifara i tačke
+  s = s.replace(",", ".").replace(/[^0-9.]/g, "");
+  if (!s) return null;
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
 function normalizeOdds(o) {
-  if (!o) return null;
-  const n = Number(o);
+  const n = toDecimal(o);
   if (!Number.isFinite(n)) return null;
-  if (n < 1.01 || n > 20) return null;
+  // MIN KVOTA 1.50, MAX 20
+  if (n < 1.5 || n > 20) return null;
   return n;
 }
 
@@ -38,12 +49,21 @@ export default async function handler(req, res) {
       if (books.length === 0) return false;
       if (!books.every((b) => trusted.has(b))) return false;
 
-      // kvote u granicama
-      const dec = normalizeOdds(m?.market_odds);
+      // kvote: preferiraj decimal polja, potom market_odds
+      const dec =
+        normalizeOdds(m?.closing_odds_decimal) ??
+        normalizeOdds(m?.market_odds_decimal) ??
+        normalizeOdds(m?.market_odds) ??
+        normalizeOdds(m?.odds) ??
+        null;
       if (!dec) return false;
 
       // kickoff validan
-      const dt = m?.datetime_local?.starting_at?.date_time || m?.datetime_local?.date_time;
+      const dt =
+        m?.datetime_local?.starting_at?.date_time ||
+        m?.datetime_local?.date_time ||
+        m?.time?.starting_at?.date_time ||
+        m?.kickoff;
       if (!dt || isNaN(new Date(dt).getTime())) return false;
 
       return true;
