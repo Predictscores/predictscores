@@ -71,8 +71,8 @@ export default async function handler(req, res) {
     out.sort((a,b) => Number(b.__rank) - Number(a.__rank));
 
     // 3) upis
-    await setLocked(`vbl:${ymd}:${slot}`, out);     // LOCKED (reads Football tab)
-    await kvSet(`vb:day:${ymd}:${slot}`, out);      // dnevni seed za apply-learning (Combined/History)
+    await setLocked(`vbl:${ymd}:${slot}`, out);     // LOCKED (Football tab)
+    await kvSet(`vb:day:${ymd}:${slot}`, out);      // dnevni seed (Combined/History ulaz)
 
     return res.status(200).json({ ok:true, slot, count: out.length, football: out });
   } catch (e) {
@@ -81,7 +81,6 @@ export default async function handler(req, res) {
 }
 
 /* ---------- helpers ---------- */
-
 function toSet(arr){ return new Set(arr); }
 function ymdInTZ(d=new Date(), tz=TZ){
   const s = d.toLocaleString("en-CA",{ timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
@@ -102,9 +101,9 @@ function leagueKeyOf(x){
   return `${c}:${n}`;
 }
 
-// LOCKED setter (koristi postojeći value-bets-locked kvSet format)
+// LOCKED setter
 async function setLocked(key, arr){
-  // pišemo i u Upstash i u KV da sve bude vidljivo svuda (UI + debug)
+  // pišemo i u KV i u Upstash da sve bude vidljivo svuda
   if (KV_URL && KV_TOKEN) {
     await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
       method: "POST",
