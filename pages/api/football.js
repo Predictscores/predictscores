@@ -1,196 +1,163 @@
-// pages/api/football.js
-// Izvor za Top predloge po slotu (late/am/pm) sa robustnim fallback-om:
-// 1) locked po slotu -> 2) value-bets po slotu -> 3) rebuild po slotu (osim ako je norebuild=1).
-// Zatim: BAN (Uxx/Under, Women/Girls, Reserves, Youth/Academy/Development; NE ban "B Team"/"II"),
-// min kvota 1.50, per-league cap (UEFA=6, ostale=2) po ključu "country:leagueName",
-// Tier prioritet (T1/T2/T3), weekday/weekend shortlist cap (15 radni dan, 25 vikend).
+// FILE: pages/api/football.js
+// Vraća listu predloga po slotu (late/am/pm), pokušava: locked -> value-bets -> (opciono) rebuild.
+// Primena BAN (name+round+stage), min kvota 1.50, cap (UEFA=6, ostale=2), tier-prioritet.
+// Služi i za Combined tab (Top 3 se bira na UI strani).
 
-export default async function handler(req, res) {
-  try {
+const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const MIN_ODDS = Number(process.env.MIN_ODDS || 1.5);
+const WEEKDAY_CAP = intFrom(process.env.SLOT_WEEKDAY_CAP, 15);
+const WEEKEND_CAP = intFrom(process.env.SLOT_WEEKEND_CAP, 25);
+
+// isti BAN regex kao u rebuild-u
+const BAN_REGEX =
+  /(?:^|[^A-Za-z0-9])U\s*-?\s*\d{1,2}s?(?:[^A-Za-z0-9]|$)|Under\s*\d{1,2}\b|Women|Girls|Reserves?|Youth|Academy|Development/i;
+
+const TIER1 = makeSet([
+  "UEFA Champions League","UEFA Europa League","UEFA Europa Conference League",
+  "UEFA Champions League Qualification","UEFA Europa League Qualification",
+  "UEFA Europa Conference League Qualification",
+  "Premier League","LaLiga","Serie A","Bundesliga","Ligue 1",
+  "Eredivisie","Primeira Liga","Pro League","Süper Lig","Super Lig","Premiership",
+  "Austrian Bundesliga","Swiss Super League",
+  "SuperLiga","Serbian SuperLiga"
+]);
+const TIER2 = makeSet([
+  "Championship","LaLiga2","Serie B","2. Bundesliga","Ligue 2",
+  "Scottish Premiership","Scottish Championship",
+  "Danish Superliga","Superligaen","Ekstraklasa","Eliteserien","Allsvenskan",
+  "Czech Liga","Romania Liga I","Croatia HNL","Poland Ekstraklasa",
+  "Norway Eliteserien","Sweden Allsvenskan",
+  "MLS","Argentina Liga Profesional","Brazil Serie A"
+]);
+
+export default async function handler(req, res){
+  try{
     const slot = String(req.query?.slot || "am").toLowerCase();
     const noRebuild = String(req.query?.norebuild || "").trim() === "1";
+    if (!["am","pm","late"].includes(slot)){
+      return res.status(200).json({ ok:false, error:"invalid slot" });
+    }
 
-    // ENV i domen
-    const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-    const WEEKDAY_CAP = numFromEnv(process.env.WEEKDAY_CAP, process.env.SLOT_WEEKDAY_CAP, 15);
-    const WEEKEND_CAP = numFromEnv(process.env.WEEKEND_CAP, process.env.SLOT_WEEKEND_CAP, 25);
-    const origin =
-      process.env.NEXT_PUBLIC_BASE_URL ||
-      (req.headers?.host ? `https://${req.headers.host}` : "");
+    const origin = getOrigin(req);
 
-    // BAN regex (NE ban "B Team"/"II")
-    const BAN_REGEX =
-      /\bU\s*-?\s*\d{1,2}\b|Under\s*\d{1,2}\b|Women|Girls|Reserves?|Youth|Academy|Development/i;
+    // fallback lanac
+    const urls = [
+      `${origin}/api/value-bets-locked?slot=${slot}`,
+      `${origin}/api/value-bets?slot=${slot}`,
+      ...(noRebuild ? [] : [`${origin}/api/cron/rebuild?slot=${slot}`]),
+    ];
 
-    // Tier mape (Serbia: SuperLiga je T1; Prva Liga je T3)
-    const TIER1 = makeSet([
-      "UEFA Champions League","UEFA Europa League","UEFA Europa Conference League",
-      "UEFA Champions League Qualification","UEFA Europa League Qualification",
-      "UEFA Europa Conference League Qualification",
-      "Premier League","LaLiga","Serie A","Bundesliga","Ligue 1",
-      "Eredivisie","Primeira Liga","Pro League","Süper Lig","Super Lig","Premiership",
-      "Austrian Bundesliga","Swiss Super League","Russian Premier League",
-      "SuperLiga","Serbian SuperLiga"
-    ]);
-    const TIER2 = makeSet([
-      "Super League","Superleague",
-      "Danish Superliga","Superligaen","Fortuna Liga","HNL","Ekstraklasa",
-      "Eliteserien","Allsvenskan","Ukrainian Premier League","Liga I","NB I",
-      "Championship","LaLiga2","Serie B","2. Bundesliga","Ligue 2",
-      "Scottish Championship","Czech Liga","Romania Liga I","Poland Ekstraklasa",
-      "Croatia HNL","Norway Eliteserien","Sweden Allsvenskan",
-      "MLS","Argentina Liga Profesional","Brazil Serie A"
-    ]);
-    const SERBIA_PRVA_KEYS = makeSet(["Prva Liga","Serbian Prva Liga","Prva liga Srbije"]);
-
-    // weekday/weekend cap po lokalnom TZ
-    const now = new Date();
-    const local = new Date(now.toLocaleString("en-US", { timeZone: TZ }));
-    const isWeekend = [0,6].includes(local.getDay()); // ned=0, sub=6
-    const SLOT_LIST_CAP = isWeekend ? (WEEKEND_CAP || 25) : (WEEKDAY_CAP || 15);
-
-    // Fallback lanac po slotu
-    const urls = [];
-    if (origin) urls.push(`${origin}/api/value-bets-locked?slot=${encodeURIComponent(slot)}`);
-    if (origin) urls.push(`${origin}/api/value-bets?slot=${encodeURIComponent(slot)}`);
-    if (!noRebuild && origin) urls.push(`${origin}/api/cron/rebuild?slot=${encodeURIComponent(slot)}`);
-
-    let base = [];
-    let source = "cache";
-    for (let i = 0; i < urls.length; i++) {
-      const r = await safeJson(urls[i]);
-      let arr =
-        (Array.isArray(r?.items) && r?.slot ? r.items : null) ||
-        (Array.isArray(r?.value_bets) ? r.value_bets : null) ||
-        (Array.isArray(r?.football) ? r.football : null) ||
-        (Array.isArray(r?.list) ? r.list : null);
-
-      // Locked: ako response.slot != traženi slot, ignoriši (sprečava "late" za ?slot=am)
-      if (i === 0) {
-        const respSlot = String(r?.slot || "").toLowerCase();
-        if (arr && respSlot && respSlot !== slot) arr = null;
-      }
-      if (arr && arr.length) {
-        base = arr;
-        source = i === 0 ? "locked" : i === 1 ? "value-bets" : "rebuild";
+    let base = [], source = "miss";
+    for (let i=0;i<urls.length;i++){
+      const r = await fetch(urls[i], { headers:{ "cache-control":"no-store" }});
+      const ct = (r.headers.get("content-type")||"").toLowerCase();
+      const j = ct.includes("application/json") ? await r.json() : {};
+      const arr =
+        Array.isArray(j?.items) ? j.items
+      : Array.isArray(j?.football) ? j.football
+      : Array.isArray(j?.value_bets) ? j.value_bets
+      : [];
+      if (arr.length){
+        base = arr; source = i===0?"locked":i===1?"value-bets":"rebuild";
         break;
       }
     }
 
-    if (!base.length) {
-      return res.status(200).json({ ok: true, slot, tz: TZ, football: [], source });
+    if (!base.length){
+      return res.status(200).json({ ok:true, slot, tz: TZ, football: [], source });
     }
 
-    // Normalizacija + BAN + min kvota + bodovanje
+    // weekday/weekend cap
+    const nowLocal = new Date(new Date().toLocaleString("en-US",{ timeZone: TZ }));
+    const isWeekend = [0,6].includes(nowLocal.getDay());
+    const SLOT_LIST_CAP = isWeekend ? WEEKEND_CAP : WEEKDAY_CAP;
+
+    // Filtriranje + bodovanje + per-league cap
+    const perLeagueCount = Object.create(null);
     const cleaned = [];
-    for (const x of base) {
-      const rawLeague = String(x?.league?.name || x?.league_name || "").trim();
-      const leagueName = rawLeague;
+
+    for (const x of base){
+      const leagueName = str(x?.league?.name) || str(x?.league_name);
       if (!leagueName) continue;
-      if (BAN_REGEX.test(leagueName)) continue;
 
-      const country = String(x?.league?.country || x?.country || "").trim();
+      const round = str(x?.league?.round) || str(x?.round);
+      const stage = str(x?.league?.stage) || str(x?.stage);
+      const banHaystack = `${leagueName} ${round} ${stage}`;
+      if (BAN_REGEX.test(banHaystack)) continue;
+
+      // odds
       const odds = bestOdds(x);
-      if (odds !== null && odds < 1.5) continue; // min kvota 1.50
+      if (odds !== null && odds < MIN_ODDS) continue;
 
-      const home =
+      // teams (robustan fallback)
+      const homeName =
         str(x?.teams?.home?.name) || str(x?.home) || str(x?.home_name) || str(x?.homeTeam);
-      const away =
+      const awayName =
         str(x?.teams?.away?.name) || str(x?.away) || str(x?.away_name) || str(x?.awayTeam);
+      if (!homeName || !awayName) continue;
 
-      let tier = 3;
-      if (TIER1.has(leagueName)) tier = 1;
-      else if (TIER2.has(leagueName)) tier = 2;
-      else if (SERBIA_PRVA_KEYS.has(leagueName)) tier = 3;
+      const leagueKey = leagueKeyOf(x);
+      const cap = isUEFA(leagueName) ? 6 : 2;
+      perLeagueCount[leagueKey] = (perLeagueCount[leagueKey] || 0);
+      if (perLeagueCount[leagueKey] >= cap) continue;
 
-      const isUEFA = /Champions League|Europa League|Conference League/i.test(leagueName);
-
-      const baseScore = num(x?.score || x?._score || x?.model_prob || x?.model || 0);
-      const learnBoost = num(x?.learnScore || x?.learn_boost || 0);
-      const tierBoost = tier === 1 ? 0.10 : tier === 2 ? 0.05 : 0;
-      const oddsBoost = odds !== null ? clamp((odds - 1.6) * 0.03, -0.05, 0.08) : 0;
-      const score = baseScore + tierBoost + oddsBoost + learnBoost;
+      const tier = tierOf(leagueName);
+      const tierBoost = tier===1 ? 30 : tier===2 ? 10 : 0;
+      const conf = num(x?.confidence_pct) ?? num(x?.confidence) ?? 0;
+      const rankScore = conf + tierBoost;
 
       cleaned.push({
         ...x,
-        league: x.league || { name: leagueName, country },
-        league_name: leagueName,
-        teams: x.teams || { home: { name: home }, away: { name: away } },
-        home_name: home,
-        away_name: away,
-        tier,
-        isUEFA,
-        __score: score,
-        __odds: odds,
-        __leagueKey: `${country}:${leagueName}` // za per-league cap
+        teams: {
+          home: { id: x?.teams?.home?.id ?? x?.home_id ?? null, name: homeName },
+          away: { id: x?.teams?.away?.id ?? x?.away_id ?? null, name: awayName },
+        },
+        __rank: rankScore,
+        __tier: tier,
+        __leagueKey: leagueKey,
       });
+
+      perLeagueCount[leagueKey] += 1;
     }
 
-    if (!cleaned.length) {
-      return res.status(200).json({ ok: true, slot, tz: TZ, football: [], source });
-    }
+    cleaned.sort((a,b) => num(b.__rank) - num(a.__rank));
 
-    // Per-league cap: UEFA=6, ostalo=2, po ključu "country:leagueName"
-    const perLeagueCount = Object.create(null);
-    const out = [];
-    for (const x of cleaned.sort((a, b) => b.__score - a.__score)) {
-      const lid = (x.__leagueKey || x.league_name || "").toString();
-      const cap = x.isUEFA ? 6 : 2;
-      const cnt = perLeagueCount[lid] || 0;
-      if (cnt >= cap) continue;
-      perLeagueCount[lid] = cnt + 1;
-      out.push(x);
-      if (out.length >= SLOT_LIST_CAP) break; // 15 radni dan, 25 vikend
-    }
+    // ograniči ukupnu listu po slotu (da ne bude predugačko)
+    const limited = cleaned.slice(0, SLOT_LIST_CAP);
 
-    return res.status(200).json({
-      ok: true,
-      slot,
-      tz: TZ,
-      football: out,
-      source
-    });
-
-  } catch (err) {
-    return res.status(200).json({ ok: false, error: String(err?.message || err) });
+    return res.status(200).json({ ok:true, slot, tz: TZ, football: limited, source });
+  } catch(e){
+    return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
 }
 
-/* ---------------- helpers ---------------- */
-
-async function safeJson(url) {
-  try {
-    const r = await fetch(url, { headers: { "cache-control": "no-store" } });
-    const ct = (r.headers.get("content-type") || "").toLowerCase();
-    if (ct.includes("application/json")) return await r.json();
-    const t = await r.text();
-    try { return JSON.parse(t); } catch { return null; }
-  } catch {
-    return null;
-  }
+/* =============== utils =============== */
+function getOrigin(req){
+  const env = process.env.NEXT_PUBLIC_BASE_URL;
+  if (env) return env.replace(/\/+$/,"");
+  const host = req?.headers?.host;
+  return host ? `https://${host}` : "";
 }
-function numFromEnv(...xs) {
-  for (const x of xs) {
-    if (x == null) continue;
-    const v = parseInt(String(x), 10);
-    if (!Number.isNaN(v) && v > 0) return v;
-  }
-  return null;
+function makeSet(arr){ const s=new Set(); arr.forEach(v=>s.add(v)); return s; }
+function intFrom(x, def){ const n=Number(x); return Number.isFinite(n) ? n : def; }
+function str(x){ return (typeof x === "string" ? x : x==null ? "" : String(x)); }
+function num(x){ const n=Number(x); return Number.isFinite(n) ? n : null; }
+function isUEFA(leagueName){ return /UEFA/i.test(leagueName); }
+function tierOf(leagueName){ if (TIER1.has(leagueName)) return 1; if (TIER2.has(leagueName)) return 2; return 3; }
+function leagueKeyOf(x){
+  const name = str(x?.league?.name) || str(x?.league_name);
+  const country = str(x?.league?.country) || str(x?.country);
+  return `${country}:${name}`.toLowerCase();
 }
-function makeSet(arr) { return new Set(arr.map((s) => (s || "").toString().trim())); }
-function str(s) { return s == null ? "" : String(s); }
-function num(x) { const n = Number(x); return Number.isFinite(n) ? n : 0; }
-function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
-
-// "best odds" tolerantno iz više polja
-function bestOdds(x) {
+// tolerantno izvlačenje kvote/best oddsa
+function bestOdds(x){
   const cands = [
     x?.odds?.best, x?.best_odds, x?.market?.best, x?.oddsBest,
     x?.odds?.home?.win, x?.odds?.match_winner?.best,
     x?.book?.best, x?.price, x?.odd, x?.odds_value,
     x?.closing_odds_decimal, x?.market_odds_decimal, x?.market_odds, x?.odds
   ];
-  for (const c of cands) {
+  for (const c of cands){
     const n = Number(c);
     if (Number.isFinite(n) && n > 1.0 && n < 100) return n;
   }
