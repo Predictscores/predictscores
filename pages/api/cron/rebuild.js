@@ -3,7 +3,7 @@
 
 import { _internalSetLocked as setLocked } from "../value-bets-locked";
 
-const TZ = process.env.TZ || "Europe/Belgrade";
+const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const TRUSTED = (process.env.TRUSTED_BOOKIES || "")
   .split(",")
   .map((s) => s.trim().toLowerCase())
