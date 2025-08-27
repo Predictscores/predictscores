@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import HistoryPanel from "./HistoryPanel"; // History tab koristi baš ovaj panel
 
-const TZ = "Europe/Belgrade";
+const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
 /* ---------------- helpers ---------------- */
 
@@ -473,4 +473,4 @@ export default function CombinedBets() {
       )}
     </div>
   );
-      }
+}
