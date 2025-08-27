@@ -11,7 +11,7 @@ export default async function handler(req, res) {
     const slot = String(req.query?.slot || "am").toLowerCase();
 
     // ENV i domen
-    const TZ = process.env.TZ || "Europe/Belgrade";
+    const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
     const WEEKDAY_CAP = numFromEnv(process.env.WEEKDAY_CAP, process.env.SLOT_WEEKDAY_CAP, 15);
     const WEEKEND_CAP = numFromEnv(process.env.WEEKEND_CAP, process.env.SLOT_WEEKEND_CAP, 25);
     const origin =
