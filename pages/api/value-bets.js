@@ -1,6 +1,7 @@
 // FILE: pages/api/value-bets.js
 // Seed za rebuild: fixtures (API-Football) + opcioni odds (API-Football /odds)
-// Ne zavisi od drugih internih endpointa — samostalno puni "kanddidate" za slotove.
+// KORISTI "date=" (ne from/to) da bi API-Football vraćao stabilno podatke.
+// Ne diramo ENV nazive — koristi se samo API_FOOTBALL_KEY (server-side).
 
 export const config = { api: { bodyParser: false } };
 
@@ -8,8 +9,8 @@ const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
 
 const AF_BASE = "https://v3.football.api-sports.io";
-const MAX_ODDS_REQUESTS = Number(process.env.MAX_ODDS_REQUESTS || 40);
-const ODDS_CONCURRENCY = Number(process.env.ODDS_CONCURRENCY || 6);
+const MAX_ODDS_REQUESTS = Number(process.env.MAX_ODDS_REQUESTS || 40); // koliko fixture-a maksimalno tražimo /odds
+const ODDS_CONCURRENCY = Number(process.env.ODDS_CONCURRENCY || 6);   // paralelni zahtevi ka /odds
 
 // BAN U-lige, Women, Reserves, Youth… (primena na name + round + stage)
 const BAN_REGEX =
@@ -26,29 +27,29 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: false, error: "invalid slot" });
     }
 
-    const { fromYMD, toYMD } = ymdRangeTodayAndTomorrow(TZ);
+    const todayYMD = ymdInTZ(new Date(), TZ);
 
-    // 1) Fixtures za danas (+ sutra kao buffer)
-    const fixtures = await fetchFixtures(fromYMD, toYMD, TZ);
+    // 1) Fixtures ZA DANAS preko "date=" (stabilno na API-Football)
+    const fixtures = await fetchFixturesByDate(todayYMD, TZ);
     if (!fixtures.length) {
       return res.status(200).json({
         ok: true,
         disabled: false,
         slot,
         value_bets: [],
-        source: "fixtures-only",
+        source: "fixtures-only", // nema podataka već na korenu
       });
     }
 
-    // 2) Slot + BAN filter pre nego što krenemo da trošimo pozive za kvote
+    // 2) Slot + BAN filter pre nego što trošimo pozive za kvote
     const candidates = fixtures.filter((fx) => {
-      // league haystack
+      // BAN na više polja (league.name + round + stage)
       const leagueName = str(fx?.league?.name) || str(fx?.league_name);
       const round = str(fx?.league?.round) || str(fx?.round);
       const stage = str(fx?.league?.stage) || str(fx?.stage);
       if (BAN_REGEX.test(`${leagueName} ${round} ${stage}`)) return false;
 
-      // slot window
+      // slot window (danas + satnica)
       const iso = fx?.fixture?.date || fx?.date || null;
       return inSlotWindow(iso, TZ, slot);
     });
@@ -59,11 +60,11 @@ export default async function handler(req, res) {
         disabled: false,
         slot,
         value_bets: [],
-        source: "fixtures-only(slot)",
+        source: "fixtures-only(slot)", // fixtures postoje, ali ne upadaju u slot posle BAN-a
       });
     }
 
-    // 3) Pokušaj da povučeš kvote za ograničen broj kandidata (da ne pregori quota)
+    // 3) Pokušaj da za ograničen broj kandidata povučeš /odds (API-Football)
     const withOdds = await enrichWithOdds(candidates, {
       limit: MAX_ODDS_REQUESTS,
       concurrency: ODDS_CONCURRENCY,
@@ -71,8 +72,8 @@ export default async function handler(req, res) {
 
     // 4) Map u format koji ostatak sistema očekuje
     const value_bets = withOdds.map(toSeedRecord);
-
     const hadAnyOdds = withOdds.some((x) => x.__odds && x.__odds.best);
+
     return res.status(200).json({
       ok: true,
       disabled: false,
@@ -87,21 +88,21 @@ export default async function handler(req, res) {
 
 /* ====================== API-Football helpers ====================== */
 
-async function fetchFixtures(fromYMD, toYMD, tz) {
-  const url = `${AF_BASE}/fixtures?from=${fromYMD}&to=${toYMD}&timezone=${encodeURIComponent(
-    tz
-  )}`;
+async function fetchFixturesByDate(ymd, tz) {
+  const url = `${AF_BASE}/fixtures?date=${ymd}&timezone=${encodeURIComponent(tz)}`;
   const r = await fetch(url, {
     headers: { "x-apisports-key": API_FOOTBALL_KEY, "cache-control": "no-store" },
   });
+
   const ct = (r.headers.get("content-type") || "").toLowerCase();
   const j = ct.includes("application/json") ? await r.json().catch(() => null) : null;
   const arr = Array.isArray(j?.response) ? j.response : [];
-  // zadrži samo normalno zakazane mečeve (ne finished/FT)
+
+  // Zadrži samo mečeve koji nisu završeni/otkazani
   return arr.filter((x) => {
     const st = str(x?.fixture?.status?.short || x?.fixture?.status?.long || "");
-    // NS/TBD/PST/SUSP? zadrži sve što nije FT/FT?
-    return !/^FT$|^AET$|^PEN$|^CANC$|^WO$|^ABD$|^INT$|^SUSP$/i.test(st);
+    // isključi završeno i nevalidno (zadržavamo NS, 1H, HT, 2H, LIVE, ET…)
+    return !/^FT$|^AET$|^PEN$|^CANC$|^WO$|^ABD$|^INT$|^SUSP$|^PST$/i.test(st);
   });
 }
 
@@ -112,17 +113,14 @@ async function fetchOddsForFixture(fixtureId) {
   });
 
   const ct = (r.headers.get("content-type") || "").toLowerCase();
-  if (!ct.includes("application/json")) {
-    return null;
-  }
+  if (!ct.includes("application/json")) return null;
+
   const j = await r.json().catch(() => null);
   const rows = Array.isArray(j?.response) ? j.response : [];
   if (!rows.length) return null;
 
-  // Kombinuj sve bookmakere i nađi 1X2 / Match Winner
-  let home = null,
-    draw = null,
-    away = null;
+  // Kombinuj knjige → 1X2 / Match Winner best
+  let home = null, draw = null, away = null;
 
   for (const row of rows) {
     const books = Array.isArray(row?.bookmakers) ? row.bookmakers : [];
@@ -137,9 +135,9 @@ async function fetchOddsForFixture(fixtureId) {
           const lbl = String(v?.value || v?.label || "").toLowerCase();
           const odd = num(v?.odd);
           if (!odd) continue;
-          if (/(home|1)\b/.test(lbl)) home = max(home, odd);
-          else if (/(draw|x)\b/.test(lbl)) draw = max(draw, odd);
-          else if (/(away|2)\b/.test(lbl)) away = max(away, odd);
+          if (/(^|\b)(home|1)(\b|$)/.test(lbl)) home = max(home, odd);
+          else if (/(^|\b)(draw|x)(\b|$)/.test(lbl)) draw = max(draw, odd);
+          else if (/(^|\b)(away|2)(\b|$)/.test(lbl)) away = max(away, odd);
         }
       }
     }
@@ -147,19 +145,9 @@ async function fetchOddsForFixture(fixtureId) {
 
   const best = max(max(home, draw), away);
   const fav =
-    best === null
-      ? null
-      : best === home
-      ? "HOME"
-      : best === draw
-      ? "DRAW"
-      : "AWAY";
+    best === null ? null : best === home ? "HOME" : best === draw ? "DRAW" : "AWAY";
 
-  return {
-    match_winner: { home, draw, away },
-    best,
-    fav,
-  };
+  return { match_winner: { home, draw, away }, best, fav };
 }
 
 async function enrichWithOdds(items, { limit = 40, concurrency = 6 } = {}) {
@@ -181,10 +169,13 @@ async function enrichWithOdds(items, { limit = 40, concurrency = 6 } = {}) {
     }
   }
 
-  const workers = Array.from({ length: Math.max(1, Math.min(concurrency, queue.length)) }, worker);
+  const workers = Array.from(
+    { length: Math.max(1, Math.min(concurrency, queue.length)) },
+    worker
+  );
   await Promise.all(workers);
 
-  // plus: dodaj ostatak (bez kvota), ako ih ima
+  // dodaj i ostatak (bez kvota), ako je presečeno limitom
   return out.concat(items.slice(queue.length));
 }
 
@@ -218,16 +209,14 @@ function toSeedRecord(row) {
       home: { id: tm?.home?.id ?? null, name: homeName || null },
       away: { id: tm?.away?.id ?? null, name: awayName || null },
     },
-    datetime_local: local
-      ? { starting_at: { date_time: local } }
-      : null,
+    datetime_local: local ? { starting_at: { date_time: local } } : null,
 
-    // Minimalna meta za kasnije korake (rebuild/apply-learning)
+    // Minimalna meta (ostatak sistema očekuje ova polja)
     market: "1X2",
     market_label: "1X2",
     selection: odds?.fav || null,
 
-    // nekoliko "kanala" za čitanje kvote (rebuild.bestOdds ih proverava)
+    // kanali za čitanje kvote (rebuild.bestOdds proverava više polja)
     market_odds: marketOdds ?? null,
     market_odds_decimal: marketOdds ?? null,
     odds: {
@@ -239,19 +228,13 @@ function toSeedRecord(row) {
       },
     },
 
-    // Osnovni “confidence” koji će kasnije biti boostovan learning-om/tier-om
+    // Osnovni “confidence” (learning ga posle boostuje)
     confidence_pct: 50,
   };
 }
 
 /* ----- time/slot helpers ----- */
 
-function ymdRangeTodayAndTomorrow(tz) {
-  const now = new Date();
-  const today = ymdInTZ(now, tz);
-  const tomorrow = ymdInTZ(new Date(now.getTime() + 24 * 3600 * 1000), tz);
-  return { fromYMD: today, toYMD: tomorrow };
-}
 function ymdInTZ(d = new Date(), tz = TZ) {
   const s = d.toLocaleString("en-CA", {
     timeZone: tz,
@@ -263,19 +246,30 @@ function ymdInTZ(d = new Date(), tz = TZ) {
 }
 function toLocalDateTime(iso, tz = TZ) {
   const d = new Date(iso);
-  const y = d.toLocaleString("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).split(",")[0];
-  const t = d.toLocaleString("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false });
+  const y = d
+    .toLocaleString("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" })
+    .split(",")[0];
+  const t = d
+    .toLocaleString("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false });
   return `${y} ${t}`;
 }
 function inSlotWindow(iso, tz, slot) {
   if (!iso) return false;
   const d = new Date(iso);
+
+  // isti dan (danas u lokalnom TZ)
   const ymd = ymdInTZ(d, tz);
   const today = ymdInTZ(new Date(), tz);
   if (ymd !== today) return false;
-  const h = Number(
-    d.toLocaleString("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).split(":")[0]
-  );
+
+  const hourStr = d.toLocaleString("en-GB", {
+    timeZone: tz,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const h = Number(String(hourStr).split(":")[0]);
+
   if (slot === "late") return h >= 0 && h < 10;
   if (slot === "am") return h >= 10 && h < 15;
   if (slot === "pm") return h >= 15 && h < 24;
