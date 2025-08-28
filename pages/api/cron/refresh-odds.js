@@ -1,8 +1,9 @@
 // pages/api/cron/refresh-odds.js
-// STRICT BATCH (bez fallbacka).
+// STRICT BATCH (bez fallbacka) + PAGINACIJA za /v3/odds.
 // - Fixtures -> API_FOOTBALL_KEY
 // - Odds batch -> API_FOOTBALL_KEY (isti host/provajder)
 // - Trusted bookies uz kanonizaciju imena (lowercase + ukloni sve osim [a-z0-9])
+// - Paginacija: dohvat svih strana iz /odds?date=...&page=N (sa cap-om)
 // - Keš: odds:fixture:<YMD>:<fixtureId> = { match_winner:{home,draw,away}, best, fav }
 
 export const config = { api: { bodyParser: false } };
@@ -19,6 +20,9 @@ const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const UP_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+// paging cap (da se ne pretera sa pozivima; možeš povisiti ako treba)
+const MAX_ODDS_PAGES = Number(process.env.ODDS_BATCH_MAX_PAGES || 50);
 
 // trusted lista (kanonizacija)
 const canon = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "").trim();
@@ -40,14 +44,13 @@ export default async function handler(req, res) {
     const fj = await jfetch(`${BASE}/fixtures?date=${ymd}&timezone=${encodeURIComponent(TZ)}`, FIX_KEY);
     const fixtures = Array.isArray(fj?.response) ? fj.response : [];
 
-    // STRICT BATCH za kvote (sa API_FOOTBALL_KEY)
-    const oj = await jfetch(`${BASE}/odds?date=${ymd}&timezone=${encodeURIComponent(TZ)}`, ODDS_KEY);
-    const batch = Array.isArray(oj?.response) ? oj.response : [];
+    // BATCH ODDS — PAGINACIJA
+    const { rows, pages } = await fetchOddsPaged(ymd, TZ, ODDS_KEY);
 
     let cached = 0;
     const seen = new Set();
 
-    for (const row of batch) {
+    for (const row of rows) {
       const fid = row?.fixture?.id;
       if (!fid || seen.has(fid)) continue;
       const odds = pick1x2(row);
@@ -63,9 +66,10 @@ export default async function handler(req, res) {
       ymd,
       slot,
       fixtures: fixtures.length,
-      batch_items: batch.length,
+      batch_pages: pages.total,
+      batch_items: rows.length,
       odds_cached: cached,
-      source: "batch:API_FOOTBALL_KEY"
+      source: "batch:API_FOOTBALL_KEY(paged)"
     });
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message || e) });
@@ -79,17 +83,37 @@ async function jfetch(url, key){
   const ct = (r.headers.get("content-type") || "").toLowerCase();
   if (!ct.includes("application/json")) throw new Error(`Bad content-type for ${url}`);
   const j = await r.json();
+  // Ako API signalizira grešku, vrati prazno umesto bacanja izuzetka.
   if (j && typeof j === "object" && j.errors && Object.keys(j.errors).length) {
-    return { response: [] };
+    return { response: [], paging: { current: 1, total: 1 } };
   }
   return j;
+}
+
+// Paginated fetch za /odds?date=YYYY-MM-DD&timezone=...&page=N
+async function fetchOddsPaged(ymd, tz, key){
+  let current = 1, total = 1, pages = 0;
+  const all = [];
+  while (current <= total && pages < MAX_ODDS_PAGES) {
+    const url = `${BASE}/odds?date=${ymd}&timezone=${encodeURIComponent(tz)}&page=${current}`;
+    const j = await jfetch(url, key);
+    const resp = Array.isArray(j?.response) ? j.response : [];
+    const pg   = j?.paging && typeof j.paging === "object" ? j.paging : { current, total: 1 };
+    total   = Number(pg.total || 1);
+    current = Number(pg.current || current) + 1;
+    pages++;
+    if (resp.length) all.push(...resp);
+    // ako API nekad vrati duplikate strana ili ne povecava current, prekini da ne uđe u petlju
+    if (pages >= MAX_ODDS_PAGES) break;
+  }
+  return { rows: all, pages: { total: Math.min(total, MAX_ODDS_PAGES), fetched: pages } };
 }
 
 function pick1x2(row){
   const books = Array.isArray(row?.bookmakers) ? row.bookmakers : [];
   if (!books.length) return null;
 
-  // strogo: uzimamo samo trusted
+  // strogo: uzimamo samo trusted (ako je lista prazna, tretira se kao „bilo koji“)
   return scanBooks(books, true);
 }
 
