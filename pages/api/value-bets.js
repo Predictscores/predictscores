@@ -1,11 +1,11 @@
 // pages/api/value-bets.js
-// Seed za rebuild: fixtures (API_FOOTBALL_KEY) + kvote iz keša (osvežene batch-om preko ODDS_API_KEY).
-// U seed ulaze SAMO mečevi sa kvotom >= MIN_ODDS (da rebuild ne pada na 0).
+// Seed = fixtures (API_FOOTBALL_KEY) + KV keš kvota (ODDS batch).
+// U seed ulaze SAMO mečevi sa kvotom >= MIN_ODDS i bez U/Women/Reserves liga.
 
 export const config = { api: { bodyParser: false } };
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-const AF_BASE = process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io";
+const BASE = process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io";
 const FIX_KEY = process.env.API_FOOTBALL_KEY || process.env.API_FOOTBALL;
 
 // storage
@@ -14,30 +14,26 @@ const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const UP_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-// business env
 const MIN_ODDS = Number(process.env.MIN_ODDS || 1.5);
 
-// BAN (U-lige, Women, Reserves, Youth…)
-const BAN_REGEX =
-  /\bU\s*-?\s*\d{1,2}\b|Under\s*\d{1,2}\b|Women|Girls|Reserves?|Youth|Academy|Development/i;
+// BAN: U-lige, Women, Reserves, Youth, Academy, Development
+const BAN_REGEX = /\bU\s*-?\s*\d{1,2}\b|Under\s*\d{1,2}\b|Women|Girls|Reserves?|Youth|Academy|Development/i;
 
-export default async function handler(req, res) {
+export default async function handler(req, res){
   try {
-    if (!FIX_KEY) return res.status(200).json({ ok:false, error:"API_FOOTBALL_KEY missing", value_bets: [] });
-
     const slot = String(req.query?.slot || "am").toLowerCase();
-    if (!["am","pm","late"].includes(slot)) {
-      return res.status(200).json({ ok:false, error:"invalid slot", value_bets: [] });
-    }
+    if (!["am","pm","late"].includes(slot)) return res.status(200).json({ ok:false, error:"invalid slot", value_bets: [] });
+
+    if (!FIX_KEY) return res.status(200).json({ ok:false, error:"API_FOOTBALL_KEY missing", value_bets: [] });
 
     const ymd = ymdInTZ(new Date(), TZ);
 
-    // 1) fixtures za danas
-    const fj = await httpJSON(`${AF_BASE}/fixtures?date=${ymd}&timezone=${encodeURIComponent(TZ)}`, FIX_KEY);
+    // fixtures
+    const fj = await httpJSON(`${BASE}/fixtures?date=${ymd}&timezone=${encodeURIComponent(TZ)}`, FIX_KEY);
     const fixtures = Array.isArray(fj?.response) ? fj.response : [];
 
-    // 2) filtriraj BAN + slot prozor
-    const filtered = fixtures.filter(fx => {
+    // filtriraj
+    const list = fixtures.filter(fx => {
       const name  = String(fx?.league?.name || "");
       const round = String(fx?.league?.round || "");
       const stage = String(fx?.league?.stage || "");
@@ -45,38 +41,30 @@ export default async function handler(req, res) {
       return inSlotWindow(fx?.fixture?.date, TZ, slot);
     });
 
-    if (!filtered.length) {
-      return res.status(200).json({ ok:true, disabled:false, slot, value_bets: [], source:"fixtures-only(slot)" });
-    }
-
-    // 3) spoji sa kešom kvota; uzmi SAMO one sa best >= MIN_ODDS
     const out = [];
-    for (const row of filtered) {
-      const fx = row?.fixture || {};
-      const lg = row?.league || {};
-      const tm = row?.teams  || {};
-      const fid = fx?.id;
+    for (const row of list) {
+      const fid = row?.fixture?.id;
       if (!fid) continue;
 
       const odds = await kvGet(`odds:fixture:${ymd}:${fid}`);
       const best = Number(odds?.best) || null;
       if (!(Number.isFinite(best) && best >= MIN_ODDS)) continue;
 
-      const iso = fx?.date ? String(fx.date).replace(" ","T") : null;
+      const iso = row?.fixture?.date ? String(row.fixture.date).replace(" ","T") : null;
       const dt  = iso ? toLocalDateTime(iso, TZ) : null;
 
       out.push({
         fixture_id: fid,
         league: {
-          id: lg?.id ?? null,
-          name: lg?.name || null,
-          country: lg?.country || null,
-          round: lg?.round || null,
-          stage: lg?.stage || null,
+          id: row?.league?.id ?? null,
+          name: row?.league?.name || null,
+          country: row?.league?.country || null,
+          round: row?.league?.round || null,
+          stage: row?.league?.stage || null,
         },
         teams: {
-          home: { id: tm?.home?.id ?? null, name: String(tm?.home?.name || "") || null },
-          away: { id: tm?.away?.id ?? null, name: String(tm?.away?.name || "") || null },
+          home: { id: row?.teams?.home?.id ?? null, name: String(row?.teams?.home?.name || "") || null },
+          away: { id: row?.teams?.away?.id ?? null, name: String(row?.teams?.away?.name || "") || null },
         },
         datetime_local: dt ? { starting_at: { date_time: dt } } : null,
 
@@ -99,7 +87,7 @@ export default async function handler(req, res) {
   }
 }
 
-/* --------------- helpers --------------- */
+/* helpers */
 
 async function httpJSON(url, key){
   const r = await fetch(url, { headers: { "x-apisports-key": key, "cache-control":"no-store" } });
@@ -107,8 +95,7 @@ async function httpJSON(url, key){
   if (!ct.includes("application/json")) throw new Error(`Bad content-type for ${url}`);
   return r.json();
 }
-
-function ymdInTZ(d = new Date(), tz = TZ){
+function ymdInTZ(d=new Date(), tz=TZ){
   const s = d.toLocaleString("en-CA",{ timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
   return (s.split(",")[0] || s).trim();
 }
@@ -135,7 +122,7 @@ function inSlotWindow(iso, tz, slot){
 async function kvGet(key){
   if (KV_URL && KV_TOKEN) {
     try {
-      const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${KV_TOKEN}` }, cache:"no-store" });
+      const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, { headers:{ Authorization:`Bearer ${KV_TOKEN}` }, cache:"no-store" });
       if (r.ok) {
         const j = await r.json().catch(()=>null);
         const raw = j?.result ?? null;
@@ -145,7 +132,7 @@ async function kvGet(key){
   }
   if (UP_URL && UP_TOKEN) {
     try {
-      const r = await fetch(`${UP_URL}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${UP_TOKEN}` }, cache:"no-store" });
+      const r = await fetch(`${UP_URL}/get/${encodeURIComponent(key)}`, { headers:{ Authorization:`Bearer ${UP_TOKEN}` }, cache:"no-store" });
       if (r.ok) {
         const j = await r.json().catch(()=>null);
         const raw = j?.result ?? null;
