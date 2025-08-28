@@ -22,6 +22,7 @@ const TIER2 = toSet([
   "Danish Superliga","Superligaen","Ekstraklasa","Eliteserien","Allsvenskan","Czech Liga","Romania Liga I","Croatia HNL",
   "Poland Ekstraklasa","Norway Eliteserien","Sweden Allsvenskan","MLS","Argentina Liga Profesional","Brazil Serie A"
 ]);
+
 const BAN_REGEX =
   /\bU\s*-?\s*\d{1,2}\b|Under\s*\d{1,2}\b|Women|Girls|Reserves?|Youth|Academy|Development/i;
 
@@ -103,7 +104,6 @@ function leagueKeyOf(x){
 
 // LOCKED setter
 async function setLocked(key, arr){
-  // pišemo u KV da UI i debug vide isto
   if (KV_URL && KV_TOKEN) {
     await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
       method: "POST",
@@ -111,7 +111,6 @@ async function setLocked(key, arr){
       body: JSON.stringify({ value: JSON.stringify(arr) }),
     }).catch(()=>{});
   }
-  // i paralelno u Upstash, ako želiš dual-write
   const US = process.env.UPSTASH_REDIS_REST_URL;
   const UT = process.env.UPSTASH_REDIS_REST_TOKEN;
   if (US && UT) {
