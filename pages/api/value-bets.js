@@ -1,5 +1,5 @@
 // pages/api/value-bets.js
-// Seed = fixtures (API_FOOTBALL_KEY) + KV keš kvota (od refresh-odds).
+// Seed = fixtures (API_FOOTBALL_KEY) + KV/Upstash keš kvota (od refresh-odds).
 // U seed ulaze SAMO mečevi sa kvotom >= MIN_ODDS i bez U/Women/Reserves liga.
 
 export const config = { api: { bodyParser: false } };
@@ -21,9 +21,12 @@ const BAN_REGEX = /\bU\s*-?\s*\d{1,2}\b|Under\s*\d{1,2}\b|Women|Girls|Reserves?|
 export default async function handler(req, res){
   try {
     const slot = String(req.query?.slot || "am").toLowerCase();
-    if (!["am","pm","late"].includes(slot)) return res.status(200).json({ ok:false, error:"invalid slot", value_bets: [] });
-
-    if (!FIX_KEY) return res.status(200).json({ ok:false, error:"API_FOOTBALL_KEY missing", value_bets: [] });
+    if (!["am","pm","late"].includes(slot)) {
+      return res.status(200).json({ ok:false, error:"invalid slot", value_bets: [] });
+    }
+    if (!FIX_KEY) {
+      return res.status(200).json({ ok:false, error:"API_FOOTBALL_KEY missing", value_bets: [] });
+    }
 
     const ymd = ymdInTZ(new Date(), TZ);
 
@@ -45,7 +48,7 @@ export default async function handler(req, res){
       const fid = row?.fixture?.id;
       if (!fid) continue;
 
-      const odds = await kvGet(`odds:fixture:${ymd}:${fid}`);
+      const odds = await kvGetCascade(`odds:fixture:${ymd}:${fid}`); // <-- KV, pa Upstash fallback i kad je null
       const best = Number(odds?.best) || null;
       if (!(Number.isFinite(best) && best >= MIN_ODDS)) continue;
 
@@ -94,16 +97,19 @@ async function httpJSON(url, key){
   if (!ct.includes("application/json")) throw new Error(`Bad content-type for ${url}`);
   return r.json();
 }
+
 function ymdInTZ(d=new Date(), tz=TZ){
   const s = d.toLocaleString("en-CA",{ timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
   return (s.split(",")[0] || s).trim();
 }
+
 function toLocalDateTime(iso, tz){
   const d = new Date(iso);
   const y = d.toLocaleString("en-CA",{ timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" }).split(",")[0];
   const t = d.toLocaleString("en-GB",{ timeZone: tz, hour:"2-digit", minute:"2-digit", hour12:false });
   return `${y} ${t}`;
 }
+
 function inSlotWindow(iso, tz, slot){
   if (!iso) return false;
   const d = new Date(iso);
@@ -117,27 +123,43 @@ function inSlotWindow(iso, tz, slot){
   return true;
 }
 
-// KV primarno, Upstash fallback
-async function kvGet(key){
+/* KV read sa kaskadnim fallback-om:
+   1) KV_REST_API_URL/TOKEN → parsiraj result; ako je null → NASTAVI na Upstash
+   2) UPSTASH_REDIS_REST_URL/TOKEN
+*/
+async function kvGetCascade(key){
+  // 1) KV (ako postoji i ako vrati NE-null, odmah vrati)
   if (KV_URL && KV_TOKEN) {
     try {
-      const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, { headers:{ Authorization:`Bearer ${KV_TOKEN}` }, cache:"no-store" });
+      const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
+        headers:{ Authorization:`Bearer ${KV_TOKEN}` }, cache:"no-store"
+      });
       if (r.ok) {
         const j = await r.json().catch(()=>null);
         const raw = j?.result ?? null;
-        try { return typeof raw === "string" ? JSON.parse(raw) : raw; } catch { return null; }
+        if (raw !== null) {
+          try { return typeof raw === "string" ? JSON.parse(raw) : raw; } catch { /* drop through to Upstash */ }
+        }
+        // ako je null → probaj Upstash (ne vraćaj odmah null)
       }
-    } catch {}
+    } catch { /* probaj Upstash */ }
   }
+
+  // 2) Upstash (fallback čak i ako je KV vratio null)
   if (UP_URL && UP_TOKEN) {
     try {
-      const r = await fetch(`${UP_URL}/get/${encodeURIComponent(key)}`, { headers:{ Authorization:`Bearer ${UP_TOKEN}` }, cache:"no-store" });
+      const r = await fetch(`${UP_URL}/get/${encodeURIComponent(key)}`, {
+        headers:{ Authorization:`Bearer ${UP_TOKEN}` }, cache:"no-store"
+      });
       if (r.ok) {
         const j = await r.json().catch(()=>null);
         const raw = j?.result ?? null;
-        try { return typeof raw === "string" ? JSON.parse(raw) : raw; } catch { return null; }
+        if (raw !== null) {
+          try { return typeof raw === "string" ? JSON.parse(raw) : raw; } catch { return null; }
+        }
       }
-    } catch {}
+    } catch { /* ignore */ }
   }
+
   return null;
 }
