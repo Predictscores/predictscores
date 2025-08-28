@@ -2,12 +2,11 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
-import HistoryPanel from "./HistoryPanel"; // History tab koristi baš ovaj panel
+import HistoryPanel from "./HistoryPanel";
 
 const TZ = "Europe/Belgrade";
-
-function currentSlot(tz = TZ){
-  const h = Number(new Intl.DateTimeFormat("en-GB",{hour:"2-digit",hour12:false,timeZone:tz}).format(new Date()));
+function currentSlot(tz = TZ) {
+  const h = Number(new Intl.DateTimeFormat("en-GB", { hour: "2-digit", hour12: false, timeZone: tz }).format(new Date()));
   return h < 12 ? "am" : h < 20 ? "pm" : "late";
 }
 
@@ -52,41 +51,15 @@ function teamName(side) {
   if (typeof side === "object") return side.name || "—";
   return "—";
 }
-function flagEmoji(country = "") {
-  const map = {
-    Albania: "🇦🇱", Algeria: "🇩🇿", Argentina: "🇦🇷", Australia: "🇦🇺",
-    Austria: "🇦🇹", Belgium: "🇧🇪", Bosnia: "🇧🇦", Brazil: "🇧🇷",
-    Bulgaria: "🇧🇬", Chile: "🇨🇱", China: "🇨🇳", Colombia: "🇨🇴",
-    Croatia: "🇭🇷", Cyprus: "🇨🇾", Czech: "🇨🇿", Denmark: "🇩🇰",
-    Ecuador: "🇪🇨", England: "🏴", Estonia: "🇪🇪", Finland: "🇫🇮",
-    France: "🇫🇷", Georgia: "🇬🇪", Germany: "🇩🇪", Greece: "🇬🇷",
-    Hungary: "🇭🇺", Iceland: "🇮🇸", India: "🇮🇳", Iran: "🇮🇷",
-    Ireland: "🇮🇪", Israel: "🇮🇱", Italy: "🇮🇹", Japan: "🇯🇵",
-    Korea: "🇰🇷", Lithuania: "🇱🇹", Malaysia: "🇲🇾", Mexico: "🇲🇽",
-    Morocco: "🇲🇦", Netherlands: "🇳🇱", Norway: "🇳🇴", Poland: "🇵🇱",
-    Portugal: "🇵🇹", Romania: "🇷🇴", Russia: "🇷🇺", Saudi: "🇸🇦",
-    Scotland: "🏴", Serbia: "🇷🇸", Slovakia: "🇸🇰", Slovenia: "🇸🇮",
-    Spain: "🇪🇸", Sweden: "🇸🇪", Switzerland: "🇨🇭", Turkey: "🇹🇷",
-    USA: "🇺🇸", Ukraine: "🇺🇦", Uruguay: "🇺🇾", Wales: "🏴",
-  };
-  const key = Object.keys(map).find((k) =>
-    country && country.toLowerCase().includes(k.toLowerCase())
-  );
-  return key ? map[key] : "";
-}
 
 function ConfidenceBar({ pct }) {
   const v = Math.max(0, Math.min(100, Number(pct || 0)));
   return (
     <div className="h-2 w-full rounded bg-[#2a2f4a] overflow-hidden">
-      <div
-        className="h-2 rounded bg-[#4f6cf7]"
-        style={{ width: `${v}%` }}
-      />
+      <div className="h-2 rounded bg-[#4f6cf7]" style={{ width: `${v}%` }} />
     </div>
   );
 }
-
 function WhyLine({ explain }) {
   const bullets = Array.isArray(explain?.bullets) ? explain.bullets : [];
   const text = bullets.filter(b => !/^forma:|^h2h/i.test((b||"").trim())).slice(0, 2).join(" · ");
@@ -106,9 +79,8 @@ function WhyLine({ explain }) {
   );
 }
 
-function TicketItem({ it }) {
+function Card({ it }) {
   const league = it?.league?.name || "—";
-  const country = it?.league?.country || "";
   const iso = toISO(it);
   const home = teamName(it?.teams?.home || it?.home);
   const away = teamName(it?.teams?.away || it?.away);
@@ -119,80 +91,28 @@ function TicketItem({ it }) {
 
   return (
     <div className="p-4 rounded-xl bg-[#1f2339]">
-      <div className="text-xs text-slate-400">
-        {league}{country ? ` · ${flagEmoji(country)}` : ""} · {fmtLocal(iso)}
-      </div>
+      <div className="text-xs text-slate-400">{league} · {fmtLocal(iso)}</div>
       <div className="font-semibold mt-0.5">
         {home} <span className="text-slate-400">vs</span> {away}
       </div>
       <div className="text-sm text-slate-200 mt-1">
         <span className="font-semibold">{market}</span>
         {market ? " → " : ""}{sel}
-        {Number.isFinite(odds) ? (
-          <span className="text-slate-300"> ({Number(odds).toFixed(2)})</span>
-        ) : null}
+        {Number.isFinite(odds) ? <span className="text-slate-300"> ({Number(odds).toFixed(2)})</span> : null}
       </div>
-
-      <div className="mt-2">
-        <WhyLine explain={it?.explain} />
-      </div>
-
+      <div className="mt-2"><WhyLine explain={it?.explain} /></div>
       <div className="mt-2">
         <div className="flex items-center gap-2 text-xs text-slate-400">
           <span>Confidence</span>
           <span className="text-white font-semibold">{Math.round(conf)}%</span>
         </div>
-        <div className="mt-1">
-          <ConfidenceBar pct={conf} />
-        </div>
-      </div>
-
-      <div className="mt-2 text-xs text-slate-300">
-        Pick: <span className="font-semibold">{sel}</span>
-        {Number.isFinite(odds) ? ` (${Number(odds).toFixed(2)})` : ""}
+        <div className="mt-1"><ConfidenceBar pct={conf} /></div>
       </div>
     </div>
   );
 }
 
-function TicketsPanel({ items }) {
-  const byMarket = useMemo(() => {
-    const res = { "1X2": [], "BTTS": [], "OU 2.5": [], "HT-FT": [] };
-    for (const it of items) {
-      const m = String(it?.market_label || it?.market || "").toUpperCase();
-      if (m.includes("1X2") || m === "1X2" || m.includes("MATCH WINNER")) res["1X2"].push(it);
-      else if (m.includes("BTTS")) res["BTTS"].push(it);
-      else if (m.includes("OU 2.5") || m.includes("OVER") || m.includes("UNDER")) res["OU 2.5"].push(it);
-      else if (m.includes("HT-FT") || m.includes("HT/FT")) res["HT-FT"].push(it);
-    }
-    for (const k of Object.keys(res)) res[k] = res[k].slice(0, 3);
-    return res;
-  }, [items]);
-
-  const groups = Object.entries(byMarket);
-
-  return (
-    <div className="rounded-2xl bg-[#15182a] p-4">
-      <div className="text-base font-semibold text-white mb-3">Top lige</div>
-      {groups.map(([k, arr]) => (
-        <div key={k} className="mb-3">
-          <div className="text-sm font-semibold text-white mb-1">{k} (3)</div>
-          {!arr.length ? (
-            <div className="text-xs text-slate-400">Za sada nema preporuka za ovaj market.</div>
-          ) : (
-            <div className="grid grid-cols-1 gap-2">
-              {arr.map((it) => (
-                <TicketItem key={it.fixture_id || `${it.league?.id}-${it?.selection}-${toISO(it)}`} it={it} />
-              ))}
-            </div>
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-/* ---------------- data hooks ---------------- */
+/* ----------- data hooks ----------- */
 
 function useLockedFeed() {
   const [state, setState] = useState({ items: [], built_at: null, day: null, error: null });
@@ -210,7 +130,7 @@ function useLockedFeed() {
       let items = Array.isArray(j?.items) ? j.items
         : Array.isArray(j?.value_bets) ? j.value_bets
         : [];
-      if (!items.length){
+      if (!items.length) {
         const fb = await safeJson(`/api/football?slot=${slot}&norebuild=1`);
         const fitems = Array.isArray(fb?.football) ? fb.football : Array.isArray(fb) ? fb : [];
         if (fitems.length) items = fitems;
@@ -246,112 +166,172 @@ function useCryptoTop3() {
   return { items, error };
 }
 
+/* ----------- Football helpers (sub-tabovi i 3× tiketi samo ovde) ----------- */
+
+function keyOf(p, i) {
+  const fid = p?.fixture_id ?? p?.id ?? i;
+  const sel = p?.selection ?? "";
+  const iso = String(
+    p?.datetime_local?.starting_at?.date_time ||
+    p?.datetime_local?.date_time ||
+    p?.kickoff || ""
+  ).replace(" ", "T");
+  return `${fid}-${sel}-${iso}`;
+}
+
+function Section({ title, rows = [] }) {
+  return (
+    <div className="rounded-2xl bg-[#15182a] p-4">
+      <div className="text-base font-semibold text-white mb-3">{title}</div>
+      {!rows.length ? (
+        <div className="text-slate-400 text-sm">Trenutno nema predloga.</div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+          {rows.map((p, i) => <Card key={keyOf(p, i)} it={p} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TicketsPanel({ items }) {
+  // grupiši po tržištima i uzmi top 3 po svakom
+  const byMarket = useMemo(() => {
+    const res = { "1X2": [], "BTTS": [], "OU 2.5": [], "HT-FT": [] };
+    for (const it of items) {
+      const m = String(it?.market_label || it?.market || "").toUpperCase();
+      if (m.includes("1X2") || m === "1X2" || m.includes("MATCH WINNER")) res["1X2"].push(it);
+      else if (m.includes("BTTS") || m.includes("BOTH TEAMS TO SCORE")) res["BTTS"].push(it);
+      else if (m.includes("OU 2.5") || m.includes("OVER") || m.includes("UNDER")) res["OU 2.5"].push(it);
+      else if (m.includes("HT-FT") || m.includes("HT/FT")) res["HT-FT"].push(it);
+    }
+    for (const k of Object.keys(res)) res[k] = res[k].slice(0, 3);
+    return res;
+  }, [items]);
+
+  return (
+    <div className="rounded-2xl bg-[#15182a] p-4">
+      <div className="text-base font-semibold text-white mb-3">Top tiketi (3× po marketu)</div>
+      {Object.entries(byMarket).map(([cat, arr]) => (
+        <div key={cat} className="mb-3">
+          <div className="text-sm font-semibold text-white mb-2">{cat} (3)</div>
+          {!arr.length ? (
+            <div className="text-xs text-slate-400">Nema kandidata.</div>
+          ) : (
+            <div className="grid grid-cols-1 gap-2">
+              {arr.map((it, i) => <Card key={`${cat}-${keyOf(it, i)}`} it={it} />)}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /* ---------------- main ---------------- */
 
 export default function CombinedBets() {
   const [tab, setTab] = useState("Combined"); // Combined | Football | Crypto
-
   const locked = useLockedFeed();
   const crypto = useCryptoTop3();
 
-  function CombinedBody() {
-    const list = locked.items;
+  /* ---------- Football sub-tabovi ---------- */
+  const [fTab, setFTab] = useState("ko"); // ko | conf | hist
 
+  const koRows = useMemo(() => {
+    return [...(locked.items || [])].sort((a,b) => {
+      const ta = Date.parse(toISO(a)?.replace(" ", "T") || "") || 9e15;
+      const tb = Date.parse(toISO(b)?.replace(" ", "T") || "") || 9e15;
+      return ta - tb;
+    });
+  }, [locked.items]);
+
+  const confRows = useMemo(() => {
+    return [...(locked.items || [])].sort((a,b) =>
+      Number(b?.confidence_pct || b?.model_prob || 0) - Number(a?.confidence_pct || a?.model_prob || 0)
+    );
+  }, [locked.items]);
+
+  function CombinedBody() {
+    const list = locked.items || [];
     return (
       <div className="space-y-4">
-        {/* gornji grid: lista + history */}
+        {/* GRID: leva lista, desno HISTORY  (NEMA 3× tiketa na Combined) */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          {/* levi panel — lista */}
           <div className="lg:col-span-2">
             {locked.error ? (
-              <div className="p-4 rounded-xl bg-[#1f2339] text-red-300 text-sm">
-                Greška: {String(locked.error)}
-              </div>
+              <div className="p-4 rounded-xl bg-[#1f2339] text-red-300 text-sm">Greška: {String(locked.error)}</div>
             ) : list.length === 0 ? (
-              <div className="p-4 rounded-xl bg-[#1f2339] text-slate-300 text-sm">
-                Trenutno nema predloga.
-              </div>
+              <div className="p-4 rounded-xl bg-[#1f2339] text-slate-300 text-sm">Trenutno nema predloga.</div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-                {list.map((it) => (
-                  <TicketItem
-                    key={it.fixture_id || `${it.league?.id}-${it?.selection}-${toISO(it)}`}
-                    it={it}
-                  />
-                ))}
+                {list.map((it, i) => <Card key={keyOf(it, i)} it={it} />)}
               </div>
             )}
           </div>
-
-          {/* desni panel — 4 tiketa */}
-          <div className="lg:col-span-1">
-            <TicketsPanel items={list} />
-          </div>
-        </div>
-
-        {/* donji grid: Crypto top 3 + History */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <div className="lg:col-span-2">
-            <div className="rounded-2xl bg-[#15182a] p-4">
-              <div className="text-base font-semibold text-white mb-2">Crypto — Top 3</div>
-              {crypto.error ? (
-                <div className="text-red-300 text-sm">Greška: {String(crypto.error)}</div>
-              ) : !crypto.items.length ? (
-                <div className="text-slate-300 text-sm">Trenutno nema signala.</div>
-              ) : (
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                  {crypto.items.map((c, i) => (
-                    <div key={i} className="p-3 rounded-xl bg-[#1f2339]">
-                      <div className="text-sm font-semibold">{c.symbol}</div>
-                      <div className="text-xs text-slate-400">{c.name}</div>
-                      <div className="mt-1 text-sm">
-                        Signal: <b>{c.signal}</b> · Conf {c.confidence_pct}%
-                      </div>
-                      <div className="text-xs text-slate-400">
-                        1h: {Math.round((c.h1_pct ?? 0)*10)/10}% · 24h: {Math.round((c.d24_pct ?? 0)*10)/10}%
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-
           <div className="lg:col-span-1">
             <HistoryPanel />
           </div>
+        </div>
+
+        {/* Donji red: Crypto top 3 */}
+        <div className="rounded-2xl bg-[#15182a] p-4">
+          <div className="text-base font-semibold text-white mb-2">Crypto — Top 3</div>
+          {crypto.error ? (
+            <div className="text-red-300 text-sm">Greška: {String(crypto.error)}</div>
+          ) : !crypto.items.length ? (
+            <div className="text-slate-300 text-sm">Trenutno nema signala.</div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {crypto.items.map((c, i) => (
+                <div key={i} className="p-3 rounded-xl bg-[#1f2339]">
+                  <div className="text-sm font-semibold">{c.symbol}</div>
+                  <div className="text-xs text-slate-400">{c.name}</div>
+                  <div className="mt-1 text-sm">Signal: <b>{c.signal}</b> · Conf {c.confidence_pct}%</div>
+                  <div className="text-xs text-slate-400">
+                    1h: {Math.round((c.h1_pct ?? 0)*10)/10}% · 24h: {Math.round((c.d24_pct ?? 0)*10)/10}%
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     );
   }
 
   function FootballBody() {
-    // Jednostavan prikaz — detaljni tabovi su u komponenti FootballBets.jsx (na Football stranici)
-    const list = locked.items;
+    const list = locked.items || [];
     return (
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <div className="lg:col-span-2">
-          {list.length === 0 ? (
-            <div className="p-4 rounded-xl bg-[#1f2339] text-slate-300 text-sm">
-              Trenutno nema predloga.
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-              {list.map((it) => (
-                <TicketItem key={it.fixture_id || `${it.league?.id}-${it?.selection}-${toISO(it)}`} it={it} />
-              ))}
-            </div>
-          )}
+      <div className="space-y-4">
+        {/* TAB dugmad (Kick-Off / Confidence / History) */}
+        <div className="flex items-center gap-2">
+          <button className={`px-3 py-1.5 rounded-lg text-sm ${fTab==="ko"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`} onClick={()=>setFTab("ko")} type="button">Kick-Off</button>
+          <button className={`px-3 py-1.5 rounded-lg text-sm ${fTab==="conf"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`} onClick={()=>setFTab("conf")} type="button">Confidence</button>
+          <button className={`px-3 py-1.5 rounded-lg text-sm ${fTab==="hist"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`} onClick={()=>setFTab("hist")} type="button">History</button>
         </div>
-        <div className="lg:col-span-1">
-          <TicketsPanel items={list} />
+
+        {/* GRID: levo lista po tabu, desno 3× tiketi (SAMO ovde) */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="lg:col-span-2 space-y-4">
+            {fTab === "ko"   && <Section title="Kick-Off" rows={koRows} />}
+            {fTab === "conf" && <Section title="Confidence" rows={confRows} />}
+            {fTab === "hist" && (
+              <div className="rounded-2xl p-4 border border-neutral-800 bg-neutral-900/60 text-sm opacity-80">
+                History (14d) prikaz ostaje isti — puni se iz nightly procesa.
+              </div>
+            )}
+          </div>
+          <div className="lg:col-span-1">
+            <TicketsPanel items={list} />
+          </div>
         </div>
       </div>
     );
   }
 
   function CryptoBody() {
-    const citems = crypto.items;
+    const citems = crypto.items || [];
     return (
       <div className="rounded-2xl bg-[#15182a] p-4">
         <div className="text-base font-semibold text-white mb-2">Crypto — Top 3</div>
@@ -365,9 +345,7 @@ export default function CombinedBets() {
               <div key={i} className="p-3 rounded-xl bg-[#1f2339]">
                 <div className="text-sm font-semibold">{c.symbol}</div>
                 <div className="text-xs text-slate-400">{c.name}</div>
-                <div className="mt-1 text-sm">
-                  Signal: <b>{c.signal}</b> · Conf {c.confidence_pct}%
-                </div>
+                <div className="mt-1 text-sm">Signal: <b>{c.signal}</b> · Conf {c.confidence_pct}%</div>
                 <div className="text-xs text-slate-400">
                   1h: {Math.round((c.h1_pct ?? 0)*10)/10}% · 24h: {Math.round((c.d24_pct ?? 0)*10)/10}%
                 </div>
@@ -382,13 +360,11 @@ export default function CombinedBets() {
   return (
     <div className="mt-4 space-y-4">
       <div className="flex items-center gap-2">
-        {["Combined", "Football", "Crypto"].map((name) => (
+        {["Combined","Football","Crypto"].map((name) => (
           <button
             key={name}
             onClick={() => setTab(name)}
-            className={`px-3 py-1.5 rounded-lg text-sm ${
-              tab === name ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
-            }`}
+            className={`px-3 py-1.5 rounded-lg text-sm ${tab===name?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
             type="button"
           >
             {name}
@@ -396,13 +372,7 @@ export default function CombinedBets() {
         ))}
       </div>
 
-      {tab === "Combined" ? (
-        <CombinedBody />
-      ) : tab === "Football" ? (
-        <FootballBody />
-      ) : (
-        <CryptoBody />
-      )}
+      {tab === "Combined" ? <CombinedBody /> : tab === "Football" ? <FootballBody /> : <CryptoBody /> }
     </div>
   );
 }
