@@ -1,7 +1,10 @@
+// components/CombinedBets.jsx
+"use client";
+
 import React, { useEffect, useMemo, useState } from "react";
 import HistoryPanel from "./HistoryPanel"; // History tab koristi baš ovaj panel
 
-const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const TZ = "Europe/Belgrade";
 
 function currentSlot(tz = TZ){
   const h = Number(new Intl.DateTimeFormat("en-GB",{hour:"2-digit",hour12:false,timeZone:tz}).format(new Date()));
@@ -130,12 +133,10 @@ function TicketItem({ it }) {
         ) : null}
       </div>
 
-      {/* Zašto / Forma — 2 reda */}
       <div className="mt-2">
         <WhyLine explain={it?.explain} />
       </div>
 
-      {/* Confidence bar */}
       <div className="mt-2">
         <div className="flex items-center gap-2 text-xs text-slate-400">
           <span>Confidence</span>
@@ -155,14 +156,8 @@ function TicketItem({ it }) {
 }
 
 function TicketsPanel({ items }) {
-  // top 3 po svakom od 4 tržišta
   const byMarket = useMemo(() => {
-    const res = {
-      "1X2": [],
-      "BTTS": [],
-      "OU 2.5": [],
-      "HT-FT": [],
-    };
+    const res = { "1X2": [], "BTTS": [], "OU 2.5": [], "HT-FT": [] };
     for (const it of items) {
       const m = String(it?.market_label || it?.market || "").toUpperCase();
       if (m.includes("1X2") || m === "1X2" || m.includes("MATCH WINNER")) res["1X2"].push(it);
@@ -231,34 +226,36 @@ function useLockedFeed() {
 }
 
 function useCryptoTop3() {
-  const [state, setState] = useState({ items: [], error: null });
+  const [items, setItems] = useState([]);
+  const [error, setError] = useState(null);
   useEffect(() => {
     let alive = true;
     (async () => {
       const j = await safeJson("/api/crypto");
       if (!alive) return;
-      if (j?.ok === false) setState({ items: [], error: j.error || "Greška" });
-      else {
-        const arr = Array.isArray(j?.items) ? j.items : Array.isArray(j?.signals) ? j.signals : Array.isArray(j?.crypto) ? j.crypto : Array.isArray(j) ? j : [];
-        setState({ items: arr.slice(0, 3), error: null });
-      }
+      if (j?.ok === false) setError(j.error || "Greška");
+      const arr = Array.isArray(j?.items) ? j.items
+        : Array.isArray(j?.signals) ? j.signals
+        : Array.isArray(j?.crypto) ? j.crypto
+        : Array.isArray(j) ? j
+        : [];
+      setItems(arr.slice(0, 3));
     })();
     return () => { alive = false; };
   }, []);
-  return state;
+  return { items, error };
 }
 
 /* ---------------- main ---------------- */
 
 export default function CombinedBets() {
   const [tab, setTab] = useState("Combined"); // Combined | Football | Crypto
-  const [sub, setSub] = useState("Kick-Off");  // Kick-Off | Confidence | History
 
-  const { items: lockedList, built_at, day, error } = useLockedFeed();
-  const { items: cryptoTop } = useCryptoTop3();
+  const locked = useLockedFeed();
+  const crypto = useCryptoTop3();
 
   function CombinedBody() {
-    const list = lockedList;
+    const list = locked.items;
 
     return (
       <div className="space-y-4">
@@ -266,9 +263,9 @@ export default function CombinedBets() {
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           {/* levi panel — lista */}
           <div className="lg:col-span-2">
-            {error ? (
+            {locked.error ? (
               <div className="p-4 rounded-xl bg-[#1f2339] text-red-300 text-sm">
-                Greška: {String(error)}
+                Greška: {String(locked.error)}
               </div>
             ) : list.length === 0 ? (
               <div className="p-4 rounded-xl bg-[#1f2339] text-slate-300 text-sm">
@@ -297,11 +294,13 @@ export default function CombinedBets() {
           <div className="lg:col-span-2">
             <div className="rounded-2xl bg-[#15182a] p-4">
               <div className="text-base font-semibold text-white mb-2">Crypto — Top 3</div>
-              {!cryptoTop?.items?.length ? (
+              {crypto.error ? (
+                <div className="text-red-300 text-sm">Greška: {String(crypto.error)}</div>
+              ) : !crypto.items.length ? (
                 <div className="text-slate-300 text-sm">Trenutno nema signala.</div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                  {cryptoTop.items.map((c, i) => (
+                  {crypto.items.map((c, i) => (
                     <div key={i} className="p-3 rounded-xl bg-[#1f2339]">
                       <div className="text-sm font-semibold">{c.symbol}</div>
                       <div className="text-xs text-slate-400">{c.name}</div>
@@ -327,8 +326,8 @@ export default function CombinedBets() {
   }
 
   function FootballBody() {
-    // Oslanja se na isti locked feed; UI razlika je raspored
-    const list = lockedList;
+    // Jednostavan prikaz — detaljni tabovi su u komponenti FootballBets.jsx (na Football stranici)
+    const list = locked.items;
     return (
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="lg:col-span-2">
@@ -352,13 +351,13 @@ export default function CombinedBets() {
   }
 
   function CryptoBody() {
-    const { items: citems, error: cerr } = cryptoTop;
+    const citems = crypto.items;
     return (
       <div className="rounded-2xl bg-[#15182a] p-4">
         <div className="text-base font-semibold text-white mb-2">Crypto — Top 3</div>
-        {cerr ? (
-          <div className="text-red-300 text-sm">Greška: {String(cerr)}</div>
-        ) : !citems?.length ? (
+        {crypto.error ? (
+          <div className="text-red-300 text-sm">Greška: {String(crypto.error)}</div>
+        ) : !citems.length ? (
           <div className="text-slate-300 text-sm">Trenutno nema signala.</div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
