@@ -2,7 +2,8 @@
 // Batch osvežavanje kvota (bez per-fixture spama).
 // - Fixtures -> API_FOOTBALL_KEY (v3/fixtures)
 // - Odds batch -> ODDS_API_KEY (v3/odds)
-// - Trusted bookies filtriranje kroz TRUSTED_BOOKIES (+ ODDS_TRUSTED_ONLY / ODDS_TRUSTED_FALLBACK_MIN)
+// - Trusted bookies filtriranje kroz TRUSTED_BOOKIES / TRUSTED_BOOKMAKERS
+//   (+ ODDS_TRUSTED_ONLY / ODDS_TRUSTED_FALLBACK_MIN)
 // - Keš: odds:fixture:<YMD>:<fixtureId> = { match_winner:{home,draw,away}, best, fav }
 // - Budžet: odds:budget:<YMD> (samo broj eksternih poziva)
 
@@ -28,10 +29,15 @@ const DAILY_BUDGET = Number(process.env.ODDS_CALL_BUDGET_DAILY || 5000);
 const PER_FIXTURE_FALLBACK = String(process.env.ODDS_FALLBACK_PER_FIXTURE || "0") === "1";
 const PER_FIXTURE_CAP = Number(process.env.ODDS_PER_FIXTURE_CAP || 100);
 
-// trusted
-const TRUSTED_LIST = String(process.env.TRUSTED_BOOKIES || "")
+// trusted (kanonizacija)
+const norm = (s) => String(s || "")
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, "") // "William Hill" / "william_hill" / "William-Hill" -> "williamhill"
+  .trim();
+
+const TRUSTED_LIST = String(process.env.TRUSTED_BOOKIES || process.env.TRUSTED_BOOKMAKERS || "")
   .split(",")
-  .map(s => s.trim().toLowerCase())
+  .map(norm)
   .filter(Boolean);
 
 const TRUSTED_ONLY = String(process.env.ODDS_TRUSTED_ONLY || "1") === "1";
@@ -118,13 +124,13 @@ async function fetchJSON(url, key) {
 }
 
 function pickTrusted1X2(row, trustedList, trustedOnly, trustedFallbackMin) {
-  const books = Array.isArray(row?.bookmakers) ? row.bookmakers : row?.odds?.bookmakers || [];
+  const books = Array.isArray(row?.bookmakers) ? row.bookmakers : [];
   if (!books.length) return null;
 
   function scanBooks(filterTrusted) {
     let home=null, draw=null, away=null, hits=0;
     for (const bk of books) {
-      const name = String(bk?.name || "").toLowerCase();
+      const name = norm(bk?.name);
       if (filterTrusted && trustedList.length && !trustedList.includes(name)) continue;
 
       const bets = Array.isArray(bk?.bets) ? bk.bets : [];
@@ -211,4 +217,4 @@ async function bumpBudget(ymd, n){
     headers: { Authorization: `Bearer ${KV_TOKEN}`, "content-type":"application/json" },
     body: JSON.stringify({ value: n }),
   }).catch(()=>{});
-      }
+}
