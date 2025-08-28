@@ -12,7 +12,7 @@ const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 
-// Optional dual-write/read to Upstash (same DB in your setup)
+// Optional dual-write/read to Upstash
 const UP_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
@@ -52,11 +52,11 @@ export async function _internalSetLocked(key, arr) {
         Authorization: `Bearer ${KV_TOKEN}`,
         "content-type": "application/json",
       },
-      // IMPORTANT: store top-level array as JSON string (no { value: [...] } wrapper)
+      // store top-level array as JSON string (no { value: [...] } wrapper)
       body: JSON.stringify({ value: JSON.stringify(value) }),
     }).catch(() => {});
   }
-  // Dual-write to Upstash (optional, same DB in your env)
+  // Dual-write to Upstash (optional)
   if (UP_URL && UP_TOKEN) {
     await fetch(`${UP_URL}/set/${encodeURIComponent(key)}`, {
       method: "POST",
@@ -87,7 +87,6 @@ function normalizeYMD(s) {
 }
 
 function ensureArray(v) {
-  // Accept either top-level array, or common wrappers we may encounter
   try {
     if (v == null) return [];
     if (Array.isArray(v)) return v;
@@ -99,20 +98,17 @@ function ensureArray(v) {
       return ensureArray(parsed);
     }
     if (typeof v === "object") {
-      // Common bad-writes seen in DB: { value: [...] }, { value_bets: [...] }, { arr: [...] }, { data: [...] }
+      // Common bad-writes in DB
       if (Array.isArray(v.value)) return v.value;
       if (Array.isArray(v.value_bets)) return v.value_bets;
       if (Array.isArray(v.arr)) return v.arr;
       if (Array.isArray(v.data)) return v.data;
-
-      // Sometimes value is a JSON string of an array
       if (typeof v.value === "string") {
         try {
           const p = JSON.parse(v.value);
           if (Array.isArray(p)) return p;
-        } catch { /* ignore */ }
+        } catch {}
       }
-      // Fallback: nothing usable
       return [];
     }
     return [];
@@ -121,6 +117,7 @@ function ensureArray(v) {
   }
 }
 
+// FIXED: try KV first; if result is NULL, DO NOT return yet — try Upstash fallback.
 async function kvGet(key) {
   // 1) KV_REST_* (primary)
   if (KV_URL && KV_TOKEN) {
@@ -131,9 +128,10 @@ async function kvGet(key) {
       });
       if (r.ok) {
         const j = await r.json().catch(() => null);
-        return j?.result ?? null;
+        if (j && j.result != null) return j.result; // only return when there is a value
+        // else: fall through to Upstash
       }
-    } catch { /* ignore */ }
+    } catch {}
   }
   // 2) Upstash fallback
   if (UP_URL && UP_TOKEN) {
@@ -144,9 +142,9 @@ async function kvGet(key) {
       });
       if (r.ok) {
         const j = await r.json().catch(() => null);
-        return j?.result ?? null;
+        if (j && j.result != null) return j.result;
       }
-    } catch { /* ignore */ }
+    } catch {}
   }
   return null;
 }
