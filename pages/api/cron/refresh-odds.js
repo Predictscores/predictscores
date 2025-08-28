@@ -1,17 +1,18 @@
 // pages/api/cron/refresh-odds.js
-// STRICT BATCH (bez ikakvog fallbacka).
+// STRICT BATCH (bez fallbacka).
 // - Fixtures -> API_FOOTBALL_KEY
-// - Odds batch -> ODDS_API_KEY
-// - Trusted bookies uz KANONIZACIJU imena (lowercase + bez spec. znakova)
+// - Odds batch -> API_FOOTBALL_KEY (isti host/provajder)
+// - Trusted bookies uz kanonizaciju imena (lowercase + ukloni sve osim [a-z0-9])
 // - Keš: odds:fixture:<YMD>:<fixtureId> = { match_winner:{home,draw,away}, best, fav }
 
 export const config = { api: { bodyParser: false } };
 
-const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const TZ   = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const BASE = process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io";
 
 const FIX_KEY  = process.env.API_FOOTBALL_KEY || process.env.API_FOOTBALL;
-const ODDS_KEY = process.env.ODDS_API_KEY     || process.env.API_FOOTBALL_KEY;
+// KLJUČNO: odds batch ide sa API_FOOTBALL_KEY (ne sa ODDS_API_KEY)
+const ODDS_KEY = process.env.API_FOOTBALL_KEY || process.env.API_FOOTBALL;
 
 // storage
 const KV_URL   = process.env.KV_REST_API_URL;
@@ -19,7 +20,7 @@ const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const UP_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-// trusted lista
+// trusted lista (kanonizacija)
 const canon = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "").trim();
 const TRUSTED_LIST = String(process.env.TRUSTED_BOOKIES || process.env.TRUSTED_BOOKMAKERS || "")
   .split(",").map(canon).filter(Boolean);
@@ -31,9 +32,7 @@ export default async function handler(req, res) {
   try {
     const slot = String(req.query?.slot || "am").toLowerCase();
     if (!["am","pm","late"].includes(slot)) return res.status(200).json({ ok:false, error:"invalid slot" });
-
     if (!FIX_KEY)  return res.status(200).json({ ok:false, error:"API_FOOTBALL_KEY missing" });
-    if (!ODDS_KEY) return res.status(200).json({ ok:false, error:"ODDS_API_KEY missing" });
 
     const ymd = ymdInTZ(new Date(), TZ);
 
@@ -41,7 +40,7 @@ export default async function handler(req, res) {
     const fj = await jfetch(`${BASE}/fixtures?date=${ymd}&timezone=${encodeURIComponent(TZ)}`, FIX_KEY);
     const fixtures = Array.isArray(fj?.response) ? fj.response : [];
 
-    // STRICT BATCH za kvote (samo ODDS_KEY)
+    // STRICT BATCH za kvote (sa API_FOOTBALL_KEY)
     const oj = await jfetch(`${BASE}/odds?date=${ymd}&timezone=${encodeURIComponent(TZ)}`, ODDS_KEY);
     const batch = Array.isArray(oj?.response) ? oj.response : [];
 
@@ -59,7 +58,6 @@ export default async function handler(req, res) {
       seen.add(fid);
     }
 
-    // rezultat (nema fallback-a)
     return res.status(200).json({
       ok: true,
       ymd,
@@ -67,7 +65,7 @@ export default async function handler(req, res) {
       fixtures: fixtures.length,
       batch_items: batch.length,
       odds_cached: cached,
-      source: "batch:ODDS_API_KEY"
+      source: "batch:API_FOOTBALL_KEY"
     });
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message || e) });
@@ -81,7 +79,6 @@ async function jfetch(url, key){
   const ct = (r.headers.get("content-type") || "").toLowerCase();
   if (!ct.includes("application/json")) throw new Error(`Bad content-type for ${url}`);
   const j = await r.json();
-  // ako API vrati "errors" polje, prijavi kao prazan batch umesto da puca
   if (j && typeof j === "object" && j.errors && Object.keys(j.errors).length) {
     return { response: [] };
   }
@@ -92,12 +89,8 @@ function pick1x2(row){
   const books = Array.isArray(row?.bookmakers) ? row.bookmakers : [];
   if (!books.length) return null;
 
-  // 1) probaj TRUSTED
-  let out = scanBooks(books, true);
-  if (out.best != null) return out;
-
-  // 2) ako trusted nema ništa, nema fallbacka na „sve“ (strogo)
-  return null;
+  // strogo: uzimamo samo trusted
+  return scanBooks(books, true);
 }
 
 function scanBooks(books, onlyTrusted){
@@ -130,7 +123,7 @@ function scanBooks(books, onlyTrusted){
 
   const best = Math.max(home||0, draw||0, away||0) || null;
   const fav  = best == null ? null : (best === home ? "HOME" : best === draw ? "DRAW" : "AWAY");
-  return { match_winner:{home,draw,away}, best, fav, hits };
+  return best == null ? null : { match_winner:{home,draw,away}, best, fav, hits };
 }
 
 function ymdInTZ(d=new Date(), tz=TZ){
