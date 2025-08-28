@@ -80,7 +80,7 @@ export default async function handler(req, res){
     const sliced = out.slice(0, LIMIT);
 
     await setKV(`vbl:${ymd}:${slot}`, sliced);   // Football tab
-    await setKV(`vb:day:${ymd}:${slot}`, sliced);// Combined/History ulaz (TOP-LEVEL niz)
+    await setKV(`vb:day:${ymd}:${slot}`, sliced);// Combined/History ulaz
 
     return res.status(200).json({ ok:true, slot, count: sliced.length, football: sliced });
   } catch (e) {
