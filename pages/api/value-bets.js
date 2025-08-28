@@ -1,14 +1,13 @@
 // pages/api/value-bets.js
-// Seed = fixtures (API_FOOTBALL_KEY) + KV keš kvota (ODDS batch).
+// Seed = fixtures (API_FOOTBALL_KEY) + KV keš kvota (od refresh-odds).
 // U seed ulaze SAMO mečevi sa kvotom >= MIN_ODDS i bez U/Women/Reserves liga.
 
 export const config = { api: { bodyParser: false } };
 
-const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const TZ   = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const BASE = process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io";
 const FIX_KEY = process.env.API_FOOTBALL_KEY || process.env.API_FOOTBALL;
 
-// storage
 const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const UP_URL   = process.env.UPSTASH_REDIS_REST_URL;
@@ -32,7 +31,7 @@ export default async function handler(req, res){
     const fj = await httpJSON(`${BASE}/fixtures?date=${ymd}&timezone=${encodeURIComponent(TZ)}`, FIX_KEY);
     const fixtures = Array.isArray(fj?.response) ? fj.response : [];
 
-    // filtriraj
+    // filtriraj po slotu + BAN
     const list = fixtures.filter(fx => {
       const name  = String(fx?.league?.name || "");
       const round = String(fx?.league?.round || "");
