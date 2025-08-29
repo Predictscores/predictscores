@@ -1,14 +1,6 @@
 // pages/api/value-bets.js
-// Spaja fixtures (API-Football) sa kvotama iz KV/Upstash i vraća filtrirane "value bets".
-// Uključeno:
-// - BAN_LEAGUES (regex, iz ENV ili query ?ban=...)
-// - ONE-PICK-PER-FIXTURE (najbolji pick po meču, preferira trusted kad postoji)
-// - VB_MAX_PER_LEAGUE (cap po ligi)
-// - VB_LIMIT (ukupan limit)
-// - "trusted-only" radi čak i kad su kvote agregirane (MW sažetak): fallback označen kao trusted="aggregate"
-// - KV/Upstash fallback za čitanje + više šema ključa
-//
-// Response: { ok, disabled:false, slot, value_bets:[...], source: "fixtures+odds(cache)+filtered" | ... }
+// Filtrirani value-bets (ban lige, one-per-fixture, cap po ligi, limit).
+// Agregatne kvote ("best" bez bukija) imaju niži confidence plafon, da ne bude 85% svuda.
 
 export const config = { api: { bodyParser: false } };
 
@@ -22,7 +14,7 @@ const AF_BASE =
 const AF_KEY =
   (process.env.API_FOOTBALL_KEY || process.env.API_FOOTBALL || "").trim();
 
-// Storage (oba su opciona; fallback KV→Upstash je ispravan)
+// Storage
 const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const UP_URL   = process.env.UPSTASH_REDIS_REST_URL;
@@ -30,25 +22,25 @@ const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
 // Filteri
 const MIN_ODDS = Number(process.env.MIN_ODDS || 1.30);
-const TRUSTED_ONLY = String(process.env.ODDS_TRUSTED_ONLY || "0") === "1";
+const TRUSTED_ONLY = String(process.env.ODDS_TRUSTED_ONLY || "1") === "1";
 const VB_LIMIT = clampInt(process.env.VB_LIMIT, 15, 1, 50);
 const VB_MAX_PER_LEAGUE = clampInt(process.env.VB_MAX_PER_LEAGUE, 2, 1, 10);
 
-// Dozvoljeni marketi (široko)
-const ALLOWED_MARKETS_DEFAULT = "1X2,Match Winner,BTTS,Both Teams to Score,OU 2.5,Over/Under,HT-FT,HT/FT";
+// Dozvoljeni marketi
+const ALLOWED_MARKETS_DEFAULT = "1X2,Match Winner";
 
-// BAN_LEAGUES regex (case-insensitive). Primer default: Women/U21/U23/Reserves/Friendlies
+// Širi default ban regex
 const BAN_LEAGUES_RE = safeRegex(
-  process.env.BAN_LEAGUES || "(Women|U21|U23|Reserve|Reserves|Friendly|Friendlies)"
+  process.env.BAN_LEAGUES || "(Women|Womens|U1[0-9]|U2[0-9]|U-?1[0-9]|U-?2[0-9]|Reserve|Reserves|B Team|B-Team|Youth|Academy|Friendly|Friendlies|Club Friendly|Test|Trial)"
 );
 
 /* =================== HANDLER =================== */
 export default async function handler(req, res) {
   try {
-    const slot = normalizeSlot(String(req.query?.slot || "am"));
+    const slot = normalizeSlot(String(req.query?.slot || "pm"));
     const ymd = normalizeYMD(String(req.query?.ymd || "") || ymdInTZ(new Date(), TZ));
 
-    // Query overrides (za test bez menjanja ENV)
+    // Query overrides
     const qpMin = req.query?.min_odds ? Number(req.query.min_odds) : null;
     const qpTrusted = req.query?.trusted != null ? String(req.query.trusted) : null;
     const qpMk = req.query?.markets ? String(req.query.markets) : null;
@@ -62,7 +54,7 @@ export default async function handler(req, res) {
       .split(",")
       .map((s) => s.trim().toUpperCase());
 
-    // 1) Fixtures za dan i slot
+    // 1) Fixtures (slot window)
     const fixtures = await fetchFixturesAF(ymd, TZ);
     let slotFixtures = fixtures.filter((fx) => inSlotWindow(getKOISO(fx), TZ, slot));
 
@@ -76,17 +68,11 @@ export default async function handler(req, res) {
     }
 
     if (!slotFixtures.length) {
-      return res.status(200).json({
-        ok: true,
-        disabled: false,
-        slot,
-        value_bets: [],
-        source: "fixtures-empty",
-      });
+      return res.status(200).json({ ok: true, disabled: false, slot, value_bets: [], source: "fixtures-empty" });
     }
 
-    // 2) Uparavanje po fixture.id → odds iz KV/Upstash (više mogućih ključeva)
-    const perFixtureBest = []; // ONE-PICK-PER-FIXTURE
+    // 2) Join sa kvotama (KV/Upstash)
+    const perFixtureBest = [];
     for (const fx of slotFixtures) {
       const fid = getFID(fx);
       if (!fid) continue;
@@ -95,21 +81,21 @@ export default async function handler(req, res) {
       const oddsObj = parseOddsValue(raw);
       if (!oddsObj) continue;
 
-      // 3) Ekstrakcija tiketa iz kvota (podržava i sažeti zapis iz refresh-odds)
+      // 3) Kandidati iz kvota
       const candAll = extractPicks(oddsObj, marketsUpper);
 
-      // Ako je uključen trusted-only: preferiraj named/trusted; ako ih nema, dozvoli "aggregate" fallback
+      // trusted-only logika: prefer named/trusted; ako nema – dozvoli aggregate fallback
       let cand = candAll;
       if (trustedOnly) {
         const namedTrusted = candAll.filter((p) => p.trusted && p.bookmaker && p.bookmaker !== "aggregate");
         cand = namedTrusted.length ? namedTrusted : candAll.filter((p) => p.bookmaker === "aggregate" && p.trusted);
       }
 
-      // 4) Filter minimalna kvota
+      // 4) min od
       const filtered = cand.filter((p) => Number(p.price || p.odds) >= minOdds);
       if (!filtered.length) continue;
 
-      // 5) ONE-PICK-PER-FIXTURE: izaberi najbolji kandidat (preferira trusted/named, pa conf/price)
+      // 5) one-per-fixture
       const best = pickBestForFixture(filtered);
       if (!best) continue;
 
@@ -117,16 +103,10 @@ export default async function handler(req, res) {
     }
 
     if (!perFixtureBest.length) {
-      return res.status(200).json({
-        ok: true,
-        disabled: false,
-        slot,
-        value_bets: [],
-        source: "fixtures-only(no-odds>=min)",
-      });
+      return res.status(200).json({ ok: true, disabled: false, slot, value_bets: [], source: "fixtures-only(no-odds>=min)" });
     }
 
-    // 6) Sort po kvalitetu: confidence desc, pa kickoff asc
+    // 6) sort
     perFixtureBest.sort((a, b) => {
       const c = Number(b.confidence_pct || 0) - Number(a.confidence_pct || 0);
       if (c !== 0) return c;
@@ -135,7 +115,7 @@ export default async function handler(req, res) {
       return ta - tb;
     });
 
-    // 7) VB_MAX_PER_LEAGUE cap + VB_LIMIT
+    // 7) cap po ligi + limit
     const capped = [];
     const leagueCount = new Map();
     for (const t of perFixtureBest) {
@@ -165,10 +145,7 @@ async function fetchFixturesAF(ymd, tz) {
   try {
     const url = `${AF_BASE.replace(/\/+$/, "")}/fixtures?date=${encodeURIComponent(ymd)}&timezone=${encodeURIComponent(tz)}`;
     const r = await fetch(url, {
-      headers: {
-        "x-apisports-key": AF_KEY,
-        accept: "application/json",
-      },
+      headers: { "x-apisports-key": AF_KEY, accept: "application/json" },
       cache: "no-store",
     });
     if (!r.ok) return [];
@@ -185,15 +162,8 @@ function normalizeAF(x) {
   const lg = x?.league || {};
   const tm = x?.teams || {};
   return {
-    fixture: {
-      id: fx.id ?? x?.id ?? null,
-      date: fx.date ?? x?.date ?? null,
-    },
-    league: {
-      id: lg.id ?? null,
-      name: lg.name ?? "",
-      country: lg.country ?? "",
-    },
+    fixture: { id: fx.id ?? x?.id ?? null, date: fx.date ?? x?.date ?? null },
+    league: { id: lg.id ?? null, name: lg.name ?? "", country: lg.country ?? "" },
     teams: {
       home: { name: tm?.home?.name ?? x?.home?.name ?? x?.home ?? "" },
       away: { name: tm?.away?.name ?? x?.away?.name ?? x?.away ?? "" },
@@ -201,23 +171,14 @@ function normalizeAF(x) {
   };
 }
 
-function getFID(fx) {
-  return fx?.fixture?.id ?? fx?.id ?? null;
-}
+function getFID(fx) { return fx?.fixture?.id ?? fx?.id ?? null; }
 function getKOISO(fx) {
-  const raw =
-    fx?.fixture?.date ||
-    fx?.datetime_local?.starting_at?.date_time ||
-    fx?.datetime_local?.date_time ||
-    fx?.kickoff ||
-    null;
+  const raw = fx?.fixture?.date || fx?.datetime_local?.starting_at?.date_time || fx?.datetime_local?.date_time || fx?.kickoff || null;
   if (!raw) return null;
   return String(raw).includes("T") ? String(raw) : String(raw).replace(" ", "T");
 }
 
 /* =================== ODDS LOOKUP =================== */
-
-// Probaj više mogućih šema ključa — writer može imati različit prefiks
 function candidateOddsKeys(ymd, fid) {
   return [
     `odds:fixture:${ymd}:${fid}`,
@@ -226,103 +187,52 @@ function candidateOddsKeys(ymd, fid) {
     `odds:${fid}`,
   ];
 }
-
-// Vrati prvu pronađenu vrednost
-async function kvGetFirst(keys) {
-  for (const k of keys) {
-    const v = await kvGet(k);
-    if (v != null) return v;
-  }
-  return null;
-}
-
-// SINGLE GET sa ispravnim fallback-om (KV pa Upstash, vrati samo ako postoji vrednost)
+async function kvGetFirst(keys) { for (const k of keys) { const v = await kvGet(k); if (v != null) return v; } return null; }
 async function kvGet(key) {
-  // KV
   if (KV_URL && KV_TOKEN) {
     try {
-      const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
-        headers: { Authorization: `Bearer ${KV_TOKEN}` },
-        cache: "no-store",
-      });
-      if (r.ok) {
-        const j = await r.json().catch(() => null);
-        if (j && j.result != null) return j.result;
-      }
+      const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${KV_TOKEN}` }, cache: "no-store" });
+      if (r.ok) { const j = await r.json().catch(() => null); if (j && j.result != null) return j.result; }
     } catch {}
   }
-  // Upstash
   if (UP_URL && UP_TOKEN) {
     try {
-      const r = await fetch(`${UP_URL}/get/${encodeURIComponent(key)}`, {
-        headers: { Authorization: `Bearer ${UP_TOKEN}` },
-        cache: "no-store",
-      });
-      if (r.ok) {
-        const j = await r.json().catch(() => null);
-        if (j && j.result != null) return j.result;
-      }
+      const r = await fetch(`${UP_URL}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${UP_TOKEN}` }, cache: "no-store" });
+      if (r.ok) { const j = await r.json().catch(() => null); if (j && j.result != null) return j.result; }
     } catch {}
   }
   return null;
 }
 
-// Raspakuj vrednost iz storage-a u usable objekat/niz
 function parseOddsValue(v) {
   try {
     if (v == null) return null;
-
-    // String → JSON (može biti i string od {value:"[...]"} ili sl.)
-    if (typeof v === "string") {
-      const s = v.trim();
-      if (!s) return null;
-      return parseOddsValue(JSON.parse(s));
-    }
+    if (typeof v === "string") return parseOddsValue(JSON.parse(v));
     if (typeof v !== "object") return null;
-
-    // Najčešći wrapperi
     if (v.value != null) return parseOddsValue(v.value);
     if (v.odds  != null) return parseOddsValue(v.odds);
     if (v.data  != null) return parseOddsValue(v.data);
     if (v.payload != null) return parseOddsValue(v.payload);
-
-    // Sažeti zapis iz refresh-odds: { match_winner:{home,draw,away}, best, fav, hits }
     if (v.match_winner && typeof v.match_winner === "object") {
       const mw = v.match_winner || {};
       return { __kind: "MW_SUMMARY", home: numOrNull(mw.home), draw: numOrNull(mw.draw), away: numOrNull(mw.away) };
     }
-
-    // API-Sports format (bookmakers/bets/values)
     if (Array.isArray(v.bookmakers)) return v;
-
-    // Normalizovan niz pikova
     if (Array.isArray(v)) return v;
-
     return null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 /* =================== EXTRACT PICKS =================== */
-
-// Napravi kandidate iz kvota — podržan je:
-//  A) Sažeti 1X2 zapis (MW_SUMMARY) iz refresh-odds
-//  B) API-Sports format (bookmakers[] -> bets[] -> values[])
-//  C) Normalizovan niz [{market,selection,price,bookmaker?,trusted?}]
 function extractPicks(odds, marketsUpper) {
-  // A) Sažeti 1X2 — OZNAČI kao trusted fallback ("aggregate"), da trusted-only ne ubije feed
+  // A) Sažeti 1X2 — tretiraj kao trusted fallback sa "aggregate" bookmaker-om
   if (odds && odds.__kind === "MW_SUMMARY") {
     const out = [];
     const pushIf = (selection, price) => {
       const n = Number(price);
-      if (Number.isFinite(n)) {
-        out.push({ market: "Match Winner", selection, price: n, bookmaker: "aggregate", trusted: true });
-      }
+      if (Number.isFinite(n)) out.push({ market: "Match Winner", selection, price: n, bookmaker: "aggregate", trusted: true });
     };
-    pushIf("Home", odds.home);
-    pushIf("Draw", odds.draw);
-    pushIf("Away", odds.away);
+    pushIf("Home", odds.home); pushIf("Draw", odds.draw); pushIf("Away", odds.away);
     return out;
   }
 
@@ -343,7 +253,7 @@ function extractPicks(odds, marketsUpper) {
     return coalesce(picks);
   }
 
-  // C) API-Sports oblik
+  // C) API-Sports
   const bks = Array.isArray(odds?.bookmakers) ? odds.bookmakers : [];
   for (const bk of bks) {
     const bets = Array.isArray(bk?.bets) ? bk.bets : Array.isArray(bk?.markets) ? bk.markets : [];
@@ -367,17 +277,13 @@ function extractPicks(odds, marketsUpper) {
 function isTrusted(name) {
   if (!name) return false;
   const list = (process.env.TRUSTED_BOOKMAKERS || process.env.TRUSTED_BOOKIES || "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
+    .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
   if (!list.length) return false;
   return list.includes(String(name).toLowerCase());
 }
 
-// Zadrži najbolju kvotu po (market, selection)
 function coalesce(picks) {
-  const out = [];
-  const map = new Map();
+  const out = []; const map = new Map();
   for (const p of picks) {
     if (!Number.isFinite(p.price)) continue;
     const key = `${String(p.market).toUpperCase()}|${String(p.selection).toUpperCase()}`;
@@ -388,42 +294,33 @@ function coalesce(picks) {
   return out;
 }
 
-// Izaberi najbolji kandidat za jedan fixture (ONE-PICK-PER-FIXTURE)
 function pickBestForFixture(arr) {
   if (!arr || !arr.length) return null;
-  // skor: (named trusted ? +2000 : aggregate trusted ? +1000 : 0) + confidence + (price * 0.01)
-  let best = null;
-  let bestScore = -1e9;
+  let best = null, bestScore = -1e9;
   for (const p of arr) {
-    const conf = confidenceFromPrice(p.price);
+    const conf = confidenceFromPrice(p.price, p.bookmaker === "aggregate");
     const namedTrusted = p.trusted && p.bookmaker && p.bookmaker !== "aggregate";
     const aggregateTrusted = p.trusted && p.bookmaker === "aggregate";
     const score = (namedTrusted ? 2000 : aggregateTrusted ? 1000 : 0) + conf + (Number(p.price) * 0.01);
-    if (score > bestScore) {
-      bestScore = score;
-      best = p;
-    }
+    if (score > bestScore) { bestScore = score; best = p; }
   }
   return best;
 }
 
 /* =================== MAP TO UI =================== */
-
-function confidenceFromPrice(price) {
+function confidenceFromPrice(price, isAggregate = false) {
   const p = Number(price || 0);
   if (!Number.isFinite(p) || p <= 1.0) return 50;
-  const cap = 85;
+  const cap = isAggregate ? 68 : 85;        // agregatne kvote plafon ~68
   const base = 50 + Math.min(cap - 50, (p - 1.30) * 18);
   return Math.round(Math.max(50, Math.min(cap, base)));
 }
 
 function toTicket(p, fx) {
-  const conf = confidenceFromPrice(p.price);
+  const conf = confidenceFromPrice(p.price, p.bookmaker === "aggregate");
   return {
-    // time
     kickoff: getKOISO(fx),
     datetime_local: { date_time: getKOISO(fx) },
-    // context
     league: {
       id: fx?.league?.id ?? null,
       name: fx?.league?.name ?? "",
@@ -433,7 +330,6 @@ function toTicket(p, fx) {
       home: { name: fx?.teams?.home?.name ?? "" },
       away: { name: fx?.teams?.away?.name ?? "" },
     },
-    // market
     market_label: p.market,
     market: p.market,
     selection: p.selection,
@@ -447,44 +343,22 @@ function toTicket(p, fx) {
 }
 
 /* =================== SLOT & TIME =================== */
-
-function normalizeSlot(s) {
-  const x = String(s || "").toLowerCase();
-  return ["am", "pm", "late"].includes(x) ? x : "am";
-}
+function normalizeSlot(s) { const x = String(s || "").toLowerCase(); return ["am","pm","late"].includes(x) ? x : "pm"; }
 function inSlotWindow(iso, tz, slot) {
   if (!iso) return false;
   const d = new Date(iso);
   const h = Number(new Intl.DateTimeFormat("en-GB", { hour: "2-digit", hour12: false, timeZone: tz }).format(d));
-  // late: 00–09:59, am: 10–14:59, pm: 15–23:59
   if (slot === "late") return h < 10;
-  if (slot === "am") return h >= 10 && h < 15;
+  if (slot === "am")   return h >= 10 && h < 15;
   return h >= 15 && h <= 23;
 }
 function ymdInTZ(d = new Date(), tz = TZ) {
   const s = d.toLocaleString("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
   return (s.split(",")[0] || s).trim();
 }
-function normalizeYMD(s) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ymdInTZ(new Date(), TZ);
-}
+function normalizeYMD(s) { return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ymdInTZ(new Date(), TZ); }
 
 /* =================== UTILS =================== */
-
-function clampInt(v, defVal, min, max) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return defVal;
-  return Math.max(min, Math.min(max, Math.floor(n)));
-}
-function safeRegex(src) {
-  try {
-    if (!src) return null;
-    return new RegExp(src, "i");
-  } catch {
-    return null;
-  }
-}
-function numOrNull(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
-}
+function clampInt(v, defVal, min, max) { const n = Number(v); if (!Number.isFinite(n)) return defVal; return Math.max(min, Math.min(max, Math.floor(n))); }
+function safeRegex(src) { try { if (!src) return null; return new RegExp(src, "i"); } catch { return null; } }
+function numOrNull(x) { const n = Number(x); return Number.isFinite(n) ? n : null; }
