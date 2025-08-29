@@ -1,5 +1,6 @@
 // pages/api/value-bets.js
-// Spaja fixtures (API-Football) sa kvotama iz KV/Upstash (odds:* ključevi) i vraća "value bets" listu.
+// Spaja fixtures (API-Football) sa kvotama upisanim u KV/Upstash od /api/cron/refresh-odds.
+// Radi i kada je zapis sažet (match_winner + best + fav), i kada je pun API-Sports oblik.
 
 export const config = { api: { bodyParser: false } };
 
@@ -13,23 +14,18 @@ const AF_BASE =
 const AF_KEY =
   (process.env.API_FOOTBALL_KEY || process.env.API_FOOTBALL || "").trim();
 
-// Storage (oba su opciona; imamo ispravan fallback)
+// Storage (oba su opciona; fallback KV→Upstash je ispravan)
 const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const UP_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-// Filteri
+// Filteri (defaulti su “labavi”, možeš stegnuti preko ENV)
 const MIN_ODDS = Number(process.env.MIN_ODDS || 1.30);
 const TRUSTED_ONLY = String(process.env.ODDS_TRUSTED_ONLY || "0") === "1";
 
 // Široko pokrivamo nazive marketa iz različitih izvora
-const ALLOWED_MARKETS = (
-  process.env.ALLOWED_MARKETS ||
-  "1X2,Match Winner,BTTS,Both Teams to Score,OU 2.5,Over/Under,HT-FT,HT/FT"
-)
-  .split(",")
-  .map((s) => s.trim().toUpperCase());
+const ALLOWED_MARKETS_DEFAULT = "1X2,Match Winner,BTTS,Both Teams to Score,OU 2.5,Over/Under,HT-FT,HT/FT";
 
 /* =================== HANDLER =================== */
 export default async function handler(req, res) {
@@ -44,7 +40,7 @@ export default async function handler(req, res) {
 
     const minOdds = Number.isFinite(qpMin) ? qpMin : MIN_ODDS;
     const trustedOnly = qpTrusted === "1" ? true : qpTrusted === "0" ? false : TRUSTED_ONLY;
-    const markets = (qpMk ? qpMk : ALLOWED_MARKETS.join(","))
+    const marketsUpper = (qpMk ? qpMk : ALLOWED_MARKETS_DEFAULT)
       .split(",")
       .map((s) => s.trim().toUpperCase());
 
@@ -62,19 +58,20 @@ export default async function handler(req, res) {
       });
     }
 
-    // 2) Za svaki fixture, probaj više mogućih ključeva dok ne nađeš odds
+    // 2) Uparavanje po fixture.id → odds iz KV/Upstash (više mogućih ključeva)
     const picks = [];
     for (const fx of slotFixtures) {
       const fid = getFID(fx);
       if (!fid) continue;
 
-      const candKeys = candidateOddsKeys(ymd, fid);
-      const raw = await kvGetFirst(candKeys);
-      const odds = parseOddsValue(raw);
-      if (!odds) continue;
+      const raw = await kvGetFirst(candidateOddsKeys(ymd, fid));
+      const oddsObj = parseOddsValue(raw);
+      if (!oddsObj) continue;
 
-      // 3) Izvuci tikete iz kvota, filtriraj i mapiraj
-      const cand = extractPicksFromOdds(odds, markets, trustedOnly);
+      // 3) Ekstrakcija tiketa iz kvota (podržava i sažeti zapis iz refresh-odds)
+      const cand = extractPicks(oddsObj, marketsUpper, trustedOnly);
+
+      // 4) Filter minimalna kvota
       const filtered = cand.filter((p) => Number(p.price || p.odds) >= minOdds);
 
       for (const p of filtered) picks.push(toTicket(p, fx));
@@ -169,7 +166,7 @@ function getKOISO(fx) {
 
 /* =================== ODDS LOOKUP =================== */
 
-// Probaj više mogućih šema ključa — writer ponekad koristi drugačiji prefiks
+// Probaj više mogućih šema ključa — writer može imati različit prefiks
 function candidateOddsKeys(ymd, fid) {
   return [
     `odds:fixture:${ymd}:${fid}`,
@@ -179,7 +176,7 @@ function candidateOddsKeys(ymd, fid) {
   ];
 }
 
-// Vrati prvu pronađenu vrednost među kandidatima
+// Vrati prvu pronađenu vrednost
 async function kvGetFirst(keys) {
   for (const k of keys) {
     const v = await kvGet(k);
@@ -188,7 +185,7 @@ async function kvGetFirst(keys) {
   return null;
 }
 
-// SINGLE GET sa ispravnim fallback-om (KV pa Upstash, ali samo ako ima vrednost)
+// SINGLE GET sa ispravnim fallback-om (KV pa Upstash, vrati samo ako postoji vrednost)
 async function kvGet(key) {
   // KV
   if (KV_URL && KV_TOKEN) {
@@ -199,7 +196,7 @@ async function kvGet(key) {
       });
       if (r.ok) {
         const j = await r.json().catch(() => null);
-        if (j && j.result != null) return j.result; // vrati samo ako postoji vrednost
+        if (j && j.result != null) return j.result;
       }
     } catch {}
   }
@@ -224,28 +221,31 @@ function parseOddsValue(v) {
   try {
     if (v == null) return null;
 
-    // String → JSON
+    // String → JSON (može biti i string od {value:"[...]"} ili sl.)
     if (typeof v === "string") {
       const s = v.trim();
       if (!s) return null;
-      return parseOddsValue(JSON.parse(s)); // rekurzivno jer često je string od {value:"[...]"}
+      return parseOddsValue(JSON.parse(s));
+    }
+    if (typeof v !== "object") return null;
+
+    // Najčešći wrapperi
+    if (v.value != null) return parseOddsValue(v.value);
+    if (v.odds  != null) return parseOddsValue(v.odds);
+    if (v.data  != null) return parseOddsValue(v.data);
+    if (v.payload != null) return parseOddsValue(v.payload);
+
+    // Direkno sažeti zapis iz refresh-odds: { match_winner:{home,draw,away}, best, fav, hits }
+    if (v.match_winner && typeof v.match_winner === "object") {
+      const mw = v.match_winner || {};
+      return { __kind: "MW_SUMMARY", home: Number(mw.home ?? null), draw: Number(mw.draw ?? null), away: Number(mw.away ?? null) };
     }
 
-    // Već je objekat
-    if (Array.isArray(v)) return v; // normalizovan niz kvota
-    if (typeof v === "object") {
-      // Najčešći wrapperi
-      if (v.value != null) return parseOddsValue(v.value);
-      if (v.odds != null) return parseOddsValue(v.odds);
-      if (v.data != null) return parseOddsValue(v.data);
-      if (v.payload != null) return parseOddsValue(v.payload);
+    // API-Sports format (bookmakers/bets/values)
+    if (Array.isArray(v.bookmakers)) return v;
 
-      // Direktno iz API-Sports formata
-      if (Array.isArray(v.bookmakers)) return v;
-
-      // Ako ništa od navedenog — nepoznat format
-      return null;
-    }
+    // Normalizovan niz pikova
+    if (Array.isArray(v)) return v;
 
     return null;
   } catch {
@@ -255,15 +255,33 @@ function parseOddsValue(v) {
 
 /* =================== EXTRACT PICKS =================== */
 
-// Izvuci kandidate iz odds objekta; podržava i API-Sports i normalizovan niz
-function extractPicksFromOdds(odds, marketsWantedUpper, trustedOnly) {
+// Napravi kandidate iz kvota — podržan je:
+//  A) Sažeti 1X2 zapis (MW_SUMMARY) iz refresh-odds
+//  B) API-Sports format (bookmakers[] -> bets[] -> values[])
+//  C) Normalizovan niz [{market,selection,price,bookmaker?,trusted?}]
+function extractPicks(odds, marketsUpper, trustedOnly) {
+  // A) Sažeti 1X2
+  if (odds && odds.__kind === "MW_SUMMARY") {
+    const out = [];
+    const pushIf = (selection, price) => {
+      const n = Number(price);
+      if (Number.isFinite(n)) {
+        out.push({ market: "Match Winner", selection, price: n, bookmaker: null, trusted: true });
+      }
+    };
+    pushIf("Home", odds.home);
+    pushIf("Draw", odds.draw);
+    pushIf("Away", odds.away);
+    return out;
+  }
+
   const picks = [];
 
-  // Normalizovan niz
+  // B) Normalizovan niz
   if (Array.isArray(odds)) {
     for (const o of odds) {
       const m = String(o?.market || o?.name || "").toUpperCase();
-      if (!marketsWantedUpper.some((mw) => m.includes(mw))) continue;
+      if (!marketsUpper.some((mw) => m.includes(mw))) continue;
       const sel = o?.selection || o?.value || o?.outcome || "";
       const price = Number(o?.price ?? o?.odd ?? o?.odds);
       if (!Number.isFinite(price)) continue;
@@ -272,16 +290,16 @@ function extractPicksFromOdds(odds, marketsWantedUpper, trustedOnly) {
       if (trustedOnly && !trusted) continue;
       picks.push({ market: o?.market || o?.name || m, selection: sel, price, bookmaker, trusted });
     }
-    return coalescePicks(picks, trustedOnly);
+    return coalesce(picks);
   }
 
-  // API-Sports oblik
+  // C) API-Sports oblik
   const bks = Array.isArray(odds?.bookmakers) ? odds.bookmakers : [];
   for (const bk of bks) {
     const bets = Array.isArray(bk?.bets) ? bk.bets : Array.isArray(bk?.markets) ? bk.markets : [];
     for (const bet of bets) {
       const m = String(bet?.name || bet?.market || "").toUpperCase();
-      if (!marketsWantedUpper.some((mw) => m.includes(mw))) continue;
+      if (!marketsUpper.some((mw) => m.includes(mw))) continue;
       const values = Array.isArray(bet?.values) ? bet.values : Array.isArray(bet?.outcomes) ? bet.outcomes : [];
       for (const v of values) {
         const sel = v?.value || v?.selection || v?.name || "";
@@ -294,8 +312,7 @@ function extractPicksFromOdds(odds, marketsWantedUpper, trustedOnly) {
       }
     }
   }
-
-  return coalescePicks(picks, trustedOnly);
+  return coalesce(picks);
 }
 
 function isTrusted(name) {
@@ -308,8 +325,7 @@ function isTrusted(name) {
   return list.includes(String(name).toLowerCase());
 }
 
-// Zadrži najbolju kvotu po (market, selection); ako je trustedOnly, već smo filtrirali
-function coalescePicks(picks) {
+function coalesce(picks) {
   const out = [];
   const map = new Map();
   for (const p of picks) {
@@ -382,4 +398,4 @@ function ymdInTZ(d = new Date(), tz = TZ) {
 }
 function normalizeYMD(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ymdInTZ(new Date(), TZ);
-}
+                    }
