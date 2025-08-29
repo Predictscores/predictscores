@@ -1,27 +1,30 @@
 // pages/api/football.js
-// Vraća finalni niz za Football tab (tačno 15), filtriran i spreman za UI.
-// UI može iz ovoga da pravi "Combined" (top 3), "Kickoff" i "Confidence" sortove.
-// Oslanja se na postojeći /api/value-bets (server-side) da odradi join i grub filter.
+// Vraća finalni niz za Football tab (TAČNO 15), bez U/W/Reserves/Youth/PL2/itd,
+// i BEZ agregatnih kvota (force no_aggregate=1). Combined uzima top 3 iz ovoga.
 
 export const config = { api: { bodyParser: false } };
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
-// default ban regex – Women/U-lige/Reserves/Friendlies/Youth/Academy/B-team
-const BAN_DEFAULT = "(Women|Womens|U1[0-9]|U2[0-9]|U-?1[0-9]|U-?2[0-9]|Reserve|Reserves|B Team|B-Team|Youth|Academy|Friendly|Friendlies|Club Friendly|Test|Trial)";
+// Široki default ban (možeš pregaziti preko BAN_LEAGUES u ENV)
+const BAN_DEFAULT =
+  "(Women|Womens|Girls|Fem|U1[0-9]|U2[0-9]|U-?1[0-9]|U-?2[0-9]|Under-?\\d+|Reserve|Reserves|B Team|B-Team|II|Youth|Academy|Development|Premier League 2|PL2|Friendly|Friendlies|Club Friendly|Test|Trial)";
 
 export default async function handler(req, res) {
   try {
     const slot = normalizeSlot(String(req.query?.slot || "pm"));
-    const ymd  = normalizeYMD(String(req.query?.ymd || "") || ymdInTZ(new Date(), TZ));
+    const ymd  = normalizeYMD(String(req.query?.ymd  || "") || ymdInTZ(new Date(), TZ));
 
-    const ban = encodeURIComponent(process.env.BAN_LEAGUES || BAN_DEFAULT);
-    const trusted = encodeURIComponent(String(process.env.ODDS_TRUSTED_ONLY || "1") === "1" ? "1" : "0");
-    const maxPerLeague = encodeURIComponent(clampInt(process.env.VB_MAX_PER_LEAGUE, 2, 1, 10));
-    const markets = encodeURIComponent("1X2,Match Winner");
+    const ban           = encodeURIComponent(process.env.BAN_LEAGUES || BAN_DEFAULT);
+    const trusted       = encodeURIComponent(String(process.env.ODDS_TRUSTED_ONLY || "1") === "1" ? "1" : "0");
+    const maxPerLeague  = encodeURIComponent(clampInt(process.env.VB_MAX_PER_LEAGUE, 2, 1, 10));
+    const markets       = encodeURIComponent("1X2,Match Winner");
 
-    // OVDE je fiksni limit za Football tab: 15 (ne uzima VB_LIMIT iz ENV)
-    const url = `${baseUrl(req)}/api/value-bets?slot=${slot}&ymd=${ymd}&limit=15&max_per_league=${maxPerLeague}&trusted=${trusted}&ban=${ban}&markets=${markets}`;
+    // Fiksno: 15 kom, force no_aggregate=1
+    const url = `${baseUrl(req)}/api/value-bets?slot=${slot}&ymd=${ymd}`
+              + `&limit=15&max_per_league=${maxPerLeague}`
+              + `&trusted=${trusted}&ban=${ban}&markets=${markets}`
+              + `&no_aggregate=1`;
 
     const r = await fetch(url, { cache: "no-store" });
     if (!r.ok) {
@@ -56,11 +59,5 @@ function ymdInTZ(d = new Date(), tz = TZ) {
   const s = d.toLocaleString("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
   return (s.split(",")[0] || s).trim();
 }
-function normalizeYMD(s) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ymdInTZ(new Date(), TZ);
-}
-function clampInt(v, defVal, min, max) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return defVal;
-  return Math.max(min, Math.min(max, Math.floor(n)));
-}
+function normalizeYMD(s) { return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ymdInTZ(new Date(), TZ); }
+function clampInt(v, defVal, min, max) { const n = Number(v); if (!Number.isFinite(n)) return defVal; return Math.max(min, Math.min(max, Math.floor(n))); }
