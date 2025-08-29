@@ -10,7 +10,7 @@ export default function CombinedBets({ slot = "pm" }) {
     setLoading(true);
     setErr(null);
     try {
-      // Combined = TOP 3 (bez &full=1)
+      // Combined = TOP 3 iz locked feed-a (bez &full=1)
       const res = await fetch(`/api/value-bets-locked?slot=${encodeURIComponent(slot)}`, {
         cache: "no-store",
       });
