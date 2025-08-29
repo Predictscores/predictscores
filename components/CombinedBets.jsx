@@ -48,9 +48,7 @@ function koStamp(iso) {
   if (!d || !Number.isFinite(d.getTime())) return 0;
   return d.getTime();
 }
-function classNames(...arr) {
-  return arr.filter(Boolean).join(" ");
-}
+function classNames(...arr) { return arr.filter(Boolean).join(" "); }
 function byConfidenceDesc(a, b) {
   const ca = Number(a?.confidence_pct || 0);
   const cb = Number(b?.confidence_pct || 0);
@@ -87,11 +85,11 @@ function TinyCard({ item }) {
 export default function CombinedBets({ defaultSlot = "pm" }) {
   const [slot, setSlot] = useState(defaultSlot);
 
-  // gornji tabovi (kartice)
-  const [tab, setTab] = useState("Combined"); // Combined | Football | Crypto
+  // gornje kartice (ostaju): Combined | Football | Crypto
+  const [tab, setTab] = useState("Combined");
 
-  // unutrašnji tabovi u Football kartici
-  const [footballTab, setFootballTab] = useState("Kickoff"); // Kickoff | Confidence | History
+  // unutrašnji tabovi u Football kartici: Kickoff | Confidence | History
+  const [footballTab, setFootballTab] = useState("Kickoff");
 
   // podaci
   const [combined, setCombined] = useState([]); // top3
@@ -99,20 +97,20 @@ export default function CombinedBets({ defaultSlot = "pm" }) {
   const [crypto, setCrypto] = useState([]);     // crypto signals
   const [loading, setLoading] = useState(false);
 
-  // slot iz URL-a (ako postoji ?slot=am|pm|late)
+  // pokupi slot iz URL (?slot=am|pm|late) – bez lokalnih dugmića
   useEffect(() => {
     const url = new URL(window.location.href);
     const s = url.searchParams.get("slot");
     if (s && ["am","pm","late"].includes(s)) setSlot(s);
   }, []);
 
-  // auto-load pri promeni slota
+  // auto load pri promeni slota
   useEffect(() => { loadAll(slot); }, [slot]);
 
   async function loadAll(slt) {
     setLoading(true);
     try {
-      // TOP 3 locked za Combined
+      // Combined = TOP3 iz locked seta
       const c = await safeJson(`/api/value-bets-locked?slot=${encodeURIComponent(slt)}`);
       const cArr = Array.isArray(c?.items) ? c.items
         : Array.isArray(c?.football) ? c.football
@@ -120,15 +118,13 @@ export default function CombinedBets({ defaultSlot = "pm" }) {
         : [];
       setCombined((cArr || []).slice(0, 3));
 
-      // Football 15 – prvo pokušaj /api/football (on već priprema 15)
+      // Football = 15 (prvo /api/football, pa fallback na locked full)
       const f = await safeJson(`/api/football?slot=${encodeURIComponent(slt)}`);
       const fArr = Array.isArray(f?.football) ? f.football
         : Array.isArray(f?.items) ? f.items
         : Array.isArray(f?.value_bets) ? f.value_bets
         : [];
       let fOut = (fArr || []).slice(0, 15);
-
-      // fallback na locked full
       if (!fOut.length) {
         const cfull = await safeJson(`/api/value-bets-locked?slot=${encodeURIComponent(slt)}&full=1`);
         const cFullArr = Array.isArray(cfull?.items) ? cfull.items
@@ -139,7 +135,7 @@ export default function CombinedBets({ defaultSlot = "pm" }) {
       }
       setFootball(fOut);
 
-      // Crypto – ostaje kompatibilno
+      // Crypto (ne diramo)
       const k = await safeJson(`/api/crypto`);
       const kArr = Array.isArray(k?.signals) ? k.signals
         : Array.isArray(k?.items) ? k.items
@@ -164,61 +160,34 @@ export default function CombinedBets({ defaultSlot = "pm" }) {
       </button>
     );
   }
-  function SlotButton({ value }) {
-    const active = slot === value;
-    return (
-      <button
-        onClick={() => setSlot(value)}
-        className={classNames(
-          "px-2 py-1 rounded-md text-xs",
-          active ? "bg-[#2563eb] text-white" : "bg-[#111827] text-gray-300 hover:bg-[#1f2937]"
-        )}
-        type="button"
-      >
-        {value.toUpperCase()}
-      </button>
-    );
-  }
 
   /* --------- tela kartica --------- */
 
   function CombinedBody() {
     if (loading && !combined.length) return <div className="text-gray-300">Učitavam…</div>;
-    if (!combined.length) {
-      return (
-        <div className="text-gray-300">
-          Nema kombinovanih predloga za ovaj slot.
-          <div className="mt-2">
-            <button className="px-3 py-1 rounded-md bg-[#1f2937]" onClick={() => loadAll(slot)}>
-              Osveži
-            </button>
-          </div>
-        </div>
-      );
-    }
+    if (!combined.length) return <div className="text-gray-300">Nema kombinovanih predloga za ovaj slot.</div>;
     return (
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
         {combined.map((it, i) => <TinyCard key={i} item={it} />)}
       </div>
     );
   }
 
   function FootballBody() {
-    // unutrašnji tabovi: Kickoff | Confidence | History
     const innerTabs = ["Kickoff", "Confidence", "History"];
     const sortedKickoff = [...football].sort(byKickoffAsc);
     const sortedConfidence = [...football].sort(byConfidenceDesc);
 
     return (
       <div className="space-y-3">
-        {/* unutrašnja navigacija */}
-        <div className="flex items-center gap-2">
+        {/* unutrašnji tabovi – samo oni, bez lokalnih slot/refreš dugmića */}
+        <div className="flex items-center gap-2 overflow-x-auto whitespace-nowrap pb-1">
           {innerTabs.map(t => (
             <button
               key={t}
               onClick={() => setFootballTab(t)}
               className={classNames(
-                "px-3 py-1 rounded-md text-sm",
+                "px-3 py-1 rounded-md text-sm shrink-0",
                 footballTab === t ? "bg-[#2563eb] text-white" : "bg-[#111827] text-gray-300 hover:bg-[#1f2937]"
               )}
               type="button"
@@ -226,29 +195,18 @@ export default function CombinedBets({ defaultSlot = "pm" }) {
               {t}
             </button>
           ))}
-          <div className="ml-auto">
-            <button
-              className="px-3 py-1 rounded-md bg-[#1f2937] text-sm"
-              onClick={() => loadAll(slot)}
-            >
-              Osveži
-            </button>
-          </div>
         </div>
 
-        {/* sadržaj po pod-tabu */}
         {footballTab === "History" ? (
           <div className="rounded-lg border border-[#1f2937]">
-            {/* History unutar Football kartice */}
             <HistoryPanel slot={slot} />
           </div>
         ) : footballTab === "Confidence" ? (
-          <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5 gap-3">
             {sortedConfidence.slice(0, 15).map((it, i) => <TinyCard key={i} item={it} />)}
           </div>
         ) : (
-          // Kickoff (default)
-          <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5 gap-3">
             {sortedKickoff.slice(0, 15).map((it, i) => <TinyCard key={i} item={it} />)}
           </div>
         )}
@@ -258,20 +216,9 @@ export default function CombinedBets({ defaultSlot = "pm" }) {
 
   function CryptoBody() {
     if (loading && !crypto.length) return <div className="text-gray-300">Učitavam…</div>;
-    if (!crypto.length) {
-      return (
-        <div className="text-gray-300">
-          Nema crypto signala trenutno.
-          <div className="mt-2">
-            <button className="px-3 py-1 rounded-md bg-[#1f2937]" onClick={() => loadAll(slot)}>
-              Osveži
-            </button>
-          </div>
-        </div>
-      );
-    }
+    if (!crypto.length) return <div className="text-gray-300">Nema crypto signala trenutno.</div>;
     return (
-      <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-3">
         {crypto.map((it, i) => <TinyCard key={i} item={it} />)}
       </div>
     );
@@ -285,44 +232,19 @@ export default function CombinedBets({ defaultSlot = "pm" }) {
 
   return (
     <div className="space-y-4">
-      {/* gornja navigacija kartica + slot preklopnici */}
+      {/* Gornje kartice (ostaju), bez lokalnih slot/refreš kontrola */}
       <div className="flex items-center gap-2">
         {tabs.map(t => (
-          <button
+          <TabButton
             key={t.key}
+            label={t.label}
+            active={tab === t.key}
             onClick={() => setTab(t.key)}
-            className={classNames(
-              "px-3 py-1 rounded-md text-sm",
-              tab === t.key ? "bg-[#1f2937] text-white" : "bg-[#111827] text-gray-300 hover:bg-[#1f2937]"
-            )}
-            type="button"
-          >
-            {t.label}
-          </button>
+          />
         ))}
-        <div className="ml-auto flex items-center gap-1">
-          <SlotButton value="am" />
-          <SlotButton value="pm" />
-          <SlotButton value="late" />
-        </div>
       </div>
 
-      {/* info traka i refresh (za vizuelnu konzistentnost) */}
-      <div className="flex justify-between items-center">
-        <div className="text-sm opacity-80">
-          Slot: <b>{slot.toUpperCase()}</b>
-        </div>
-        <div>
-          <button
-            className="px-3 py-1 rounded-md bg-[#1f2937] text-sm"
-            onClick={() => loadAll(slot)}
-          >
-            Osveži sve
-          </button>
-        </div>
-      </div>
-
-      {/* telo selektovane kartice */}
+      {/* Telo selektovane kartice */}
       <div className="rounded-lg border border-[#1f2937] p-3">
         {tab === "Combined" ? (
           <CombinedBody />
@@ -334,4 +256,4 @@ export default function CombinedBets({ defaultSlot = "pm" }) {
       </div>
     </div>
   );
-        }
+      }
