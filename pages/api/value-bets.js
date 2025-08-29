@@ -1,6 +1,6 @@
 // pages/api/value-bets.js
-// Spaja fixtures (API-Football) sa kvotama upisanim u KV/Upstash od /api/cron/refresh-odds.
-// Radi i kada je zapis sažet (match_winner + best + fav), i kada je pun API-Sports oblik.
+// Spaja fixtures (API-Football) sa kvotama iz KV/Upstash i vraća filtrirane "value bets".
+// Dodato: BAN_LEAGUES (regex), ONE-PICK-PER-FIXTURE, VB_MAX_PER_LEAGUE, VB_LIMIT.
 
 export const config = { api: { bodyParser: false } };
 
@@ -20,12 +20,19 @@ const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const UP_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-// Filteri (defaulti su “labavi”, možeš stegnuti preko ENV)
+// Filteri
 const MIN_ODDS = Number(process.env.MIN_ODDS || 1.30);
 const TRUSTED_ONLY = String(process.env.ODDS_TRUSTED_ONLY || "0") === "1";
+const VB_LIMIT = clampInt(process.env.VB_LIMIT, 15, 1, 50);
+const VB_MAX_PER_LEAGUE = clampInt(process.env.VB_MAX_PER_LEAGUE, 2, 1, 10);
 
 // Široko pokrivamo nazive marketa iz različitih izvora
 const ALLOWED_MARKETS_DEFAULT = "1X2,Match Winner,BTTS,Both Teams to Score,OU 2.5,Over/Under,HT-FT,HT/FT";
+
+// BAN_LEAGUES regex (case-insensitive). Primer: (Women|U21|U23|Reserve|Friendlies)
+const BAN_LEAGUES_RE = safeRegex(
+  process.env.BAN_LEAGUES || "(Women|U21|U23|Reserve|Reserves|Friendly|Friendlies)"
+);
 
 /* =================== HANDLER =================== */
 export default async function handler(req, res) {
@@ -37,6 +44,9 @@ export default async function handler(req, res) {
     const qpMin = req.query?.min_odds ? Number(req.query.min_odds) : null;
     const qpTrusted = req.query?.trusted != null ? String(req.query.trusted) : null;
     const qpMk = req.query?.markets ? String(req.query.markets) : null;
+    const qpLimit = req.query?.limit ? clampInt(req.query.limit, VB_LIMIT, 1, 50) : VB_LIMIT;
+    const qpMaxPerLeague = req.query?.max_per_league ? clampInt(req.query.max_per_league, VB_MAX_PER_LEAGUE, 1, 10) : VB_MAX_PER_LEAGUE;
+    const qpBan = req.query?.ban ? safeRegex(String(req.query.ban)) : BAN_LEAGUES_RE;
 
     const minOdds = Number.isFinite(qpMin) ? qpMin : MIN_ODDS;
     const trustedOnly = qpTrusted === "1" ? true : qpTrusted === "0" ? false : TRUSTED_ONLY;
@@ -46,7 +56,16 @@ export default async function handler(req, res) {
 
     // 1) Fixtures za dan i slot
     const fixtures = await fetchFixturesAF(ymd, TZ);
-    const slotFixtures = fixtures.filter((fx) => inSlotWindow(getKOISO(fx), TZ, slot));
+    let slotFixtures = fixtures.filter((fx) => inSlotWindow(getKOISO(fx), TZ, slot));
+
+    // 1a) BAN liga/country
+    if (qpBan) {
+      slotFixtures = slotFixtures.filter((fx) => {
+        const name = (fx?.league?.name || "").toString();
+        const country = (fx?.league?.country || "").toString();
+        return !(qpBan.test(name) || qpBan.test(country));
+      });
+    }
 
     if (!slotFixtures.length) {
       return res.status(200).json({
@@ -59,7 +78,7 @@ export default async function handler(req, res) {
     }
 
     // 2) Uparavanje po fixture.id → odds iz KV/Upstash (više mogućih ključeva)
-    const picks = [];
+    const perFixtureBest = []; // ONE-PICK-PER-FIXTURE
     for (const fx of slotFixtures) {
       const fid = getFID(fx);
       if (!fid) continue;
@@ -73,11 +92,16 @@ export default async function handler(req, res) {
 
       // 4) Filter minimalna kvota
       const filtered = cand.filter((p) => Number(p.price || p.odds) >= minOdds);
+      if (!filtered.length) continue;
 
-      for (const p of filtered) picks.push(toTicket(p, fx));
+      // 5) ONE-PICK-PER-FIXTURE: izaberi najbolji kandidat za ovaj fixture
+      const best = pickBestForFixture(filtered);
+      if (!best) continue;
+
+      perFixtureBest.push(toTicket(best, fx));
     }
 
-    if (!picks.length) {
+    if (!perFixtureBest.length) {
       return res.status(200).json({
         ok: true,
         disabled: false,
@@ -87,8 +111,8 @@ export default async function handler(req, res) {
       });
     }
 
-    // Sort: confidence desc, pa kickoff asc
-    picks.sort((a, b) => {
+    // 6) Sort po kvalitetu: confidence desc, pa kickoff asc
+    perFixtureBest.sort((a, b) => {
       const c = Number(b.confidence_pct || 0) - Number(a.confidence_pct || 0);
       if (c !== 0) return c;
       const ta = Date.parse(getKOISO(a) || "") || 0;
@@ -96,12 +120,24 @@ export default async function handler(req, res) {
       return ta - tb;
     });
 
+    // 7) VB_MAX_PER_LEAGUE cap
+    const capped = [];
+    const leagueCount = new Map();
+    for (const t of perFixtureBest) {
+      const leagueKey = (t?.league?.country ? `${t.league.country}|` : "") + (t?.league?.name || "");
+      const cur = leagueCount.get(leagueKey) || 0;
+      if (cur >= qpMaxPerLeague) continue;
+      leagueCount.set(leagueKey, cur + 1);
+      capped.push(t);
+      if (capped.length >= qpLimit) break;
+    }
+
     return res.status(200).json({
       ok: true,
       disabled: false,
       slot,
-      value_bets: picks,
-      source: "fixtures+odds(cache)",
+      value_bets: capped.slice(0, qpLimit),
+      source: "fixtures+odds(cache)+filtered",
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -235,10 +271,10 @@ function parseOddsValue(v) {
     if (v.data  != null) return parseOddsValue(v.data);
     if (v.payload != null) return parseOddsValue(v.payload);
 
-    // Direkno sažeti zapis iz refresh-odds: { match_winner:{home,draw,away}, best, fav, hits }
+    // Sažeti zapis iz refresh-odds: { match_winner:{home,draw,away}, best, fav, hits }
     if (v.match_winner && typeof v.match_winner === "object") {
       const mw = v.match_winner || {};
-      return { __kind: "MW_SUMMARY", home: Number(mw.home ?? null), draw: Number(mw.draw ?? null), away: Number(mw.away ?? null) };
+      return { __kind: "MW_SUMMARY", home: numOrNull(mw.home), draw: numOrNull(mw.draw), away: numOrNull(mw.away) };
     }
 
     // API-Sports format (bookmakers/bets/values)
@@ -266,13 +302,14 @@ function extractPicks(odds, marketsUpper, trustedOnly) {
     const pushIf = (selection, price) => {
       const n = Number(price);
       if (Number.isFinite(n)) {
-        out.push({ market: "Match Winner", selection, price: n, bookmaker: null, trusted: true });
+        // aggregated NEMA bookmaker → tretira se kao NOT trusted
+        out.push({ market: "Match Winner", selection, price: n, bookmaker: null, trusted: false });
       }
     };
     pushIf("Home", odds.home);
     pushIf("Draw", odds.draw);
     pushIf("Away", odds.away);
-    return out;
+    return trustedOnly ? out.filter(x => x.trusted) : out;
   }
 
   const picks = [];
@@ -325,6 +362,7 @@ function isTrusted(name) {
   return list.includes(String(name).toLowerCase());
 }
 
+// Zadrži najbolju kvotu po (market, selection); ako je trustedOnly, već smo filtrirali
 function coalesce(picks) {
   const out = [];
   const map = new Map();
@@ -336,6 +374,23 @@ function coalesce(picks) {
   }
   map.forEach((v) => out.push(v));
   return out;
+}
+
+// Izaberi najbolji kandidat za jedan fixture (ONE-PICK-PER-FIXTURE)
+function pickBestForFixture(arr) {
+  if (!arr || !arr.length) return null;
+  // skor: (trusted ? +1 : 0) * 1000 + confidenceFromPrice + (price * 0.01)
+  let best = null;
+  let bestScore = -1e9;
+  for (const p of arr) {
+    const conf = confidenceFromPrice(p.price);
+    const score = (p.trusted ? 1000 : 0) + conf + (Number(p.price) * 0.01);
+    if (score > bestScore) {
+      bestScore = score;
+      best = p;
+    }
+  }
+  return best;
 }
 
 /* =================== MAP TO UI =================== */
@@ -398,4 +453,24 @@ function ymdInTZ(d = new Date(), tz = TZ) {
 }
 function normalizeYMD(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ymdInTZ(new Date(), TZ);
-                    }
+}
+
+/* =================== UTILS =================== */
+
+function clampInt(v, defVal, min, max) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return defVal;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+function safeRegex(src) {
+  try {
+    if (!src) return null;
+    return new RegExp(src, "i");
+  } catch {
+    return null;
+  }
+}
+function numOrNull(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+                                  }
