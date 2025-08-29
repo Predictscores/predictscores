@@ -1,149 +1,94 @@
 // pages/api/value-bets-locked.js
-// READ/WRITE "locked" feed (vbl:<YMD>:<slot>) from KV / Upstash.
-// - GET:  /api/value-bets-locked?slot=am|pm|late  -> { ok, ymd, slot, items, source }
-// - Internal setter: _internalSetLocked(key, arr)
+// Combined vs Football bez menjanja fronta:
+// - Default (Combined): vrati TOP 3 iz vbl:<YMD>:<slot>
+// - Football (preko Referer koji sadrži "/football") ili ?full=1: vrati FULL 15 iz vbl_full:<YMD>:<slot>
 
 export const config = { api: { bodyParser: false } };
 
-// Timezone & storage
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-
-// Primary storage (what apply-learning/history already use)
 const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
-
-// Optional dual-write/read to Upstash
 const UP_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
 export default async function handler(req, res) {
   try {
-    const slot = String(req.query?.slot || "am").toLowerCase();
-    if (!["am", "pm", "late"].includes(slot)) {
-      return res.status(200).json({ ok: false, error: "invalid slot" });
+    const slot = normalizeSlot(String(req.query?.slot || "pm"));
+    const ymd  = normalizeYMD(String(req.query?.ymd || "") || ymdInTZ(new Date(), TZ));
+
+    // Minimalna detekcija taba:
+    const wantFullByQuery = String(req.query?.full || "") === "1";
+    const ref = String(req.headers?.referer || "");
+    const wantFullByRef = /\/football(\b|\/|$)/i.test(ref);
+    const wantFull = wantFullByQuery || wantFullByRef;
+
+    const keyTop3 = `vbl:${ymd}:${slot}`;
+    const keyFull = `vbl_full:${ymd}:${slot}`;
+
+    const [rawTop3, rawFull] = await Promise.all([kvGet(keyTop3), kvGet(keyFull)]);
+    const top3 = ensureArray(rawTop3);
+    const full = ensureArray(rawFull);
+
+    let items, source;
+    if (wantFull && full.length) {
+      items = full.slice(0, 15);
+      source = `vbl_full:${ymd}:${slot}`;
+    } else if (top3.length) {
+      items = top3.slice(0, 3);
+      source = `vbl:${ymd}:${slot}`;
+    } else if (wantFull && !full.length && top3.length) {
+      items = top3.slice(0, 3);
+      source = `fallback->vbl:${ymd}:${slot}`;
+    } else {
+      items = [];
+      source = "miss";
     }
 
-    const ymd = normalizeYMD(String(req.query?.ymd || "") || ymdInTZ(new Date(), TZ));
-    const key = `vbl:${ymd}:${slot}`;
-
-    const raw = await kvGet(key);
-    const items = ensureArray(raw);
-
-    return res.status(200).json({
-      ok: true,
-      ymd,
-      slot,
-      items,
-      source: items.length ? "hit" : "miss",
-    });
+    return res.status(200).json({ ok: true, ymd, slot, items, source });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
 }
 
-/* ============ Internal setter for rebuild ============ */
-export async function _internalSetLocked(key, arr) {
-  const value = Array.isArray(arr) ? arr : [];
-  // Write to KV (primary)
-  if (KV_URL && KV_TOKEN) {
-    await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${KV_TOKEN}`,
-        "content-type": "application/json",
-      },
-      // store top-level array as JSON string (no { value: [...] } wrapper)
-      body: JSON.stringify({ value: JSON.stringify(value) }),
-    }).catch(() => {});
-  }
-  // Dual-write to Upstash (optional)
-  if (UP_URL && UP_TOKEN) {
-    await fetch(`${UP_URL}/set/${encodeURIComponent(key)}`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${UP_TOKEN}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ value: JSON.stringify(value) }),
-    }).catch(() => {});
-  }
-  return true;
-}
-
-/* ================= Helpers ================= */
-
+/* ===== Helpers ===== */
 function ymdInTZ(d = new Date(), tz = TZ) {
-  const s = d.toLocaleString("en-CA", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
+  const s = d.toLocaleString("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
   return (s.split(",")[0] || s).trim();
 }
-function normalizeYMD(s) {
-  // Expect YYYY-MM-DD; fallback to today in TZ if malformed
-  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ymdInTZ(new Date(), TZ);
-}
+function normalizeYMD(s) { return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ymdInTZ(new Date(), TZ); }
+function normalizeSlot(s) { const x = String(s || "").toLowerCase(); return ["am","pm","late"].includes(x) ? x : "pm"; }
 
 function ensureArray(v) {
   try {
     if (v == null) return [];
     if (Array.isArray(v)) return v;
-
-    if (typeof v === "string") {
-      const maybe = v.trim();
-      if (!maybe) return [];
-      const parsed = JSON.parse(maybe);
-      return ensureArray(parsed);
-    }
+    if (typeof v === "string") return ensureArray(JSON.parse(v));
     if (typeof v === "object") {
-      // Common bad-writes in DB
       if (Array.isArray(v.value)) return v.value;
-      if (Array.isArray(v.value_bets)) return v.value_bets;
-      if (Array.isArray(v.arr)) return v.arr;
       if (Array.isArray(v.data)) return v.data;
       if (typeof v.value === "string") {
-        try {
-          const p = JSON.parse(v.value);
-          if (Array.isArray(p)) return p;
-        } catch {}
+        try { const p = JSON.parse(v.value); if (Array.isArray(p)) return p; } catch {}
       }
-      return [];
     }
     return [];
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
-// FIXED: try KV first; if result is NULL, DO NOT return yet — try Upstash fallback.
 async function kvGet(key) {
-  // 1) KV_REST_* (primary)
   if (KV_URL && KV_TOKEN) {
     try {
       const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
-        headers: { Authorization: `Bearer ${KV_TOKEN}` },
-        cache: "no-store",
+        headers: { Authorization: `Bearer ${KV_TOKEN}` }, cache: "no-store",
       });
-      if (r.ok) {
-        const j = await r.json().catch(() => null);
-        if (j && j.result != null) return j.result; // only return when there is a value
-        // else: fall through to Upstash
-      }
+      if (r.ok) { const j = await r.json().catch(() => null); return j?.result ?? null; }
     } catch {}
   }
-  // 2) Upstash fallback
   if (UP_URL && UP_TOKEN) {
     try {
       const r = await fetch(`${UP_URL}/get/${encodeURIComponent(key)}`, {
-        headers: { Authorization: `Bearer ${UP_TOKEN}` },
-        cache: "no-store",
+        headers: { Authorization: `Bearer ${UP_TOKEN}` }, cache: "no-store",
       });
-      if (r.ok) {
-        const j = await r.json().catch(() => null);
-        if (j && j.result != null) return j.result;
-      }
+      if (r.ok) { const j = await r.json().catch(() => null); return j?.result ?? null; }
     } catch {}
   }
   return null;
