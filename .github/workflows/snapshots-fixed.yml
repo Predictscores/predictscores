@@ -15,16 +15,19 @@ on:
         required: false
         default: 'auto'
 
-# Koristimo apsolutni URL. Ako BASE_URL secret ne postoji, koristimo fallback.
 env:
   BASE: ${{ secrets.BASE_URL }}
   FALLBACK_BASE: https://predictscores.vercel.app
+
+concurrency:
+  group: snapshots
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve BASE and SLOT
+      - name: Resolve BASE, SLOT and YMD (Europe/Belgrade)
         id: ctx
         run: |
           set -euo pipefail
@@ -41,27 +44,48 @@ jobs:
               "0 8 * * *")  SLOT="am"  ;;
               "0 13 * * *") SLOT="pm"  ;;
               "0 22 * * *") SLOT="late";;
-              *)            SLOT="am"  ;; # default pri ručnom pokretanju bez izbora
+              *)            SLOT="am"  ;;
             esac
           fi
           echo "slot=$SLOT" >> $GITHUB_OUTPUT
-          echo "Resolved: BASE=$BASE, SLOT=$SLOT"
 
-      - name: Rebuild (${{ steps.ctx.outputs.slot }} slot)
+          YMD=$(TZ=Europe/Belgrade date +%F)
+          echo "ymd=$YMD" >> $GITHUB_OUTPUT
+          echo "Resolved: BASE=$BASE, SLOT=$SLOT, YMD=$YMD"
+
+      - name: Refresh odds for slot (FIRST)
         run: |
           set -euo pipefail
-          echo "CALL: ${{ steps.ctx.outputs.base }}/api/cron/rebuild?slot=${{ steps.ctx.outputs.slot }}"
-          curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/rebuild?slot=${{ steps.ctx.outputs.slot }}"
+          curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/refresh-odds?slot=${{ steps.ctx.outputs.slot }}&ymd=${{ steps.ctx.outputs.ymd }}"
 
-      - name: Refresh odds (window)
+      - name: Sanity check value-bets before rebuild (retry)
         run: |
           set -euo pipefail
-          curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/refresh-odds"
+          B="${{ steps.ctx.outputs.base }}"
+          S="${{ steps.ctx.outputs.slot }}"
+          D="${{ steps.ctx.outputs.ymd }}"
+          tries=5
+          delay=6
+          for i in $(seq 1 $tries); do
+            RESP=$(curl -fsS "$B/api/value-bets?slot=$S&ymd=$D&limit=1")
+            echo "$RESP"
+            if ! echo "$RESP" | grep -q '"value_bets":\[\]'; then
+              echo "Non-empty feed, proceed."
+              exit 0
+            fi
+            echo "Empty feed, retry in ${delay}s..."
+            sleep $delay
+          done
+          echo "Still empty feed; proceeding anyway."
+
+      - name: Rebuild locked feed for slot
+        run: |
+          set -euo pipefail
+          curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/rebuild?slot=${{ steps.ctx.outputs.slot }}&ymd=${{ steps.ctx.outputs.ymd }}"
 
       - name: Insights build
         run: |
           set -euo pipefail
-          # PRAVILAN endpoint (bez /cron)
           curl -fsS "${{ steps.ctx.outputs.base }}/api/insights-build"
 
       - name: Apply learning (writes :last)
