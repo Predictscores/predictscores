@@ -1,174 +1,248 @@
 // pages/api/cron/refresh-odds.js
-// STRICT BATCH (bez fallbacka) + PAGINACIJA za /v3/odds.
-// - Fixtures -> API_FOOTBALL_KEY
-// - Odds batch -> API_FOOTBALL_KEY (isti host/provajder)
-// - Trusted bookies uz kanonizaciju imena (lowercase + ukloni sve osim [a-z0-9])
-// - Paginacija: dohvat svih strana iz /odds?date=...&page=N (sa cap-om)
-// - Keš: odds:fixture:<YMD>:<fixtureId> = { match_winner:{home,draw,away}, best, fav }
+// Cilj: upisati REALNE (named) 1X2 kvote po bukmejkerima u KV/Upstash.
+// Pokušaj 1: API-Football v3 /odds?fixture=<id>
+// Fallback: agregatni sažetak (ako baš nema named kvota).
+//
+// Ključevi koje pišemo (top-level JSON string):
+//   odds:<YMD>:<fixtureId>
+//   odds:fixture:<YMD>:<fixtureId>
+//   (radi kompatibilnosti i sa starijim reader-ima)
+//
+// Posle ovoga /api/value-bets će AUTOMATSKI preferirati named/trusted kvote,
+// pa će confidence i cene izgledati normalno (nema plafona 68/85 za sve).
 
 export const config = { api: { bodyParser: false } };
 
-const TZ   = process.env.TZ_DISPLAY || "Europe/Belgrade";
-const BASE = process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io";
+const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
-const FIX_KEY  = process.env.API_FOOTBALL_KEY || process.env.API_FOOTBALL;
-// KLJUČNO: odds batch ide sa API_FOOTBALL_KEY (ne sa ODDS_API_KEY)
-const ODDS_KEY = process.env.API_FOOTBALL_KEY || process.env.API_FOOTBALL;
+// API-Football
+const AF_BASE =
+  (process.env.API_FOOTBALL_BASE_URL || "").trim() ||
+  "https://v3.football.api-sports.io";
+const AF_KEY =
+  (process.env.API_FOOTBALL_KEY || process.env.API_FOOTBALL || "").trim();
 
-// storage
+// KV / Upstash
 const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const UP_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-// paging cap (da se ne pretera sa pozivima; možeš povisiti ako treba)
-const MAX_ODDS_PAGES = Number(process.env.ODDS_BATCH_MAX_PAGES || 50);
+// Budžeti / limiti
+const PER_FIXTURE_TIMEOUT_MS = clampInt(process.env.ODDS_PER_FIXTURE_TIMEOUT_MS, 4000, 1000, 15000);
+const ODDS_PER_FIXTURE_CAP   = clampInt(process.env.ODDS_PER_FIXTURE_CAP, 1, 1, 5); // koliko puta pokušavamo odds endpoint za jedan fixture
+const ODDS_BATCH_MAX_PAGES   = clampInt(process.env.ODDS_BATCH_MAX_PAGES, 25, 1, 200);
 
-// trusted lista (kanonizacija)
-const canon = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "").trim();
-const TRUSTED_LIST = String(process.env.TRUSTED_BOOKIES || process.env.TRUSTED_BOOKMAKERS || "")
-  .split(",").map(canon).filter(Boolean);
-
-// 1X2 market detekcija
-const ONE_X_TWO = /match\s*winner|^1x2$|^winner$/i;
-
+// Slot granice (Europe/Belgrade): late 00–09:59, am 10–14:59, pm 15–23:59
 export default async function handler(req, res) {
   try {
-    const slot = String(req.query?.slot || "am").toLowerCase();
-    if (!["am","pm","late"].includes(slot)) return res.status(200).json({ ok:false, error:"invalid slot" });
-    if (!FIX_KEY)  return res.status(200).json({ ok:false, error:"API_FOOTBALL_KEY missing" });
+    const slot = normalizeSlot(String(req.query?.slot || "pm"));
+    const ymd  = normalizeYMD(String(req.query?.ymd || "") || ymdInTZ(new Date(), TZ));
 
-    const ymd = ymdInTZ(new Date(), TZ);
+    // 1) fixtures za dan
+    const fixtures = await fetchFixturesAF(ymd, TZ);
+    const windowFixtures = fixtures.filter((fx) => inSlotWindow(getKOISO(fx), TZ, slot));
+    const pages = Math.min(Math.ceil(windowFixtures.length / 50), ODDS_BATCH_MAX_PAGES);
 
-    // fixtures (informativno)
-    const fj = await jfetch(`${BASE}/fixtures?date=${ymd}&timezone=${encodeURIComponent(TZ)}`, FIX_KEY);
-    const fixtures = Array.isArray(fj?.response) ? fj.response : [];
+    let namedWritten = 0;
+    let aggWritten = 0;
+    let processed = 0;
 
-    // BATCH ODDS — PAGINACIJA
-    const { rows, pages } = await fetchOddsPaged(ymd, TZ, ODDS_KEY);
+    for (let p = 0; p < pages; p++) {
+      const chunk = windowFixtures.slice(p * 50, (p + 1) * 50);
 
-    let cached = 0;
-    const seen = new Set();
+      for (const fx of chunk) {
+        const fid = getFID(fx);
+        if (!fid) continue;
 
-    for (const row of rows) {
-      const fid = row?.fixture?.id;
-      if (!fid || seen.has(fid)) continue;
-      const odds = pick1x2(row);
-      if (odds) {
-        await saveOdds(ymd, fid, odds);
-        cached++;
+        // 2) probaj da dobiješ NAMED kvote od API-Football
+        let named = null;
+        for (let attempt = 0; attempt < ODDS_PER_FIXTURE_CAP; attempt++) {
+          named = await fetchAFOddsForFixture(fid, PER_FIXTURE_TIMEOUT_MS);
+          if (named && Array.isArray(named.bookmakers) && named.bookmakers.length) break;
+        }
+
+        if (named && Array.isArray(named.bookmakers) && named.bookmakers.length) {
+          // 2a) upiši RAW API-Football odds objekt (bookmakers/bets/values)
+          await kvSetOdds(ymd, fid, named);
+          namedWritten++;
+        } else {
+          // 3) fallback — agregat 1X2 ako nema named
+          const agg = makeAggregateFromFixture(fx); // sažetak (bez bukija)
+          await kvSetOdds(ymd, fid, agg);
+          aggWritten++;
+        }
+        processed++;
       }
-      seen.add(fid);
     }
 
     return res.status(200).json({
       ok: true,
       ymd,
       slot,
-      fixtures: fixtures.length,
-      batch_pages: pages.total,
-      batch_items: rows.length,
-      odds_cached: cached,
-      source: "batch:API_FOOTBALL_KEY(paged)"
+      fixtures: windowFixtures.length,
+      batch_pages: pages,
+      batch_items: processed,
+      odds_cached: namedWritten + aggWritten,
+      named_written: namedWritten,
+      aggregate_written: aggWritten,
+      source: namedWritten ? "API_FOOTBALL_ODDS(named)" : "aggregate-fallback",
     });
   } catch (e) {
-    return res.status(200).json({ ok:false, error:String(e?.message || e) });
+    return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
 }
 
-/* ---------------- helpers ---------------- */
+/* ================= API-Football helpers ================= */
 
-async function jfetch(url, key){
-  const r = await fetch(url, { headers: { "x-apisports-key": key, "cache-control":"no-store" } });
-  const ct = (r.headers.get("content-type") || "").toLowerCase();
-  if (!ct.includes("application/json")) throw new Error(`Bad content-type for ${url}`);
-  const j = await r.json();
-  // Ako API signalizira grešku, vrati prazno umesto bacanja izuzetka.
-  if (j && typeof j === "object" && j.errors && Object.keys(j.errors).length) {
-    return { response: [], paging: { current: 1, total: 1 } };
+async function fetchFixturesAF(ymd, tz) {
+  try {
+    const url = `${AF_BASE.replace(/\/+$/, "")}/fixtures?date=${encodeURIComponent(ymd)}&timezone=${encodeURIComponent(tz)}`;
+    const r = await fetch(url, {
+      headers: { "x-apisports-key": AF_KEY, accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!r.ok) return [];
+    const j = await r.json().catch(() => ({}));
+    const arr = Array.isArray(j?.response) ? j.response : Array.isArray(j) ? j : [];
+    return arr.map(normalizeAF);
+  } catch {
+    return [];
   }
-  return j;
 }
 
-// Paginated fetch za /odds?date=YYYY-MM-DD&timezone=...&page=N
-async function fetchOddsPaged(ymd, tz, key){
-  let current = 1, total = 1, pages = 0;
-  const all = [];
-  while (current <= total && pages < MAX_ODDS_PAGES) {
-    const url = `${BASE}/odds?date=${ymd}&timezone=${encodeURIComponent(tz)}&page=${current}`;
-    const j = await jfetch(url, key);
-    const resp = Array.isArray(j?.response) ? j.response : [];
-    const pg   = j?.paging && typeof j.paging === "object" ? j.paging : { current, total: 1 };
-    total   = Number(pg.total || 1);
-    current = Number(pg.current || current) + 1;
-    pages++;
-    if (resp.length) all.push(...resp);
-    // ako API nekad vrati duplikate strana ili ne povecava current, prekini da ne uđe u petlju
-    if (pages >= MAX_ODDS_PAGES) break;
+// Pokušaj da dobiješ odds po fixture-u (named)
+async function fetchAFOddsForFixture(fid, timeoutMs) {
+  try {
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs || 4000) : null;
+
+    const url = `${AF_BASE.replace(/\/+$/, "")}/odds?fixture=${encodeURIComponent(fid)}`;
+    const r = await fetch(url, {
+      headers: { "x-apisports-key": AF_KEY, accept: "application/json" },
+      signal: ctrl ? ctrl.signal : undefined,
+      cache: "no-store",
+    }).catch(() => null);
+
+    if (timer) clearTimeout(timer);
+    if (!r || !r.ok) return null;
+
+    const j = await r.json().catch(() => null);
+    // očekivano: { response: [ { bookmakers: [ { name, bets:[{ name, values:[{ value, odd }] }] } ] } ] }
+    const first = Array.isArray(j?.response) && j.response.length ? j.response[0] : null;
+    if (!first || !Array.isArray(first.bookmakers) || !first.bookmakers.length) return null;
+    return first;
+  } catch {
+    return null;
   }
-  return { rows: all, pages: { total: Math.min(total, MAX_ODDS_PAGES), fetched: pages } };
 }
 
-function pick1x2(row){
-  const books = Array.isArray(row?.bookmakers) ? row.bookmakers : [];
-  if (!books.length) return null;
+/* ================= Storage ================= */
 
-  // strogo: uzimamo samo trusted (ako je lista prazna, tretira se kao „bilo koji“)
-  return scanBooks(books, true);
-}
+async function kvSetOdds(ymd, fixtureId, obj) {
+  const payload = JSON.stringify(obj);
+  const keys = [
+    `odds:${ymd}:${fixtureId}`,
+    `odds:fixture:${ymd}:${fixtureId}`, // kompatibilnost
+  ];
 
-function scanBooks(books, onlyTrusted){
-  let home=null, draw=null, away=null, hits=0;
-
-  for (const bk of books) {
-    const nameCanon = canon(bk?.name);
-    if (onlyTrusted && TRUSTED_LIST.length && !TRUSTED_LIST.includes(nameCanon)) continue;
-
-    const bets = Array.isArray(bk?.bets) ? bk.bets : [];
-    for (const bet of bets) {
-      const nm = String(bet?.name || "");
-      if (!ONE_X_TWO.test(nm)) continue;
-
-      const vals = Array.isArray(bet?.values) ? bet.values : [];
-      let got=false;
-
-      for (const v of vals) {
-        const lbl = String(v?.value || v?.label || "").toLowerCase();
-        const odd = Number(v?.odd);
-        if (!Number.isFinite(odd)) continue;
-
-        if (/(^|\b)(home|1)(\b|$)/.test(lbl)) { home = Math.max(home ?? 0, odd); got=true; }
-        else if (/(^|\b)(draw|x)(\b|$)/.test(lbl)) { draw = Math.max(draw ?? 0, odd); got=true; }
-        else if (/(^|\b)(away|2)(\b|$)/.test(lbl)) { away = Math.max(away ?? 0, odd); got=true; }
+  // KV primary
+  if (KV_URL && KV_TOKEN) {
+    for (const key of keys) {
+      try {
+        const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${KV_TOKEN}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ value: payload }),
+        });
+        if (!r.ok) throw new Error("KV set failed");
+      } catch {
+        // probaj sledeći key / fallback
       }
-      if (got) hits++;
     }
   }
 
-  const best = Math.max(home||0, draw||0, away||0) || null;
-  const fav  = best == null ? null : (best === home ? "HOME" : best === draw ? "DRAW" : "AWAY");
-  return best == null ? null : { match_winner:{home,draw,away}, best, fav, hits };
+  // Upstash fallback
+  if (UP_URL && UP_TOKEN) {
+    for (const key of keys) {
+      try {
+        const r = await fetch(`${UP_URL}/set/${encodeURIComponent(key)}`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${UP_TOKEN}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ value: payload }),
+        });
+        if (!r.ok) throw new Error("Upstash set failed");
+      } catch {
+        // ignore
+      }
+    }
+  }
 }
 
-function ymdInTZ(d=new Date(), tz=TZ){
-  const s = d.toLocaleString("en-CA",{ timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
+/* ================= Normalization & misc ================= */
+
+function makeAggregateFromFixture(fx) {
+  // Ovo ostavlja minimalan sažetak, koji /api/value-bets zna da pročita kao MW_SUMMARY
+  return {
+    match_winner: {
+      home: null,
+      draw: null,
+      away: null,
+    },
+    // možeš dodatno popuniti iz drugih izvora ako želiš
+  };
+}
+
+function normalizeAF(x) {
+  const fx = x?.fixture || {};
+  const lg = x?.league || {};
+  const tm = x?.teams || {};
+  return {
+    fixture: {
+      id: fx.id ?? x?.id ?? null,
+      date: fx.date ?? x?.date ?? null,
+    },
+    league: {
+      id: lg.id ?? null,
+      name: lg.name ?? "",
+      country: lg.country ?? "",
+    },
+    teams: {
+      home: { name: tm?.home?.name ?? x?.home?.name ?? x?.home ?? "" },
+      away: { name: tm?.away?.name ?? x?.away?.name ?? x?.away ?? "" },
+    },
+  };
+}
+
+function getFID(fx) { return fx?.fixture?.id ?? fx?.id ?? null; }
+function getKOISO(fx) {
+  const raw = fx?.fixture?.date || fx?.datetime_local?.starting_at?.date_time || fx?.datetime_local?.date_time || fx?.kickoff || null;
+  if (!raw) return null;
+  return String(raw).includes("T") ? String(raw) : String(raw).replace(" ", "T");
+}
+
+function inSlotWindow(iso, tz, slot) {
+  if (!iso) return false;
+  const d = new Date(iso);
+  const h = Number(new Intl.DateTimeFormat("en-GB", { hour: "2-digit", hour12: false, timeZone: tz }).format(d));
+  if (slot === "late") return h < 10;
+  if (slot === "am") return h >= 10 && h < 15;
+  return h >= 15 && h <= 23;
+}
+
+function ymdInTZ(d = new Date(), tz = TZ) {
+  const s = d.toLocaleString("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
   return (s.split(",")[0] || s).trim();
 }
-
-async function saveOdds(ymd, fid, odds){
-  const key = `odds:fixture:${ymd}:${fid}`;
-  if (KV_URL && KV_TOKEN) {
-    await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
-      method:"POST",
-      headers:{ Authorization:`Bearer ${KV_TOKEN}`, "content-type":"application/json" },
-      body: JSON.stringify({ value: JSON.stringify(odds) })
-    }).catch(()=>{});
-  }
-  if (UP_URL && UP_TOKEN) {
-    await fetch(`${UP_URL}/set/${encodeURIComponent(key)}`, {
-      method:"POST",
-      headers:{ Authorization:`Bearer ${UP_TOKEN}`, "content-type":"application/json" },
-      body: JSON.stringify({ value: JSON.stringify(odds) })
-    }).catch(()=>{});
-  }
+function normalizeYMD(s) { return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ymdInTZ(new Date(), TZ); }
+function clampInt(v, defVal, min, max) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return defVal;
+  return Math.max(min, Math.min(max, Math.floor(n)));
 }
