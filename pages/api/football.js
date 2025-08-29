@@ -1,6 +1,6 @@
 // pages/api/football.js
-// Vraća finalni niz za Football tab (TAČNO 15), bez U/W/Reserves/Youth/PL2/itd,
-// i BEZ agregatnih kvota (force no_aggregate=1). Combined uzima top 3 iz ovoga.
+// Vraća finalni niz za Football tab (TAČNO 15), sa ban-om U/W/Youth/Reserves/PL2 itd.
+// Combined uzima top 3 iz ovoga. NEMA no_aggregate=1 u pozivu ka /api/value-bets.
 
 export const config = { api: { bodyParser: false } };
 
@@ -20,11 +20,10 @@ export default async function handler(req, res) {
     const maxPerLeague  = encodeURIComponent(clampInt(process.env.VB_MAX_PER_LEAGUE, 2, 1, 10));
     const markets       = encodeURIComponent("1X2,Match Winner");
 
-    // Fiksno: 15 kom, force no_aggregate=1
+    // Fiksno: 15 kom za Football; BEZ no_aggregate=1
     const url = `${baseUrl(req)}/api/value-bets?slot=${slot}&ymd=${ymd}`
               + `&limit=15&max_per_league=${maxPerLeague}`
-              + `&trusted=${trusted}&ban=${ban}&markets=${markets}`
-              + `&no_aggregate=1`;
+              + `&trusted=${trusted}&ban=${ban}&markets=${markets}`;
 
     const r = await fetch(url, { cache: "no-store" });
     if (!r.ok) {
