@@ -1,184 +1,194 @@
-// FILE: pages/api/cron/apply-learning.js
-// Ne diramo learning logiku (pretpostavlja se da je već nameštena van ovog fajla).
-// Ovaj job čita slot picks, sortira/boostuje (ako postoje weights) i:
-// 1) upisuje u :last (što koristi Combined/Football UI),
-// 2) upisuje u HISTORY tačno Top 3 iz Combined po slotu,
-// 3) održava indeks poslednjih 14 dana.
+// pages/api/cron/apply-learning.js
+// Svrha: osiguraj da "learning/history" ZAUVEK imaju ulaz.
+// Ako nema vb:day:<YMD>:<slot>, fallback na vbl:<YMD>:<slot> i upiši ga u vb:day:<YMD>:<slot>.
+// (Ostatak learning pipeline-a u projektu može da koristi vb:day kao izvor.)
+// Podržava poziv bez parametara (danas, sva tri slota) ili ?ymd=YYYY-MM-DD&slot=am|pm|late ili ?days=N.
 
 export const config = { api: { bodyParser: false } };
 
+const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const KV_URL   = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
-const TZ       = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const UP_URL   = process.env.UPSTASH_REDIS_REST_URL;
+const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-// History uključivanje preko ENV (ostavi kako već koristiš)
-const FEATURE_HISTORY = process.env.FEATURE_HISTORY === "1";
+export default async function handler(req, res) {
+  try {
+    const qDays = toInt(req.query?.days, 0);
+    const qYMD = normalizeYMD(String(req.query?.ymd || "") || ymdInTZ(new Date(), TZ));
+    const qSlot = normalizeSlot(String(req.query?.slot || "") || "");
 
-// VAŽNO: po default-u čuvamo baš ono što je u Combined → Top 3
-// (možeš promeniti ENV-om ako zatreba: npr. HISTORY_STORE_TOP_N=5)
-const HIST_TOP_N = Number(process.env.HISTORY_STORE_TOP_N || 3);
+    let totalWritten = 0;
+    let processed = [];
 
-/* ---------- KV helpers ---------- */
-async function kvGet(key) {
-  if (!KV_URL || !KV_TOKEN) return null;
-  const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${KV_TOKEN}` },
-  });
-  if (!r.ok) return null;
-  const j = await r.json().catch(() => null);
-  return j?.result ?? null;
-}
-async function kvSet(key, val) {
-  if (!KV_URL || !KV_TOKEN) return;
-  await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${KV_TOKEN}`, "content-type":"application/json" },
-    body: JSON.stringify({ value: val }),
-  }).catch(()=>{});
-}
-async function kvDel(key) {
-  if (!KV_URL || !KV_TOKEN) return;
-  await fetch(`${KV_URL}/del/${encodeURIComponent(key)}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${KV_TOKEN}` },
-  }).catch(()=>{});
+    if (qDays && qDays > 0) {
+      // Obradi poslednjih N dana (uključujući danas)
+      for (let d = 0; d < qDays; d++) {
+        const ymd = ymdMinusDays(qYMD, d);
+        const slots = qSlot ? [qSlot] : ["am", "pm", "late"];
+        for (const slot of slots) {
+          const wrote = await ensureDaySlot(ymd, slot);
+          processed.push({ ymd, slot, wrote });
+          if (wrote) totalWritten++;
+        }
+      }
+      return res.status(200).json({ ok: true, days: qDays, count_written: totalWritten, processed });
+    }
+
+    // Jedan dan (qYMD), jedan ili sva tri slota
+    const slots = qSlot ? [qSlot] : ["am", "pm", "late"];
+    for (const slot of slots) {
+      const wrote = await ensureDaySlot(qYMD, slot);
+      processed.push({ ymd: qYMD, slot, wrote });
+      if (wrote) totalWritten++;
+    }
+
+    return res.status(200).json({ ok: true, ymd: qYMD, count_written: totalWritten, processed });
+  } catch (e) {
+    return res.status(200).json({ ok: false, error: String(e?.message || e) });
+  }
 }
 
-/* ---------- time helpers ---------- */
-function str(x){ return (typeof x === "string" ? x : x==null ? "" : String(x)); }
-function ymdInTZ(d = new Date(), tz = TZ) {
-  const s = d.toLocaleString("en-CA", { timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
-  return (s.split(",")[0] || s);
-}
-function hhInTZ(d = new Date(), tz = TZ){
-  const s = d.toLocaleString("en-GB", { timeZone: tz, hour:"2-digit", minute:"2-digit", hour12:false });
-  const [h] = String(s).split(":");
-  return Number(h);
-}
-function toTZParts(iso, tz = TZ){
-  const dt = new Date(String(iso||"").replace(" ","T"));
-  const y = ymdInTZ(dt, tz);
-  const h = hhInTZ(dt, tz);
-  return { ymd: y, hour: h };
-}
-function inSlotWindow(pick, ymd, slot){
-  const iso = pick?.datetime_local?.starting_at?.date_time
-           || pick?.datetime_local?.date_time
-           || pick?.time?.starting_at?.date_time
-           || pick?.kickoff
-           || null;
-  if (!iso) return false;
-  const tz = toTZParts(iso, TZ);
-  if (tz.ymd !== ymd) return false;
-  if (slot === "am")   return tz.hour >= 10 && tz.hour < 15;
-  if (slot === "pm")   return tz.hour >= 15 && tz.hour < 24;
-  if (slot === "late") return tz.hour >= 0  && tz.hour < 10;
+/* ================= helpers ================= */
+
+async function ensureDaySlot(ymd, slot) {
+  // 1) postoji li vb:day:<ymd>:<slot> ?
+  let day = await kvGet(`vb:day:${ymd}:${slot}`);
+  let arr = ensureArray(day);
+  if (arr.length) return false; // već postoji — ništa ne radi
+
+  // 2) fallback na vbl:<ymd>:<slot>
+  const vbl = await kvGet(`vbl:${ymd}:${slot}`);
+  const items = ensureArray(vbl);
+  if (!items.length) return false; // ni locked nema — nema šta da upišemo
+
+  // 3) upiši u vb:day:<ymd>:<slot> (kao JSON string top-level niza)
+  await kvSet(`vb:day:${ymd}:${slot}`, JSON.stringify(items));
+
+  // 4) opcionalno zapamti "last" markere
+  await kvSet(`vb:last:${slot}`, JSON.stringify({ ymd, slot, count: items.length, at: new Date().toISOString() }));
+
   return true;
 }
 
-/* ---------- learning weights primena (ostavljeno netaknuto) ---------- */
-function applyWeights(items, weights) {
-  if (!Array.isArray(items)) return [];
-  if (!weights) return items;
-  return items.map((p) => {
-    let adj = 0;
-    const mk = p?.market_label || p?.market || "";
-    if (weights?.markets && typeof weights.markets[mk] === "number") adj += weights.markets[mk];
-    if (typeof weights?.global === "number") adj += weights.global;
-    const base = p?.confidence_pct ?? p?.confidence ?? 0;
-    const conf = Math.max(0, Math.min(100, base + adj));
-    return { ...p, confidence_pct: conf };
-  });
-}
+function ensureArray(v) {
+  try {
+    if (v == null) return [];
+    if (Array.isArray(v)) return v;
 
-/* ---------- HISTORY: zapis sa ispravnim teams objektom ---------- */
-function toHistoryRecord(slot, pick){
-  const homeName = str(pick?.teams?.home?.name) || str(pick?.home) || str(pick?.home_name);
-  const awayName = str(pick?.teams?.away?.name) || str(pick?.away) || str(pick?.away_name);
-  return {
-    fixture_id: pick?.fixture_id ?? pick?.id ?? null,
-    teams: {
-      home: { id: pick?.teams?.home?.id ?? pick?.home_id ?? null, name: homeName || null },
-      away: { id: pick?.teams?.away?.id ?? pick?.away_id ?? null, name: awayName || null },
-    },
-    // dodatni fallback da UI i stari zapisi rade
-    home_name: homeName || null,
-    away_name: awayName || null,
-    league: {
-      id: pick?.league?.id ?? null,
-      name: pick?.league?.name ?? pick?.league_name ?? null,
-      country: pick?.league?.country ?? pick?.country ?? null
-    },
-    kickoff: String(pick?.datetime_local?.starting_at?.date_time || pick?.kickoff || "").replace(" ","T"),
-    slot: String(slot || "").toUpperCase(),
-    market: pick?.market || pick?.market_label || null,
-    selection: pick?.selection || null,
-    odds: Number(pick?.market_odds) || Number(pick?.odds) || null,
-    locked_at: new Date().toISOString(),
-
-    // ostavi mesta da postojeći cron-ovi za settle upišu ishod
-    final_score: pick?.final_score ?? null,
-    won: pick?.won ?? null,
-    settled_at: pick?.settled_at ?? null,
-  };
-}
-
-export default async function handler(req, res){
-  try{
-    const now  = new Date();
-    const ymd  = ymdInTZ(now);
-    const hour = hhInTZ(now);
-    const slot = hour < 10 ? "late" : hour < 15 ? "am" : "pm";
-
-    // ČITAMO kandidovane predloge za aktivni slot (seed koji već koristiš u projektu)
-    const slotKey = `vb:day:${ymd}:${slot}`;
-    const rawItems = (await kvGet(slotKey)) || [];
-
-    // filtriraj u slot prozor (sigurnosno)
-    const slotItems = Array.isArray(rawItems) ? rawItems.filter(p => inSlotWindow(p, ymd, slot)) : [];
-
-    // Learning weights (NE menjamo ih; samo primenjujemo ako postoje)
-    const weights = await kvGet(`vb:learn:weights`);
-
-    // Boost + sort by confidence
-    const boosted = applyWeights(slotItems, weights)
-      .slice()
-      .sort((a,b) => (Number(b?.confidence_pct || 0) - Number(a?.confidence_pct || 0)));
-
-    // PIŠI :last + :last_meta (ovo koristi Combined/Football UI)
-    await kvSet(`vb:day:${ymd}:last`, boosted);
-    await kvSet(`vb:meta:${ymd}:last_meta`, {
-      ymd, slot, built_at: new Date().toISOString(), count: boosted.length, source: `slot:${slot}`,
-    });
-
-    // HISTORY: tačno ono što vidiš u Combined → Top 3 po slotu (kroz HIST_TOP_N)
-    if (FEATURE_HISTORY) {
-      const N = Number.isFinite(HIST_TOP_N) ? HIST_TOP_N : 3;
-      const toStore = boosted.slice(0, Math.max(0, N)).map(p => toHistoryRecord(slot, p));
-
-      const histKey = `hist:${ymd}:${slot}`;
-      await kvSet(histKey, toStore);
-
-      // indeks poslednjih 14 dana
-      const idxKey = `hist:index`;
-      let days = await kvGet(idxKey);
-      try { days = Array.isArray(days) ? days : JSON.parse(days); } catch {}
-      if (!Array.isArray(days)) days = [];
-      if (!days.includes(ymd)) days.push(ymd);
-      days.sort().reverse();
-      const keep = days.slice(0, 14);
-      await kvSet(idxKey, keep);
-
-      // trim viškove dana
-      for (const d of days.slice(14)) {
-        await kvDel(`hist:${d}:am`);
-        await kvDel(`hist:${d}:pm`);
-        await kvDel(`hist:${d}:late`);
-      }
+    if (typeof v === "string") {
+      const s = v.trim();
+      if (!s) return [];
+      const parsed = JSON.parse(s);
+      return ensureArray(parsed);
     }
-
-    res.status(200).json({ ok:true, ymd, slot, count: boosted.length });
-  } catch (e) {
-    res.status(200).json({ ok:false, error:String(e?.message||e) });
+    if (typeof v === "object") {
+      if (Array.isArray(v.value)) return v.value;
+      if (Array.isArray(v.arr)) return v.arr;
+      if (Array.isArray(v.data)) return v.data;
+      if (typeof v.value === "string") {
+        try {
+          const p = JSON.parse(v.value);
+          if (Array.isArray(p)) return p;
+        } catch {}
+      }
+      return [];
+    }
+    return [];
+  } catch {
+    return [];
   }
+}
+
+async function kvGet(key) {
+  // try KV first
+  if (KV_URL && KV_TOKEN) {
+    try {
+      const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
+        headers: { Authorization: `Bearer ${KV_TOKEN}` },
+        cache: "no-store",
+      });
+      if (r.ok) {
+        const j = await r.json().catch(() => null);
+        if (j && j.result != null) return j.result;
+      }
+    } catch {}
+  }
+  // fallback Upstash
+  if (UP_URL && UP_TOKEN) {
+    try {
+      const r = await fetch(`${UP_URL}/get/${encodeURIComponent(key)}`, {
+        headers: { Authorization: `Bearer ${UP_TOKEN}` },
+        cache: "no-store",
+      });
+      if (r.ok) {
+        const j = await r.json().catch(() => null);
+        if (j && j.result != null) return j.result;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+async function kvSet(key, valueJSON) {
+  // KV primary
+  if (KV_URL && KV_TOKEN) {
+    try {
+      const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${KV_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ value: valueJSON }),
+      });
+      if (r.ok) return true;
+    } catch {}
+  }
+  // Upstash fallback
+  if (UP_URL && UP_TOKEN) {
+    try {
+      const r = await fetch(`${UP_URL}/set/${encodeURIComponent(key)}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${UP_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ value: valueJSON }),
+      });
+      if (r.ok) return true;
+    } catch {}
+  }
+  return false;
+}
+
+function ymdInTZ(d = new Date(), tz = TZ) {
+  const s = d.toLocaleString("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  return (s.split(",")[0] || s).trim();
+}
+function normalizeYMD(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ymdInTZ(new Date(), TZ);
+}
+function ymdMinusDays(ymd, daysBack) {
+  try {
+    const [Y, M, D] = ymd.split("-").map((n) => parseInt(n, 10));
+    const d = new Date(Date.UTC(Y, (M - 1), D));
+    d.setUTCDate(d.getUTCDate() - daysBack);
+    return ymdInTZ(d, TZ);
+  } catch {
+    return ymd;
+  }
+}
+function normalizeSlot(s) {
+  const x = String(s || "").toLowerCase();
+  return ["am", "pm", "late"].includes(x) ? x : "";
+}
+function toInt(v, def = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.floor(n) : def;
 }
