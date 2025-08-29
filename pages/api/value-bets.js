@@ -1,6 +1,7 @@
 // pages/api/value-bets.js
-// Filtrirani value-bets (ban lige, one-per-fixture, cap po ligi, limit).
-// Agregatne kvote ("best" bez bukija) imaju niži confidence plafon, da ne bude 85% svuda.
+// Filtrirani value-bets (ban lige i TIMOVA, one-per-fixture, cap po ligi, limit).
+// Podržava "trusted-only"; po difoltu dozvoljava aggregate fallback samo ako nema named/trusted,
+// ali možeš da GA UGASIŠ parametrom ?no_aggregate=1 (npr. za Football tab).
 
 export const config = { api: { bodyParser: false } };
 
@@ -29,26 +30,28 @@ const VB_MAX_PER_LEAGUE = clampInt(process.env.VB_MAX_PER_LEAGUE, 2, 1, 10);
 // Dozvoljeni marketi
 const ALLOWED_MARKETS_DEFAULT = "1X2,Match Winner";
 
-// Širi default ban regex
-const BAN_LEAGUES_RE = safeRegex(
-  process.env.BAN_LEAGUES || "(Women|Womens|U1[0-9]|U2[0-9]|U-?1[0-9]|U-?2[0-9]|Reserve|Reserves|B Team|B-Team|Youth|Academy|Friendly|Friendlies|Club Friendly|Test|Trial)"
-);
+// Širi default ban regex (liga, država, TIMOVI)
+const BAN_DEFAULT =
+  "(Women|Womens|Girls|Fem|U1[0-9]|U2[0-9]|U-?1[0-9]|U-?2[0-9]|Under-?\\d+|Reserve|Reserves|B Team|B-Team|II|Youth|Academy|Development|Premier League 2|PL2|Friendly|Friendlies|Club Friendly|Test|Trial)";
+
+const BAN_LEAGUES_RE = safeRegex(process.env.BAN_LEAGUES || BAN_DEFAULT);
 
 /* =================== HANDLER =================== */
 export default async function handler(req, res) {
   try {
     const slot = normalizeSlot(String(req.query?.slot || "pm"));
-    const ymd = normalizeYMD(String(req.query?.ymd || "") || ymdInTZ(new Date(), TZ));
+    const ymd  = normalizeYMD(String(req.query?.ymd  || "") || ymdInTZ(new Date(), TZ));
 
     // Query overrides
-    const qpMin = req.query?.min_odds ? Number(req.query.min_odds) : null;
-    const qpTrusted = req.query?.trusted != null ? String(req.query.trusted) : null;
-    const qpMk = req.query?.markets ? String(req.query.markets) : null;
-    const qpLimit = req.query?.limit ? clampInt(req.query.limit, VB_LIMIT, 1, 50) : VB_LIMIT;
+    const qpMin          = req.query?.min_odds ? Number(req.query.min_odds) : null;
+    const qpTrusted      = req.query?.trusted != null ? String(req.query.trusted) : null;
+    const qpMk           = req.query?.markets ? String(req.query.markets) : null;
+    const qpLimit        = req.query?.limit ? clampInt(req.query.limit, VB_LIMIT, 1, 50) : VB_LIMIT;
     const qpMaxPerLeague = req.query?.max_per_league ? clampInt(req.query.max_per_league, VB_MAX_PER_LEAGUE, 1, 10) : VB_MAX_PER_LEAGUE;
-    const qpBan = req.query?.ban ? safeRegex(String(req.query.ban)) : BAN_LEAGUES_RE;
+    const qpBan          = req.query?.ban ? safeRegex(String(req.query.ban)) : BAN_LEAGUES_RE;
+    const noAggregate    = String(req.query?.no_aggregate || "0") === "1";
 
-    const minOdds = Number.isFinite(qpMin) ? qpMin : MIN_ODDS;
+    const minOdds     = Number.isFinite(qpMin) ? qpMin : MIN_ODDS;
     const trustedOnly = qpTrusted === "1" ? true : qpTrusted === "0" ? false : TRUSTED_ONLY;
     const marketsUpper = (qpMk ? qpMk : ALLOWED_MARKETS_DEFAULT)
       .split(",")
@@ -58,12 +61,19 @@ export default async function handler(req, res) {
     const fixtures = await fetchFixturesAF(ymd, TZ);
     let slotFixtures = fixtures.filter((fx) => inSlotWindow(getKOISO(fx), TZ, slot));
 
-    // 1a) BAN liga/country
+    // 1a) BAN po ligi, državi I TIMOVIMA (home/away)
     if (qpBan) {
       slotFixtures = slotFixtures.filter((fx) => {
-        const name = (fx?.league?.name || "").toString();
-        const country = (fx?.league?.country || "").toString();
-        return !(qpBan.test(name) || qpBan.test(country));
+        const league   = (fx?.league?.name || "").toString();
+        const country  = (fx?.league?.country || "").toString();
+        const homeName = (fx?.teams?.home?.name || "").toString();
+        const awayName = (fx?.teams?.away?.name || "").toString();
+        // ako regex pogodi bilo šta od ovoga — BAN
+        if (qpBan.test(league))   return false;
+        if (qpBan.test(country))  return false;
+        if (qpBan.test(homeName)) return false;
+        if (qpBan.test(awayName)) return false;
+        return true;
       });
     }
 
@@ -81,14 +91,23 @@ export default async function handler(req, res) {
       const oddsObj = parseOddsValue(raw);
       if (!oddsObj) continue;
 
-      // 3) Kandidati iz kvota
+      // 3) kandidati
       const candAll = extractPicks(oddsObj, marketsUpper);
 
-      // trusted-only logika: prefer named/trusted; ako nema – dozvoli aggregate fallback
+      // trusted-only logika:
+      //  - prvo uzmi named/trusted
+      //  - ako ih nema: ako je noAggregate=0, dozvoli aggregate fallback; ako je 1, ostavi prazno
       let cand = candAll;
       if (trustedOnly) {
         const namedTrusted = candAll.filter((p) => p.trusted && p.bookmaker && p.bookmaker !== "aggregate");
-        cand = namedTrusted.length ? namedTrusted : candAll.filter((p) => p.bookmaker === "aggregate" && p.trusted);
+        if (namedTrusted.length) {
+          cand = namedTrusted;
+        } else {
+          cand = noAggregate ? [] : candAll.filter((p) => p.bookmaker === "aggregate" && p.trusted);
+        }
+      } else if (noAggregate) {
+        // čak i u non-trusted režimu možeš isključiti aggregate
+        cand = candAll.filter((p) => p.bookmaker && p.bookmaker !== "aggregate");
       }
 
       // 4) min od
@@ -163,8 +182,8 @@ function normalizeAF(x) {
   const tm = x?.teams || {};
   return {
     fixture: { id: fx.id ?? x?.id ?? null, date: fx.date ?? x?.date ?? null },
-    league: { id: lg.id ?? null, name: lg.name ?? "", country: lg.country ?? "" },
-    teams: {
+    league:  { id: lg.id ?? null, name: lg.name ?? "", country: lg.country ?? "" },
+    teams:   {
       home: { name: tm?.home?.name ?? x?.home?.name ?? x?.home ?? "" },
       away: { name: tm?.away?.name ?? x?.away?.name ?? x?.away ?? "" },
     },
@@ -209,9 +228,9 @@ function parseOddsValue(v) {
     if (v == null) return null;
     if (typeof v === "string") return parseOddsValue(JSON.parse(v));
     if (typeof v !== "object") return null;
-    if (v.value != null) return parseOddsValue(v.value);
-    if (v.odds  != null) return parseOddsValue(v.odds);
-    if (v.data  != null) return parseOddsValue(v.data);
+    if (v.value   != null) return parseOddsValue(v.value);
+    if (v.odds    != null) return parseOddsValue(v.odds);
+    if (v.data    != null) return parseOddsValue(v.data);
     if (v.payload != null) return parseOddsValue(v.payload);
     if (v.match_winner && typeof v.match_winner === "object") {
       const mw = v.match_winner || {};
@@ -299,7 +318,7 @@ function pickBestForFixture(arr) {
   let best = null, bestScore = -1e9;
   for (const p of arr) {
     const conf = confidenceFromPrice(p.price, p.bookmaker === "aggregate");
-    const namedTrusted = p.trusted && p.bookmaker && p.bookmaker !== "aggregate";
+    const namedTrusted     = p.trusted && p.bookmaker && p.bookmaker !== "aggregate";
     const aggregateTrusted = p.trusted && p.bookmaker === "aggregate";
     const score = (namedTrusted ? 2000 : aggregateTrusted ? 1000 : 0) + conf + (Number(p.price) * 0.01);
     if (score > bestScore) { bestScore = score; best = p; }
@@ -311,7 +330,7 @@ function pickBestForFixture(arr) {
 function confidenceFromPrice(price, isAggregate = false) {
   const p = Number(price || 0);
   if (!Number.isFinite(p) || p <= 1.0) return 50;
-  const cap = isAggregate ? 68 : 85;        // agregatne kvote plafon ~68
+  const cap = isAggregate ? 68 : 85; // agregatne kvote plafon ~68
   const base = 50 + Math.min(cap - 50, (p - 1.30) * 18);
   return Math.round(Math.max(50, Math.min(cap, base)));
 }
