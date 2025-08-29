@@ -11,11 +11,17 @@ export default function CombinedBets({ slot = "pm" }) {
     setErr(null);
     try {
       // Combined = TOP 3 iz locked feed-a (bez &full=1)
-      const res = await fetch(`/api/value-bets-locked?slot=${encodeURIComponent(slot)}`, {
-        cache: "no-store",
-      });
+      const url = `/api/value-bets-locked?slot=${encodeURIComponent(slot)}`;
+      const res = await fetch(url, { cache: "no-store" });
       const j = await res.json();
-      const arr = Array.isArray(j?.items) ? j.items.slice(0, 3) : [];
+
+      // BEZBEDNO: prihvati bilo koji od ova 3 oblika iz backend-a
+      const arr =
+        (Array.isArray(j?.items) ? j.items :
+        Array.isArray(j?.football) ? j.football :
+        Array.isArray(j?.value_bets) ? j.value_bets : [])
+        .slice(0, 3);
+
       setItems(arr);
     } catch (e) {
       console.error("CombinedBets fetch error:", e);
@@ -30,9 +36,7 @@ export default function CombinedBets({ slot = "pm" }) {
     load();
   }, [load]);
 
-  if (loading) {
-    return <div>Učitavam kombinovane predloge…</div>;
-  }
+  if (loading) return <div>Učitavam kombinovane predloge…</div>;
 
   if (err) {
     return (
@@ -61,26 +65,24 @@ export default function CombinedBets({ slot = "pm" }) {
       {items.map((item, idx) => (
         <div key={idx} className="card p-4 rounded-xl">
           <div className="text-sm opacity-80 mb-1">
-            {item.league?.name} · {item?.datetime_local?.date_time || item?.kickoff}
+            {item?.league?.name} · {item?.datetime_local?.date_time || item?.kickoff}
           </div>
           <div className="text-xl font-semibold mb-2">
-            {item.teams?.home?.name} <span className="opacity-70">vs</span>{" "}
-            {item.teams?.away?.name}
+            {item?.teams?.home?.name} <span className="opacity-70">vs</span>{" "}
+            {item?.teams?.away?.name}
           </div>
           <div className="mb-1">
-            {item.market_label} → <b>{item.selection}</b>{" "}
+            {item?.market_label} → <b>{item?.selection}</b>{" "}
             <span className="opacity-80">
-              ({Number(item.odds).toFixed ? Number(item.odds).toFixed(2) : item.odds})
+              ({Number(item?.odds).toFixed ? Number(item?.odds).toFixed(2) : item?.odds})
             </span>
           </div>
           <div className="text-sm opacity-80 mb-2">
-            {Array.isArray(item.explain?.bullets)
-              ? item.explain.bullets.join(" · ")
-              : ""}
+            {Array.isArray(item?.explain?.bullets) ? item.explain.bullets.join(" · ") : ""}
           </div>
           <div className="text-sm">
             <span className="opacity-80">Confidence</span>{" "}
-            <b>{item.confidence_pct}%</b>
+            <b>{item?.confidence_pct}%</b>
           </div>
         </div>
       ))}
