@@ -1,67 +1,110 @@
 // pages/api/cron/closing-capture.js
-// Povlači mečeve oko KO i filtrira kvote po BAN/Trusted/normalize
+// Hvatamo "closing" consensus oko KO (±10 min) i snimamo u vb:close:<fixture_id>.
+// Pozivati na 5–10 min, ili iz noćnog joba sa days=1–2.
 
-const ROOT = "https://predictscores.vercel.app";
-const BAN_REGEX =
-  /(U-?\d{1,2}\b|\bU\d{1,2}\b|Under\s?\d{1,2}|Reserve|Reserves|B Team|B-Team|\bB$|\bII\b|Youth|Women|Girls|Development|Academy)/i;
+export const config = { runtime: "nodejs" };
 
-function parseTrusted() {
-  const list = (process.env.TRUSTED_BOOKIES || "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-  return new Set(list);
+const TZ = process.env.APP_TZ || "Europe/Belgrade";
+const AF_BASE = process.env.API_FOOTBALL_BASE || "https://v3.football.api-sports.io";
+const AF_KEY = process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.env.API_FOOTBALL_KEY;
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+const CLOSING_WINDOW_MIN = Number(process.env.CLOSING_WINDOW_MIN ?? 10);
+
+function ymdInTZ(d = new Date(), tz = TZ) {
+  const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
+  return fmt.format(d);
 }
-function toDecimal(x) {
-  if (x === null || x === undefined) return null;
-  let s = String(x).trim();
-  s = s.replace(",", ".").replace(/[^0-9.]/g, "");
-  if (!s) return null;
-  const n = parseFloat(s);
-  return Number.isFinite(n) ? n : null;
+function minsDiff(aISO, b = new Date()) {
+  if (!aISO) return 9999;
+  const t = new Date(aISO.replace(" ", "T") + (aISO.endsWith("Z") ? "" : "Z"));
+  return Math.round((t.getTime() - b.getTime()) / 60000);
 }
-function normalizeOdds(o) {
-  const n = toDecimal(o);
-  if (!Number.isFinite(n)) return null;
-  if (n < 1.5 || n > 20) return null; // MIN 1.50
-  return n;
+async function kvSet(key, value, ttlSec = 0) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  const body = new URLSearchParams();
+  body.set("value", typeof value === "string" ? value : JSON.stringify(value));
+  if (ttlSec > 0) body.set("ex", String(ttlSec));
+  const r = await fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}`, {
+    method: "POST", headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }, body,
+  });
+  return r.ok;
+}
+async function af(path, params = {}) {
+  const qs = new URLSearchParams(params);
+  const url = `${AF_BASE}${path}?${qs}`;
+  const r = await fetch(url, { headers: { "x-apisports-key": AF_KEY }, cache: "no-store" });
+  if (!r.ok) throw new Error(`AF ${path} ${r.status}`);
+  const j = await r.json();
+  if (j.errors && Object.keys(j.errors).length) throw new Error(`AF error: ${JSON.stringify(j.errors)}`);
+  return j;
+}
+function median(arr) {
+  if (!arr || arr.length === 0) return null;
+  const a = [...arr].sort((x,y)=>x-y);
+  const m = Math.floor(a.length/2);
+  return a.length % 2 ? a[m] : (a[m-1]+a[m])/2;
 }
 
-export default async function handler(_req, res) {
+export default async function handler(req, res) {
   try {
-    const trusted = parseTrusted();
+    const days = Math.max(1, Number(req.query.days ?? 1));
+    const out = [];
+    for (let i=0; i<days; i++) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const ymd = ymdInTZ(d);
 
-    const r = await fetch(`${ROOT}/api/football?hours=6`);
-    if (!r.ok) return res.status(502).json({ ok: false, error: `downstream ${r.status}` });
-    const data = await r.json();
+      // 1) Sve današnje fiksture
+      const fx = await af("/fixtures", { date: ymd });
+      const fixtures = (fx.response || []).map(r => ({
+        id: r.fixture?.id,
+        kickoff: r.fixture?.date?.replace("T", " ").slice(0,16) || null,
+        status: r.fixture?.status?.short || "",
+      })).filter(x => x.id);
 
-    let captured = 0;
-    for (const m of data.football || []) {
-      if (BAN_REGEX.test(m?.league?.name || "")) continue;
+      // 2) Za one u prozoru oko KO (±CLOSING_WINDOW_MIN), pokupi kvote i izračunaj consensus
+      const odds = await af("/odds", { date: ymd, page: 1 });
+      const totalPages = Number(odds?.paging?.total || 1);
+      const all = [];
+      for (let p=1; p<=totalPages; p++) {
+        const j = p===1 ? odds : await af("/odds", { date: ymd, page: p });
+        (j.response || []).forEach(o => all.push(o));
+      }
 
-      const books = (m.books_used || []).map((b) => String(b).toLowerCase());
-      if (books.length === 0) continue;
-      if (!books.every((b) => trusted.has(b))) continue;
+      for (const f of fixtures) {
+        const mdiff = Math.abs(minsDiff(f.kickoff));
+        if (mdiff > CLOSING_WINDOW_MIN) continue;
 
-      const dec =
-        normalizeOdds(m?.closing_odds_decimal) ??
-        normalizeOdds(m?.market_odds_decimal) ??
-        normalizeOdds(m?.market_odds) ??
-        normalizeOdds(m?.odds) ??
-        null;
-      if (!dec) continue;
+        const rel = all.filter(o => o.fixture?.id === f.id);
+        if (!rel.length) continue;
 
-      captured++;
-      // ovde bi išao upis closing_odds_decimal u KV/DB po tvojoj implementaciji
+        const prices = [];
+        for (const o of rel) {
+          const bkm = o?.bookmakers || [];
+          for (const b of bkm) {
+            const bets = b?.bets || [];
+            const win1x2 = bets.find(bb => (bb.name || "").toLowerCase().includes("match winner") || (bb.id === 1));
+            if (!win1x2) continue;
+            for (const v of (win1x2.values || [])) {
+              const pr = Number(v.odd);
+              if (Number.isFinite(pr) && pr > 1.01) prices.push(pr);
+            }
+          }
+        }
+        const consensusPrice = median(prices);
+        if (!consensusPrice) continue;
+
+        await kvSet(`vb:close:${f.id}`, {
+          ymd, fixture_id: f.id, price: consensusPrice, implied: 1/consensusPrice, kickoff: f.kickoff, status: f.status, ts: Date.now()
+        });
+        out.push(f.id);
+      }
     }
 
-    res.status(200).json({
-      ok: true,
-      inspected: Array.isArray(data.football) ? data.football.length : 0,
-      captured,
-      note: "closing odds window processed",
-    });
+    return res.status(200).json({ ok: true, captured: out.length, fixtures: out.slice(0,50) });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
 }
