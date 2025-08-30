@@ -3,9 +3,11 @@ export const config = { runtime: "nodejs" };
 
 const TZ = "Europe/Belgrade";
 const AF_BASE = "https://v3.football.api-sports.io";
-const AF_KEY = process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.env.API_FOOTBALL_KEY;
-const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const AF_KEY = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY;
+
+// Vercel KV
+const KV_URL = process.env.KV_REST_API_URL;
+const KV_TOKEN = process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN;
 
 const CLOSING_WINDOW_MIN = 10;
 
@@ -19,13 +21,13 @@ function minsDiff(aISO, b = new Date()) {
   return Math.round((t.getTime() - b.getTime()) / 60000);
 }
 async function kvSet(key, value) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  if (!KV_URL || !KV_TOKEN) return false;
   const body = new URLSearchParams();
   body.set("value", typeof value === "string" ? value : JSON.stringify(value));
-  const r = await fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}`, {
-    method: "POST", headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }, body,
-  });
-  return r.ok;
+  const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
+    method: "POST", headers: { Authorization: `Bearer ${KV_TOKEN}` }, body,
+  }).catch(() => null);
+  return !!(r && r.ok);
 }
 async function af(path, params = {}) {
   const qs = new URLSearchParams(params);
