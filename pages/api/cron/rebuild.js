@@ -1,170 +1,238 @@
 // pages/api/cron/rebuild.js
-// Zaključava feed bez promene fronta:
-// - vbl:<YMD>:<slot>      -> TOP 3 (za Combined tab)
-// - vbl_full:<YMD>:<slot> -> do 15 (Football/analitika/istorija)
-//
-// Raspodela po tier-ovima kroz ENV (regex + cap + bonus):
-//   TIER1_RE, TIER2_RE             (RegExp, "i" flag; Tier3 je ostalo)
-//   TIER1_CAP, TIER2_CAP, TIER3_CAP  (default 7/5/3 -> ukupno 15)
-//   TIER1_BONUS, TIER2_BONUS       (poeni na confidence pri sortiranju)
-// + VB_MAX_PER_LEAGUE (po defaultu 2) i ostali već važe u /api/value-bets.
-//
-// Napomena: očekuješ da /api/value-bets radi named-only (bez agregata).
+// Gradi listu fudbalskih kandidata iz API-Football predikcija i kvota.
+// - slot filtering (late/am/pm) po Europe/Belgrade
+// - /predictions?fixture=<id> i /odds?fixture=<id>
+// - konsenzus kvote (median) za 1X2; model_prob iz predikcija
+// - EV i bazni confidence
+// - dry=1 -> samo vrati; bez dry -> upiši u KV: vbl:YYYY-MM-DD:slot i vbl_full:YYYY-MM-DD:slot
 
-export const config = { api: { bodyParser: false } };
+export const config = { runtime: "nodejs" };
 
-const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const TZ = "Europe/Belgrade";
+const AF_BASE = "https://v3.football.api-sports.io";
+const AF_KEY = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY;
 
-// KV / Upstash
-const KV_URL   = process.env.KV_REST_API_URL;
-const KV_TOKEN = process.env.KV_REST_API_TOKEN;
-const UP_URL   = process.env.UPSTASH_REDIS_REST_URL;
-const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+// Vercel KV
+const KV_URL = process.env.KV_REST_API_URL;
+const KV_TOKEN_RO = process.env.KV_REST_API_READ_ONLY_TOKEN;
+const KV_TOKEN = process.env.KV_REST_API_TOKEN || KV_TOKEN_RO;
 
-// Tier ENV (regex & parametri)
-const TIER1_RE  = safeRegex(process.env.TIER1_RE || "(Premier League|La Liga|Serie A|Bundesliga|Ligue 1|Champions League|UEFA\\s*Champ)");
-const TIER2_RE  = safeRegex(process.env.TIER2_RE || "(Championship|Eredivisie|Primeira|Liga Portugal|Super Lig|Pro League|EFL|Eredivisie|Jupiter|Bundesliga 2|Serie B|LaLiga 2|Ligue 2|Eerste Divisie|S\\.?Liga)");
-const TIER1_CAP = intEnv(process.env.TIER1_CAP, 7, 0, 15);
-const TIER2_CAP = intEnv(process.env.TIER2_CAP, 5, 0, 15);
-const TIER3_CAP = intEnv(process.env.TIER3_CAP, 3, 0, 15);
-const TIER1_BONUS = numEnv(process.env.TIER1_BONUS, 10);
-const TIER2_BONUS = numEnv(process.env.TIER2_BONUS, 4);
+// --- helpers: KV ---
+async function kvGet(key) {
+  if (!KV_URL || (!KV_TOKEN && !KV_TOKEN_RO)) return null;
+  const token = KV_TOKEN_RO || KV_TOKEN;
+  const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${token}` }, cache: "no-store",
+  }).catch(() => null);
+  if (!r || !r.ok) return null;
+  const j = await r.json().catch(() => null);
+  if (!j || typeof j.result === "undefined") return null;
+  try { return JSON.parse(j.result); } catch { return j.result; }
+}
+async function kvSet(key, value) {
+  if (!KV_URL || !KV_TOKEN) return false;
+  const body = new URLSearchParams();
+  body.set("value", typeof value === "string" ? value : JSON.stringify(value));
+  const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
+    method: "POST", headers: { Authorization: `Bearer ${KV_TOKEN}` }, body,
+  }).catch(() => null);
+  return !!(r && r.ok);
+}
 
-// Defaults iz value-bets-a
-const VB_MAX_PER_LEAGUE = intEnv(process.env.VB_MAX_PER_LEAGUE, 2, 1, 10);
-const TRUSTED_ONLY = String(process.env.ODDS_TRUSTED_ONLY || "1") === "1";
-const BAN_DEFAULT =
-  "(Women|Womens|Girls|Fem|U1[0-9]|U2[0-9]|U-?1[0-9]|U-?2[0-9]|Under-?\\d+|Reserve|Reserves|B Team|B-Team|II|Youth|Academy|Development|Premier League 2|PL2|Friendly|Friendlies|Club Friendly|Test|Trial)";
+// --- helpers: time/slot ---
+function ymdInTZ(d = new Date(), tz = TZ) {
+  const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
+  return fmt.format(d);
+}
+function hourMinInTZ(isoUtc, tz = TZ) {
+  const d = new Date(isoUtc);
+  const p = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false
+  }).formatToParts(d);
+  const hh = Number(p.find(x => x.type === "hour").value);
+  const mm = Number(p.find(x => x.type === "minute").value);
+  return { hh, mm, str: `${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}` };
+}
+function inSlot(hh, mm, slot) {
+  const m = hh * 60 + mm;
+  if (slot === "late") return m >= 0 && m < 600;        // 00:00–09:59
+  if (slot === "am")   return m >= 600 && m < 900;      // 10:00–14:59
+  return m >= 900 && m < 1440;                          // 15:00–23:59
+}
+function autoSlot() {
+  const d = new Date();
+  const p = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false })
+    .formatToParts(d);
+  const hh = Number(p.find(x => x.type === "hour").value);
+  if (hh < 10) return "late";
+  if (hh < 15) return "am";
+  return "pm";
+}
 
+// --- helpers: AF ---
+async function af(path, params = {}) {
+  const qs = new URLSearchParams(params);
+  const url = `${AF_BASE}${path}?${qs}`;
+  const r = await fetch(url, { headers: { "x-apisports-key": AF_KEY }, cache: "no-store" });
+  if (!r.ok) throw new Error(`AF ${path} ${r.status}`);
+  const j = await r.json();
+  if (j.errors && Object.keys(j.errors).length) throw new Error(`AF error: ${JSON.stringify(j.errors)}`);
+  return j;
+}
+function median(arr) {
+  if (!arr || !arr.length) return null;
+  const a = [...arr].sort((x,y)=>x-y);
+  const m = Math.floor(a.length/2);
+  return a.length % 2 ? a[m] : (a[m-1]+a[m])/2;
+}
+function toNum(x) { const n = Number(x); return Number.isFinite(n) ? n : null; }
+function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+
+// --- EV helpers ---
+function probToFairOdds(p) { p = clamp(p, 1e-6, 0.999999); return 1/p; }
+function evPercent(modelProb, price) {
+  if (!modelProb || !price) return null;
+  return (probToFairOdds(modelProb) - price) / price; // e.g. 0.05 = +5%
+}
+
+// --- build one fixture (predictions + odds) ---
+async function buildForFixture(fx) {
+  const fixtureId = fx.fixture.id;
+  // 1) Predictions
+  const pred = await af("/predictions", { fixture: fixtureId }).catch(() => null);
+  if (!pred || !Array.isArray(pred.response) || pred.response.length === 0) return null;
+  const p = pred.response[0];
+
+  // Extract model probs for 1/X/2 from percent fields if available
+  // API-Football returns strings like "home": "45%", "draw":"25%", "away":"30%"
+  const perc = p?.predictions?.percent || p?.predictions || {};
+  const ph = toNum(String(perc.home || "").replace("%","")) || null;
+  const pd = toNum(String(perc.draw || "").replace("%","")) || null;
+  const pa = toNum(String(perc.away || "").replace("%","")) || null;
+
+  if (ph === null && pd === null && pa === null) return null;
+
+  // choose top outcome
+  const cand = [
+    { key: "1", prob: ph ? ph/100 : 0 },
+    { key: "X", prob: pd ? pd/100 : 0 },
+    { key: "2", prob: pa ? pa/100 : 0 },
+  ].sort((a,b)=>b.prob-a.prob)[0];
+  if (!cand || cand.prob <= 0) return null;
+
+  // 2) Odds for the fixture (1X2 consensus per selection)
+  const o = await af("/odds", { fixture: fixtureId }).catch(() => null);
+  if (!o || !Array.isArray(o.response) || o.response.length === 0) return null;
+
+  const prices = { "1": [], "X": [], "2": [] };
+  let booksCount = 0;
+  for (const row of o.response) {
+    const bkm = row?.bookmakers || [];
+    for (const b of bkm) {
+      const vals = (b?.bets || []).find(bb => (bb.name || "").toLowerCase().includes("match winner") || bb.id === 1)?.values || [];
+      if (vals.length) booksCount++;
+      for (const v of vals) {
+        const label = (v.value || v.label || "").trim().toUpperCase(); // "Home", "Draw", "Away" or "1/X/2"
+        const map = /home/i.test(label) ? "1" : /draw/i.test(label) ? "X" : /away/i.test(label) ? "2" :
+                    (["1","X","2"].includes(label) ? label : null);
+        const pr = toNum(v.odd);
+        if (map && pr && pr > 1.01) prices[map].push(pr);
+      }
+    }
+  }
+  const price = median(prices[cand.key]);
+  if (!price) return null;
+
+  const league = {
+    id: fx.league?.id,
+    name: fx.league?.name,
+    country: fx.league?.country
+  };
+  const teams = {
+    home: fx.teams?.home?.name,
+    away: fx.teams?.away?.name
+  };
+  const koUtc = fx.fixture?.date || null;
+  const { hh, mm, str } = hourMinInTZ(koUtc, TZ);
+
+  const modelProb = cand.prob; // 0..1
+  const ev = evPercent(modelProb, price);
+
+  // Bazni confidence: 55–85, grubo iz (modelProb vs implied)
+  const implied = 1 / price;
+  let conf = 55 + (modelProb - implied) * 100 * 1.2; // malo “oštrije”
+  conf = clamp(Math.round(conf), 50, 88);
+
+  return {
+    fixture_id: fixtureId,
+    market: "1X2",
+    pick: cand.key,                // "1" | "X" | "2"
+    model_prob: Number(modelProb.toFixed(4)),
+    confidence_pct: conf,
+    odds: { price: Number(price.toFixed(3)), books_count: booksCount },
+    league,
+    teams,
+    kickoff: `${ymdInTZ(new Date(koUtc))} ${str}`,
+    kickoff_utc: koUtc,
+    source_meta: { books_counts_raw: { "1": prices["1"].length, "X": prices["X"].length, "2": prices["2"].length } }
+  };
+}
+
+// --- main handler ---
 export default async function handler(req, res) {
   try {
-    const slot = normalizeSlot(String(req.query?.slot || "pm"));
-    const ymd  = normalizeYMD(String(req.query?.ymd  || "") || ymdInTZ(new Date(), TZ));
+    const qslot = String(req.query.slot || "").toLowerCase();
+    const slot = ["am","pm","late"].includes(qslot) ? qslot : autoSlot();
+    const dry = String(req.query.dry || "") === "1";
+    const ymd = ymdInTZ();
 
-    // Povuci NAMED-ONLY listu (širi limit da imamo prostora za tier raspodelu)
-    const ban          = encodeURIComponent(process.env.BAN_LEAGUES || BAN_DEFAULT);
-    const trusted      = encodeURIComponent(TRUSTED_ONLY ? "1" : "0");
-    const maxPerLeague = encodeURIComponent(VB_MAX_PER_LEAGUE);
-    const markets      = encodeURIComponent("1X2,Match Winner");
-
-    const url = `${baseUrl(req)}/api/value-bets?slot=${slot}&ymd=${ymd}`
-              + `&limit=60&max_per_league=${maxPerLeague}`
-              + `&trusted=${trusted}&ban=${ban}&markets=${markets}`;
-
-    const r = await fetch(url, { cache: "no-store" });
-    if (!r.ok) {
-      return res.status(200).json({ ok: false, slot, ymd, count: 0, football: [], source: "value-bets:error" });
-    }
-    const j = await r.json().catch(() => null);
-    const arr = Array.isArray(j?.value_bets) ? j.value_bets : [];
-
-    // Raspodela po tierovima + bonus pri sortiranju
-    const decorated = arr.map((t) => {
-      const tier = tierOf(t?.league?.name, t?.league?.country);
-      const baseConf = Number(t?.confidence_pct || 0);
-      const bonus = tier === 1 ? TIER1_BONUS : tier === 2 ? TIER2_BONUS : 0;
-      const score = baseConf + bonus;
-      return { ...t, __tier: tier, __score: score };
+    // 0) današnje fiksture
+    const fx = await af("/fixtures", { date: ymd });
+    const fixtures = (fx.response || []).filter(r => {
+      const t = hourMinInTZ(r.fixture?.date || "");
+      return inSlot(t.hh, t.mm, slot);
     });
 
-    // Sort: score desc, pa kickoff asc
-    decorated.sort((a, b) => {
-      const s = (b.__score || 0) - (a.__score || 0);
-      if (s !== 0) return s;
-      const ta = Date.parse(a?.kickoff || a?.datetime_local?.date_time || "") || 0;
-      const tb = Date.parse(b?.kickoff || b?.datetime_local?.date_time || "") || 0;
-      return ta - tb;
-    });
+    // 1) limit da ne potrošimo previše (realno dosta je 300 po slotu)
+    const MAX_FIXTURES = 300;
+    const todo = fixtures.slice(0, MAX_FIXTURES);
 
-    // Grupacija po tieru
-    const g1 = decorated.filter(x => x.__tier === 1);
-    const g2 = decorated.filter(x => x.__tier === 2);
-    const g3 = decorated.filter(x => x.__tier === 3);
-
-    // Primena cap-ova po tieru
-    const pick1 = g1.slice(0, TIER1_CAP);
-    const pick2 = g2.slice(0, TIER2_CAP);
-    const pick3 = g3.slice(0, TIER3_CAP);
-
-    let selected = [...pick1, ...pick2, ...pick3];
-    // Ako nemamo 15, popuni ostatak najboljima koji nisu ušli
-    if (selected.length < 15) {
-      const left = decorated.filter(x => !selected.includes(x));
-      selected = selected.concat(left.slice(0, 15 - selected.length));
+    // 2) paralelizacija sa ograničenjem (da ne “rokuje” API)
+    const CONC = 8;
+    const out = [];
+    for (let i = 0; i < todo.length; i += CONC) {
+      const batch = todo.slice(i, i + CONC);
+      const results = await Promise.all(batch.map(buildForFixture).map(p => p.catch(() => null)));
+      results.forEach(r => { if (r) out.push(r); });
     }
-    // Ako pređe 15 (npr. cap-ovi veći) — skrati
-    selected = selected.slice(0, 15);
 
-    const top3 = selected.slice(0, 3);
+    // 3) rangiraj po EV
+    out.sort((a,b) => (b._ev || evPercent(b.model_prob, b.odds?.price) || -1) - (a._ev || evPercent(a.model_prob, a.odds?.price) || -1));
 
-    // Upis u KV: vbl_full i vbl
-    const keyFull = `vbl_full:${ymd}:${slot}`;
-    const keyTop3 = `vbl:${ymd}:${slot}`;
-    await kvSetJSON(keyFull, selected);
-    await kvSetJSON(keyTop3, top3);
+    const full = out.slice(0, 50); // vbl_full (za Football tab)
+    const slim = out.slice(0, 15); // vbl (kraća lista)
+
+    const keys = {
+      vbl: `vbl:${ymd}:${slot}`,
+      vbl_full: `vbl_full:${ymd}:${slot}`
+    };
+
+    if (!dry) {
+      await kvSet(keys.vbl_full, full);
+      await kvSet(keys.vbl, slim);
+    }
 
     return res.status(200).json({
       ok: true,
-      slot,
-      ymd,
-      count: top3.length,
-      count_full: selected.length,
-      football: top3,
-      tier_buckets: { tier1: g1.length, tier2: g2.length, tier3: g3.length },
-      source: `rebuild->${j?.source || "value-bets(named-only)"}`,
-      keys: { vbl: keyTop3, vbl_full: keyFull },
+      slot, ymd,
+      count: slim.length,
+      count_full: full.length,
+      football: dry ? full : slim,        // u dry modu vrati “puniju” sliku da se lakše debuguje
+      tier_buckets: { tier1: 0, tier2: 0, tier3: 0 }, // (ostavljeno za kasnije)
+      source: `rebuild(api-football predictions+odds)·dry:${dry ? "1":"0"}`,
+      keys
     });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
 }
-
-/* ================= helpers ================= */
-
-function tierOf(leagueName = "", country = "") {
-  const L = String(leagueName || "");
-  const C = String(country || "");
-  if (TIER1_RE && (TIER1_RE.test(L) || TIER1_RE.test(C))) return 1;
-  if (TIER2_RE && (TIER2_RE.test(L) || TIER2_RE.test(C))) return 2;
-  return 3;
-}
-
-async function kvSetJSON(key, arr) {
-  const valueJSON = JSON.stringify(Array.isArray(arr) ? arr : []);
-  // primary KV
-  if (KV_URL && KV_TOKEN) {
-    try {
-      await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${KV_TOKEN}`, "content-type": "application/json" },
-        body: JSON.stringify({ value: valueJSON }),
-      });
-    } catch {}
-  }
-  // fallback Upstash
-  if (UP_URL && UP_TOKEN) {
-    try {
-      await fetch(`${UP_URL}/set/${encodeURIComponent(key)}`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${UP_TOKEN}`, "content-type": "application/json" },
-        body: JSON.stringify({ value: valueJSON }),
-      });
-    } catch {}
-  }
-  return true;
-}
-
-function baseUrl(req) {
-  const host = String(req.headers?.host || "").trim();
-  const proto = host.startsWith("localhost") ? "http" : "https";
-  return `${proto}://${host}`;
-}
-function normalizeSlot(s) { const x = String(s || "").toLowerCase(); return ["am","pm","late"].includes(x) ? x : "pm"; }
-function ymdInTZ(d = new Date(), tz = TZ) {
-  const s = d.toLocaleString("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
-  return (s.split(",")[0] || s).trim();
-}
-function normalizeYMD(s) { return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ymdInTZ(new Date(), TZ); }
-function intEnv(v, defVal, min, max) { const n = Number(v); if (!Number.isFinite(n)) return defVal; return Math.max(min, Math.min(max, Math.floor(n))); }
-function numEnv(v, defVal) { const n = Number(v); return Number.isFinite(n) ? n : defVal; }
-function safeRegex(src) { try { if (!src) return null; return new RegExp(src, "i"); } catch { return null; } }
