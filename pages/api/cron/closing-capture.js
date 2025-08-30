@@ -1,16 +1,13 @@
 // pages/api/cron/closing-capture.js
-// Hvatamo "closing" consensus oko KO (±10 min) i snimamo u vb:close:<fixture_id>.
-// Pozivati na 5–10 min, ili iz noćnog joba sa days=1–2.
-
 export const config = { runtime: "nodejs" };
 
-const TZ = process.env.APP_TZ || "Europe/Belgrade";
-const AF_BASE = process.env.API_FOOTBALL_BASE || "https://v3.football.api-sports.io";
+const TZ = "Europe/Belgrade";
+const AF_BASE = "https://v3.football.api-sports.io";
 const AF_KEY = process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.env.API_FOOTBALL_KEY;
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-const CLOSING_WINDOW_MIN = Number(process.env.CLOSING_WINDOW_MIN ?? 10);
+const CLOSING_WINDOW_MIN = 10;
 
 function ymdInTZ(d = new Date(), tz = TZ) {
   const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
@@ -21,11 +18,10 @@ function minsDiff(aISO, b = new Date()) {
   const t = new Date(aISO.replace(" ", "T") + (aISO.endsWith("Z") ? "" : "Z"));
   return Math.round((t.getTime() - b.getTime()) / 60000);
 }
-async function kvSet(key, value, ttlSec = 0) {
+async function kvSet(key, value) {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
   const body = new URLSearchParams();
   body.set("value", typeof value === "string" ? value : JSON.stringify(value));
-  if (ttlSec > 0) body.set("ex", String(ttlSec));
   const r = await fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}`, {
     method: "POST", headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }, body,
   });
@@ -50,13 +46,12 @@ function median(arr) {
 export default async function handler(req, res) {
   try {
     const days = Math.max(1, Number(req.query.days ?? 1));
-    const out = [];
+    const captured = [];
+
     for (let i=0; i<days; i++) {
-      const d = new Date();
-      d.setDate(d.getDate() - i);
+      const d = new Date(); d.setDate(d.getDate() - i);
       const ymd = ymdInTZ(d);
 
-      // 1) Sve današnje fiksture
       const fx = await af("/fixtures", { date: ymd });
       const fixtures = (fx.response || []).map(r => ({
         id: r.fixture?.id,
@@ -64,7 +59,6 @@ export default async function handler(req, res) {
         status: r.fixture?.status?.short || "",
       })).filter(x => x.id);
 
-      // 2) Za one u prozoru oko KO (±CLOSING_WINDOW_MIN), pokupi kvote i izračunaj consensus
       const odds = await af("/odds", { date: ymd, page: 1 });
       const totalPages = Number(odds?.paging?.total || 1);
       const all = [];
@@ -99,11 +93,11 @@ export default async function handler(req, res) {
         await kvSet(`vb:close:${f.id}`, {
           ymd, fixture_id: f.id, price: consensusPrice, implied: 1/consensusPrice, kickoff: f.kickoff, status: f.status, ts: Date.now()
         });
-        out.push(f.id);
+        captured.push(f.id);
       }
     }
 
-    return res.status(200).json({ ok: true, captured: out.length, fixtures: out.slice(0,50) });
+    return res.status(200).json({ ok: true, captured: captured.length, fixtures: captured.slice(0,50) });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
