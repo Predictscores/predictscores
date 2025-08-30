@@ -1,10 +1,11 @@
 // pages/api/cron/rebuild.js
-// Gradi listu fudbalskih kandidata iz API-Football predikcija i kvota.
-// - slot filtering (late/am/pm) po Europe/Belgrade
-// - /predictions?fixture=<id> i /odds?fixture=<id>
-// - konsenzus kvote (median) za 1X2; model_prob iz predikcija
+// Gradi listu fudbalskih kandidata iz API-Football predikcija + kvota.
+// - Slot filter (late/am/pm) po Europe/Belgrade
+// - /predictions?fixture=<id> + /odds?fixture=<id>
+// - Konsenzus (median) kvote za 1X2; model_prob iz predikcija
 // - EV i bazni confidence
-// - dry=1 -> samo vrati; bez dry -> upiši u KV: vbl:YYYY-MM-DD:slot i vbl_full:YYYY-MM-DD:slot
+// - Kad dry=1 -> samo vrati; kad nije -> upiši vbl/vbl_full + history ključeve u KV
+// - Default: isključi Women takmičenja (override sa ?includeWomen=1)
 
 export const config = { runtime: "nodejs" };
 
@@ -17,7 +18,7 @@ const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN_RO = process.env.KV_REST_API_READ_ONLY_TOKEN;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN || KV_TOKEN_RO;
 
-// --- helpers: KV ---
+// --- KV helpers ---
 async function kvGet(key) {
   if (!KV_URL || (!KV_TOKEN && !KV_TOKEN_RO)) return null;
   const token = KV_TOKEN_RO || KV_TOKEN;
@@ -39,7 +40,7 @@ async function kvSet(key, value) {
   return !!(r && r.ok);
 }
 
-// --- helpers: time/slot ---
+// --- time/slot ---
 function ymdInTZ(d = new Date(), tz = TZ) {
   const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
   return fmt.format(d);
@@ -61,15 +62,14 @@ function inSlot(hh, mm, slot) {
 }
 function autoSlot() {
   const d = new Date();
-  const p = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false })
-    .formatToParts(d);
+  const p = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false }).formatToParts(d);
   const hh = Number(p.find(x => x.type === "hour").value);
   if (hh < 10) return "late";
   if (hh < 15) return "am";
   return "pm";
 }
 
-// --- helpers: AF ---
+// --- API-Football helpers ---
 async function af(path, params = {}) {
   const qs = new URLSearchParams(params);
   const url = `${AF_BASE}${path}?${qs}`;
@@ -87,40 +87,41 @@ function median(arr) {
 }
 function toNum(x) { const n = Number(x); return Number.isFinite(n) ? n : null; }
 function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+function isWomenLeague(league) {
+  const name = (league?.name || "").toLowerCase();
+  const country = (league?.country || "").toLowerCase();
+  return /(women|femenin|feminine|femminile|feminino|frauen|女子|dames)/i.test(name)
+      || /(women|女子|femenin)/i.test(country);
+}
 
 // --- EV helpers ---
 function probToFairOdds(p) { p = clamp(p, 1e-6, 0.999999); return 1/p; }
-function evPercent(modelProb, price) {
-  if (!modelProb || !price) return null;
-  return (probToFairOdds(modelProb) - price) / price; // e.g. 0.05 = +5%
-}
+function evPercent(modelProb, price) { if (!modelProb || !price) return null; return (probToFairOdds(modelProb) - price) / price; }
 
-// --- build one fixture (predictions + odds) ---
+// --- build one fixture ---
+function labelForPick(k){ return k==="1"?"Home":k==="2"?"Away":"Draw"; }
+
 async function buildForFixture(fx) {
   const fixtureId = fx.fixture.id;
+
   // 1) Predictions
   const pred = await af("/predictions", { fixture: fixtureId }).catch(() => null);
   if (!pred || !Array.isArray(pred.response) || pred.response.length === 0) return null;
   const p = pred.response[0];
-
-  // Extract model probs for 1/X/2 from percent fields if available
-  // API-Football returns strings like "home": "45%", "draw":"25%", "away":"30%"
   const perc = p?.predictions?.percent || p?.predictions || {};
   const ph = toNum(String(perc.home || "").replace("%","")) || null;
   const pd = toNum(String(perc.draw || "").replace("%","")) || null;
   const pa = toNum(String(perc.away || "").replace("%","")) || null;
-
   if (ph === null && pd === null && pa === null) return null;
 
-  // choose top outcome
-  const cand = [
+  const top = [
     { key: "1", prob: ph ? ph/100 : 0 },
     { key: "X", prob: pd ? pd/100 : 0 },
     { key: "2", prob: pa ? pa/100 : 0 },
   ].sort((a,b)=>b.prob-a.prob)[0];
-  if (!cand || cand.prob <= 0) return null;
+  if (!top || top.prob <= 0) return null;
 
-  // 2) Odds for the fixture (1X2 consensus per selection)
+  // 2) Odds (1X2)
   const o = await af("/odds", { fixture: fixtureId }).catch(() => null);
   if (!o || !Array.isArray(o.response) || o.response.length === 0) return null;
 
@@ -132,7 +133,7 @@ async function buildForFixture(fx) {
       const vals = (b?.bets || []).find(bb => (bb.name || "").toLowerCase().includes("match winner") || bb.id === 1)?.values || [];
       if (vals.length) booksCount++;
       for (const v of vals) {
-        const label = (v.value || v.label || "").trim().toUpperCase(); // "Home", "Draw", "Away" or "1/X/2"
+        const label = (v.value || v.label || "").trim().toUpperCase();
         const map = /home/i.test(label) ? "1" : /draw/i.test(label) ? "X" : /away/i.test(label) ? "2" :
                     (["1","X","2"].includes(label) ? label : null);
         const pr = toNum(v.odd);
@@ -140,40 +141,40 @@ async function buildForFixture(fx) {
       }
     }
   }
-  const price = median(prices[cand.key]);
+  const price = median(prices[top.key]);
   if (!price) return null;
 
-  const league = {
-    id: fx.league?.id,
-    name: fx.league?.name,
-    country: fx.league?.country
-  };
-  const teams = {
-    home: fx.teams?.home?.name,
-    away: fx.teams?.away?.name
-  };
+  const league = { id: fx.league?.id, name: fx.league?.name, country: fx.league?.country };
+  const teams = { home: fx.teams?.home?.name, away: fx.teams?.away?.name };
   const koUtc = fx.fixture?.date || null;
-  const { hh, mm, str } = hourMinInTZ(koUtc, TZ);
+  const { str } = hourMinInTZ(koUtc, TZ);
 
-  const modelProb = cand.prob; // 0..1
+  const modelProb = top.prob;
+  const implied = 1 / price;
   const ev = evPercent(modelProb, price);
 
-  // Bazni confidence: 55–85, grubo iz (modelProb vs implied)
-  const implied = 1 / price;
-  let conf = 55 + (modelProb - implied) * 100 * 1.2; // malo “oštrije”
+  let conf = 55 + (modelProb - implied) * 100 * 1.2;
   conf = clamp(Math.round(conf), 50, 88);
 
+  // UI bridge polja:
   return {
     fixture_id: fixtureId,
     market: "1X2",
-    pick: cand.key,                // "1" | "X" | "2"
+    pick: top.key,                         // "1" | "X" | "2"
+    selection_label: labelForPick(top.key),// "Home"/"Draw"/"Away" → izbegava [object Object]
     model_prob: Number(modelProb.toFixed(4)),
     confidence_pct: conf,
     odds: { price: Number(price.toFixed(3)), books_count: booksCount },
     league,
+    league_name: league.name,
+    league_country: league.country,
     teams,
-    kickoff: `${ymdInTZ(new Date(koUtc))} ${str}`,
+    home: teams.home,                      // bridge za stari UI
+    away: teams.away,                      // bridge za stari UI
+    kickoff: `${ymdInTZ(new Date(koUtc))} ${str}`, // lokalno vreme
     kickoff_utc: koUtc,
+    _implied: Number(implied.toFixed(4)),
+    _ev: ev,
     source_meta: { books_counts_raw: { "1": prices["1"].length, "X": prices["X"].length, "2": prices["2"].length } }
   };
 }
@@ -184,42 +185,56 @@ export default async function handler(req, res) {
     const qslot = String(req.query.slot || "").toLowerCase();
     const slot = ["am","pm","late"].includes(qslot) ? qslot : autoSlot();
     const dry = String(req.query.dry || "") === "1";
+    const includeWomen = String(req.query.includeWomen || "0") === "1";
     const ymd = ymdInTZ();
 
-    // 0) današnje fiksture
+    // 0) fixtures for today
     const fx = await af("/fixtures", { date: ymd });
-    const fixtures = (fx.response || []).filter(r => {
-      const t = hourMinInTZ(r.fixture?.date || "");
-      return inSlot(t.hh, t.mm, slot);
+    let fixtures = (fx.response || []).filter(r => {
+      const { hh, mm } = hourMinInTZ(r.fixture?.date || "");
+      return inSlot(hh, mm, slot);
     });
 
-    // 1) limit da ne potrošimo previše (realno dosta je 300 po slotu)
+    // 1) filter out women competitions by default
+    if (!includeWomen) {
+      fixtures = fixtures.filter(r => !isWomenLeague(r.league));
+    }
+
     const MAX_FIXTURES = 300;
     const todo = fixtures.slice(0, MAX_FIXTURES);
 
-    // 2) paralelizacija sa ograničenjem (da ne “rokuje” API)
+    // 2) parallel with small concurrency
     const CONC = 8;
     const out = [];
     for (let i = 0; i < todo.length; i += CONC) {
       const batch = todo.slice(i, i + CONC);
-      const results = await Promise.all(batch.map(buildForFixture).map(p => p.catch(() => null)));
+      const results = await Promise.all(
+        batch.map(buildForFixture).map(p => p.catch(() => null))
+      );
       results.forEach(r => { if (r) out.push(r); });
     }
 
-    // 3) rangiraj po EV
-    out.sort((a,b) => (b._ev || evPercent(b.model_prob, b.odds?.price) || -1) - (a._ev || evPercent(a.model_prob, a.odds?.price) || -1));
+    // 3) sort by EV desc (calculate if missing cached _ev)
+    out.forEach(x => { if (typeof x._ev !== "number" && x.model_prob && x.odds?.price) x._ev = evPercent(x.model_prob, x.odds.price); });
+    out.sort((a,b) => (b._ev ?? -1) - (a._ev ?? -1));
 
-    const full = out.slice(0, 50); // vbl_full (za Football tab)
-    const slim = out.slice(0, 15); // vbl (kraća lista)
+    const full = out.slice(0, 50);
+    const slim = out.slice(0, 15);
 
-    const keys = {
-      vbl: `vbl:${ymd}:${slot}`,
-      vbl_full: `vbl_full:${ymd}:${slot}`
-    };
+    const keys = { vbl: `vbl:${ymd}:${slot}`, vbl_full: `vbl_full:${ymd}:${slot}` };
 
     if (!dry) {
       await kvSet(keys.vbl_full, full);
       await kvSet(keys.vbl, slim);
+
+      // --- History zapisi (po slotu + index) ---
+      await kvSet(`hist:${ymd}:${slot}`, full);
+      const idx = (await kvGet("hist:index")) || [];
+      const tag = `${ymd}:${slot}`;
+      if (!idx.includes(tag)) {
+        const next = [tag, ...idx].slice(0, 120); // čuvaj ~120 poslednjih zapisa
+        await kvSet("hist:index", next);
+      }
     }
 
     return res.status(200).json({
@@ -227,9 +242,8 @@ export default async function handler(req, res) {
       slot, ymd,
       count: slim.length,
       count_full: full.length,
-      football: dry ? full : slim,        // u dry modu vrati “puniju” sliku da se lakše debuguje
-      tier_buckets: { tier1: 0, tier2: 0, tier3: 0 }, // (ostavljeno za kasnije)
-      source: `rebuild(api-football predictions+odds)·dry:${dry ? "1":"0"}`,
+      football: dry ? full : slim,
+      source: `rebuild(api-football predictions+odds)·women:${includeWomen?"on":"off"}·dry:${dry?"1":"0"}`,
       keys
     });
   } catch (e) {
