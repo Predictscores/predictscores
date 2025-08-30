@@ -1,12 +1,7 @@
 // pages/api/value-bets.js
-// Čita bazu iz KV (vbl_full/vbl) ili radi fallback rebuild(dry) preko self-base.
-// Primena learning overlay/evmin. Dodaje bridge polja (home/away/selection_label) radi UI-a.
-
 export const config = { runtime: "nodejs" };
 
 const TZ = "Europe/Belgrade";
-
-// Vercel KV
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN_RO = process.env.KV_REST_API_READ_ONLY_TOKEN;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN || KV_TOKEN_RO;
@@ -32,7 +27,6 @@ async function kvSet(key, value, ttlSec = 0) {
   }).catch(() => null);
   return !!(r && r.ok);
 }
-
 function ymdInTZ(d = new Date(), tz = TZ) {
   const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
   return fmt.format(d);
@@ -48,7 +42,6 @@ function autoSlot(tz = TZ) {
   return "pm";
 }
 function safeNumber(x, d=0){ const n = Number(x); return Number.isFinite(n)?n:d; }
-function oddsBand(price){ if(!price||price<=0) return "b0"; if(price<=1.8) return "b18"; if(price<=2.6) return "b26"; if(price<=4.0) return "b40"; return "bXX"; }
 
 async function loadCalibration() {
   const calib = (await kvGet("vb:learn:calib:latest")) || {};
@@ -56,6 +49,7 @@ async function loadCalibration() {
   const evmin = (await kvGet("learn:evmin:v1")) || {};
   return { calib, overlay, evmin };
 }
+function labelForPick(k){ return k==="1"?"Home":k==="2"?"Away":k==="X"?"Draw":String(k||""); }
 
 export default async function handler(req, res) {
   try {
@@ -67,12 +61,10 @@ export default async function handler(req, res) {
     const host = req.headers.host;
     const SELF_BASE = `${proto}://${host}`;
 
-    // 1) baza iz KV (prefer vbl_full, pa vbl)
     let base =
       (await kvGet(`vbl_full:${ymd}:${slot}`)) ||
       (await kvGet(`vbl:${ymd}:${slot}`));
 
-    // fallback na rebuild(dry) ako nema
     const src = [];
     if (!Array.isArray(base)) {
       const r = await fetch(`${SELF_BASE}/api/cron/rebuild?slot=${slot}&dry=1`, { cache: "no-store" }).catch(() => null);
@@ -85,32 +77,25 @@ export default async function handler(req, res) {
 
     const { overlay, evmin } = await loadCalibration();
 
-    // decorate: apply learning and add bridge fields if missing
     const out = base.map(it => {
+      // pick normalizacija za UI:
+      const code = it.pick_code || (typeof it.pick === "string" && ["1","X","2"].includes(it.pick) ? it.pick : "");
+      const pickLabel = it.selection_label || (typeof it.pick === "string" && !["1","X","2"].includes(it.pick) ? it.pick : labelForPick(code));
       let conf = safeNumber(it?.confidence_pct ?? it?.confidence ?? 0);
-      const price = Number(it?.odds?.price || 0) || null;
-      const band = price ? oddsBand(price) : "b0";
-      const m2k = it?.kickoff ? 999 : 999; // (nije nam bitno ovde)
 
-      const market = (it?.market || it?.market_label || "UNK").toUpperCase();
-      const tier = "UNK";
-      const tko = "UNK";
-      const key = `${market}:${tier}:${band}:${tko}`;
-
-      if (typeof overlay[key] === "number") conf = Math.max(0, Math.min(100, conf + overlay[key]));
-
-      // bridge fields
-      const pick = typeof it.pick === "string" ? it.pick : (it.pick?.code || "");
-      const selection_label = it.selection_label || (pick==="1"?"Home":pick==="2"?"Away":pick==="X"?"Draw":String(pick||""));
+      // per-bucket overlay/evmin — jednostavno: ako postoji ključ “1X2:*”, primeni ga
+      const market = (it?.market || "UNK").toUpperCase();
+      const bucketKey = `${market}:*`;
+      if (typeof overlay[bucketKey] === "number") conf = Math.max(0, Math.min(100, conf + overlay[bucketKey]));
 
       return {
         ...it,
-        confidence_pct: conf,
+        pick: pickLabel,      // <<< string koji UI lepo prikaže
+        pick_code: code,      // originalni kod ako ti treba
         home: it.home || it?.teams?.home || "",
         away: it.away || it?.teams?.away || "",
         league_name: it.league_name || it?.league?.name || "",
         league_country: it.league_country || it?.league?.country || "",
-        selection_label
       };
     });
 
