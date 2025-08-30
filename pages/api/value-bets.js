@@ -3,35 +3,40 @@ export const config = { runtime: "nodejs" };
 
 const TZ = "Europe/Belgrade";
 
-// ---- Upstash Redis (REST) ----
-const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+// ---- Vercel KV (REST) ----
+const KV_URL = process.env.KV_REST_API_URL;                // REQUIRED
+const KV_TOKEN_RO = process.env.KV_REST_API_READ_ONLY_TOKEN; // optional (prefer for GET)
+const KV_TOKEN = process.env.KV_REST_API_TOKEN || KV_TOKEN_RO; // write or fallback read
 
 async function kvGet(key) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
-  const r = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }, cache: "no-store",
-  });
-  if (!r.ok) return null;
+  if (!KV_URL || !KV_TOKEN_RO && !KV_TOKEN) return null;
+  const token = KV_TOKEN_RO || KV_TOKEN;
+  const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+    cache: "no-store",
+  }).catch(() => null);
+  if (!r || !r.ok) return null;
   const j = await r.json().catch(() => null);
   if (!j || typeof j.result === "undefined") return null;
   try { return JSON.parse(j.result); } catch { return j.result; }
 }
 async function kvSet(key, value, ttlSec = 0) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  if (!KV_URL || !KV_TOKEN) return false;
   const body = new URLSearchParams();
   body.set("value", typeof value === "string" ? value : JSON.stringify(value));
   if (ttlSec > 0) body.set("ex", String(ttlSec));
-  const r = await fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}`, {
-    method: "POST", headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }, body,
-  });
-  return r.ok;
+  const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${KV_TOKEN}` },
+    body,
+  }).catch(() => null);
+  return !!(r && r.ok);
 }
 
 // ---- helpers ----
 function ymdInTZ(d = new Date(), tz = TZ) {
   const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
-  return fmt.format(d); // YYYY-MM-DD
+  return fmt.format(d);
 }
 function hourInTZ(d = new Date(), tz = TZ) {
   const fmt = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", hour12: false });
@@ -86,7 +91,7 @@ function evPercent(modelProb, price) {
   return (probToFairOdds(modelProb) - price) / price;
 }
 
-// ---- learning fetch ----
+// ---- learning ----
 async function loadCalibration() {
   const calib = (await kvGet("vb:learn:calib:latest")) || {};
   const overlay = (await kvGet("learn:overlay:v1")) || {};
@@ -103,37 +108,42 @@ function bucketKey(item) {
   return `${market}:${tier}:${band}:${tko}`;
 }
 
-// ---- konstante (umesto ENV) ----
+// ---- konstante (bez dodatnih ENV) ----
 const APPLY_LEARNING = true;
 const MAX_ONE_MARKET_PER_MATCH = true;
-const EV_MIN_T1 = 0.03, EV_MIN_T2 = 0.04, EV_MIN_T3 = 0.05;   // bazni pragovi
-const EV_BAND_18 = 0.02, EV_BAND_26 = 0.03, EV_BAND_40 = 0.05, EV_BAND_XX = 0.07; // po bandu kvota
-const EV_KO_EARLY_MINUTES = 90;  // “blizu KO” – za male korekcije po želji
+const EV_MIN_T1 = 0.03, EV_MIN_T2 = 0.04, EV_MIN_T3 = 0.05;
+const EV_BAND_18 = 0.02, EV_BAND_26 = 0.03, EV_BAND_40 = 0.05, EV_BAND_XX = 0.07;
+const EV_KO_EARLY_MINUTES = 90;
 
 export default async function handler(req, res) {
   try {
     const qslot = String(req.query.slot || "").toLowerCase();
     const slot = ["am","pm","late"].includes(qslot) ? qslot : autoSlot();
     const ymd = ymdInTZ();
-    const sourceNotes = [];
+    const src = [];
 
-    // 1) baza kandidata iz Redis-a (ne pozivamo rebuild bez base URL-a)
+    // 0) self-base (radi i na Vercel-u)
+    const proto = req.headers["x-forwarded-proto"] || "https";
+    const host = req.headers.host;
+    const SELF_BASE = `${proto}://${host}`;
+
+    // 1) pokupi bazu kandidata iz KV; ako nema → fallback rebuild(dry)
     let base =
       (await kvGet(`vb:base:${ymd}:${slot}`)) ||
       (await kvGet(`vb:${ymd}:${slot}`)) ||
       (await kvGet(`vbl_full:${ymd}:${slot}`));
 
     if (!Array.isArray(base)) {
-      base = [];
-      sourceNotes.push("redis(miss)");
+      const r = await fetch(`${SELF_BASE}/api/cron/rebuild?slot=${slot}&dry=1`, { cache: "no-store" }).catch(() => null);
+      const j = r && (await r.json().catch(() => null));
+      base = Array.isArray(j?.football) ? j.football : [];
+      src.push(j?.source || "rebuild(dry)");
     } else {
-      sourceNotes.push("redis");
+      src.push("kv");
     }
 
-    // 2) learning (ako postoji)
     const { overlay, evmin } = await loadCalibration();
 
-    // 3) obrada
     const seenFixture = new Map();
     const out = [];
 
@@ -143,10 +153,8 @@ export default async function handler(req, res) {
       const tier = leagueTier(it?.league);
       const key = bucketKey(it);
 
-      // bazni evMin po tieru
       let evMin = tier === "T1" ? EV_MIN_T1 : tier === "T2" ? EV_MIN_T2 : EV_MIN_T3;
 
-      // po bandu kvota
       if (price) {
         const band = oddsBand(price);
         if (band === "b18") evMin = Math.max(evMin, EV_BAND_18);
@@ -155,31 +163,26 @@ export default async function handler(req, res) {
         else evMin = Math.max(evMin, EV_BAND_XX);
       }
 
-      // blizu KO – blage korekcije (drži isto ako ne želiš promenu)
       const m2k = minsToKO(koISO(it));
       if (m2k <= EV_KO_EARLY_MINUTES) {
-        evMin = Math.max(evMin, evMin); // placeholder (ostaje isto)
+        evMin = Math.max(evMin, evMin); // bez promene – zadržano za moguće tweak-ove
       }
 
-      // per-bucket evmin iz learning-a ima prioritet
       if (APPLY_LEARNING && evmin && typeof evmin[key] === "number") {
         evMin = Math.max(evMin, evmin[key]);
       }
 
       if (ev !== null && ev < evMin) continue;
 
-      // overlay na confidence
       let conf = safeNumber(it?.confidence_pct ?? it?.confidence ?? 0);
       if (APPLY_LEARNING && overlay && typeof overlay[key] === "number") {
         conf = Math.max(0, Math.min(100, conf + overlay[key]));
       }
 
-      // blaga nagrada za više bukija (ako postoji info)
       const booksN = safeNumber(it?.odds?.books_count ?? it?.books_count ?? 0);
       if (booksN >= 4) conf = Math.min(100, conf + 1);
       if (booksN >= 6) conf = Math.min(100, conf + 2);
 
-      // anti-correlation: max 1 market po meču
       const fid = String(it?.fixture_id ?? it?.fixture?.id ?? it?.id ?? "");
       if (MAX_ONE_MARKET_PER_MATCH) {
         if (seenFixture.has(fid)) continue;
@@ -195,7 +198,7 @@ export default async function handler(req, res) {
       ok: true,
       slot,
       value_bets: out,
-      source: `base:${sourceNotes.join("+")}·learning:${APPLY_LEARNING ? "on" : "off"}`,
+      source: `base:${src.join("+")}·learning:${APPLY_LEARNING ? "on" : "off"}`,
     });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
