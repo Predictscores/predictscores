@@ -1,17 +1,15 @@
 // pages/api/cron/refresh-odds.js
-// Osvežava kvote po slotu, zadržava "keep-first", ALI dozvoljava rewrite u KO prozoru
-// ako se consensus implied promeni ≥ KO_REWRITE_IP_DELTA (default 3 p.p.).
-
 export const config = { runtime: "nodejs" };
 
-const TZ = process.env.APP_TZ || "Europe/Belgrade";
-const AF_BASE = process.env.API_FOOTBALL_BASE || "https://v3.football.api-sports.io";
+const TZ = "Europe/Belgrade";
+const AF_BASE = "https://v3.football.api-sports.io";
 const AF_KEY = process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.env.API_FOOTBALL_KEY;
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-const KO_REWRITE_MINUTES = Number(process.env.KO_REWRITE_MINUTES ?? 180);
-const KO_REWRITE_IP_DELTA = Number(process.env.KO_REWRITE_IP_DELTA ?? 0.03); // 3 p.p.
+// KO rewrite podešavanja (hardkod)
+const KO_REWRITE_MINUTES = 180;   // u poslednja 3h
+const KO_REWRITE_IP_DELTA = 0.03; // 3 p.p. implied
 
 function ymdInTZ(d = new Date(), tz = TZ) {
   const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
@@ -33,17 +31,15 @@ async function kvGet(key) {
   if (!j || typeof j.result === "undefined") return null;
   try { return JSON.parse(j.result); } catch { return j.result; }
 }
-async function kvSet(key, value, ttlSec = 0) {
+async function kvSet(key, value) {
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
   const body = new URLSearchParams();
   body.set("value", typeof value === "string" ? value : JSON.stringify(value));
-  if (ttlSec > 0) body.set("ex", String(ttlSec));
   const r = await fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}`, {
     method: "POST", headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }, body,
   });
   return r.ok;
 }
-
 async function af(path, params = {}) {
   const qs = new URLSearchParams(params);
   const url = `${AF_BASE}${path}?${qs}`;
@@ -66,14 +62,12 @@ export default async function handler(req, res) {
     const slot = String(req.query.slot || "pm").toLowerCase();
     const ymd = ymdInTZ();
 
-    // 1) Uzmi listu današnjih fikstura (samo ID i kickoff)
     const fx = await af("/fixtures", { date: ymd });
     const fixtures = (fx.response || []).map(r => ({
       id: r.fixture?.id,
       kickoff: r.fixture?.date?.replace("T", " ").slice(0,16) || null,
     })).filter(x => x.id);
 
-    // 2) Povuci kvote po stranama (paginacija preko API-Football "odds" po datumu)
     const odds = await af("/odds", { date: ymd, page: 1 });
     const totalPages = Number(odds?.paging?.total || 1);
     const all = [];
@@ -83,12 +77,11 @@ export default async function handler(req, res) {
     }
 
     let namedWritten = 0, cachedKept = 0, rewrites = 0;
-    // 3) Po fiksturi – izračunaj CONSENSUS (median preko dostupnih bukija) za odgovarajući market
+
     for (const f of fixtures) {
       const rel = all.filter(o => o.fixture?.id === f.id);
       if (!rel.length) continue;
 
-      // skupi sve koeficijente 1X2 (kao primer glavnog tržišta) → median implied
       const prices = [];
       for (const o of rel) {
         const bkm = o?.bookmakers || [];
@@ -117,29 +110,25 @@ export default async function handler(req, res) {
         continue;
       }
 
-      // update "last" snapshot uvek
       const newVal = { ...existing, last: { price: consensusPrice, implied, ts: nowTs } };
-
-      // KO-window rewrite: dozvoli prepisivanje "named" samo ako smo blizu KO i pomeraj je dovoljno velik
       const ipDelta = Math.abs((existing?.named?.implied || 0) - implied);
+
       if (m2k <= KO_REWRITE_MINUTES && ipDelta >= KO_REWRITE_IP_DELTA) {
         newVal.named = { price: consensusPrice, implied, ts: nowTs, reason: "ko-window-rewrite" };
         rewrites++;
       } else {
         cachedKept++;
       }
-
       await kvSet(key, newVal);
     }
 
     return res.status(200).json({
       ok: true,
-      ymd,
-      slot,
+      ymd, slot,
       named_written: namedWritten,
       cached_named_kept: cachedKept,
       ko_rewrites: rewrites,
-      source: "api-football(odds-by-date)"
+      source: "api-football(odds-by-date)",
     });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
