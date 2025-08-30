@@ -3,12 +3,14 @@ export const config = { runtime: "nodejs" };
 
 const TZ = "Europe/Belgrade";
 const AF_BASE = "https://v3.football.api-sports.io";
-const AF_KEY = process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.env.API_FOOTBALL_KEY;
-const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const AF_KEY = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY;
 
-// KO rewrite podešavanja (hardkod)
-const KO_REWRITE_MINUTES = 180;   // u poslednja 3h
+// Vercel KV
+const KV_URL = process.env.KV_REST_API_URL;
+const KV_TOKEN_RO = process.env.KV_REST_API_READ_ONLY_TOKEN;
+const KV_TOKEN = process.env.KV_REST_API_TOKEN || KV_TOKEN_RO;
+
+const KO_REWRITE_MINUTES = 180;   // poslednja 3h
 const KO_REWRITE_IP_DELTA = 0.03; // 3 p.p. implied
 
 function ymdInTZ(d = new Date(), tz = TZ) {
@@ -22,23 +24,24 @@ function minsToKO(iso) {
   return Math.round((ko.getTime() - now.getTime()) / 60000);
 }
 async function kvGet(key) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
-  const r = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }, cache: "no-store",
-  });
-  if (!r.ok) return null;
+  if (!KV_URL || !KV_TOKEN_RO && !KV_TOKEN) return null;
+  const token = KV_TOKEN_RO || KV_TOKEN;
+  const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${token}` }, cache: "no-store",
+  }).catch(() => null);
+  if (!r || !r.ok) return null;
   const j = await r.json().catch(() => null);
   if (!j || typeof j.result === "undefined") return null;
   try { return JSON.parse(j.result); } catch { return j.result; }
 }
 async function kvSet(key, value) {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  if (!KV_URL || !KV_TOKEN) return false;
   const body = new URLSearchParams();
   body.set("value", typeof value === "string" ? value : JSON.stringify(value));
-  const r = await fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}`, {
-    method: "POST", headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }, body,
-  });
-  return r.ok;
+  const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
+    method: "POST", headers: { Authorization: `Bearer ${KV_TOKEN}` }, body,
+  }).catch(() => null);
+  return !!(r && r.ok);
 }
 async function af(path, params = {}) {
   const qs = new URLSearchParams(params);
