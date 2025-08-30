@@ -1,12 +1,4 @@
 // pages/api/cron/rebuild.js
-// Gradi listu fudbalskih kandidata iz API-Football predikcija + kvota.
-// - Slot filter (late/am/pm) po Europe/Belgrade
-// - /predictions?fixture=<id> + /odds?fixture=<id>
-// - Konsenzus (median) kvote za 1X2; model_prob iz predikcija
-// - EV i bazni confidence
-// - Kad dry=1 -> samo vrati; kad nije -> upiši vbl/vbl_full + history ključeve u KV
-// - Default: isključi Women takmičenja (override sa ?includeWomen=1)
-
 export const config = { runtime: "nodejs" };
 
 const TZ = "Europe/Belgrade";
@@ -18,7 +10,6 @@ const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN_RO = process.env.KV_REST_API_READ_ONLY_TOKEN;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN || KV_TOKEN_RO;
 
-// --- KV helpers ---
 async function kvGet(key) {
   if (!KV_URL || (!KV_TOKEN && !KV_TOKEN_RO)) return null;
   const token = KV_TOKEN_RO || KV_TOKEN;
@@ -40,7 +31,6 @@ async function kvSet(key, value) {
   return !!(r && r.ok);
 }
 
-// --- time/slot ---
 function ymdInTZ(d = new Date(), tz = TZ) {
   const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
   return fmt.format(d);
@@ -56,9 +46,9 @@ function hourMinInTZ(isoUtc, tz = TZ) {
 }
 function inSlot(hh, mm, slot) {
   const m = hh * 60 + mm;
-  if (slot === "late") return m >= 0 && m < 600;        // 00:00–09:59
-  if (slot === "am")   return m >= 600 && m < 900;      // 10:00–14:59
-  return m >= 900 && m < 1440;                          // 15:00–23:59
+  if (slot === "late") return m >= 0 && m < 600;   // 00:00–09:59
+  if (slot === "am")   return m >= 600 && m < 900; // 10:00–14:59
+  return m >= 900 && m < 1440;                     // 15:00–23:59
 }
 function autoSlot() {
   const d = new Date();
@@ -69,7 +59,6 @@ function autoSlot() {
   return "pm";
 }
 
-// --- API-Football helpers ---
 async function af(path, params = {}) {
   const qs = new URLSearchParams(params);
   const url = `${AF_BASE}${path}?${qs}`;
@@ -93,18 +82,17 @@ function isWomenLeague(league) {
   return /(women|femenin|feminine|femminile|feminino|frauen|女子|dames)/i.test(name)
       || /(women|女子|femenin)/i.test(country);
 }
-
-// --- EV helpers ---
+function isWomenByTeams(home, away) {
+  const rg = /\b(w|women|ladies|fem|femin[a|e|o]?|frauen|dames)\b/i;
+  return rg.test(home || "") || rg.test(away || "");
+}
 function probToFairOdds(p) { p = clamp(p, 1e-6, 0.999999); return 1/p; }
 function evPercent(modelProb, price) { if (!modelProb || !price) return null; return (probToFairOdds(modelProb) - price) / price; }
-
-// --- build one fixture ---
 function labelForPick(k){ return k==="1"?"Home":k==="2"?"Away":"Draw"; }
 
 async function buildForFixture(fx) {
   const fixtureId = fx.fixture.id;
 
-  // 1) Predictions
   const pred = await af("/predictions", { fixture: fixtureId }).catch(() => null);
   if (!pred || !Array.isArray(pred.response) || pred.response.length === 0) return null;
   const p = pred.response[0];
@@ -121,7 +109,6 @@ async function buildForFixture(fx) {
   ].sort((a,b)=>b.prob-a.prob)[0];
   if (!top || top.prob <= 0) return null;
 
-  // 2) Odds (1X2)
   const o = await af("/odds", { fixture: fixtureId }).catch(() => null);
   if (!o || !Array.isArray(o.response) || o.response.length === 0) return null;
 
@@ -156,30 +143,35 @@ async function buildForFixture(fx) {
   let conf = 55 + (modelProb - implied) * 100 * 1.2;
   conf = clamp(Math.round(conf), 50, 88);
 
-  // UI bridge polja:
   return {
     fixture_id: fixtureId,
     market: "1X2",
-    pick: top.key,                         // "1" | "X" | "2"
-    selection_label: labelForPick(top.key),// "Home"/"Draw"/"Away" → izbegava [object Object]
+    // UI expects a string; keep code separately:
+    pick: labelForPick(top.key),      // <<< string za UI ("Home"/"Draw"/"Away")
+    pick_code: top.key,               // "1" | "X" | "2"
+    selection_label: labelForPick(top.key),
+
     model_prob: Number(modelProb.toFixed(4)),
     confidence_pct: conf,
     odds: { price: Number(price.toFixed(3)), books_count: booksCount },
+
     league,
     league_name: league.name,
     league_country: league.country,
+
     teams,
-    home: teams.home,                      // bridge za stari UI
-    away: teams.away,                      // bridge za stari UI
-    kickoff: `${ymdInTZ(new Date(koUtc))} ${str}`, // lokalno vreme
+    home: teams.home,
+    away: teams.away,
+
+    kickoff: `${ymdInTZ(new Date(koUtc))} ${str}`,
     kickoff_utc: koUtc,
+
     _implied: Number(implied.toFixed(4)),
     _ev: ev,
     source_meta: { books_counts_raw: { "1": prices["1"].length, "X": prices["X"].length, "2": prices["2"].length } }
   };
 }
 
-// --- main handler ---
 export default async function handler(req, res) {
   try {
     const qslot = String(req.query.slot || "").toLowerCase();
@@ -188,34 +180,34 @@ export default async function handler(req, res) {
     const includeWomen = String(req.query.includeWomen || "0") === "1";
     const ymd = ymdInTZ();
 
-    // 0) fixtures for today
     const fx = await af("/fixtures", { date: ymd });
     let fixtures = (fx.response || []).filter(r => {
       const { hh, mm } = hourMinInTZ(r.fixture?.date || "");
       return inSlot(hh, mm, slot);
     });
 
-    // 1) filter out women competitions by default
     if (!includeWomen) {
-      fixtures = fixtures.filter(r => !isWomenLeague(r.league));
+      fixtures = fixtures.filter(r => {
+        const byLeague = !isWomenLeague(r.league);
+        const home = r?.teams?.home?.name || "";
+        const away = r?.teams?.away?.name || "";
+        const byTeams = !isWomenByTeams(home, away);
+        return byLeague && byTeams;
+      });
     }
 
     const MAX_FIXTURES = 300;
     const todo = fixtures.slice(0, MAX_FIXTURES);
 
-    // 2) parallel with small concurrency
     const CONC = 8;
     const out = [];
     for (let i = 0; i < todo.length; i += CONC) {
       const batch = todo.slice(i, i + CONC);
-      const results = await Promise.all(
-        batch.map(buildForFixture).map(p => p.catch(() => null))
-      );
+      const results = await Promise.all(batch.map(buildForFixture).map(p => p.catch(() => null)));
       results.forEach(r => { if (r) out.push(r); });
     }
 
-    // 3) sort by EV desc (calculate if missing cached _ev)
-    out.forEach(x => { if (typeof x._ev !== "number" && x.model_prob && x.odds?.price) x._ev = evPercent(x.model_prob, x.odds.price); });
+    out.forEach(x => { if (typeof x._ev !== "number" && x.model_prob && x.odds?.price) x._ev = (1/x.model_prob - x.odds.price)/x.odds.price; });
     out.sort((a,b) => (b._ev ?? -1) - (a._ev ?? -1));
 
     const full = out.slice(0, 50);
@@ -227,12 +219,13 @@ export default async function handler(req, res) {
       await kvSet(keys.vbl_full, full);
       await kvSet(keys.vbl, slim);
 
-      // --- History zapisi (po slotu + index) ---
+      // --- History (robustan index) ---
       await kvSet(`hist:${ymd}:${slot}`, full);
-      const idx = (await kvGet("hist:index")) || [];
+      let idx = await kvGet("hist:index");
+      if (!Array.isArray(idx)) idx = [];
       const tag = `${ymd}:${slot}`;
       if (!idx.includes(tag)) {
-        const next = [tag, ...idx].slice(0, 120); // čuvaj ~120 poslednjih zapisa
+        const next = [tag, ...idx].slice(0, 120);
         await kvSet("hist:index", next);
       }
     }
