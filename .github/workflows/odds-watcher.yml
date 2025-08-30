@@ -13,23 +13,7 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    env:
-      # koristi taj koji postoji: secret ili var (case-insensitive fallback)
-      BASE_URL: ${{ secrets.BASE_URL || vars.BASE_URL || vars.base_url }}
-
     steps:
-      - name: Validate BASE_URL
-        run: |
-          set -euo pipefail
-          if [ -z "${BASE_URL:-}" ]; then
-            echo "::error::BASE_URL is empty. Add it in GitHub → Settings → Secrets and variables → Actions."
-            exit 1
-          fi
-          if ! echo "$BASE_URL" | grep -Eqi '^https?://'; then
-            echo "::error::BASE_URL must start with http:// or https:// (got: $BASE_URL)"
-            exit 1
-          fi
-
       - name: Refresh odds window for current slot
         run: |
           set -euo pipefail
@@ -48,6 +32,6 @@ jobs:
             --retry-all-errors \
             --retry-delay 8 \
             --retry-max-time 300 \
-            "$BASE_URL/api/cron/refresh-odds?slot=$SLOT"
+            "https://predictscores.vercel.app/api/cron/refresh-odds?slot=$SLOT"
 
           echo "✅ refresh-odds done for slot=$SLOT" >> $GITHUB_STEP_SUMMARY
