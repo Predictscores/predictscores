@@ -2,45 +2,40 @@ name: Odds watcher
 
 on:
   schedule:
-    - cron: '1-59/10 * * * *'
-  workflow_dispatch:
-
-env:
-  BASE: ${{ secrets.BASE_URL }}
-  FALLBACK_BASE: https://predictscores.vercel.app
+    - cron: "*/15 8-23 * * *"   # svakih 15min, 08–23h
+  workflow_dispatch: {}
 
 concurrency:
   group: odds-watcher
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
+
     steps:
-      - name: Resolve BASE, SLOT and YMD
-        id: ctx
-        run: |
-          set -euo pipefail
-          BASE="${BASE:-}"
-          if [ -z "$BASE" ]; then BASE="$FALLBACK_BASE"; fi
-          echo "base=$BASE" >> $GITHUB_OUTPUT
-
-          H=$(TZ=Europe/Belgrade date +%H)
-          if   [ "$H" -lt 10 ]; then SLOT="late"
-          elif [ "$H" -lt 15 ]; then SLOT="am"
-          else                         SLOT="pm"
-          fi
-          echo "slot=$SLOT" >> $GITHUB_OUTPUT
-          YMD=$(TZ=Europe/Belgrade date +%F)
-          echo "ymd=$YMD" >> $GITHUB_OUTPUT
-
-      - name: Warmup (quick ping)
-        run: |
-          set -euo pipefail
-          curl -fsS --connect-timeout 5 --max-time 10 "${{ steps.ctx.outputs.base }}/api/ping" | cat || true
-
       - name: Refresh odds window for current slot
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}   # npr. https://predictscores.vercel.app
         run: |
           set -euo pipefail
-          curl -fsS --ipv4 --connect-timeout 10 --max-time 60 "${{ steps.ctx.outputs.base }}/api/cron/refresh-odds?slot=${{ steps.ctx.outputs.slot }}&ymd=${{ steps.ctx.outputs.ymd }}"
+
+          TZZ="Europe/Belgrade"
+          H=$(TZ=$TZZ date +%H)
+          if   [ "$H" -lt 10 ]; then SLOT=late
+          elif [ "$H" -lt 15 ]; then SLOT=am
+          else SLOT=pm; fi
+
+          echo "Slot: $SLOT"
+
+          curl -fsS \
+            --connect-timeout 10 \
+            --max-time 240 \
+            --retry 3 \
+            --retry-all-errors \
+            --retry-delay 8 \
+            --retry-max-time 300 \
+            "$BASE_URL/api/cron/refresh-odds?slot=$SLOT"
+
+          echo "✅ refresh-odds done for slot=$SLOT" >> $GITHUB_STEP_SUMMARY
