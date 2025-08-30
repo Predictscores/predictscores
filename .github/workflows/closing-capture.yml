@@ -13,11 +13,8 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 4
-
     steps:
       - name: Capture closings (cheap & robust)
-        env:
-          BASE_URL: ${{ secrets.BASE_URL }}
         run: |
           set -euo pipefail
           curl -fsS \
@@ -27,6 +24,6 @@ jobs:
             --retry-all-errors \
             --retry-delay 8 \
             --retry-max-time 240 \
-            "$BASE_URL/api/cron/closing-capture?days=1"
+            "https://predictscores.vercel.app/api/cron/closing-capture?days=1"
 
           echo "✅ closing-capture done" >> $GITHUB_STEP_SUMMARY
