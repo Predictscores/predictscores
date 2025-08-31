@@ -2,8 +2,8 @@ name: "Odds watcher"
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # watcher svakih 15m (UTC)
-    - cron: "5 * * * *"      # scheduler na svakih 60m u :05 (UTC)
+    - cron: "*/15 * * * *"   # watcher svakih 15 min (UTC)
+    - cron: "5 * * * *"      # scheduler svakog sata u :05 (UTC)
   workflow_dispatch: {}
 
 concurrency:
@@ -29,39 +29,48 @@ jobs:
           else SLOT=pm; fi
           echo "slot=$SLOT"  >> "$GITHUB_OUTPUT"
           echo "minute=$M"   >> "$GITHUB_OUTPUT"
-          echo "Local: $H:$M -> SLOT=$SLOT"
+          echo "Local time $H:$M -> SLOT=$SLOT"
 
       - name: Resolve BASE URL
         id: base
         env:
-          BASE_FROM_VARS: ${{ vars.BASE_URL }}
-          BASE_FROM_SECRETS: ${{ secrets.BASE_URL }}
+          BASE_FROM_VARS: ${{ vars.BASE_URL }}        # (opciono) GitHub Repo/Org Variable
+          BASE_FROM_SECRETS: ${{ secrets.BASE_URL }}  # (opciono) GitHub Secret
         run: |
           set -euo pipefail
           BASE="${BASE_FROM_VARS:-${BASE_FROM_SECRETS:-https://predictscores.vercel.app}}"
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "Resolved BASE=$BASE"
 
-      - name: Kick scheduler hourly (:05) -> rebuild KV
+      # SATNI SCHEDULER: u :05 (UTC) napuni KV za detektovani slot
+      - name: Rebuild KV (hourly at :05)
         if: steps.ctx.outputs.minute == '05'
         run: |
           set -euo pipefail
           BASE="${{ steps.base.outputs.base }}"
-          echo "Calling scheduler to (re)build KV…"
+          SLOT="${{ steps.ctx.outputs.slot }}"
+          echo "Rebuilding KV for SLOT=$SLOT …"
           curl -fsS \
+            -A "gha-odds-watcher/1.0" \
             --connect-timeout 10 \
-            --max-time 120 \
-            --retry 3 --retry-all-errors --retry-delay 5 --retry-max-time 150 \
-            "$BASE/api/cron/scheduler?source=gha"
+            --max-time 180 \
+            --retry 3 --retry-all-errors --retry-delay 5 --retry-max-time 200 \
+            "$BASE/api/cron/rebuild?slot=$SLOT"
 
+      # GUARD: u ostalim minutima proveri da li je KV spreman (KV-only endpoint)
       - name: Guard – skip refresh if KV not ready
         id: guard
+        if: steps.ctx.outputs.minute != '05'
         run: |
           set -euo pipefail
           BASE="${{ steps.base.outputs.base }}"
           SLOT="${{ steps.ctx.outputs.slot }}"
-          echo "Probe KV for slot=$SLOT…"
-          OUT=$(curl -fsS "$BASE/api/value-bets-locked?slot=$SLOT&n=1")
+          echo "Probing KV for slot=$SLOT …"
+          OUT=$(curl -fsS \
+            -A "gha-odds-watcher/1.0" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "$BASE/api/value-bets-locked?slot=$SLOT&n=1")
           if echo "$OUT" | grep -q '"source":"vb-locked:kv:hit'; then
             echo "KV ready -> will refresh odds"
             echo "skip=0" >> "$GITHUB_OUTPUT"
@@ -70,14 +79,16 @@ jobs:
             echo "skip=1" >> "$GITHUB_OUTPUT"
           fi
 
+      # REFRESH: ako je KV spreman, osveži kvote za trenutni slot (per-fixture prozor)
       - name: Refresh odds for current slot
-        if: steps.guard.outputs.skip != '1'
+        if: steps.ctx.outputs.minute != '05' && steps.guard.outputs.skip != '1'
         run: |
           set -euo pipefail
           BASE="${{ steps.base.outputs.base }}"
           SLOT="${{ steps.ctx.outputs.slot }}"
-          echo "Refreshing odds for SLOT=$SLOT…"
+          echo "Refreshing odds for SLOT=$SLOT …"
           curl -fsS \
+            -A "gha-odds-watcher/1.0" \
             --connect-timeout 10 \
             --max-time 120 \
             --retry 3 --retry-all-errors --retry-delay 5 --retry-max-time 150 \
