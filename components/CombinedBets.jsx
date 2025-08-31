@@ -1,11 +1,11 @@
-// components/CombinedBets.jsx
+// components/CombinedBets.js
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
-import HistoryPanel from "./HistoryPanel";
 
 const TZ = "Europe/Belgrade";
 
+/* ===================== slot ===================== */
 // late = 00:00–09:59, am = 10:00–14:59, pm = 15:00–23:59
 function currentSlot(tz = TZ) {
   const h = Number(
@@ -18,26 +18,21 @@ function currentSlot(tz = TZ) {
   return h < 10 ? "late" : h < 15 ? "am" : "pm";
 }
 
-/* ---------------- helpers ---------------- */
-
+/* ===================== helpers ===================== */
 async function safeJson(url) {
   try {
     const r = await fetch(url, { cache: "no-store" });
     const ct = r.headers.get("content-type") || "";
     if (ct.includes("application/json")) return await r.json();
     const t = await r.text();
-    try {
-      return JSON.parse(t);
-    } catch {
-      return { ok: false, error: "non-JSON", raw: t };
-    }
+    try { return JSON.parse(t); } catch { return { ok:false, error:"non-JSON", raw:t }; }
   } catch (e) {
-    return { ok: false, error: String(e?.message || e) };
+    return { ok:false, error:String(e?.message||e) };
   }
 }
 
 function parseKickoff(it) {
-  if (it?.kickoff_utc) return new Date(it.kickoff_utc);
+  if (it?.kickoff_utc) return new Date(it.kickoff_utc); // ISO sa zonom
   const iso =
     it?.kickoff ||
     it?.datetime_local?.starting_at?.date_time ||
@@ -45,20 +40,19 @@ function parseKickoff(it) {
     it?.time?.starting_at?.date_time ||
     null;
   if (!iso) return null;
-  // većina feed-ova šalje "YYYY-MM-DD HH:mm"
   const s = iso.includes("T") ? iso : iso.replace(" ", "T");
-  // tretiramo kao UTC ako nema zone
-  return new Date(s + (s.endsWith("Z") || /[+-]\d\d:\d\d$/.test(s) ? "" : "Z"));
+  // ako nema zonu, tretiramo kao UTC (dodaj Z)
+  return new Date(s + (/[Z+-]\d\d:?\d\d$/.test(s) ? "" : "Z"));
 }
 
 function fmtLocal(date, tz = TZ) {
   if (!date) return "—";
   const f = new Intl.DateTimeFormat("en-GB", {
     timeZone: tz,
-    hour: "2-digit",
-    minute: "2-digit",
     day: "2-digit",
     month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
   });
   return f.format(date);
 }
@@ -188,54 +182,29 @@ function FootballCard({ bet }) {
   );
 }
 
-/* ---------------- crypto block (ostaje isto, Top 3) ---------------- */
-function CryptoPanel({ list }) {
-  if (!Array.isArray(list) || list.length === 0) {
-    return <div className="text-sm text-slate-400">Trenutno nema kripto signala.</div>;
-  }
-  return (
-    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-      {list.map((c, idx) => (
-        <div key={c.symbol || idx} className="p-4 rounded-xl bg-[#1f2339]">
-          <div className="text-sm font-semibold">{c.symbol}</div>
-          <div className="text-xs text-slate-400">{c.name}</div>
-          <div className="mt-1 text-sm">
-            Signal: <b>{c.signal}</b> · Conf {Math.round(Number(c.confidence_pct || 0))}%
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-/* ---------------- body ---------------- */
-export default function CombinedBets() {
+/* ===================== data hooks ===================== */
+function useFootballFeed() {
+  const [list, setList] = useState([]);
+  const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [football, setFootball] = useState([]);
-  const [crypto, setCrypto] = useState([]);
 
   async function load() {
     try {
       setLoading(true);
-      setError(null);
+      setErr(null);
       const slot = currentSlot();
-
-      const j = await safeJson(`/api/value-bets-locked?slot=${slot}&n=50`);
-      const arr = Array.isArray(j?.items) ? j.items : Array.isArray(j) ? j : [];
-      const fbets = arr.map(normalizeBet).filter((b) => b.sel || b.odds || b.conf);
-
-      const cj = await safeJson(`/api/crypto`);
-      const cl = Array.isArray(cj?.signals) ? cj.signals : Array.isArray(cj) ? cj : [];
-
-      // Combined prikazuje Top 3 football + Top 3 crypto
-      const topF = [...fbets].sort((a, b) => b.conf - a.conf).slice(0, 3);
-      const topC = cl.slice(0, 3);
-
-      setFootball(topF);
-      setCrypto(topC);
+      const j = await safeJson(`/api/value-bets-locked?slot=${slot}&n=200`);
+      const arr = Array.isArray(j?.items)
+        ? j.items
+        : Array.isArray(j?.football)
+        ? j.football
+        : Array.isArray(j)
+        ? j
+        : [];
+      setList(arr.map(normalizeBet));
     } catch (e) {
-      setError(String(e?.message || e));
+      setErr(String(e?.message || e));
+      setList([]);
     } finally {
       setLoading(false);
     }
@@ -245,30 +214,207 @@ export default function CombinedBets() {
     load();
   }, []);
 
-  if (loading) return <div className="text-sm text-slate-400">Učitavam…</div>;
-  if (error) return <div className="text-sm text-red-400">Greška: {error}</div>;
+  return { list, err, loading, reload: load };
+}
 
+function useCryptoTop3() {
+  const [items, setItems] = useState([]);
+  const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  async function load() {
+    try {
+      setLoading(true);
+      setErr(null);
+      const j = await safeJson(`/api/crypto`);
+      const arr = Array.isArray(j?.signals) ? j.signals : Array.isArray(j) ? j : [];
+      setItems(arr.slice(0, 3));
+    } catch (e) {
+      setErr(String(e?.message || e));
+      setItems([]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { load(); }, []);
+  return { items, err, loading };
+}
+
+/* ===================== sections ===================== */
+function CombinedBody({ footballTop3, cryptoTop3 }) {
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-      <div className="lg:col-span-2">
-        <div className="text-sm font-semibold mb-2">Football — Top 3</div>
-        {football.length === 0 ? (
-          <div className="p-4 rounded-xl bg-[#1f2339] text-slate-300 text-sm">Trenutno nema predloga.</div>
+    <div className="space-y-4">
+      {/* Football Top 3 */}
+      <div className="rounded-2xl bg-[#15182a] p-4">
+        <div className="text-base font-semibold text-white mb-3">Football — Top 3</div>
+        {!footballTop3.length ? (
+          <div className="text-slate-400 text-sm">Trenutno nema predloga.</div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            {football.map((b) => (
+            {footballTop3.map((b) => (
               <FootballCard key={b.id} bet={b} />
             ))}
           </div>
         )}
       </div>
-      <div className="lg:col-span-1">
-        <HistoryPanel />
-        <div className="mt-4">
-          <div className="text-sm font-semibold mb-2">Crypto — Top 3</div>
-          <CryptoPanel list={crypto} />
-        </div>
+
+      {/* Crypto Top 3 */}
+      <div className="rounded-2xl bg-[#15182a] p-4">
+        <div className="text-base font-semibold text-white mb-3">Crypto — Top 3</div>
+        {!cryptoTop3.length ? (
+          <div className="text-slate-400 text-sm">Trenutno nema kripto signala.</div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {cryptoTop3.map((c, i) => (
+              <div key={c?.symbol || i} className="p-4 rounded-xl bg-[#1f2339]">
+                <div className="text-sm font-semibold">{c.symbol}</div>
+                <div className="text-xs text-slate-400">{c.name}</div>
+                <div className="mt-1 text-sm">
+                  Signal: <b>{c.signal}</b> · Conf {Math.round(Number(c.confidence_pct || 0))}%
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
+    </div>
+  );
+}
+
+function FootballBody({ list }) {
+  const [tab, setTab] = useState("ko"); // ko | conf | hist
+
+  const koRows = useMemo(
+    () => [...list].sort((a, b) => (a.date?.getTime?.() || 9e15) - (b.date?.getTime?.() || 9e15)),
+    [list]
+  );
+  const confRows = useMemo(
+    () => [...list].sort((a, b) => b.conf - a.conf),
+    [list]
+  );
+
+  return (
+    <div className="space-y-4">
+      {/* Unutrašnji tabovi */}
+      <div className="flex items-center gap-2">
+        <button
+          className={`px-3 py-1.5 rounded-lg text-sm ${tab==="ko"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
+          onClick={()=>setTab("ko")} type="button"
+        >Kick-Off</button>
+        <button
+          className={`px-3 py-1.5 rounded-lg text-sm ${tab==="conf"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
+          onClick={()=>setTab("conf")} type="button
+        ">Confidence</button>
+        <button
+          className={`px-3 py-1.5 rounded-lg text-sm ${tab==="hist"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
+          onClick={()=>setTab("hist")} type="button"
+        >History</button>
+      </div>
+
+      {tab !== "hist" ? (
+        <div className="rounded-2xl bg-[#15182a] p-4">
+          <div className="text-base font-semibold text-white mb-3">
+            {tab === "ko" ? "Kick-Off" : "Confidence"}
+          </div>
+          {! (tab==="ko"?koRows:confRows).length ? (
+            <div className="text-slate-400 text-sm">Trenutno nema predloga.</div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+              {(tab==="ko"?koRows:confRows).map((b) => <FootballCard key={b.id} bet={b} />)}
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="rounded-2xl p-4 border border-neutral-800 bg-neutral-900/60 text-sm opacity-80">
+          History (14d) se puni iz KV `hist:*` kada job upiše rezultate posle završetka mečeva.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CryptoBody({ list }) {
+  return (
+    <div className="rounded-2xl bg-[#15182a] p-4">
+      <div className="text-base font-semibold text-white mb-3">Crypto — Top 3</div>
+      {!list.length ? (
+        <div className="text-slate-400 text-sm">Trenutno nema kripto signala.</div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          {list.map((c, i) => (
+            <div key={c?.symbol || i} className="p-4 rounded-xl bg-[#1f2339]">
+              <div className="text-sm font-semibold">{c.symbol}</div>
+              <div className="text-xs text-slate-400">{c.name}</div>
+              <div className="mt-1 text-sm">
+                Signal: <b>{c.signal}</b> · Conf {Math.round(Number(c.confidence_pct || 0))}%
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ===================== main ===================== */
+export default function CombinedBets() {
+  const [tab, setTab] = useState("Combined"); // Combined | Football | Crypto
+  const fb = useFootballFeed();
+  const crypto = useCryptoTop3();
+
+  // Combined: Top 3 po confidence
+  const top3Football = useMemo(
+    () => [...fb.list].sort((a,b)=> b.conf - a.conf).slice(0,3),
+    [fb.list]
+  );
+
+  return (
+    <div className="mt-4 space-y-4">
+      {/* Gornji tabovi */}
+      <div className="flex items-center gap-2">
+        {["Combined","Football","Crypto"].map((name) => (
+          <button
+            key={name}
+            onClick={() => setTab(name)}
+            className={`px-3 py-1.5 rounded-lg text-sm ${tab===name?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
+            type="button"
+          >
+            {name}
+          </button>
+        ))}
+      </div>
+
+      {/* Sadržaj tabova */}
+      {tab === "Combined" && (
+        fb.loading ? (
+          <div className="text-slate-400 text-sm">Učitavam…</div>
+        ) : fb.err ? (
+          <div className="text-red-400 text-sm">Greška: {fb.err}</div>
+        ) : (
+          <CombinedBody footballTop3={top3Football} cryptoTop3={crypto.items} />
+        )
+      )}
+
+      {tab === "Football" && (
+        fb.loading ? (
+          <div className="text-slate-400 text-sm">Učitavam…</div>
+        ) : fb.err ? (
+          <div className="text-red-400 text-sm">Greška: {fb.err}</div>
+        ) : (
+          <FootballBody list={fb.list} />
+        )
+      )}
+
+      {tab === "Crypto" && (
+        crypto.loading ? (
+          <div className="text-slate-400 text-sm">Učitavam…</div>
+        ) : crypto.err ? (
+          <div className="text-red-400 text-sm">Greška: {crypto.err}</div>
+        ) : (
+          <CryptoBody list={crypto.items} />
+        )
+      )}
     </div>
   );
 }
