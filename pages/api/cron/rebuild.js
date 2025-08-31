@@ -1,13 +1,12 @@
 // pages/api/cron/rebuild.js
-// Rebuild job (value-bets) — slot-wide, sa stratifikacijom kandidata po satima
-// + extras_by_fixture: za svaki fixture računamo i najbolji pick za BTTS, OU2.5 (2.5 linija) i HT-FT
-// - Uzima mečeve za današnji slot (late/am/pm)
-// - Povlači odds + predictions, računa medijane, implied, blend modela (predictions vs implied) za 1X2
-// - Guardrails: trusted-only, spread limiti, uplift cap, min odds, itd.
-// - Rangira po EV i upisuje u KV:
-//     vbl:<YMD>:<slot> (slim, TOP N), vbl_full:<YMD>:<slot> (full, širi preseci + extras_by_fixture)
-//   + alias ključevi radi kompatibilnosti: vb-locked:/vb:locked:/vb_locked:/locked:vbl:
-// - Ne prazni KV kada nema rezultata
+// Slot rebuild (15/25 po slotu), objedinjeno biranje NAJBOLJEG predloga po utakmici
+// preko 4 tržišta: 1X2, BTTS, OU 2.5, HT-FT.
+// - pokriva ceo slot (late 00–09, am 10–14, pm 15–23:59)
+// - koristi trimovani medijan kvota (skida outliere), implied -> blend sa predictions (1X2)
+// - dinamički uplift limit u odnosu na dubinu/raspon cena (manji kada je tržište plitko/rasuto)
+// - po UTKM: iz 1X2/BTTS/OU/HT-FT uzmi NAJKONFIDENTNIJI kandidat (tie-break EV), pa globalno rangiraj po EV
+// - two-pass: ako strogi pass ne da rezultate, uradi blago relaksirani pass na ISTIM već učitanim podacima (nema novih API poziva)
+// - upisuje vbl:<YMD>:<slot> i vbl_full:<YMD>:<slot> + alias ključeve
 
 export const config = { api: { bodyParser: false } };
 
@@ -18,8 +17,8 @@ function ymdInTZ(d = new Date(), tz = TZ) {
     const fmt = new Intl.DateTimeFormat("sv-SE", {
       timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit"
     });
-    const parts = fmt.formatToParts(d).reduce((a, p) => (a[p.type] = p.value, a), {});
-    return `${parts.year}-${parts.month}-${parts.day}`;
+    const p = fmt.formatToParts(d).reduce((a, x) => (a[x.type] = x.value, a), {});
+    return `${p.year}-${p.month}-${p.day}`;
   } catch {
     const y = d.getUTCFullYear(),
       m = String(d.getUTCMonth() + 1).padStart(2, "0"),
@@ -60,14 +59,14 @@ function isWeekend(d = new Date(), tz = TZ) {
     return wd === 0 || wd === 6;
   }
 }
-function envBool(name, def = false) {
-  const v = process.env[name];
-  if (v == null) return def;
-  return /^(1|true|yes|on)$/i.test(String(v).trim());
-}
 function envNum(name, def) {
   const v = Number(process.env[name]);
   return Number.isFinite(v) ? v : def;
+}
+function envBool(name, def=false){
+  const v = process.env[name];
+  if (v == null) return def;
+  return /^(1|true|yes|on)$/i.test(String(v));
 }
 function envList(nameA, nameB) {
   const raw = process.env[nameA] || process.env[nameB] || "";
@@ -78,26 +77,28 @@ function envList(nameA, nameB) {
     .map(s => s.toLowerCase());
 }
 
-// limiti/slotevi
+// limiti po danu/slotu
 const DEFAULT_LIMIT_WEEKDAY = envNum("SLOT_WEEKDAY_LIMIT", 15);
 const DEFAULT_LIMIT_WEEKEND = envNum("SLOT_WEEKEND_LIMIT", 25);
 const LIMIT_LATE_WEEKDAY = envNum("SLOT_LATE_WEEKDAY_LIMIT", DEFAULT_LIMIT_WEEKDAY);
-const VB_LIMIT = envNum("VB_LIMIT", 0); // 0 = no cap
+const VB_LIMIT = envNum("VB_LIMIT", 0); // 0 = no extra cap
 
-// filter/guardrails
+// filter/guardrails (ugrađene default vrednosti; ENV ako postoje biće poštovani)
 const MIN_ODDS = envNum("MIN_ODDS", 1.01);
-const TRUSTED_ONLY = envBool("ODDS_TRUSTED_ONLY", false);
-const TRUSTED_LIST = envList("TRUSTED_BOOKMAKERS", "TRUSTED_BOOKIES");
-const TRUSTED_SPREAD_MAX = Number.isFinite(envNum("TRUSTED_SPREAD_MAX", NaN)) ? envNum("TRUSTED_SPREAD_MAX", NaN) : NaN;
-const ALL_SPREAD_MAX = Number.isFinite(envNum("ALL_SPREAD_MAX", NaN)) ? envNum("ALL_SPREAD_MAX", NaN) : NaN;
-const UPLIFT_CAP = envNum("TRUSTED_UPLIFT_CAP", 0.08);
-const ONE_TRUSTED_TOL = envNum("ONE_TRUSTED_TOL", 0.02);
 const MODEL_ALPHA = envNum("MODEL_ALPHA", 0.4);
 const EXCLUDE_WOMEN = envBool("EXCLUDE_WOMEN", true);
+const TRUSTED_ONLY = envBool("ODDS_TRUSTED_ONLY", false);
+const TRUSTED_LIST = envList("TRUSTED_BOOKMAKERS", "TRUSTED_BOOKIES");
+
+// kvalitet selekcije (bez ENV pominjanja – default pravila u kodu)
+const MIN_BOOKS_PER_SEL = 3;     // minimalno nezavisnih knjiga na izabranoj selekciji
+const EV_FLOOR = 0.02;           // minimalni EV za ulaz u listu (2%)
+const SPREAD_STRICT = 0.25;      // ako je raspon unutar selekcije > 25%, tretiraj kao rizično
+const SPREAD_LOOSE  = 0.40;      // gornja granica za “relaxed” pass
 
 // API-Football
 const API_BASE = process.env.API_FOOTBALL_BASE_URL || process.env.API_FOOTBALL || "https://v3.football.api-sports.io";
-const API_KEY = process.env.API_FOOTBALL_KEY || process.env.API_FOOTBALL || "";
+const API_KEY  = process.env.API_FOOTBALL_KEY || process.env.API_FOOTBALL || "";
 function afHeaders() {
   const h = {};
   if (API_KEY) {
@@ -116,40 +117,41 @@ async function fetchFixturesByDate(ymd) {
   if (!API_KEY) return [];
   try {
     const j = await getJSON(`${API_BASE.replace(/\/+$/, "")}/fixtures?date=${encodeURIComponent(ymd)}`);
-    if (!j || (j.errors && Object.keys(j.errors).length)) return [];
     return Array.isArray(j?.response) ? j.response : [];
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 async function fetchOddsForFixture(fixtureId) {
   if (!API_KEY) return [];
   try {
     const j = await getJSON(`${API_BASE.replace(/\/+$/, "")}/odds?fixture=${encodeURIComponent(fixtureId)}`);
-    if (!j || (j.errors && Object.keys(j.errors).length)) return [];
     return Array.isArray(j?.response) ? j.response : [];
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 async function fetchPredictionForFixture(fixtureId) {
   if (!API_KEY) return null;
   try {
     const j = await getJSON(`${API_BASE.replace(/\/+$/, "")}/predictions?fixture=${encodeURIComponent(fixtureId)}`);
-    if (!j || (j.errors && Object.keys(j.errors).length)) return null;
     const arr = Array.isArray(j?.response) ? j.response : [];
     return arr[0] || null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-// 1X2 extraction + trust/spread
-function median(nums) {
-  const a = nums.filter(Number.isFinite).sort((x, y) => x - y);
-  if (!a.length) return NaN;
-  const m = Math.floor(a.length / 2);
-  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+// helpers
+function median(a) {
+  const x = a.filter(Number.isFinite).sort((p, q) => p - q);
+  if (!x.length) return NaN;
+  const m = Math.floor(x.length / 2);
+  return x.length % 2 ? x[m] : (x[m - 1] + x[m]) / 2;
+}
+function trimmedMedian(a) {
+  const x = a.filter(Number.isFinite).sort((p, q) => p - q);
+  if (x.length >= 5) { x.shift(); x.pop(); }
+  if (!x.length) return NaN;
+  const m = Math.floor(x.length / 2);
+  return x.length % 2 ? x[m] : (x[m - 1] + x[m]) / 2;
+}
+function uniqueName(row) {
+  return String(row?.name ?? row?.bookmaker?.name ?? row?.id ?? row?.bookmaker ?? "").toLowerCase();
 }
 function isTrustedBook(name) {
   if (!TRUSTED_ONLY) return true;
@@ -168,17 +170,26 @@ function extractRows(oddsPayload) {
   }
   return rows;
 }
-function extract1X2FromOdds(oddsPayload) {
-  const priceBy = { "1": [], "X": [], "2": [] };
-  const seenBy = { "1": new Set(), "X": new Set(), "2": new Set() };
+function spreadOf(arr) {
+  const a = arr.filter(Number.isFinite);
+  if (a.length < 2) return 0;
+  const mx = Math.max(...a), mn = Math.min(...a);
+  if (!(mx > 0 && mn > 0)) return 0;
+  return (mx / mn) - 1;
+}
+
+// --- market extractors (vraćaju {pricesBy, countsBy, medBy, spreadBy})
+function extract1X2(oddsPayload) {
   const rows = extractRows(oddsPayload);
+  const by = { "1": [], "X": [], "2": [] };
+  const seen = { "1": new Set(), "X": new Set(), "2": new Set() };
   for (const row of rows) {
-    const bkmName = String(row?.name ?? row?.bookmaker?.name ?? row?.id ?? row?.bookmaker ?? "");
-    if (!isTrustedBook(bkmName)) continue;
+    const bkm = uniqueName(row);
+    if (!isTrustedBook(bkm)) continue;
     const bets = Array.isArray(row?.bets) ? row.bets : [];
     for (const bet of bets) {
       const nm = (bet?.name || "").toLowerCase();
-      if (!/match\s*winner|1x2|winner/i.test(nm)) continue;
+      if (!/match\s*winner|^1x2$|(^|\s)winner(\s|$)/i.test(nm)) continue;
       const vals = Array.isArray(bet?.values) ? bet.values : [];
       for (const v of vals) {
         const lab = (v?.value || v?.label || "").toString().toLowerCase();
@@ -189,46 +200,22 @@ function extract1X2FromOdds(oddsPayload) {
         if (!code) continue;
         const price = Number(v?.odd ?? v?.price ?? v?.odds);
         if (!Number.isFinite(price) || price < MIN_ODDS) continue;
-        priceBy[code].push(price);
-        if (bkmName) seenBy[code].add(bkmName);
+        by[code].push(price);
+        seen[code].add(bkm);
       }
     }
   }
-  const med = { "1": median(priceBy["1"]), "X": median(priceBy["X"]), "2": median(priceBy["2"]) };
-  const counts = { "1": seenBy["1"].size, "X": seenBy["X"].size, "2": seenBy["2"].size };
-
-  const spreadPer = {};
-  for (const k of ["1","X","2"]) {
-    const arr = priceBy[k];
-    if (arr.length >= 2) {
-      const mx = Math.max(...arr), mn = Math.min(...arr);
-      spreadPer[k] = mx > 0 ? (mx / mn - 1) : 0;
-    } else {
-      spreadPer[k] = 0;
-    }
-  }
-  const spread = Math.max(spreadPer["1"], spreadPer["X"], spreadPer["2"]);
-  return { med, counts, spread };
+  const medBy = { "1": trimmedMedian(by["1"]), "X": trimmedMedian(by["X"]), "2": trimmedMedian(by["2"]) };
+  const countsBy = { "1": seen["1"].size, "X": seen["X"].size, "2": seen["2"].size };
+  const spreadBy = { "1": spreadOf(by["1"]), "X": spreadOf(by["X"]), "2": spreadOf(by["2"]) };
+  return { by, medBy, countsBy, spreadBy };
 }
-function normalizeImplied(med) {
-  const imp = {
-    "1": Number.isFinite(med["1"]) ? 1 / med["1"] : 0,
-    "X": Number.isFinite(med["X"]) ? 1 / med["X"] : 0,
-    "2": Number.isFinite(med["2"]) ? 1 / med["2"] : 0
-  };
-  const s = (imp["1"] || 0) + (imp["X"] || 0) + (imp["2"] || 0);
-  if (s <= 0) return { "1": null, "X": null, "2": null };
-  return { "1": imp["1"] / s, "X": imp["X"] / s, "2": imp["2"] / s };
-}
-
-// dodatni marketi (iz istog payload-a)
 function extractBTTS(oddsPayload) {
   const rows = extractRows(oddsPayload);
-  const priceBy = { Y: [], N: [] };
-  const seen = { Y: new Set(), N: new Set() };
+  const by = { Y: [], N: [] }, seen = { Y: new Set(), N: new Set() };
   for (const row of rows) {
-    const bkmName = String(row?.name ?? row?.bookmaker?.name ?? row?.id ?? "");
-    if (!isTrustedBook(bkmName)) continue;
+    const bkm = uniqueName(row);
+    if (!isTrustedBook(bkm)) continue;
     const bets = Array.isArray(row?.bets) ? row.bets : [];
     for (const bet of bets) {
       const nm = (bet?.name || "").toLowerCase();
@@ -236,26 +223,26 @@ function extractBTTS(oddsPayload) {
       const vals = Array.isArray(bet?.values) ? bet.values : [];
       for (const v of vals) {
         const lab = (v?.value || v?.label || "").toString().toLowerCase();
-        let code = lab.includes("yes") ? "Y" : lab.includes("no") ? "N" : null;
+        const code = lab.includes("yes") ? "Y" : lab.includes("no") ? "N" : null;
         if (!code) continue;
         const price = Number(v?.odd ?? v?.price ?? v?.odds);
         if (!Number.isFinite(price) || price < MIN_ODDS) continue;
-        priceBy[code].push(price);
-        seen[code].add(bkmName);
+        by[code].push(price);
+        seen[code].add(bkm);
       }
     }
   }
-  const med = { Y: median(priceBy.Y), N: median(priceBy.N) };
-  const counts = { Y: seen.Y.size, N: seen.N.size };
-  return { med, counts };
+  const medBy = { Y: trimmedMedian(by.Y), N: trimmedMedian(by.N) };
+  const countsBy = { Y: seen.Y.size, N: seen.N.size };
+  const spreadBy = { Y: spreadOf(by.Y), N: spreadOf(by.N) };
+  return { by, medBy, countsBy, spreadBy };
 }
 function extractOU25(oddsPayload) {
   const rows = extractRows(oddsPayload);
-  const priceBy = { O: [], U: [] };
-  const seen = { O: new Set(), U: new Set() };
+  const by = { O: [], U: [] }, seen = { O: new Set(), U: new Set() };
   for (const row of rows) {
-    const bkmName = String(row?.name ?? row?.bookmaker?.name ?? row?.id ?? "");
-    if (!isTrustedBook(bkmName)) continue;
+    const bkm = uniqueName(row);
+    if (!isTrustedBook(bkm)) continue;
     const bets = Array.isArray(row?.bets) ? row.bets : [];
     for (const bet of bets) {
       const nm = (bet?.name || "").toLowerCase();
@@ -263,77 +250,76 @@ function extractOU25(oddsPayload) {
       const vals = Array.isArray(bet?.values) ? bet.values : [];
       for (const v of vals) {
         const lab = (v?.value || v?.label || "").toString().toLowerCase();
-        // tražimo baš liniju 2.5
         if (!/2\.5/.test(lab)) continue;
-        const isOver = lab.includes("over");
-        const isUnder = lab.includes("under");
-        const code = isOver ? "O" : isUnder ? "U" : null;
+        const code = lab.includes("over") ? "O" : lab.includes("under") ? "U" : null;
         if (!code) continue;
         const price = Number(v?.odd ?? v?.price ?? v?.odds);
         if (!Number.isFinite(price) || price < MIN_ODDS) continue;
-        priceBy[code].push(price);
-        seen[code].add(bkmName);
+        by[code].push(price);
+        seen[code].add(bkm);
       }
     }
   }
-  const med = { O: median(priceBy.O), U: median(priceBy.U) };
-  const counts = { O: seen.O.size, U: seen.U.size };
-  return { med, counts };
+  const medBy = { O: trimmedMedian(by.O), U: trimmedMedian(by.U) };
+  const countsBy = { O: seen.O.size, U: seen.U.size };
+  const spreadBy = { O: spreadOf(by.O), U: spreadOf(by.U) };
+  return { by, medBy, countsBy, spreadBy };
 }
 function extractHTFT(oddsPayload) {
   const rows = extractRows(oddsPayload);
-  const priceBy = { HH: [], HD: [], HA: [], DH: [], DD: [], DA: [], AH: [], AD: [], AA: [] };
-  const seen = { HH: new Set(), HD: new Set(), HA: new Set(), DH: new Set(), DD: new Set(), DA: new Set(), AH: new Set(), AD: new Set(), AA: new Set() };
-  const mapCode = (lab) => {
-    lab = lab.toLowerCase();
-    const repl = s => s.replace(/\s+/g, "");
-    if (/home\/home|^hh$/.test(repl(lab))) return "HH";
-    if (/home\/draw|^hd$/.test(repl(lab))) return "HD";
-    if (/home\/away|^ha$/.test(repl(lab))) return "HA";
-    if (/draw\/home|^dh$/.test(repl(lab))) return "DH";
-    if (/draw\/draw|^dd$/.test(repl(lab))) return "DD";
-    if (/draw\/away|^da$/.test(repl(lab))) return "DA";
-    if (/away\/home|^ah$/.test(repl(lab))) return "AH";
-    if (/away\/draw|^ad$/.test(repl(lab))) return "AD";
-    if (/away\/away|^aa$/.test(repl(lab))) return "AA";
-    return null;
-  };
+  const keys = ["HH","HD","HA","DH","DD","DA","AH","AD","AA"];
+  const by = Object.fromEntries(keys.map(k => [k, []]));
+  const seen = Object.fromEntries(keys.map(k => [k, new Set()]));
   for (const row of rows) {
-    const bkmName = String(row?.name ?? row?.bookmaker?.name ?? row?.id ?? "");
-    if (!isTrustedBook(bkmName)) continue;
+    const bkm = uniqueName(row);
+    if (!isTrustedBook(bkm)) continue;
     const bets = Array.isArray(row?.bets) ? row.bets : [];
     for (const bet of bets) {
       const nm = (bet?.name || "").toLowerCase();
       if (!/half\s*time.*full\s*time|ht\s*\/\s*ft|ht-?ft/i.test(nm)) continue;
       const vals = Array.isArray(bet?.values) ? bet.values : [];
       for (const v of vals) {
-        const label = (v?.value || v?.label || "").toString();
-        const code = mapCode(label);
+        const label = (v?.value || v?.label || "").toString().toLowerCase().replace(/\s+/g, "");
+        let code = null;
+        if (/^home\/home|^hh$/.test(label)) code = "HH";
+        else if (/^home\/draw|^hd$/.test(label)) code = "HD";
+        else if (/^home\/away|^ha$/.test(label)) code = "HA";
+        else if (/^draw\/home|^dh$/.test(label)) code = "DH";
+        else if (/^draw\/draw|^dd$/.test(label)) code = "DD";
+        else if (/^draw\/away|^da$/.test(label)) code = "DA";
+        else if (/^away\/home|^ah$/.test(label)) code = "AH";
+        else if (/^away\/draw|^ad$/.test(label)) code = "AD";
+        else if (/^away\/away|^aa$/.test(label)) code = "AA";
         if (!code) continue;
         const price = Number(v?.odd ?? v?.price ?? v?.odds);
         if (!Number.isFinite(price) || price < MIN_ODDS) continue;
-        priceBy[code].push(price);
-        seen[code].add(bkmName);
+        by[code].push(price);
+        seen[code].add(bkm);
       }
     }
   }
-  const med = {};
-  const counts = {};
-  for (const k of Object.keys(priceBy)) {
-    med[k] = median(priceBy[k]);
-    counts[k] = seen[k].size;
-  }
-  return { med, counts };
+  const medBy = Object.fromEntries(keys.map(k => [k, trimmedMedian(by[k])] ));
+  const countsBy = Object.fromEntries(keys.map(k => [k, seen[k].size] ));
+  const spreadBy = Object.fromEntries(keys.map(k => [k, spreadOf(by[k])] ));
+  return { by, medBy, countsBy, spreadBy };
 }
 
-function implied2(probA, probB) {
-  const s = (probA || 0) + (probB || 0);
-  if (s <= 0) return { A: null, B: null };
-  return { A: (probA || 0) / s, B: (probB || 0) / s };
+function norm3(a,b,c){
+  const s = (a||0)+(b||0)+(c||0);
+  if (s<=0) return {A:null,B:null,C:null};
+  return {A:(a||0)/s,B:(b||0)/s,C:(c||0)/s};
+}
+function pickLabel1X2(code){ return code==="1"?"Home":(code==="2"?"Away":"Draw"); }
+
+function dynamicUpliftCap(selBooksCount, selSpread){
+  // dublje tržište → stroži cap; plitko → nešto veći cap, ali ga smanjuj kad je spread visok
+  let base = selBooksCount>=8 ? 0.03 : (selBooksCount>=5 ? 0.04 : 0.05);
+  if (selSpread > 0.30) base *= 0.6;
+  else if (selSpread > 0.20) base *= 0.8;
+  return base;
 }
 
-// ženski filter
-function isWomenString(s = "") {
+function womenMention(s=""){
   if (/\b(women|women's|ladies)\b/i.test(s)) return true;
   if (/\b(femenina|feminine|feminin|femminile)\b/i.test(s)) return true;
   if (/\b(dames|dam|kvinner|kvinn|kvinnor)\b/i.test(s)) return true;
@@ -343,52 +329,75 @@ function isWomenString(s = "") {
   return false;
 }
 function isWomensLeague(leagueName = "", teams = { home: "", away: "" }) {
-  return EXCLUDE_WOMEN ? (isWomenString(leagueName) || isWomenString(teams.home) || isWomenString(teams.away)) : false;
+  return EXCLUDE_WOMEN ? (womenMention(leagueName) || womenMention(teams.home) || womenMention(teams.away)) : false;
 }
 
 // KV
 async function kvSetJSON_safe(key, value, ttlSec = null) {
   const base = process.env.KV_REST_API_URL || process.env.KV_URL || process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!base || !token) throw new Error("KV_REST_API_URL / KV_REST_API_TOKEN nisu postavljeni");
-
-  const urlPOST = ttlSec != null
+  if (!base || !token) throw new Error("KV REST env not set");
+  const urlA = ttlSec!=null
     ? `${base.replace(/\/+$/, "")}/setex/${encodeURIComponent(key)}/${ttlSec}`
     : `${base.replace(/\/+$/, "")}/set/${encodeURIComponent(key)}`;
-
-  let r = await fetch(urlPOST, {
+  let r = await fetch(urlA, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "text/plain;charset=UTF-8" },
     body: JSON.stringify(value)
-  }).catch(() => null);
+  }).catch(()=>null);
   if (r && r.ok) return true;
 
-  const urlPATH = ttlSec != null
+  const urlB = ttlSec!=null
     ? `${base.replace(/\/+$/, "")}/setex/${encodeURIComponent(key)}/${ttlSec}/${encodeURIComponent(JSON.stringify(value))}`
     : `${base.replace(/\/+$/, "")}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}`;
-  r = await fetch(urlPATH, { method: "POST", headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
+  r = await fetch(urlB, { method: "POST", headers: { Authorization: `Bearer ${token}` } }).catch(()=>null);
   if (r && r.ok) return true;
 
-  const msg = r ? await r.text().catch(() => String(r.status)) : "network-error";
-  throw new Error(`KV set failed: ${msg.slice(0, 200)}`);
+  const msg = r ? await r.text().catch(()=>String(r.status)) : "network-error";
+  throw new Error(`KV set failed: ${msg.slice(0,200)}`);
 }
 
-export default async function handler(req, res) {
-  try {
+// evaluacija kandidata po tržištu za jedan fixture
+function buildCandidate(recBase, market, code, label, price, prob, booksCount) {
+  if (!Number.isFinite(price) || price < MIN_ODDS) return null;
+  if (!Number.isFinite(prob)) return null;
+  if (!Number.isFinite(booksCount) || booksCount < MIN_BOOKS_PER_SEL) return null;
+
+  const confidence_pct = Math.round(Math.max(0, Math.min(100, prob*100)));
+  const _implied = Number((1/price).toFixed(4));
+  const _ev = Number((price*prob - 1).toFixed(12));
+
+  if (!Number.isFinite(_ev) || _ev < EV_FLOOR) return null;
+
+  return {
+    fixture_id: recBase.fixture_id,
+    market, pick: label, pick_code: code, selection_label: label,
+    model_prob: Number(prob.toFixed(4)),
+    confidence_pct,
+    odds: { price: Number(price), books_count: booksCount },
+    league: recBase.league, league_name: recBase.league_name, league_country: recBase.league_country,
+    teams: recBase.teams, home: recBase.home, away: recBase.away,
+    kickoff: recBase.kickoff, kickoff_utc: recBase.kickoff_utc,
+    _implied, _ev,
+  };
+}
+
+export default async function handler(req, res){
+  try{
     const now = new Date();
     const ymd = ymdInTZ(now, TZ);
-    const qSlot = (req.query.slot && String(req.query.slot)) || slotOfHour(toLocal(now, TZ).hour);
-    const slotWin = windowForSlot(qSlot);
-    const wantDebug = String(req.query.debug || "") === "1";
-
-    let slotLimit = qSlot === "late"
-      ? (isWeekend(now, TZ) ? DEFAULT_LIMIT_WEEKEND : LIMIT_LATE_WEEKDAY)
-      : (isWeekend(now, TZ) ? DEFAULT_LIMIT_WEEKEND : DEFAULT_LIMIT_WEEKDAY);
+    const slotQ = (req.query.slot && String(req.query.slot)) || slotOfHour(toLocal(now, TZ).hour);
+    const slotWin = windowForSlot(slotQ);
+    const isWknd = isWeekend(now, TZ);
+    let slotLimit = slotQ === "late"
+      ? (isWknd ? DEFAULT_LIMIT_WEEKEND : LIMIT_LATE_WEEKDAY)
+      : (isWknd ? DEFAULT_LIMIT_WEEKEND : DEFAULT_LIMIT_WEEKDAY);
     if (VB_LIMIT > 0) slotLimit = Math.min(slotLimit, VB_LIMIT);
 
-    const debug = { ymd, slot: qSlot };
+    const wantDebug = String(req.query.debug||"") === "1";
+    const debug = { ymd, slot: slotQ };
 
-    // 1) fixtures → slot → ženske out
+    // 1) fixtures u slotu
     const raw = await fetchFixturesByDate(ymd);
     debug.fixtures_total = Array.isArray(raw) ? raw.length : 0;
 
@@ -397,13 +406,12 @@ export default async function handler(req, res) {
         const fx = r?.fixture || {};
         const lg = r?.league || {};
         const tm = r?.teams || {};
-        const dateIso = fx?.date;
-        const loc = toLocal(dateIso, TZ);
+        const loc = toLocal(fx?.date, TZ);
         const home = tm?.home?.name || tm?.home || "";
         const away = tm?.away?.name || tm?.away || "";
         return {
           fixture_id: fx?.id,
-          date_utc: dateIso,
+          date_utc: fx?.date,
           local_hour: loc.hour,
           local_str: `${loc.ymd} ${loc.hm}`,
           league: { id: lg?.id, name: lg?.name, country: lg?.country },
@@ -420,295 +428,253 @@ export default async function handler(req, res) {
     fixtures = fixtures.filter(fx => !isWomensLeague(fx.league?.name, fx.teams));
     debug.after_gender_filter = fixtures.length;
 
-    // 1b) STRATIFIKACIJA kandidata po satima slota (umesto .slice(0, N*3))
-    const hours = [];
-    for (let h = slotWin.hmin; h <= slotWin.hmax; h++) hours.push(h);
-    const maxCandidates = Math.max(1, slotLimit) * 3; // isti budžet kao ranije, ali raspoređen po satima
-    const perHour = Math.max(1, Math.ceil(maxCandidates / hours.length));
-
-    const byHour = new Map();
-    for (const fx of fixtures) {
-      const arr = byHour.get(fx.local_hour) || [];
-      arr.push(fx);
-      byHour.set(fx.local_hour, arr);
-    }
-    const bucketed = [];
-    for (const h of hours) {
-      const arr = (byHour.get(h) || []).slice(0, perHour);
-      bucketed.push(...arr);
-    }
-    fixtures = bucketed.slice(0, maxCandidates);
+    // cap kandidata radi troška (3x limit je obično dosta)
+    const considered = Math.min(fixtures.length, Math.max(slotLimit*3, slotLimit+10));
+    fixtures = fixtures.slice(0, considered);
     debug.considered = fixtures.length;
-    debug.strat_hours = { perHour, hours: hours.length };
 
-    // 2) odds/predictions → BLEND modela + guardrails → EV
-    const recs = [];
-    const extrasByFixture = {}; // fixture_id -> array of extra market picks
-    const dropReasons = { noOdds: 0, spread: 0, prices: 0, noModel: 0, minOdds: 0, ok: 0 };
+    const bestPerFixture_strict = [];
+    const bestPerFixture_relaxed = [];
+    const dropStats = { noOdds:0, noPick:0, ok:0 };
 
     for (const fx of fixtures) {
-      try {
-        const oddsPayload = await fetchOddsForFixture(fx.fixture_id);
-        const oddsArr = Array.isArray(oddsPayload) ? oddsPayload : [];
+      // payloadi (jednom po fixture-u)
+      const oddsPayload = await fetchOddsForFixture(fx.fixture_id);
+      const oddsArr = Array.isArray(oddsPayload) ? oddsPayload : [];
+      if (!oddsArr.length){ dropStats.noOdds++; continue; }
 
-        // 2a) 1X2 bazni market (kao ranije)
-        const { med, counts, spread } = extract1X2FromOdds(oddsArr);
-        if (!Number.isFinite(med["1"]) && !Number.isFinite(med["X"]) && !Number.isFinite(med["2"])) { dropReasons.noOdds++; continue; }
-        if (Number.isFinite(TRUSTED_SPREAD_MAX) && TRUSTED_ONLY && spread > TRUSTED_SPREAD_MAX) { dropReasons.spread++; continue; }
-        if (Number.isFinite(ALL_SPREAD_MAX) && !TRUSTED_ONLY && spread > ALL_SPREAD_MAX) { dropReasons.spread++; continue; }
+      const pred = await fetchPredictionForFixture(fx.fixture_id).catch(()=>null);
+      const comp = pred?.predictions || pred?.prediction || pred || {};
+      const pHome = Number(String(comp?.percent?.home || comp?.home_percent || "").replace("%",""));
+      const pDraw = Number(String(comp?.percent?.draw || comp?.draw_percent || "").replace("%",""));
+      const pAway = Number(String(comp?.percent?.away || comp?.away_percent || "").replace("%",""));
 
-        const impliedN = normalizeImplied(med);
-        if (impliedN["1"] == null || impliedN["X"] == null || impliedN["2"] == null) { dropReasons.prices++; continue; }
+      const recBase = {
+        fixture_id: fx.fixture_id,
+        league: fx.league, league_name: fx.league?.name||"", league_country: fx.league?.country||"",
+        teams: fx.teams, home: fx.teams.home, away: fx.teams.away,
+        kickoff: fx.local_str, kickoff_utc: fx.date_utc
+      };
 
-        const pred = await fetchPredictionForFixture(fx.fixture_id).catch(() => null);
-        const comp = pred?.predictions || pred?.prediction || pred || {};
-        const pHome = Number(String(comp?.percent?.home || comp?.home_percent || "").replace("%", "")) / 100;
-        const pDraw = Number(String(comp?.percent?.draw || comp?.draw_percent || "").replace("%", "")) / 100;
-        const pAway = Number(String(comp?.percent?.away || comp?.away_percent || "").replace("%", "")) / 100;
-
-        let model = {
-          "1": Number.isFinite(pHome) ? pHome : impliedN["1"],
-          "X": Number.isFinite(pDraw) ? pDraw : impliedN["X"],
-          "2": Number.isFinite(pAway) ? pAway : impliedN["2"]
+      // --- 1X2
+      const m1 = extract1X2(oddsArr);
+      const imp1 = {
+        "1": Number.isFinite(m1.medBy["1"]) ? 1/m1.medBy["1"] : 0,
+        "X": Number.isFinite(m1.medBy["X"]) ? 1/m1.medBy["X"] : 0,
+        "2": Number.isFinite(m1.medBy["2"]) ? 1/m1.medBy["2"] : 0
+      };
+      const n1 = norm3(imp1["1"], imp1["X"], imp1["2"]);
+      let model1 = { "1": n1.A, "X": n1.B, "2": n1.C };
+      // blend sa predictions (samo 1X2)
+      if (Number.isFinite(pHome) || Number.isFinite(pDraw) || Number.isFinite(pAway)) {
+        const ph = Number.isFinite(pHome) ? (pHome/100) : model1["1"];
+        const pd = Number.isFinite(pDraw) ? (pDraw/100) : model1["X"];
+        const pa = Number.isFinite(pAway) ? (pAway/100) : model1["2"];
+        const s = ph+pd+pa; const nh = s>0 ? ph/s : 0; const nd = s>0 ? pd/s : 0; const na = s>0 ? pa/s : 0;
+        model1 = {
+          "1": MODEL_ALPHA*nh + (1-MODEL_ALPHA)*model1["1"],
+          "X": MODEL_ALPHA*nd + (1-MODEL_ALPHA)*model1["X"],
+          "2": MODEL_ALPHA*na + (1-MODEL_ALPHA)*model1["2"]
         };
-        {
-          const s = (model["1"] || 0) + (model["X"] || 0) + (model["2"] || 0);
-          if (s > 0) { model = { "1": model["1"] / s, "X": model["X"] / s, "2": model["2"] / s }; }
+      }
+      // cap odstupanje per selekcija
+      for (const k of ["1","X","2"]) {
+        const cap = dynamicUpliftCap(m1.countsBy[k]||0, m1.spreadBy[k]||0);
+        const base = (k==="1")?model1["1"]: (k==="X")?model1["X"]:model1["2"];
+        const imp = (k==="1")?model1["1"]: (k==="X")?model1["X"]:model1["2"];
+        const implied = (k==="1")? (n1.A||0) : (k==="X")? (n1.B||0) : (n1.C||0);
+        let v = base; // već blendovano
+        const diff = v - implied;
+        if (diff > cap) v = implied + cap;
+        if (diff < -cap) v = Math.max(0.0001, implied - cap);
+        if (k==="1") model1["1"] = v;
+        else if (k==="X") model1["X"] = v;
+        else model1["2"] = v;
+      }
+      { // renormalizuj
+        const s = (model1["1"]||0)+(model1["X"]||0)+(model1["2"]||0);
+        if (s>0){ model1={"1":model1["1"]/s,"X":model1["X"]/s,"2":model1["2"]/s}; }
+      }
+
+      // kandidati 1X2 (strogo/relaxed per selekcija)
+      function candidates1X2(strict=true){
+        const out=[];
+        for (const k of ["1","X","2"]) {
+          const price = m1.medBy[k]; if (!Number.isFinite(price)) continue;
+          const books = m1.countsBy[k]||0;
+          const spr = m1.spreadBy[k]||0;
+          const prob = model1[k];
+          // pravila
+          const okBooks = books >= MIN_BOOKS_PER_SEL;
+          const okSpread = strict ? spr <= SPREAD_STRICT : spr <= SPREAD_LOOSE;
+          if (!okBooks || !okSpread) continue;
+          const lab = pickLabel1X2(k);
+          const c = buildCandidate(recBase, "1X2", k, lab, price, prob, books);
+          if (c) out.push(c);
         }
-        const alpha = MODEL_ALPHA;
-        if (Number.isFinite(pHome)) model["1"] = alpha * pHome + (1 - alpha) * impliedN["1"];
-        if (Number.isFinite(pDraw)) model["X"] = alpha * pDraw + (1 - alpha) * impliedN["X"];
-        if (Number.isFinite(pAway)) model["2"] = alpha * pAway + (1 - alpha) * impliedN["2"];
-        for (const k of ["1", "X", "2"]) {
-          const diff = model[k] - impliedN[k];
-          if (diff > UPLIFT_CAP) model[k] = impliedN[k] + UPLIFT_CAP;
-          if (diff < -UPLIFT_CAP) model[k] = Math.max(0.0001, impliedN[k] - UPLIFT_CAP);
-        }
-        {
-          const s = (model["1"] || 0) + (model["X"] || 0) + (model["2"] || 0);
-          if (s > 0) { model = { "1": model["1"] / s, "X": model["X"] / s, "2": model["2"] / s }; }
-        }
+        return out;
+      }
 
-        const evBy = {
-          "1": Number.isFinite(med["1"]) && Number.isFinite(model["1"]) ? (med["1"] * model["1"] - 1) : -Infinity,
-          "X": Number.isFinite(med["X"]) && Number.isFinite(model["X"]) ? (med["X"] * model["X"] - 1) : -Infinity,
-          "2": Number.isFinite(med["2"]) && Number.isFinite(model["2"]) ? (med["2"] * model["2"] - 1) : -Infinity
-        };
-        let best = "1";
-        if (evBy["X"] > evBy[best]) best = "X";
-        if (evBy["2"] > evBy[best]) best = "2";
-
-        const bestPrice = med[best];
-        if (!Number.isFinite(bestPrice) || bestPrice < MIN_ODDS) { dropReasons.minOdds++; continue; }
-
-        if (TRUSTED_ONLY && Number.isFinite(ONE_TRUSTED_TOL) && ONE_TRUSTED_TOL > 0) {
-          const trustedCount = counts[best] || 0;
-          if (trustedCount === 1) {
-            const uplift = (model[best] || 0) - (impliedN[best] || 0);
-            if (!(uplift >= ONE_TRUSTED_TOL)) { dropReasons.noModel++; continue; }
+      // --- BTTS
+      const mb = extractBTTS(oddsArr);
+      function candidatesBTTS(strict=true){
+        const out=[];
+        const y = mb.medBy.Y, n = mb.medBy.N;
+        const impY = Number.isFinite(y)? 1/y : 0;
+        const impN = Number.isFinite(n)? 1/n : 0;
+        const s = impY+impN;
+        const pY = s>0 ? impY/s : null;
+        const pN = s>0 ? impN/s : null;
+        if (Number.isFinite(y)) {
+          const books = mb.countsBy.Y||0, spr = mb.spreadBy.Y||0;
+          const okBooks = books>=MIN_BOOKS_PER_SEL;
+          const okSpread = strict ? spr<=SPREAD_STRICT : spr<=SPREAD_LOOSE;
+          if (okBooks && okSpread) {
+            const c = buildCandidate(recBase, "BTTS", "Y", "Yes", y, pY, books);
+            if (c) out.push(c);
           }
         }
-
-        const mp = model[best];
-        if (!Number.isFinite(mp)) { dropReasons.noModel++; continue; }
-
-        const confidence_pct = Math.round(Math.max(0, Math.min(100, mp <= 1 ? mp * 100 : mp)));
-        const leagueName = fx.league?.name || "";
-        const leagueCountry = fx.league?.country || "";
-
-        const rec = {
-          fixture_id: fx.fixture_id,
-          market: "1X2",
-          pick: best === "1" ? "Home" : best === "2" ? "Away" : "Draw",
-          pick_code: best,
-          selection_label: best === "1" ? "Home" : best === "2" ? "Away" : "Draw",
-          model_prob: Number(mp.toFixed(4)),
-          confidence_pct,
-          odds: { price: Number(bestPrice), books_count: counts[best] || 0 },
-          league: { id: fx.league?.id, name: leagueName, country: leagueCountry },
-          league_name: leagueName,
-          league_country: leagueCountry,
-          teams: { home: fx.teams.home, away: fx.teams.away },
-          home: fx.teams.home,
-          away: fx.teams.away,
-          kickoff: fx.local_str,
-          kickoff_utc: fx.date_utc,
-          _implied: Number((1 / Number(bestPrice)).toFixed(4)),
-          _ev: Number((bestPrice * mp - 1).toFixed(12)),
-          source_meta: { books_counts_raw: { "1": counts["1"] || 0, "X": counts["X"] || 0, "2": counts["2"] || 0 } }
-        };
-        recs.push(rec);
-        dropReasons.ok++;
-
-        // 2b) EXTRAS: BTTS, OU2.5, HT-FT (implied-only za model_prob; predictions za ove markete tipično nema stabilno)
-        const extras = [];
-
-        // BTTS
-        try {
-          const bt = extractBTTS(oddsArr);
-          const y = bt.med.Y, n = bt.med.N;
-          if (Number.isFinite(y) || Number.isFinite(n)) {
-            const impY = Number.isFinite(y) ? 1 / y : 0;
-            const impN = Number.isFinite(n) ? 1 / n : 0;
-            const nn = implied2(impY, impN);
-            let pick = null, price = null, prob = null, booksCount = 0, label = null, code = null;
-            if (nn.A != null && nn.B != null) {
-              if (nn.A >= nn.B) { pick = "Yes"; label = "Yes"; code="Y"; price = y; prob = nn.A; booksCount = bt.counts.Y || 0; }
-              else { pick = "No"; label = "No"; code="N"; price = n; prob = nn.B; booksCount = bt.counts.N || 0; }
-              if (Number.isFinite(price) && price >= MIN_ODDS && Number.isFinite(prob)) {
-                extras.push({
-                  fixture_id: fx.fixture_id,
-                  market: "BTTS",
-                  pick, pick_code: code, selection_label: label,
-                  model_prob: Number(prob.toFixed(4)),
-                  confidence_pct: Math.round(Math.max(0, Math.min(100, prob * 100))),
-                  odds: { price: Number(price), books_count: booksCount },
-                  league: rec.league, league_name: rec.league_name, league_country: rec.league_country,
-                  teams: rec.teams, home: rec.home, away: rec.away,
-                  kickoff: rec.kickoff, kickoff_utc: rec.kickoff_utc,
-                  _implied: Number((1 / Number(price)).toFixed(4)),
-                  _ev: Number((price * prob - 1).toFixed(12)),
-                  source_meta: { books_counts_raw: { Y: bt.counts.Y || 0, N: bt.counts.N || 0 } }
-                });
-              }
-            }
+        if (Number.isFinite(n)) {
+          const books = mb.countsBy.N||0, spr = mb.spreadBy.N||0;
+          const okBooks = books>=MIN_BOOKS_PER_SEL;
+          const okSpread = strict ? spr<=SPREAD_STRICT : spr<=SPREAD_LOOSE;
+          if (okBooks && okSpread) {
+            const c = buildCandidate(recBase, "BTTS", "N", "No", n, pN, books);
+            if (c) out.push(c);
           }
-        } catch {}
+        }
+        return out;
+      }
 
-        // OU 2.5
-        try {
-          const ou = extractOU25(oddsArr);
-          const o = ou.med.O, u = ou.med.U;
-          if (Number.isFinite(o) || Number.isFinite(u)) {
-            const impO = Number.isFinite(o) ? 1 / o : 0;
-            const impU = Number.isFinite(u) ? 1 / u : 0;
-            const nn = implied2(impO, impU);
-            let pick=null, label=null, code=null, price=null, prob=null, booksCount=0;
-            if (nn.A != null && nn.B != null) {
-              if (nn.A >= nn.B) { pick="Over 2.5"; label="Over 2.5"; code="O2.5"; price=o; prob=nn.A; booksCount=ou.counts.O||0; }
-              else { pick="Under 2.5"; label="Under 2.5"; code="U2.5"; price=u; prob=nn.B; booksCount=ou.counts.U||0; }
-              if (Number.isFinite(price) && price >= MIN_ODDS && Number.isFinite(prob)) {
-                extras.push({
-                  fixture_id: fx.fixture_id,
-                  market: "OU2.5",
-                  pick, pick_code: code, selection_label: label,
-                  model_prob: Number(prob.toFixed(4)),
-                  confidence_pct: Math.round(Math.max(0, Math.min(100, prob * 100))),
-                  odds: { price: Number(price), books_count: booksCount },
-                  league: rec.league, league_name: rec.league_name, league_country: rec.league_country,
-                  teams: rec.teams, home: rec.home, away: rec.away,
-                  kickoff: rec.kickoff, kickoff_utc: rec.kickoff_utc,
-                  _implied: Number((1 / Number(price)).toFixed(4)),
-                  _ev: Number((price * prob - 1).toFixed(12)),
-                  source_meta: { books_counts_raw: { O: ou.counts.O || 0, U: ou.counts.U || 0 } }
-                });
-              }
-            }
+      // --- OU 2.5
+      const mo = extractOU25(oddsArr);
+      function candidatesOU(strict=true){
+        const out=[];
+        const o = mo.medBy.O, u = mo.medBy.U;
+        const impO = Number.isFinite(o)? 1/o : 0;
+        const impU = Number.isFinite(u)? 1/u : 0;
+        const s = impO+impU;
+        const pO = s>0 ? impO/s : null;
+        const pU = s>0 ? impU/s : null;
+        if (Number.isFinite(o)) {
+          const books = mo.countsBy.O||0, spr = mo.spreadBy.O||0;
+          const okBooks = books>=MIN_BOOKS_PER_SEL;
+          const okSpread = strict ? spr<=SPREAD_STRICT : spr<=SPREAD_LOOSE;
+          if (okBooks && okSpread) {
+            const c = buildCandidate(recBase, "OU2.5", "O2.5", "Over 2.5", o, pO, books);
+            if (c) out.push(c);
           }
-        } catch {}
-
-        // HT-FT
-        try {
-          const hf = extractHTFT(oddsArr);
-          // izračunaj implied normalized kroz sve 9 kombinacija
-          const imp = {};
-          let sum = 0;
-          for (const k of Object.keys(hf.med)) {
-            const p = Number.isFinite(hf.med[k]) ? 1 / hf.med[k] : 0;
-            imp[k] = p; sum += p;
+        }
+        if (Number.isFinite(u)) {
+          const books = mo.countsBy.U||0, spr = mo.spreadBy.U||0;
+          const okBooks = books>=MIN_BOOKS_PER_SEL;
+          const okSpread = strict ? spr<=SPREAD_STRICT : spr<=SPREAD_LOOSE;
+          if (okBooks && okSpread) {
+            const c = buildCandidate(recBase, "OU2.5", "U2.5", "Under 2.5", u, pU, books);
+            if (c) out.push(c);
           }
-          if (sum > 0) {
-            let bestK = null, bestProb = -1, bestPrice = null, bestCount = 0;
-            for (const k of Object.keys(imp)) {
-              const pr = imp[k] / sum;
-              if (Number.isFinite(pr) && pr > bestProb && Number.isFinite(hf.med[k])) {
-                bestProb = pr; bestK = k; bestPrice = hf.med[k]; bestCount = hf.counts[k] || 0;
-              }
-            }
-            if (bestK && Number.isFinite(bestPrice) && bestPrice >= MIN_ODDS && Number.isFinite(bestProb)) {
-              const labels = {
-                HH: "Home/Home", HD: "Home/Draw", HA: "Home/Away",
-                DH: "Draw/Home", DD: "Draw/Draw", DA: "Draw/Away",
-                AH: "Away/Home", AD: "Away/Draw", AA: "Away/Away"
-              };
-              extras.push({
-                fixture_id: fx.fixture_id,
-                market: "HT-FT",
-                pick: labels[bestK] || bestK, pick_code: bestK, selection_label: labels[bestK] || bestK,
-                model_prob: Number(bestProb.toFixed(4)),
-                confidence_pct: Math.round(Math.max(0, Math.min(100, bestProb * 100))),
-                odds: { price: Number(bestPrice), books_count: bestCount },
-                league: rec.league, league_name: rec.league_name, league_country: rec.league_country,
-                teams: rec.teams, home: rec.home, away: rec.away,
-                kickoff: rec.kickoff, kickoff_utc: rec.kickoff_utc,
-                _implied: Number((1 / Number(bestPrice)).toFixed(4)),
-                _ev: Number((bestPrice * bestProb - 1).toFixed(12)),
-                source_meta: { books_counts_raw: hf.counts }
-              });
-            }
-          }
-        } catch {}
+        }
+        return out;
+      }
 
-        if (extras.length) extrasByFixture[fx.fixture_id] = extras;
+      // --- HT-FT
+      const mh = extractHTFT(oddsArr);
+      function candidatesHTFT(strict=true){
+        const out=[];
+        // implied-normalize kroz svih 9 kombinacija
+        let sum=0; const imp = {};
+        for (const k of Object.keys(mh.medBy)) {
+          const p = Number.isFinite(mh.medBy[k]) ? 1/mh.medBy[k] : 0;
+          imp[k]=p; sum+=p;
+        }
+        if (sum<=0) return out;
+        for (const k of Object.keys(mh.medBy)) {
+          const price = mh.medBy[k]; if (!Number.isFinite(price)) continue;
+          const books = mh.countsBy[k]||0, spr = mh.spreadBy[k]||0;
+          const okBooks = books>=MIN_BOOKS_PER_SEL;
+          const okSpread = strict ? spr<=SPREAD_STRICT : spr<=SPREAD_LOOSE;
+          if (!okBooks || !okSpread) continue;
+          const prob = imp[k]/sum;
+          const labels = {
+            HH:"Home/Home", HD:"Home/Draw", HA:"Home/Away",
+            DH:"Draw/Home", DD:"Draw/Draw", DA:"Draw/Away",
+            AH:"Away/Home", AD:"Away/Draw", AA:"Away/Away"
+          };
+          const c = buildCandidate(recBase, "HT-FT", k, labels[k]||k, price, prob, books);
+          if (c) out.push(c);
+        }
+        return out;
+      }
 
-      } catch {
-        // skip fixture na grešku jednog poziva
+      const strictCands = [
+        ...candidates1X2(true),
+        ...candidatesBTTS(true),
+        ...candidatesOU(true),
+        ...candidatesHTFT(true),
+      ];
+      if (strictCands.length) {
+        // best-of-market po fixture-u: max confidence, pa veći EV
+        strictCands.sort((a,b)=> (b.confidence_pct - a.confidence_pct) || (b._ev - a._ev));
+        bestPerFixture_strict.push(strictCands[0]);
+        dropStats.ok++;
+      } else {
+        // probaj relaxed na istim payload-ima (bez novih poziva)
+        const relaxedCands = [
+          ...candidates1X2(false),
+          ...candidatesBTTS(false),
+          ...candidatesOU(false),
+          ...candidatesHTFT(false),
+        ];
+        if (relaxedCands.length){
+          relaxedCands.sort((a,b)=> (b.confidence_pct - a.confidence_pct) || (b._ev - a._ev));
+          bestPerFixture_relaxed.push(relaxedCands[0]);
+          dropStats.ok++;
+        } else {
+          dropStats.noPick++;
+        }
       }
     }
 
-    debug.recs = recs.length;
-    debug.extras_fixtures = Object.keys(extrasByFixture).length;
-    debug.dropped = dropReasons;
+    // rangiranje i preseci
+    const prim = bestPerFixture_strict.length ? bestPerFixture_strict : bestPerFixture_relaxed;
+    const mode = bestPerFixture_strict.length ? "strict" : "relaxed";
+    const sorted = [...prim].sort((a,b)=> (b._ev - a._ev) || (b.confidence_pct - a.confidence_pct));
+    const fullCount = Math.max(slotLimit, Math.min(sorted.length, 100));
+    const slimCount = Math.min(slotLimit, sorted.length);
+    const fullList = sorted.slice(0, fullCount);
+    const slimList = sorted.slice(0, slimCount);
 
-    // 3) Rangiranje i preseci (1X2 kao do sada)
-    const byEV = [...recs].sort((a, b) => (b._ev - a._ev) || (b.confidence_pct - a.confidence_pct));
-    const fullCount = Math.max(slotLimit, Math.min(byEV.length, 100));
-    const slimCount = Math.min(slotLimit, byEV.length);
-    const fullList = byEV.slice(0, fullCount);
-    const slimList = byEV.slice(0, slimCount);
-
-    // 4) Upis u KV
-    let wrote = false;
-    if (slimList.length > 0 || fullList.length > 0) {
-      const keySlim = `vbl:${ymd}:${qSlot}`;
-      const keyFull = `vbl_full:${ymd}:${qSlot}`;
-
-      const payloadSlim = { items: slimList, football: slimList, value_bets: slimList };
-      const payloadFull = { items: fullList, football: fullList, value_bets: fullList, extras_by_fixture: extrasByFixture };
-
+    // upis u KV
+    let wrote=false;
+    if (slimList.length>0) {
+      const keySlim = `vbl:${ymd}:${slotQ}`;
+      const keyFull = `vbl_full:${ymd}:${slotQ}`;
+      const payloadSlim = { items: slimList, football: slimList, value_bets: slimList, source_meta:{mode} };
+      const payloadFull = { items: fullList, football: fullList, value_bets: fullList, source_meta:{mode} };
       await kvSetJSON_safe(keySlim, payloadSlim);
       await kvSetJSON_safe(keyFull, payloadFull);
 
-      const keyLockedDash = `vb-locked:${ymd}:${qSlot}`;
-      const keyLockedColon = `vb:locked:${ymd}:${qSlot}`;
-      const keyLockedUnder = `vb_locked:${ymd}:${qSlot}`;
-      const keyLockedVbl = `locked:vbl:${ymd}:${qSlot}`;
-
-      await kvSetJSON_safe(keyLockedDash, payloadSlim);
-      await kvSetJSON_safe(keyLockedColon, payloadSlim);
-      await kvSetJSON_safe(keyLockedUnder, payloadSlim);
-      await kvSetJSON_safe(keyLockedVbl, payloadSlim);
+      // aliasi zbog kompatibilnosti
+      await kvSetJSON_safe(`vb-locked:${ymd}:${slotQ}`, payloadSlim);
+      await kvSetJSON_safe(`vb:locked:${ymd}:${slotQ}`, payloadSlim);
+      await kvSetJSON_safe(`vb_locked:${ymd}:${slotQ}`, payloadSlim);
+      await kvSetJSON_safe(`locked:vbl:${ymd}:${slotQ}`, payloadSlim);
 
       await kvSetJSON_safe(`vb:day:${ymd}:last`, {
-        key: keyLockedDash,
-        alt: [keySlim, keyFull, keyLockedColon, keyLockedUnder, keyLockedVbl]
+        key: `vb-locked:${ymd}:${slotQ}`,
+        alt: [keySlim, keyFull]
       });
-
       wrote = true;
     }
 
     return res.status(200).json({
-      ok: true,
-      slot: qSlot,
-      ymd,
-      count: slimList.length,
-      count_full: fullList.length,
-      wrote,
+      ok:true, slot:slotQ, ymd,
+      count: slimList.length, count_full: fullList.length, wrote,
       football: slimList,
-      ...(wantDebug ? { debug } : {})
+      ...(wantDebug ? { debug:{ ...debug, dropped: dropStats } } : {})
     });
 
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } catch(e){
+    return res.status(500).json({ ok:false, error: String(e?.message||e) });
   }
 }
