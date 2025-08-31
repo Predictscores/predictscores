@@ -1,6 +1,6 @@
 // pages/api/value-bets-locked.js
-// Adapter za stari UI: čita vbl_* iz KV i garantuje da je `pick` STRING,
-// te dodaje top-level `home`/`away`/`league_name`/`league_country`.
+// Adapter za stari Football tab. Čita vbl_* iz KV, bez fallbacka.
+// Garantuje pick/selection = string i home/away na vrhu.
 
 export const config = { runtime: "nodejs" };
 
@@ -37,11 +37,38 @@ function autoSlot(tz = TZ) {
   if (h < 15) return "am";
   return "pm";
 }
-function labelForPick(code) {
-  if (code === "1") return "Home";
-  if (code === "2") return "Away";
-  if (code === "X") return "Draw";
-  return String(code || "");
+function labelForPick(code){ return code==="1"?"Home":code==="2"?"Away":code==="X"?"Draw":String(code||""); }
+
+function normalize(it) {
+  const raw = it?.pick;
+  let code = it?.pick_code;
+  let pickStr = "";
+  if (typeof raw === "string") {
+    pickStr = ["1","X","2"].includes(raw) ? labelForPick(raw) : raw;
+  } else if (raw && typeof raw === "object") {
+    code = code || raw.code;
+    pickStr = raw.label || it?.selection_label || labelForPick(code);
+  } else {
+    pickStr = it?.selection_label || labelForPick(code);
+  }
+  const home = it.home || it?.teams?.home || "";
+  const away = it.away || it?.teams?.away || "";
+  const league_name = it.league_name || it?.league?.name || "";
+  const league_country = it.league_country || it?.league?.country || "";
+  const price = it?.odds?.price ?? it?.price ?? null;
+
+  return {
+    ...it,
+    pick: pickStr,
+    pick_code: code || it?.pick_code || null,
+    selection: pickStr,
+    selection_code: code || it?.pick_code || null,
+    selection_label: it?.selection_label || pickStr,
+    home, away,
+    league_name, league_country,
+    price,
+    books_count: it?.odds?.books_count ?? it?.books_count ?? null,
+  };
 }
 
 export default async function handler(req, res) {
@@ -50,46 +77,18 @@ export default async function handler(req, res) {
     const slot = ["am","pm","late"].includes(qslot) ? qslot : autoSlot();
     const ymd = ymdInTZ();
 
-    // Čitaj iz KV (nema NIKAKVOG fallback-a na rebuild)
-    const full = await kvGet(`vbl_full:${ymd}:${slot}`);   // puniji
-    const slim = await kvGet(`vbl:${ymd}:${slot}`);        // kraći
-    let items = Array.isArray(full) ? full : (Array.isArray(slim) ? slim : []);
-
-    // Normalizuj shape za stari front
-    items = items.map(it => {
-      // pick uvek string
-      const raw = it?.pick;
-      let code = it?.pick_code;
-      let pickStr = "";
-
-      if (typeof raw === "string") {
-        if (["1","X","2"].includes(raw)) { code = code || raw; pickStr = labelForPick(code); }
-        else { pickStr = raw; }
-      } else if (raw && typeof raw === "object") {
-        code = code || raw.code;
-        pickStr = raw.label || it?.selection_label || labelForPick(code);
-      } else {
-        pickStr = it?.selection_label || labelForPick(code);
-      }
-
-      return {
-        ...it,
-        pick: pickStr,                                      // <<< front više ne vidi [object Object]
-        pick_code: code || it?.pick_code || null,
-        home: it.home || it?.teams?.home || "",
-        away: it.away || it?.teams?.away || "",
-        league_name: it.league_name || it?.league?.name || "",
-        league_country: it.league_country || it?.league?.country || "",
-      };
-    });
+    const full = await kvGet(`vbl_full:${ymd}:${slot}`);
+    const slim = await kvGet(`vbl:${ymd}:${slot}`);
+    const base = Array.isArray(full) ? full : (Array.isArray(slim) ? slim : []);
+    const items = base.map(normalize);
 
     return res.status(200).json({
       ok: true,
       slot,
-      value_bets: items,      // ono što Football tab očekuje
-      // (za svaki slučaj dodaj i "football" polje – neke verzije UI-a ga čitaju)
+      value_bets: items,
       football: items,
-      source: `vb-locked:kv·ymd:${ymd}`,
+      items,
+      source: `vb-locked:kv:${Array.isArray(base) ? "hit" : "miss"}·ymd:${ymd}`,
     });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
