@@ -1,11 +1,13 @@
 // pages/api/cron/rebuild.js
+// Jedina ruta koja zove API-Football. Puni KV (vbl, vbl_full) i History.
+// Pick je string ("Home/Draw/Away"). Po difoltu isključuje ženske lige (heuristike).
+
 export const config = { runtime: "nodejs" };
 
 const TZ = "Europe/Belgrade";
 const AF_BASE = "https://v3.football.api-sports.io";
 const AF_KEY = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY;
 
-// Vercel KV
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN_RO = process.env.KV_REST_API_READ_ONLY_TOKEN;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN || KV_TOKEN_RO;
@@ -146,9 +148,8 @@ async function buildForFixture(fx) {
   return {
     fixture_id: fixtureId,
     market: "1X2",
-    // UI expects a string; keep code separately:
-    pick: labelForPick(top.key),      // <<< string za UI ("Home"/"Draw"/"Away")
-    pick_code: top.key,               // "1" | "X" | "2"
+    pick: labelForPick(top.key),
+    pick_code: top.key,
     selection_label: labelForPick(top.key),
 
     model_prob: Number(modelProb.toFixed(4)),
@@ -196,7 +197,7 @@ export default async function handler(req, res) {
       });
     }
 
-    const MAX_FIXTURES = 300;
+    const MAX_FIXTURES = 150; // limit da budeš daleko ispod 5k/dan
     const todo = fixtures.slice(0, MAX_FIXTURES);
 
     const CONC = 8;
@@ -219,7 +220,7 @@ export default async function handler(req, res) {
       await kvSet(keys.vbl_full, full);
       await kvSet(keys.vbl, slim);
 
-      // --- History (robustan index) ---
+      // History
       await kvSet(`hist:${ymd}:${slot}`, full);
       let idx = await kvGet("hist:index");
       if (!Array.isArray(idx)) idx = [];
