@@ -186,19 +186,15 @@ async function kvSetJSON(key, value, ttlSec = null) {
     ? `${base.replace(/\/+$/,"")}/setex/${encodeURIComponent(key)}/${ttlSec}`
     : `${base.replace(/\/+$/,"")}/set/${encodeURIComponent(key)}`;
 
-  // ⬇️ Upstash: za JSON/binary vrednost — pošalji vrednost u TELU (body),
-  // a ne kao path param. Ovo izbegava limite dužine URL-a i probleme sa encodingom.
   const r = await fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
-      // Content-Type nije obavezan, ali ga stavljamo radi jasnoće
       "Content-Type": "text/plain;charset=UTF-8"
     },
     body: JSON.stringify(value)
   });
 
-  // očekujemo { "result": "OK" } u JSON-u
   const ct = r.headers.get("content-type") || "";
   const resp = ct.includes("application/json") ? await r.json().catch(()=>null) : null;
   if (!r.ok || (resp && resp.error)) {
@@ -259,9 +255,12 @@ export default async function handler(req, res){
       try {
         const oddsPayload = await fetchOddsForFixture(fx.fixture_id);
         const oddsRows = Array.isArray(oddsPayload) ? oddsPayload.slice(0, perFixtureCap) : [];
-        const { med, books_count } = extract1X2FromOdds(oddsRows);
+
+        // PRVA ekstrakcija (ograničeni set) → medijane i books count (slice)
+        const { med, books_count: booksCountSlice } = extract1X2FromOdds(oddsRows);
         if (!Number.isFinite(med["1"]) && !Number.isFinite(med["X"]) && !Number.isFinite(med["2"])) continue;
 
+        // predictions
         let model = { "1": null, "X": null, "2": null };
         const pred = await fetchPredictionForFixture(fx.fixture_id).catch(()=>null);
         const comp = pred?.predictions || pred?.prediction || pred || {};
@@ -272,6 +271,7 @@ export default async function handler(req, res){
         if (Number.isFinite(pDraw)) model["X"] = pDraw/100;
         if (Number.isFinite(pAway)) model["2"] = pAway/100;
 
+        // fallback na impl.prob iz kvota
         const implied = { "1": med["1"] ? 1/med["1"] : null, "X": med["X"] ? 1/med["X"] : null, "2": med["2"] ? 1/med["2"] : null };
         const sumImp = (implied["1"]||0) + (implied["X"]||0) + (implied["2"]||0);
         const probs = sumImp > 0 ? {
@@ -305,6 +305,7 @@ export default async function handler(req, res){
         const leagueName = fx.league?.name || "";
         const leagueCountry = fx.league?.country || "";
 
+        // inicijalni zapis (books_count dopunjujemo ispod kompletnim proračunom)
         recs.push({
           fixture_id: fx.fixture_id,
           market: "1X2",
@@ -313,7 +314,7 @@ export default async function handler(req, res){
           selection_label: fromPickCodeToLabel(best),
           model_prob: Number(mp.toFixed(4)),
           confidence_pct,
-          odds: { price: Number(bestPrice), books_count: (fx._books_count_best || 0) || (isFinite ? (0 + (1)) : 0) }, // books_count se dodeljuje ispod
+          odds: { price: Number(bestPrice), books_count: 0 },
           league: { id: fx.league?.id, name: leagueName, country: leagueCountry },
           league_name: leagueName,
           league_country: leagueCountry,
@@ -327,11 +328,15 @@ export default async function handler(req, res){
           source_meta: { books_counts_raw: {} }
         });
 
-        // upiši realne books_count po ishodu u najnoviji element
+        // DRUGA ekstrakcija (na celom oddsPayload) → precizniji books_count
         const last = recs[recs.length - 1];
-        const { books_count } = extract1X2FromOdds(Array.isArray(oddsPayload) ? oddsPayload : []);
-        last.odds.books_count = books_count[best] || 0;
-        last.source_meta.books_counts_raw = { "1":books_count["1"]||0, "X":books_count["X"]||0, "2":books_count["2"]||0 };
+        const { books_count: booksCountAll } = extract1X2FromOdds(Array.isArray(oddsPayload) ? oddsPayload : []);
+        last.odds.books_count = (booksCountAll[best] || booksCountSlice[best] || 0);
+        last.source_meta.books_counts_raw = {
+          "1": (booksCountAll["1"] ?? booksCountSlice["1"] ?? 0),
+          "X": (booksCountAll["X"] ?? booksCountSlice["X"] ?? 0),
+          "2": (booksCountAll["2"] ?? booksCountSlice["2"] ?? 0)
+        };
 
       } catch {
         // ignoriši fixture na grešku
