@@ -1,9 +1,10 @@
 // pages/api/cron/refresh-odds.js
-// Per-fixture watcher (jeftin):
-// - čita današnji slot iz KV (robustno: vbl/vbl_full + svi "vb-locked" aliasi + pointer),
-// - izabere mečeve sa KO ∈ [now-2h, now+6h] (po kickoff_utc),
-// - osveži kvote iz API-Football za najviše ODDS_PER_FIXTURE_CAP (default 10),
-// - ažurira SAMO odds/metapodatke za postojeći pick (ne menja pick) u vbl i vbl_full (+ aliasima ako postoje).
+// Per-fixture watcher — SLOT-BOUND + ROUND-ROBIN
+// - Čita value-bets iz KV (robustno: vbl/vbl_full + svi aliasi + pointer)
+// - Umesto rolling prozora, cilja CEO slot (late/am/pm) po lokalnom kickoff-u
+// - U svakom run-u osveži najviše ODDS_PER_FIXTURE_CAP mečeva, round-robin kroz ceo slot
+// - Ne menja pick; ažurira samo odds / books_count / _implied / _ev / source_meta
+// - UI i druge rute ostaju KV-only
 
 export const config = { api: { bodyParser: false } };
 
@@ -30,6 +31,11 @@ function ymdInTZ(d = new Date(), tz = TZ) {
   }
 }
 function slotOfHour(h) { return h < 10 ? "late" : (h < 15 ? "am" : "pm"); }
+function windowForSlot(slot) {
+  if (slot === "late") return { hmin: 0,  hmax: 9,  label: "late" };
+  if (slot === "am")   return { hmin: 10, hmax: 14, label: "am"   };
+  return                  { hmin: 15, hmax: 23, label: "pm"   };
+}
 function localHour(tz = TZ) {
   try { return Number(new Intl.DateTimeFormat("sv-SE", { timeZone: tz, hour: "2-digit", hour12: false }).format(new Date())); }
   catch { return new Date().getUTCHours(); }
@@ -38,20 +44,30 @@ function parseISO(x) {
   const t = Date.parse(x);
   return Number.isFinite(t) ? t : NaN;
 }
-function betweenUTC(tsUTC, nowUTC, pastMs, futureMs) {
-  return (nowUTC - pastMs) <= tsUTC && tsUTC <= (nowUTC + futureMs);
-}
 function median(nums) {
   const a = nums.filter(Number.isFinite).sort((x, y) => x - y);
   if (!a.length) return NaN;
   const m = Math.floor(a.length / 2);
   return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
 }
+function localPartsFromISO(dateIso, tz = TZ) {
+  try {
+    const d = new Date(dateIso);
+    const fmt = new Intl.DateTimeFormat("sv-SE", {
+      timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hour12: false
+    });
+    const p = fmt.formatToParts(d).reduce((a, x) => (a[x.type] = x.value, a), {});
+    return { ymd: `${p.year}-${p.month}-${p.day}`, hour: Number(p.hour), hm: `${p.hour}:${p.minute}` };
+  } catch {
+    return { ymd: ymdInTZ(new Date(), tz), hour: 0, hm: "00:00" };
+  }
+}
 
 // ----------------------- config consts (pre KV/AF) -----------------------
 const MIN_ODDS = envNum("MIN_ODDS", 1.01);
-const PER_FIXTURE_CAP = envNum("ODDS_PER_FIXTURE_CAP", 10);
-const DRY_RUN = envBool("WATCHER_DRY_RUN", false);
+const CAP = envNum("ODDS_PER_FIXTURE_CAP", 10);         // koliko mečeva osvežavaš po run-u
+const DRY_RUN = envBool("WATCHER_DRY_RUN", false);      // ako 1/true, ne piše nazad u KV
 
 // ----------------------- KV (Upstash) -----------------------
 async function kvGetRaw(key) {
@@ -157,11 +173,11 @@ function extract1X2FromOdds(oddsPayload) {
 export default async function handler(req, res) {
   try {
     const now = new Date();
-    const nowUTC = Date.now();
     const ymd = ymdInTZ(now, TZ);
     const slot = (req.query.slot && String(req.query.slot)) || slotOfHour(localHour(TZ));
+    const win = windowForSlot(slot);
 
-    const debug = { tried: [], pickedKey: null, listLen: 0, targetedIds: [] };
+    const debug = { tried: [], pickedKey: null, listLen: 0, filteredBySlot: 0, rrOffset: 0, targetedIds: [], mode: "slot-bound" };
 
     // 1) Učitaj payload iz KV (robustno)
     const keyCandidates = [
@@ -230,36 +246,95 @@ export default async function handler(req, res) {
     if (!inspected) {
       return res.status(200).json({
         ok: true, ymd, slot,
-        inspected: 0, targeted: 0, touched: 0,
+        inspected: 0, filtered: 0, targeted: 0, touched: 0,
         source: "refresh-odds:per-fixture",
         debug
       });
     }
 
-    // 2) Izaberi targete po KO prozoru (kickoff_utc)
-    const PAST_MS = 2 * 60 * 60 * 1000;   // -2h
-    const FUT_MS = 6 * 60 * 60 * 1000;    // +6h
-    const candidates = payload.arr.filter(r => {
-      const ts = parseISO(r?.kickoff_utc);
-      if (Number.isFinite(ts)) return betweenUTC(ts, nowUTC, PAST_MS, FUT_MS);
-      const ts2 = parseISO(r?.kickoff);
-      return Number.isFinite(ts2) ? betweenUTC(ts2, nowUTC, PAST_MS, FUT_MS) : false;
-    });
+    // 2) SLOT-BOUND filter: ceo slot dana (po lokalnom kickoff-u)
+    //    Prefer "kickoff" (lokalni string koji je rebuild već izračunao u TZ), fallback na "kickoff_utc" -> pretvori u lokalni sat & ymd.
+    const candidates = payload.arr
+      .map(r => {
+        if (r && typeof r === "object") {
+          // pokušaj direktno iz "kickoff" stringa "YYYY-MM-DD HH:mm"
+          const k = String(r.kickoff || "");
+          if (/^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}$/.test(k)) {
+            const ymdLocal = k.slice(0, 10);
+            const hh = Number(k.slice(11, 13));
+            return { rec: r, ymdLocal, hh };
+          }
+          // fallback: kickoff_utc -> lokalni delovi
+          const ts = parseISO(r.kickoff_utc);
+          if (Number.isFinite(ts)) {
+            const parts = localPartsFromISO(r.kickoff_utc, TZ);
+            return { rec: r, ymdLocal: parts.ymd, hh: parts.hour };
+          }
+        }
+        return null;
+      })
+      .filter(Boolean)
+      .filter(x => x.ymdLocal === ymd && x.hh >= win.hmin && x.hh <= win.hmax)
+      .sort((a, b) => {
+        // očuvaj hronologiju u slotu (po utc datetime)
+        const ta = parseISO(a.rec.kickoff_utc) || parseISO(`${a.ymdLocal} ${String(a.hh).padStart(2, "0")}:00:00Z`);
+        const tb = parseISO(b.rec.kickoff_utc) || parseISO(`${b.ymdLocal} ${String(b.hh).padStart(2, "0")}:00:00Z`);
+        return ta - tb;
+      })
+      .map(x => x.rec);
 
-    const targets = candidates.slice(0, Math.max(0, PER_FIXTURE_CAP));
+    debug.filteredBySlot = candidates.length;
+
+    if (!candidates.length) {
+      return res.status(200).json({
+        ok: true, ymd, slot,
+        inspected, filtered: 0, targeted: 0, touched: 0,
+        source: "refresh-odds:per-fixture",
+        debug
+      });
+    }
+
+    // 3) ROUND-ROBIN odabir u okviru slot liste (persistira offset u KV)
+    const rrKey = `vb:rr:${ymd}:${slot}`;
+    let rr = 0;
+    const rrRaw = await kvGetRaw(rrKey);
+    if (rrRaw != null) {
+      try {
+        if (typeof rrRaw === "string") {
+          const jj = JSON.parse(rrRaw);
+          rr = Number.isFinite(Number(jj?.offset)) ? Number(jj.offset) : (Number.isFinite(Number(rrRaw)) ? Number(rrRaw) : 0);
+        } else if (typeof rrRaw === "object" && rrRaw) {
+          rr = Number.isFinite(Number(rrRaw.offset)) ? Number(rrRaw.offset) : 0;
+        } else {
+          rr = Number.isFinite(Number(rrRaw)) ? Number(rrRaw) : 0;
+        }
+      } catch {
+        rr = Number.isFinite(Number(rrRaw)) ? Number(rrRaw) : 0;
+      }
+    }
+    rr = Math.max(0, Math.min(rr, Math.max(0, candidates.length - 1)));
+    debug.rrOffset = rr;
+
+    // uzmi CAP komada počev od rr; wrap-around po listi
+    const tgt = [];
+    for (let i = 0; i < Math.min(CAP, candidates.length); i++) {
+      tgt.push(candidates[(rr + i) % candidates.length]);
+    }
+    const targets = tgt;
     const targeted = targets.length;
-    debug.targetedIds = targets.map(t => t?.fixture_id).filter(Boolean);
+    const targetedIds = targets.map(t => t?.fixture_id).filter(Boolean);
+    debug.targetedIds = targetedIds;
 
     if (!targeted) {
       return res.status(200).json({
         ok: true, ymd, slot,
-        inspected, targeted: 0, touched: 0,
+        inspected, filtered: candidates.length, targeted: 0, touched: 0,
         source: "refresh-odds:per-fixture",
         debug
       });
     }
 
-    // 3) Osveži kvote za targete
+    // 4) Osveži kvote za targete
     const updatesById = new Map(); // fixture_id -> { price, books_count, raw_counts, implied, ev }
     for (const rec of targets) {
       const fid = rec?.fixture_id;
@@ -288,54 +363,52 @@ export default async function handler(req, res) {
     }
 
     const touched = updatesById.size;
-    if (!touched) {
-      return res.status(200).json({
-        ok: true, ymd, slot,
-        inspected, targeted, touched: 0,
-        source: "refresh-odds:per-fixture",
-        debug
-      });
-    }
 
-    // 4) Upis nazad u KV – update polja u vbl & vbl_full + aliasi ako postoje
-    const keysToPatch = [
-      `vbl:${ymd}:${slot}`,
-      `vbl_full:${ymd}:${slot}`,
-      `vb-locked:${ymd}:${slot}`,
-      `vb:locked:${ymd}:${slot}`,
-      `vb_locked:${ymd}:${slot}`,
-      `locked:vbl:${ymd}:${slot}`
-    ];
+    // 5) Upis nazad u KV – patch u vbl & vbl_full + aliasi (ako postoje)
+    if (touched > 0 && !DRY_RUN) {
+      const keysToPatch = [
+        `vbl:${ymd}:${slot}`,
+        `vbl_full:${ymd}:${slot}`,
+        `vb-locked:${ymd}:${slot}`,
+        `vb:locked:${ymd}:${slot}`,
+        `vb_locked:${ymd}:${slot}`,
+        `locked:vbl:${ymd}:${slot}`
+      ];
 
-    for (const k of keysToPatch) {
-      const raw = await kvGetRaw(k);
-      if (!raw) continue;
+      for (const k of keysToPatch) {
+        const raw = await kvGetRaw(k);
+        if (!raw) continue;
 
-      let obj = raw;
-      if (typeof obj === "string") { try { obj = JSON.parse(obj); } catch { continue; } }
-      const fields = ["items", "value_bets", "football", "arr", "data"];
-      let changed = false;
+        let obj = raw;
+        if (typeof obj === "string") { try { obj = JSON.parse(obj); } catch { continue; } }
+        const fields = ["items", "value_bets", "football", "arr", "data"];
+        let changed = false;
 
-      for (const f of fields) {
-        if (!Array.isArray(obj?.[f])) continue;
-        for (const it of obj[f]) {
-          const u = updatesById.get(it?.fixture_id);
-          if (!u) continue;
+        for (const f of fields) {
+          if (!Array.isArray(obj?.[f])) continue;
+          for (const it of obj[f]) {
+            const u = updatesById.get(it?.fixture_id);
+            if (!u) continue;
 
-          it.odds = Object.assign({}, it.odds, { price: u.price, books_count: u.books_count });
-          it._implied = u.implied;
-          it._ev = u.ev;
-          it.source_meta = Object.assign({}, it.source_meta, { books_counts_raw: u.raw_counts });
-          changed = true;
+            it.odds = Object.assign({}, it.odds, { price: u.price, books_count: u.books_count });
+            it._implied = u.implied;
+            it._ev = u.ev;
+            it.source_meta = Object.assign({}, it.source_meta, { books_counts_raw: u.raw_counts });
+            changed = true;
+          }
         }
-      }
 
-      if (changed) await kvSetJSON(k, obj);
+        if (changed) await kvSetJSON(k, obj);
+      }
     }
+
+    // 6) Sačuvaj round-robin offset (i kad nema touched, da ne zaglavimo na istim)
+    const nextRR = (rr + targeted) % candidates.length;
+    await kvSetJSON(rrKey, { offset: nextRR });
 
     return res.status(200).json({
       ok: true, ymd, slot,
-      inspected, targeted, touched,
+      inspected, filtered: candidates.length, targeted, touched,
       source: "refresh-odds:per-fixture",
       debug
     });
