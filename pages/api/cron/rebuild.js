@@ -433,14 +433,12 @@ export default async function handler(req, res){
     debug.considered = fixtures.length;
 
     const bestPerFixture_strict = [];
-    const bestPerFixture_relaxed = [];
-    const dropStats = { noOdds:0, noPick:0, ok:0 };
-
+    theLoop:
     for (const fx of fixtures) {
       // payloadi (jednom po fixture-u)
       const oddsPayload = await fetchOddsForFixture(fx.fixture_id);
       const oddsArr = Array.isArray(oddsPayload) ? oddsPayload : [];
-      if (!oddsArr.length){ dropStats.noOdds++; continue; }
+      if (!oddsArr.length) continue;
 
       const pred = await fetchPredictionForFixture(fx.fixture_id).catch(()=>null);
       const comp = pred?.predictions || pred?.prediction || pred || {};
@@ -464,7 +462,6 @@ export default async function handler(req, res){
       };
       const n1 = norm3(imp1["1"], imp1["X"], imp1["2"]);
       let model1 = { "1": n1.A, "X": n1.B, "2": n1.C };
-      // blend sa predictions (samo 1X2)
       if (Number.isFinite(pHome) || Number.isFinite(pDraw) || Number.isFinite(pAway)) {
         const ph = Number.isFinite(pHome) ? (pHome/100) : model1["1"];
         const pd = Number.isFinite(pDraw) ? (pDraw/100) : model1["X"];
@@ -476,7 +473,6 @@ export default async function handler(req, res){
           "2": MODEL_ALPHA*na + (1-MODEL_ALPHA)*model1["2"]
         };
       }
-      // cap odstupanje per selekcija
       for (const k of ["1","X","2"]) {
         const cap = dynamicUpliftCap(m1.countsBy[k]||0, m1.spreadBy[k]||0);
         const implied = (k==="1")? (n1.A||0) : (k==="X")? (n1.B||0) : (n1.C||0);
@@ -486,12 +482,8 @@ export default async function handler(req, res){
         if (diff < -cap) v = Math.max(0.0001, implied - cap);
         model1[k] = v;
       }
-      { // renormalizuj
-        const s = (model1["1"]||0)+(model1["X"]||0)+(model1["2"]||0);
-        if (s>0){ model1={"1":model1["1"]/s,"X":model1["X"]/s,"2":model1["2"]/s}; }
-      }
+      { const s = (model1["1"]||0)+(model1["X"]||0)+(model1["2"]||0); if (s>0){ model1={"1":model1["1"]/s,"X":model1["X"]/s,"2":model1["2"]/s}; } }
 
-      // kandidati 1X2
       function candidates1X2(strict=true){
         const out=[];
         const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX;
@@ -501,9 +493,7 @@ export default async function handler(req, res){
           const books = m1.countsBy[k]||0;
           const spr = m1.spreadBy[k]||0;
           const prob = model1[k];
-          const okBooks = books >= needBooks;
-          const okSpread = spr <= sprLimit;
-          if (!okBooks || !okSpread) continue;
+          if (books < needBooks || spr > sprLimit) continue;
           const lab = pickLabel1X2(k);
           const c = buildCandidate(recBase, "1X2", k, lab, price, prob, books, needBooks);
           if (c) out.push(c);
@@ -511,7 +501,7 @@ export default async function handler(req, res){
         return out;
       }
 
-      // --- BTTS (OBE strane, ali relaxed dopušta books>=2 i veći spread)
+      // --- BTTS
       const mb = extractBTTS(oddsArr);
       function candidatesBTTS(strict=true){
         const out=[];
@@ -535,7 +525,7 @@ export default async function handler(req, res){
         return out;
       }
 
-      // --- OU 2.5 (OBE strane, relaxed dopušta books>=2 i veći spread)
+      // --- OU 2.5
       const mo = extractOU25(oddsArr);
       function candidatesOU(strict=true){
         const out=[];
@@ -559,7 +549,7 @@ export default async function handler(req, res){
         return out;
       }
 
-      // --- HT-FT (punina tržišta: ≥3 strict / ≥2 relaxed; per selekcija books i spread po režimu)
+      // --- HT-FT
       const mh = extractHTFT(oddsArr);
       function candidatesHTFT(strict=true){
         const out=[];
@@ -572,8 +562,7 @@ export default async function handler(req, res){
           const price = mh.medBy[k];
           const books = mh.countsBy[k]||0;
           const spr = mh.spreadBy[k]||0;
-          const ok = Number.isFinite(price) && books>=needBooks && spr<=sprLimit;
-          if (ok) valid.push(k);
+          if (Number.isFinite(price) && books>=needBooks && spr<=sprLimit) valid.push(k);
         }
         const need = strict ? HTFT_MIN_COMBOS_STRICT : HTFT_MIN_COMBOS_RELAX;
         if (valid.length < need) return out;
@@ -599,7 +588,6 @@ export default async function handler(req, res){
       if (strictCands.length) {
         strictCands.sort((a,b)=> (b.confidence_pct - a.confidence_pct) || (b._ev - a._ev));
         bestPerFixture_strict.push(strictCands[0]);
-        dropStats.ok++;
       } else {
         const relaxedCands = [
           ...candidates1X2(false),
@@ -609,18 +597,13 @@ export default async function handler(req, res){
         ];
         if (relaxedCands.length){
           relaxedCands.sort((a,b)=> (b.confidence_pct - a.confidence_pct) || (b._ev - a._ev));
-          bestPerFixture_relaxed.push(relaxedCands[0]);
-          dropStats.ok++;
-        } else {
-          dropStats.noPick++;
+          bestPerFixture_strict.push(relaxedCands[0]); // koristimo isti skup
         }
       }
     }
 
     // rangiranje i preseci
-    const prim = bestPerFixture_strict.length ? bestPerFixture_strict : bestPerFixture_relaxed;
-    const mode = bestPerFixture_strict.length ? "strict" : "relaxed";
-    const sorted = [...prim].sort((a,b)=> (b._ev - a._ev) || (b.confidence_pct - a.confidence_pct));
+    const sorted = bestPerFixture_strict.sort((a,b)=> (b._ev - a._ev) || (b.confidence_pct - a.confidence_pct));
     const fullCount = Math.max(slotLimit, Math.min(sorted.length, 100));
     const slimCount = Math.min(slotLimit, sorted.length);
     const fullList = sorted.slice(0, fullCount);
@@ -631,8 +614,8 @@ export default async function handler(req, res){
     if (slimList.length>0) {
       const keySlim = `vbl:${ymd}:${slotQ}`;
       const keyFull = `vbl_full:${ymd}:${slotQ}`;
-      const payloadSlim = { items: slimList, football: slimList, value_bets: slimList, source_meta:{mode} };
-      const payloadFull = { items: fullList, football: fullList, value_bets: fullList, source_meta:{mode} };
+      const payloadSlim = { items: slimList, football: slimList, value_bets: slimList };
+      const payloadFull = { items: fullList, football: fullList, value_bets: fullList };
       await kvSetJSON_safe(keySlim, payloadSlim);
       await kvSetJSON_safe(keyFull, payloadFull);
 
@@ -652,8 +635,7 @@ export default async function handler(req, res){
     return res.status(200).json({
       ok:true, slot:slotQ, ymd,
       count: slimList.length, count_full: fullList.length, wrote,
-      football: slimList,
-      ...(wantDebug ? { debug:{ ...debug, dropped: dropStats } } : {})
+      football: slimList
     });
 
   } catch(e){
