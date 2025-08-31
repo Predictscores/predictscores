@@ -1,6 +1,8 @@
 // pages/api/debug/kv.js
-// Unified KV diagnostika: vb:day:* pointeri (CET/UTC) + skeniranje vbl/vbl_full za 0/-1/-2 dana.
-// Radi samo sa KV REST (nema spoljnog API-ja).
+// Unified KV dijagnostika: vb:day:* pointeri (CET/UTC) + skeniranje vbl/vbl_full (0/-1/-2 dana)
+// uz dekodiranje (JSON string, base64, base64-gzip) i „pametno” brojanje.
+
+// ⚠️ NEMA novih fajlova; ovo je 1:1 zamena postojećeg debug endpointa.
 
 export const config = { api: { bodyParser: false } };
 
@@ -20,17 +22,65 @@ function ymdInTZ(d = new Date(), tz = TZ) {
 }
 function shiftDays(d, days){ const nd = new Date(d.getTime()); nd.setUTCDate(nd.getUTCDate()+days); return nd; }
 
-async function kvGETraw(key){
-  const r = await fetch(`${KV_URL.replace(/\/+$/,"")}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${KV_TOKEN}` }
-  });
-  const ct = r.headers.get("content-type") || "";
-  const body = ct.includes("application/json") ? await r.json().catch(()=>null) : await r.text().catch(()=>null);
-  return (body && typeof body === "object" && "result" in body) ? body.result : body;
+function gunzipBase64ToString(b64){
+  try {
+    const zlib = require("zlib");
+    const buf = Buffer.from(b64, "base64");
+    const out = zlib.gunzipSync(buf);
+    return out.toString("utf8");
+  } catch { return null; }
 }
-
-function countItems(v) {
-  try { if (typeof v === "string") v = JSON.parse(v); } catch { /* leave as-is */ }
+function tryDecode(raw){
+  if (raw && typeof raw === "object") return raw;
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "string") {
+    try { return JSON.parse(raw); } catch {}
+    const maybe = gunzipBase64ToString(raw);
+    if (maybe){ try { return JSON.parse(maybe); } catch {} }
+    try {
+      const dec = Buffer.from(raw, "base64").toString("utf8");
+      try { return JSON.parse(dec); } catch {}
+    } catch {}
+  }
+  return raw;
+}
+function looksLikeBet(o){
+  if (!o || typeof o !== "object") return false;
+  const keys = Object.keys(o);
+  const must = ["fixture_id","teams","home","away","selection","pick","market","kickoff","confidence_pct","model_prob"];
+  let score = 0;
+  for (const k of must){ if (k in o) score++; }
+  return score >= 2 || ("league" in o && ("teams" in o || "home" in o || "away" in o));
+}
+function collectCandidateArrays(x, limit = 500){
+  const out = [];
+  const seen = new Set();
+  const stack = [x];
+  let guard = 0;
+  while (stack.length && out.length < limit && guard < 2000){
+    guard++;
+    const cur = stack.pop();
+    if (!cur) continue;
+    if (Array.isArray(cur)){
+      if (cur.length && typeof cur[0] === "object" && looksLikeBet(cur[0])) {
+        const id = `arr:${cur.length}:${Object.keys(cur[0]).slice(0,5).join(",")}`;
+        if (!seen.has(id)){ seen.add(id); out.push(cur); }
+        continue;
+      }
+      for (const it of cur){ if (it && (typeof it==="object" || Array.isArray(it))) stack.push(it); }
+      continue;
+    }
+    if (typeof cur === "object"){
+      for (const k in cur){
+        const v = cur[k];
+        if (v && (typeof v==="object" || Array.isArray(v))) stack.push(v);
+      }
+    }
+  }
+  return out;
+}
+function countAny(v){
+  try { v = tryDecode(v); } catch {}
   const arr =
     (Array.isArray(v) && v) ||
     (Array.isArray(v?.items) && v.items) ||
@@ -39,30 +89,45 @@ function countItems(v) {
     (Array.isArray(v?.data?.items) && v.data.items) ||
     (Array.isArray(v?.data?.value_bets) && v.data.value_bets) ||
     (Array.isArray(v?.data?.football) && v.data.football) ||
-    [];
-  return { count: arr.length, sample: arr[0] ?? null };
+    (Array.isArray(v?.full) && v.full) ||
+    (Array.isArray(v?.slim) && v.slim) ||
+    (Array.isArray(v?.list) && v.list) ||
+    (Array.isArray(v?.arr) && v.arr) ||
+    (Array.isArray(v?.recs) && v.recs) ||
+    (Array.isArray(v?.recommendations) && v.recommendations) ||
+    (Array.isArray(v?.football_full) && v.football_full) ||
+    (Array.isArray(v?.football_slim) && v.football_slim) ||
+    (collectCandidateArrays(v)[0] || []);
+  return { count: arr.length, sample: arr[0] ?? null, keys: v && typeof v === "object" ? Object.keys(v) : [] };
 }
 
-// Ako pointer vrednost izgleda kao JSON { key: "..." } ili kao plain key string, dereferenciraj
+async function kvGETraw(key){
+  const r = await fetch(`${KV_URL.replace(/\/+$/,"")}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${KV_TOKEN}` }
+  });
+  const ct = r.headers.get("content-type") || "";
+  const body = ct.includes("application/json") ? await r.json().catch(()=>null) : await r.text().catch(()=>null);
+  const result = (body && typeof body==="object" && "result" in body) ? body.result : body;
+  const exists = result != null;
+  return { exists, raw: result };
+}
+
 async function derefPointer(val) {
   if (val == null) return { target: null, exists: false, count: 0 };
-  // 1) JSON object with key
   if (typeof val === "string") {
     try {
       const obj = JSON.parse(val);
       if (obj && typeof obj === "object" && typeof obj.key === "string") {
-        const raw = await kvGETraw(obj.key);
-        const { count } = countItems(raw);
-        return { target: obj.key, exists: raw != null, count };
+        const got = await kvGETraw(obj.key);
+        const { count } = countAny(got.raw);
+        return { target: obj.key, exists: got.exists, count };
       }
     } catch { /* not JSON */ }
-    // 2) Treat as key
-    const raw2 = await kvGETraw(val);
-    const { count: c2 } = countItems(raw2);
-    return { target: val, exists: raw2 != null, count: c2 };
+    const got2 = await kvGETraw(val);
+    const { count: c2 } = countAny(got2.raw);
+    return { target: val, exists: got2.exists, count: c2 };
   }
-  // 3) Embedded snapshot with items
-  const { count } = countItems(val);
+  const { count } = countAny(val);
   return { target: "(embedded)", exists: count > 0, count };
 }
 
@@ -75,16 +140,15 @@ export default async function handler(req, res){
   const dayCET = ymdInTZ(now, TZ);
   const dayUTC = ymdInTZ(now, "UTC");
 
-  // 1) vb:day pointers
+  // 1) vb:day pointers (CET/UTC)
   const ptrCETkey = `vb:day:${dayCET}:last`;
   const ptrUTCkey = `vb:day:${dayUTC}:last`;
   const ptrCETraw = await kvGETraw(ptrCETkey);
   const ptrUTCraw = await kvGETraw(ptrUTCkey);
+  const ptrCET = await derefPointer(ptrCETraw.raw);
+  const ptrUTC = await derefPointer(ptrUTCraw.raw);
 
-  const ptrCET = await derefPointer(ptrCETraw);
-  const ptrUTC = await derefPointer(ptrUTCraw);
-
-  // 2) vbl/vbl_full scan for 0/-1/-2 days, slots pm/am/late
+  // 2) skeniranje vbl/vbl_full + locked varijante, za 0/-1/-2 dana
   const days = [0, -1, -2];
   const slots = ["pm","am","late"];
   const scan = [];
@@ -94,22 +158,21 @@ export default async function handler(req, res){
       for (const prefix of ["vbl","vbl_full"]) {
         const key = `${prefix}:${y}:${s}`;
         const raw = await kvGETraw(key);
-        const { count } = countItems(raw);
-        scan.push({ key, ymd:y, slot:s, exists: raw != null, count });
+        const { count } = countAny(raw.raw);
+        scan.push({ key, ymd:y, slot:s, exists: raw.exists, count });
       }
-      // i locked varijante koje se ponekad koriste
       for (const alt of ["vb:locked","vb_locked","vb-locked","locked:vbl"]) {
         const key = `${alt}:${y}:${s}`;
         const raw = await kvGETraw(key);
-        const { count } = countItems(raw);
-        scan.push({ key, ymd:y, slot:s, exists: raw != null, count });
+        const { count } = countAny(raw.raw);
+        scan.push({ key, ymd:y, slot:s, exists: raw.exists, count });
       }
     }
-    // vb:day:<ymd>:last pointer za taj dan
+    // pointer za taj YMD
     const kDay = `vb:day:${y}:last`;
     const rawDay = await kvGETraw(kDay);
-    const deref = await derefPointer(rawDay);
-    scan.push({ key: kDay, ymd:y, slot:"-", exists: rawDay != null, pointer_target: deref.target, pointer_count: deref.count });
+    const deref = await derefPointer(rawDay.raw);
+    scan.push({ key: kDay, ymd:y, slot:"-", exists: rawDay.exists, pointer_target: deref.target, pointer_count: deref.count });
   }
 
   return res.status(200).json({
@@ -120,6 +183,6 @@ export default async function handler(req, res){
       cet_key: ptrCETkey, cet_target: ptrCET.target, cet_exists: ptrCET.exists, cet_count: ptrCET.count,
       utc_key: ptrUTCkey, utc_target: ptrUTC.target, utc_exists: ptrUTC.exists, utc_count: ptrUTC.count,
     },
-    scan // lista objekata: {key, ymd, slot, exists, count, ...}
+    scan
   });
 }
