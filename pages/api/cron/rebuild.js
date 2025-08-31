@@ -81,7 +81,7 @@ const API_KEY  = process.env.API_FOOTBALL_KEY || process.env.API_FOOTBALL || "";
 function afHeaders(){
   const h = {};
   h["x-apisports-key"] = API_KEY;  // api-sports v3
-  h["x-rapidapi-key"]  = API_KEY;  // rapidapi fallback
+  h["x-rapidapi-key"]  = API_KEY;  // rapidapi fallback (ako koristiš RapidAPI proxy)
   return h;
 }
 async function getJSON(url){
@@ -168,12 +168,23 @@ function normalizeTeams(t){
   const away = t?.away?.name || t?.away || t?.awayTeam || "";
   return { home, away };
 }
+
+// ✅ Korektna heuristika za ženske lige/timove (bez lažnih pogodaka na “IF/FF/F”)
+function isWomenString(s=""){
+  const x = s.toLowerCase();
+  // jasni markeri
+  if (/\b(women|women's|ladies)\b/i.test(s)) return true;
+  if (/\b(femenina|feminine|feminin|femminile)\b/i.test(s)) return true;
+  if (/\b(dames|dam|kvinner|kvinn|kvinnor)\b/i.test(s)) return true; // 'Damallsvenskan', 'Kvinner'
+  // oznake tipa "Team W", "Chelsea W", "(W)"
+  if (/\(w\)/i.test(s)) return true;
+  if (/\sW$/i.test(s)) return true; // završava na ' W'
+  // azijski markeri
+  if (/女子|여자/.test(x)) return true;
+  return false;
+}
 function isWomensLeague(leagueName="", teams={home:"",away:""}){
-  const n = (leagueName || "").toLowerCase();
-  const h = (teams.home || "").toLowerCase();
-  const a = (teams.away || "").toLowerCase();
-  const pat = /(women|femenina|feminine|feminin|femminile|dam|kvinn|女子|여자|f|w$|\bw\b)/i;
-  return pat.test(n) || pat.test(h) || pat.test(a);
+  return isWomenString(leagueName) || isWomenString(teams.home) || isWomenString(teams.away);
 }
 
 // ------------------------------ KV (Upstash REST: POST body za JSON!) ------------------------------
@@ -211,6 +222,7 @@ export default async function handler(req, res){
     const ymd = ymdInTZ(now, TZ);
     const qSlot = (req.query.slot && String(req.query.slot)) || slotOfHour(toLocal(now, TZ).hour);
     const slotWin = windowForSlot(qSlot);
+    const wantDebug = String(req.query.debug||"") === "1";
 
     // limit po slotu
     let slotLimit;
@@ -221,9 +233,13 @@ export default async function handler(req, res){
     }
     if (VB_LIMIT > 0) slotLimit = Math.min(slotLimit, VB_LIMIT);
 
+    const debug = { ymd, slot:qSlot };
+
     // 1) Fixtures za danas → filtriraj po slotu i heuristički isključi ženske lige
     let fixtures = [];
     const raw = await fetchFixturesByDate(ymd);
+    debug.fixtures_total = Array.isArray(raw) ? raw.length : 0;
+
     fixtures = raw
       .map((r) => {
         const fx = r?.fixture || {};
@@ -241,12 +257,24 @@ export default async function handler(req, res){
           teams: { home: tms.home, away: tms.away }
         };
       })
-      .filter(fx => fx.fixture_id && fx.date_utc != null)
-      .filter(fx => fx.local_hour >= slotWin.hmin && fx.local_hour <= slotWin.hmax)
+      .filter(fx => fx.fixture_id && fx.date_utc != null);
+
+    debug.after_basic = fixtures.length;
+
+    fixtures = fixtures
+      .filter(fx => fx.local_hour >= slotWin.hmin && fx.local_hour <= slotWin.hmax);
+
+    debug.after_slot = fixtures.length;
+
+    fixtures = fixtures
       .filter(fx => EXCLUDE_WOMEN ? !isWomensLeague(fx.league?.name, {home:fx.teams.home, away:fx.teams.away}) : true);
+
+    debug.after_gender_filter = fixtures.length;
 
     // ograniči broj fixture-a (malo šire, pa preseci posle rangiranja)
     fixtures = fixtures.slice(0, Math.max(1, slotLimit, 1) * 3);
+    debug.considered = fixtures.length;
+
     const perFixtureCap = Math.max(1, PER_FIXTURE_ODDS_CAP);
 
     // 2) Za svaku utakmicu: median 1X2 kvote + predikcije → EV
@@ -256,11 +284,9 @@ export default async function handler(req, res){
         const oddsPayload = await fetchOddsForFixture(fx.fixture_id);
         const oddsRows = Array.isArray(oddsPayload) ? oddsPayload.slice(0, perFixtureCap) : [];
 
-        // PRVA ekstrakcija (ograničeni set) → medijane i books count (slice)
         const { med, books_count: booksCountSlice } = extract1X2FromOdds(oddsRows);
         if (!Number.isFinite(med["1"]) && !Number.isFinite(med["X"]) && !Number.isFinite(med["2"])) continue;
 
-        // predictions
         let model = { "1": null, "X": null, "2": null };
         const pred = await fetchPredictionForFixture(fx.fixture_id).catch(()=>null);
         const comp = pred?.predictions || pred?.prediction || pred || {};
@@ -271,7 +297,6 @@ export default async function handler(req, res){
         if (Number.isFinite(pDraw)) model["X"] = pDraw/100;
         if (Number.isFinite(pAway)) model["2"] = pAway/100;
 
-        // fallback na impl.prob iz kvota
         const implied = { "1": med["1"] ? 1/med["1"] : null, "X": med["X"] ? 1/med["X"] : null, "2": med["2"] ? 1/med["2"] : null };
         const sumImp = (implied["1"]||0) + (implied["X"]||0) + (implied["2"]||0);
         const probs = sumImp > 0 ? {
@@ -305,7 +330,6 @@ export default async function handler(req, res){
         const leagueName = fx.league?.name || "";
         const leagueCountry = fx.league?.country || "";
 
-        // inicijalni zapis (books_count dopunjujemo ispod kompletnim proračunom)
         recs.push({
           fixture_id: fx.fixture_id,
           market: "1X2",
@@ -328,7 +352,7 @@ export default async function handler(req, res){
           source_meta: { books_counts_raw: {} }
         });
 
-        // DRUGA ekstrakcija (na celom oddsPayload) → precizniji books_count
+        // precizniji books_count na celom payloadu
         const last = recs[recs.length - 1];
         const { books_count: booksCountAll } = extract1X2FromOdds(Array.isArray(oddsPayload) ? oddsPayload : []);
         last.odds.books_count = (booksCountAll[best] || booksCountSlice[best] || 0);
@@ -342,6 +366,8 @@ export default async function handler(req, res){
         // ignoriši fixture na grešku
       }
     }
+
+    debug.recs = recs.length;
 
     // 3) Rangiranje i preseci: "full" i "slim"
     const byEV = [...recs].sort((a,b)=> (b._ev - a._ev) || (b.confidence_pct - a.confidence_pct));
@@ -369,7 +395,8 @@ export default async function handler(req, res){
       ymd,
       count: slimList.length,
       count_full: fullList.length,
-      football: slimList
+      football: slimList,
+      ...(wantDebug ? { debug } : {})
     });
 
   }catch(e){
