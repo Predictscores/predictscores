@@ -1,7 +1,6 @@
 // pages/api/value-bets-locked.js
-// KV-only shortlist sa pametnim fallbackom (danas/slot→ostali slotovi→juče→prekjuče)
-// + robustan parser: JSON string, base64, base64-gzip + rekurzivno otkrivanje nizova sa utakmicama.
-// Ne zove spoljne API-je.
+// KV-only shortlist sa pametnim fallbackom + failsafe na live rebuild ako je KV prazan.
+// Nema spoljnog API-ja: failsafe zove ISKLJUČIVO tvoju internu rutu /api/cron/rebuild na istom hostu.
 
 const TZ = "Europe/Belgrade";
 
@@ -17,6 +16,13 @@ function slotOfHour(h){ return h < 10 ? "late" : h < 15 ? "am" : "pm"; }
 function currentSlot(tz = TZ){ return slotOfHour(currentHour(tz)); }
 function orderForSlot(slot){ return slot==="late" ? ["late","am","pm"] : slot==="am" ? ["am","pm","late"] : ["pm","am","late"]; }
 
+function getBaseFromReq(req){
+  const proto = req.headers["x-forwarded-proto"] || "https";
+  const host  = req.headers["x-forwarded-host"] || req.headers.host || "localhost:3000";
+  return `${proto}://${host}`;
+}
+
+/* ---------- dekoderi ---------- */
 function gunzipBase64ToString(b64){
   try {
     const zlib = require("zlib");
@@ -29,12 +35,21 @@ function tryDecode(raw){
   if (raw && typeof raw === "object") return raw;
   if (Array.isArray(raw)) return raw;
   if (typeof raw === "string") {
-    // JSON string?
+    // 1) JSON string
     try { return JSON.parse(raw); } catch {}
-    // base64-gzip JSON?
+    // 2) NDJSON (linije JSON-a)
+    if (raw.includes("\n") && raw.includes("{")) {
+      const lines = raw.split("\n").map(s=>s.trim()).filter(Boolean);
+      const arr = [];
+      for (const ln of lines){
+        try { const o = JSON.parse(ln); arr.push(o); } catch {/* ignore */ }
+      }
+      if (arr.length) return arr;
+    }
+    // 3) base64-gzip JSON
     const maybe = gunzipBase64ToString(raw);
     if (maybe){ try { return JSON.parse(maybe); } catch {} }
-    // plain base64 JSON?
+    // 4) plain base64 JSON
     try {
       const dec = Buffer.from(raw, "base64").toString("utf8");
       try { return JSON.parse(dec); } catch {}
@@ -45,8 +60,8 @@ function tryDecode(raw){
 
 async function kvFetch(key){
   const base = process.env.KV_REST_API_URL;
-  const token = process.env.KV_REST_API_TOKEN;
-  if(!base || !token) throw new Error("KV_REST_API_URL / KV_REST_API_TOKEN nisu postavljeni");
+  const token = process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN;
+  if(!base || !token) return { exists:false, value:null };
   const url = `${base.replace(/\/+$/,"")}/get/${encodeURIComponent(key)}`;
   const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   if (!r.ok) return { exists:false, value:null };
@@ -56,15 +71,11 @@ async function kvFetch(key){
   return { exists:true, value: tryDecode(raw) };
 }
 
+/* ---------- prepoznavanje i ekstrakcija niza ---------- */
 function looksLikeBet(o){
   if (!o || typeof o !== "object") return false;
-  const keys = Object.keys(o);
   const must = ["fixture_id","teams","home","away","selection","pick","market","kickoff","confidence_pct","model_prob"];
-  let score = 0;
-  for (const k of must){
-    if (k in o) score++;
-  }
-  // prag fleksibilan: ako ima bar 2-3 od navedenih + nije trivijalan
+  let score = 0; for (const k of must){ if (k in o) score++; }
   return score >= 2 || ("league" in o && ("teams" in o || "home" in o || "away" in o));
 }
 function collectCandidateArrays(x, limit = 500){
@@ -94,7 +105,6 @@ function collectCandidateArrays(x, limit = 500){
   }
   return out;
 }
-
 function toArrayAny(x){
   if (!x) return [];
   if (Array.isArray(x)) return x;
@@ -129,7 +139,6 @@ function toArrayAny(x){
 
   return [];
 }
-
 function uniqueByFixture(arr){
   const seen = new Set();
   const out = [];
@@ -166,6 +175,23 @@ async function tryKey(key, tried){
   return { ok:false, why:"no-array" };
 }
 
+/* ---------- Failsafe: rebuild na istom hostu ---------- */
+async function fetchLiveFromRebuild(req, slot, n){
+  try{
+    const base = getBaseFromReq(req);
+    const url  = `${base}/api/cron/rebuild?slot=${encodeURIComponent(slot)}&kv=0`;
+    const r = await fetch(url, { headers: { "x-internal": "vbl-fallback" } });
+    const ct = r.headers.get("content-type") || "";
+    const j = ct.includes("application/json") ? await r.json() : JSON.parse(await r.text());
+    let arr = [];
+    if (Array.isArray(j?.items)) arr = j.items;
+    else if (Array.isArray(j?.football)) arr = j.football;
+    if (n>0 && arr.length>n) arr = arr.slice(0,n);
+    return arr;
+  }catch{ return []; }
+}
+
+/* ---------- Handler ---------- */
 export default async function handler(req, res){
   try{
     const now = new Date();
@@ -221,6 +247,23 @@ export default async function handler(req, res){
           }
           if (items.length) break;
         }
+      }
+    }
+
+    // 5) FAILSAFE: ako je i dalje prazno, povuci live iz /api/cron/rebuild (isti host)
+    if (!items.length){
+      const live = await fetchLiveFromRebuild(req, qSlot, n || 50);
+      if (live.length){
+        return res.status(200).json({
+          ok: true,
+          slot: qSlot,
+          ymd,
+          items: live,
+          value_bets: live,
+          football: live,
+          source: "vb-locked:fallback→live:rebuild",
+          ...(debug ? { debug_tried: tried, size: live.length } : {})
+        });
       }
     }
 
