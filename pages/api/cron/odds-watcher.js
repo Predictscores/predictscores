@@ -1,33 +1,13 @@
-name: Odds watcher
+// pages/api/cron/odds-watcher.js
+// ⚠️ Ovaj fajl je ranije greškom sadržao GitHub Actions YAML i rušio build.
+// Sada je bezbedan stub. Pravi watcher je /api/cron/refresh-odds i /api/cron/closing-capture.
 
-on:
-  schedule:
-    - cron: "*/15 8-23 * * *"
-  workflow_dispatch: {}
-
-concurrency:
-  group: odds-watcher
-  cancel-in-progress: true
-
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Refresh odds window for current slot
-        run: |
-          set -euo pipefail
-          TZZ="Europe/Belgrade"
-          H=$(TZ=$TZZ date +%H)
-          if   [ "$H" -lt 10 ]; then SLOT=late
-          elif [ "$H" -lt 15 ]; then SLOT=am
-          else SLOT=pm; fi
-          echo "Resolved: SLOT=$SLOT"
-          curl -fsS \
-            --connect-timeout 10 \
-            --max-time 240 \
-            --retry 3 \
-            --retry-all-errors \
-            --retry-delay 8 \
-            --retry-max-time 300 \
-            "https://predictscores.vercel.app/api/cron/refresh-odds?slot=$SLOT"
+export default async function handler(req, res) {
+  // opcionalno: proslijedi iste query parametre pravoj ruti, ali ovde samo jasno vratimo status
+  res.status(410).json({
+    ok: false,
+    disabled: true,
+    note:
+      "Use /api/cron/refresh-odds (window [-2h,+6h]) or /api/cron/closing-capture ([-15m,+5m]). This route is deprecated.",
+  });
+}
