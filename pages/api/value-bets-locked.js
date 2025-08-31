@@ -1,21 +1,30 @@
 // pages/api/value-bets-locked.js
-// KV-only shortlist sa pametnim fallbackom + failsafe na live rebuild ako je KV prazan.
-// Nema spoljnog API-ja: failsafe zove ISKLJUČIVO tvoju internu rutu /api/cron/rebuild na istom hostu.
+// KV-only čitanje value-bets feeda (vbl / vbl_full / pointer varijante).
+// ❗ Nema automatskog poziva /api/cron/rebuild (da se ne troše API pozivi).
+// Fallback na rebuild je opciono: LOCKED_FALLBACK_TO_LIVE=1 ili query ?live=1.
 
-const TZ = "Europe/Belgrade";
+export const config = { api: { bodyParser: false } };
+
+const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const ALLOW_FALLBACK = /^(1|true|yes|on)$/i.test(String(process.env.LOCKED_FALLBACK_TO_LIVE || "0"));
+const FALLBACK_TTL_MS = 5 * 60 * 1000; // 5 min ako ručno koristiš fallback
+const FALLBACK_CACHE = Object.create(null); // in-memory cache (best-effort)
 
 function ymdInTZ(d = new Date(), tz = TZ) {
-  const fmt = new Intl.DateTimeFormat("sv-SE", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
-  const parts = fmt.formatToParts(d).reduce((a,p)=> (a[p.type]=p.value, a), {});
-  return `${parts.year}-${parts.month}-${parts.day}`;
+  try {
+    const fmt = new Intl.DateTimeFormat("sv-SE", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
+    const parts = fmt.formatToParts(d).reduce((a,p)=> (a[p.type]=p.value, a), {});
+    return `${parts.year}-${parts.month}-${parts.day}`;
+  } catch {
+    const y = d.getUTCFullYear(), m = String(d.getUTCMonth()+1).padStart(2,"0"), dd = String(d.getUTCDate()).padStart(2,"0");
+    return `${y}-${m}-${dd}`;
+  }
 }
 function shiftDays(d, days) { const nd = new Date(d.getTime()); nd.setUTCDate(nd.getUTCDate()+days); return nd; }
 function currentHour(tz = TZ){ return Number(new Intl.DateTimeFormat("en-GB",{hour:"2-digit",hour12:false,timeZone:tz}).format(new Date())); }
-// late = 00:00–09:59, am = 10:00–14:59, pm = 15:00–23:59
-function slotOfHour(h){ return h < 10 ? "late" : h < 15 ? "am" : "pm"; }
+function slotOfHour(h){ return h < 10 ? "late" : h < 15 ? "am" : "pm"; } // late 00–09, am 10–14, pm 15–23
 function currentSlot(tz = TZ){ return slotOfHour(currentHour(tz)); }
 function orderForSlot(slot){ return slot==="late" ? ["late","am","pm"] : slot==="am" ? ["am","pm","late"] : ["pm","am","late"]; }
-
 function getBaseFromReq(req){
   const proto = req.headers["x-forwarded-proto"] || "https";
   const host  = req.headers["x-forwarded-host"] || req.headers.host || "localhost:3000";
@@ -37,19 +46,17 @@ function tryDecode(raw){
   if (typeof raw === "string") {
     // 1) JSON string
     try { return JSON.parse(raw); } catch {}
-    // 2) NDJSON (linije JSON-a)
+    // 2) NDJSON
     if (raw.includes("\n") && raw.includes("{")) {
       const lines = raw.split("\n").map(s=>s.trim()).filter(Boolean);
       const arr = [];
-      for (const ln of lines){
-        try { const o = JSON.parse(ln); arr.push(o); } catch {/* ignore */ }
-      }
+      for (const ln of lines){ try { arr.push(JSON.parse(ln)); } catch {} }
       if (arr.length) return arr;
     }
-    // 3) base64-gzip JSON
+    // 3) base64+gzip JSON
     const maybe = gunzipBase64ToString(raw);
     if (maybe){ try { return JSON.parse(maybe); } catch {} }
-    // 4) plain base64 JSON
+    // 4) base64 JSON
     try {
       const dec = Buffer.from(raw, "base64").toString("utf8");
       try { return JSON.parse(dec); } catch {}
@@ -59,8 +66,8 @@ function tryDecode(raw){
 }
 
 async function kvFetch(key){
-  const base = process.env.KV_REST_API_URL;
-  const token = process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN;
+  const base = process.env.KV_REST_API_URL || process.env.KV_URL || process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
   if(!base || !token) return { exists:false, value:null };
   const url = `${base.replace(/\/+$/,"")}/get/${encodeURIComponent(key)}`;
   const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
@@ -74,9 +81,9 @@ async function kvFetch(key){
 /* ---------- prepoznavanje i ekstrakcija niza ---------- */
 function looksLikeBet(o){
   if (!o || typeof o !== "object") return false;
-  const must = ["fixture_id","teams","home","away","selection","pick","market","kickoff","confidence_pct","model_prob"];
+  const must = ["fixture_id","teams","home","away","market","kickoff"];
   let score = 0; for (const k of must){ if (k in o) score++; }
-  return score >= 2 || ("league" in o && ("teams" in o || "home" in o || "away" in o));
+  return score >= 2;
 }
 function collectCandidateArrays(x, limit = 500){
   const out = [];
@@ -109,7 +116,7 @@ function toArrayAny(x){
   if (!x) return [];
   if (Array.isArray(x)) return x;
 
-  // najčešća polja
+  // tipična polja
   if (Array.isArray(x.items)) return x.items;
   if (Array.isArray(x.value_bets)) return x.value_bets;
   if (Array.isArray(x.football)) return x.football;
@@ -133,7 +140,7 @@ function toArrayAny(x){
   if (typeof x.key === "string") return [{ __pointer: x.key }];
   if (typeof x.target === "string") return [{ __pointer: x.target }];
 
-  // poslednja šansa: rekurzivno pretraži sve nizove
+  // rekurzivno
   const found = collectCandidateArrays(x);
   if (found.length) return found[0];
 
@@ -175,7 +182,7 @@ async function tryKey(key, tried){
   return { ok:false, why:"no-array" };
 }
 
-/* ---------- Failsafe: rebuild na istom hostu ---------- */
+/* ---------- fakultativni (ručni) fallback na rebuild ---------- */
 async function fetchLiveFromRebuild(req, slot, n){
   try{
     const base = getBaseFromReq(req);
@@ -199,6 +206,7 @@ export default async function handler(req, res){
     const qSlot = (req.query.slot && String(req.query.slot)) || currentSlot(TZ);
     const n = Math.max(0, Math.min(200, Number(req.query.n ?? 0)));
     const debug = String(req.query.debug||"") === "1";
+    const wantLive = String(req.query.live||"") === "1";
 
     const tried = [];
     let items = [];
@@ -214,7 +222,7 @@ export default async function handler(req, res){
       if (items.length) break;
     }
 
-    // 2) juče & 3) prekjuče (pm→am→late)
+    // 2) juče & 3) prekjuče
     for (const delta of [-1, -2]){
       if (items.length) break;
       const y = ymdInTZ(shiftDays(now, delta), TZ);
@@ -250,20 +258,21 @@ export default async function handler(req, res){
       }
     }
 
-    // 5) FAILSAFE: ako je i dalje prazno, povuci live iz /api/cron/rebuild (isti host)
-    if (!items.length){
-      const live = await fetchLiveFromRebuild(req, qSlot, n || 50);
-      if (live.length){
-        return res.status(200).json({
-          ok: true,
-          slot: qSlot,
-          ymd,
-          items: live,
-          value_bets: live,
-          football: live,
-          source: "vb-locked:fallback→live:rebuild",
-          ...(debug ? { debug_tried: tried, size: live.length } : {})
-        });
+    // 5) Opcioni FALLBACK (samo ako je eksplicitno traženo ili dozvoljeno ENV-om)
+    if (!items.length && (wantLive || ALLOW_FALLBACK)) {
+      const cacheKey = `${ymd}:${qSlot}`;
+      const nowMs = Date.now();
+      const cached = FALLBACK_CACHE[cacheKey];
+      if (cached && (nowMs - cached.ts) < FALLBACK_TTL_MS) {
+        items = cached.items.slice();
+        src = "vb-locked:fallback→cache";
+      } else {
+        const live = await fetchLiveFromRebuild(req, qSlot, n || 50);
+        if (live.length){
+          FALLBACK_CACHE[cacheKey] = { ts: nowMs, items: live.slice() };
+          items = live;
+          src = "vb-locked:fallback→live:rebuild";
+        }
       }
     }
 
@@ -289,7 +298,7 @@ export default async function handler(req, res){
       items,
       value_bets: items,
       football: items,
-      source: `vb-locked:kv:hit·${src}`,
+      source: src.startsWith("vb-locked") ? src : `vb-locked:kv:hit·${src}`,
       ...(debug ? { debug_tried: tried, size: items.length } : {})
     });
   }catch(e){
