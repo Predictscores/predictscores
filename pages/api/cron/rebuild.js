@@ -2,14 +2,13 @@
 // Slot rebuild (15/25 po slotu), objedinjeno biranje NAJBOLJEG predloga po utakmici
 // preko 4 tržišta: 1X2, BTTS, OU 2.5, HT-FT.
 //
-// Ispravke u ovoj verziji:
-// - BTTS i OU 2.5: kandidat nastaje SAMO ako tržište ima OBE strane (Yes & No / Over & Under)
-//   sa validnim median cenama i dovoljno knjiga na OBE strane; nema više “jednostranih” 100% confidence.
-// - HT-FT: kandidat nastaje samo ako postoji minimalan broj validnih kombinacija (≥3 strict / ≥2 relaxed).
-// - Best-of-market po fixture-u ostaje: max confidence (tie-break EV). Globalno rangiranje po EV.
-// - Two-pass: ako strogi pass ne vrati ništa, radi se relaxed pass na već učitanim payload-ima (bez dodatnih poziva).
-//
-// UI ne diramo. Upisuje vbl:<YMD>:<slot> i vbl_full:<YMD>:<slot> + kompatibilne alias ključeve.
+// Ova verzija ublažava RELAXED pass pragove da bi slot (15–23:59) davao više realnih parova:
+// - BTTS/OU2.5 i dalje zahtevaju OBE strane, ali u relaxed pass-u je min. books ≥2 (strogo je ≥3)
+// - 1X2 relaxed: books ≥2 (strogo ≥3)
+// - SPREAD_LOOSE podignut na 0.55 (strogo ostaje 0.25)
+// - HT-FT: minimalno 3 validne kombinacije (strict) / 2 (relaxed)
+// - Best-of-market po fixture-u ostaje: max confidence (tie-break EV). Globalni rang: EV → confidence.
+// - Two-pass: ako strict ne vrati dovoljno, relaxed koristi iste payload-e (bez dodatnih API poziva).
 
 export const config = { api: { bodyParser: false } };
 
@@ -93,13 +92,14 @@ const EXCLUDE_WOMEN = envBool("EXCLUDE_WOMEN", true);
 const TRUSTED_ONLY = envBool("ODDS_TRUSTED_ONLY", false);
 const TRUSTED_LIST = envList("TRUSTED_BOOKMAKERS", "TRUSTED_BOOKIES");
 
-// kvalitet selekcije (default pravila u kodu)
-const MIN_BOOKS_PER_SEL = 3;     // minimalno nezavisnih knjiga na izabranoj selekciji
+// kvalitet selekcije
+const MIN_BOOKS_STRICT = 3;      // strogo: min broj knjiga po selekciji
+const MIN_BOOKS_RELAX  = 2;      // relaxed: blaže
 const EV_FLOOR = 0.02;           // minimalni EV za ulaz u listu (2%)
-const SPREAD_STRICT = 0.25;      // spread (mx/mn - 1) u okviru jedne selekcije (strogo)
-const SPREAD_LOOSE  = 0.40;      // spread (opušteno) za fallback pass
+const SPREAD_STRICT = 0.25;      // spread (mx/mn - 1) strogo
+const SPREAD_LOOSE  = 0.55;      // spread opušteno (povišen radi pokrivanja kasnijih mečeva)
 
-// minimalna “punina” HT-FT tržišta (broj validnih kombinacija sa dovoljnim books/spread-om)
+// HT-FT “punina” tržišta
 const HTFT_MIN_COMBOS_STRICT = 3;
 const HTFT_MIN_COMBOS_RELAX  = 2;
 
@@ -144,12 +144,6 @@ async function fetchPredictionForFixture(fixtureId) {
 }
 
 // helpers
-function median(a) {
-  const x = a.filter(Number.isFinite).sort((p, q) => p - q);
-  if (!x.length) return NaN;
-  const m = Math.floor(x.length / 2);
-  return x.length % 2 ? x[m] : (x[m - 1] + x[m]) / 2;
-}
 function trimmedMedian(a) {
   const x = a.filter(Number.isFinite).sort((p, q) => p - q);
   if (x.length >= 5) { x.shift(); x.pop(); }
@@ -185,7 +179,7 @@ function spreadOf(arr) {
   return (mx / mn) - 1;
 }
 
-// --- market extractors (vraćaju {pricesBy, countsBy, medBy, spreadBy})
+// --- market extractors (vraćaju {by, medBy, countsBy, spreadBy})
 function extract1X2(oddsPayload) {
   const rows = extractRows(oddsPayload);
   const by = { "1": [], "X": [], "2": [] };
@@ -217,7 +211,6 @@ function extract1X2(oddsPayload) {
   const spreadBy = { "1": spreadOf(by["1"]), "X": spreadOf(by["X"]), "2": spreadOf(by["2"]) };
   return { by, medBy, countsBy, spreadBy };
 }
-
 function extractBTTS(oddsPayload) {
   const rows = extractRows(oddsPayload);
   const by = { Y: [], N: [] }, seen = { Y: new Set(), N: new Set() };
@@ -245,7 +238,6 @@ function extractBTTS(oddsPayload) {
   const spreadBy = { Y: spreadOf(by.Y), N: spreadOf(by.N) };
   return { by, medBy, countsBy, spreadBy };
 }
-
 function extractOU25(oddsPayload) {
   const rows = extractRows(oddsPayload);
   const by = { O: [], U: [] }, seen = { O: new Set(), U: new Set() };
@@ -274,7 +266,6 @@ function extractOU25(oddsPayload) {
   const spreadBy = { O: spreadOf(by.O), U: spreadOf(by.U) };
   return { by, medBy, countsBy, spreadBy };
 }
-
 function extractHTFT(oddsPayload) {
   const rows = extractRows(oddsPayload);
   const keys = ["HH","HD","HA","DH","DD","DA","AH","AD","AA"];
@@ -322,7 +313,6 @@ function norm3(a,b,c){
 function pickLabel1X2(code){ return code==="1"?"Home":(code==="2"?"Away":"Draw"); }
 
 function dynamicUpliftCap(selBooksCount, selSpread){
-  // dublje tržište → stroži cap; plitko → nešto veći cap, ali ga smanjuj kad je spread visok
   let base = selBooksCount>=8 ? 0.03 : (selBooksCount>=5 ? 0.04 : 0.05);
   if (selSpread > 0.30) base *= 0.6;
   else if (selSpread > 0.20) base *= 0.8;
@@ -368,15 +358,14 @@ async function kvSetJSON_safe(key, value, ttlSec = null) {
 }
 
 // evaluacija kandidata po tržištu za jedan fixture
-function buildCandidate(recBase, market, code, label, price, prob, booksCount) {
+function buildCandidate(recBase, market, code, label, price, prob, booksCount, minBooksNeeded) {
   if (!Number.isFinite(price) || price < MIN_ODDS) return null;
   if (!Number.isFinite(prob)) return null;
-  if (!Number.isFinite(booksCount) || booksCount < MIN_BOOKS_PER_SEL) return null;
+  if (!Number.isFinite(booksCount) || booksCount < (minBooksNeeded ?? MIN_BOOKS_STRICT)) return null;
 
   const confidence_pct = Math.round(Math.max(0, Math.min(100, prob*100)));
   const _implied = Number((1/price).toFixed(4));
   const _ev = Number((price*prob - 1).toFixed(12));
-
   if (!Number.isFinite(_ev) || _ev < EV_FLOOR) return null;
 
   return {
@@ -502,30 +491,35 @@ export default async function handler(req, res){
         if (s>0){ model1={"1":model1["1"]/s,"X":model1["X"]/s,"2":model1["2"]/s}; }
       }
 
-      // kandidati 1X2 (strogo/relaxed per selekcija)
+      // kandidati 1X2
       function candidates1X2(strict=true){
         const out=[];
+        const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX;
+        const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
         for (const k of ["1","X","2"]) {
           const price = m1.medBy[k]; if (!Number.isFinite(price)) continue;
           const books = m1.countsBy[k]||0;
           const spr = m1.spreadBy[k]||0;
           const prob = model1[k];
-          const okBooks = books >= MIN_BOOKS_PER_SEL;
-          const okSpread = strict ? spr <= SPREAD_STRICT : spr <= SPREAD_LOOSE;
+          const okBooks = books >= needBooks;
+          const okSpread = spr <= sprLimit;
           if (!okBooks || !okSpread) continue;
           const lab = pickLabel1X2(k);
-          const c = buildCandidate(recBase, "1X2", k, lab, price, prob, books);
+          const c = buildCandidate(recBase, "1X2", k, lab, price, prob, books, needBooks);
           if (c) out.push(c);
         }
         return out;
       }
 
-      // --- BTTS (mora OBJE strane)
+      // --- BTTS (OBE strane, ali relaxed dopušta books>=2 i veći spread)
       const mb = extractBTTS(oddsArr);
       function candidatesBTTS(strict=true){
         const out=[];
-        const haveY = Number.isFinite(mb.medBy.Y) && (mb.countsBy.Y||0) >= MIN_BOOKS_PER_SEL && (strict ? mb.spreadBy.Y <= SPREAD_STRICT : mb.spreadBy.Y <= SPREAD_LOOSE);
-        const haveN = Number.isFinite(mb.medBy.N) && (mb.countsBy.N||0) >= MIN_BOOKS_PER_SEL && (strict ? mb.spreadBy.N <= SPREAD_STRICT : mb.spreadBy.N <= SPREAD_LOOSE);
+        const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX;
+        const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
+
+        const haveY = Number.isFinite(mb.medBy.Y) && (mb.countsBy.Y||0) >= needBooks && (mb.spreadBy.Y||0) <= sprLimit;
+        const haveN = Number.isFinite(mb.medBy.N) && (mb.countsBy.N||0) >= needBooks && (mb.spreadBy.N||0) <= sprLimit;
         if (!(haveY && haveN)) return out;
 
         const impY = 1/mb.medBy.Y;
@@ -534,19 +528,22 @@ export default async function handler(req, res){
         const pY = s>0 ? impY/s : null;
         const pN = s>0 ? impN/s : null;
 
-        const cY = buildCandidate(recBase, "BTTS", "Y", "Yes", mb.medBy.Y, pY, mb.countsBy.Y||0);
+        const cY = buildCandidate(recBase, "BTTS", "Y", "Yes", mb.medBy.Y, pY, mb.countsBy.Y||0, needBooks);
         if (cY) out.push(cY);
-        const cN = buildCandidate(recBase, "BTTS", "N", "No",  mb.medBy.N, pN, mb.countsBy.N||0);
+        const cN = buildCandidate(recBase, "BTTS", "N", "No",  mb.medBy.N, pN, mb.countsBy.N||0, needBooks);
         if (cN) out.push(cN);
         return out;
       }
 
-      // --- OU 2.5 (mora OBJE strane)
+      // --- OU 2.5 (OBE strane, relaxed dopušta books>=2 i veći spread)
       const mo = extractOU25(oddsArr);
       function candidatesOU(strict=true){
         const out=[];
-        const haveO = Number.isFinite(mo.medBy.O) && (mo.countsBy.O||0) >= MIN_BOOKS_PER_SEL && (strict ? mo.spreadBy.O <= SPREAD_STRICT : mo.spreadBy.O <= SPREAD_LOOSE);
-        const haveU = Number.isFinite(mo.medBy.U) && (mo.countsBy.U||0) >= MIN_BOOKS_PER_SEL && (strict ? mo.spreadBy.U <= SPREAD_STRICT : mo.spreadBy.U <= SPREAD_LOOSE);
+        const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX;
+        const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
+
+        const haveO = Number.isFinite(mo.medBy.O) && (mo.countsBy.O||0) >= needBooks && (mo.spreadBy.O||0) <= sprLimit;
+        const haveU = Number.isFinite(mo.medBy.U) && (mo.countsBy.U||0) >= needBooks && (mo.spreadBy.U||0) <= sprLimit;
         if (!(haveO && haveU)) return out;
 
         const impO = 1/mo.medBy.O;
@@ -555,38 +552,39 @@ export default async function handler(req, res){
         const pO = s>0 ? impO/s : null;
         const pU = s>0 ? impU/s : null;
 
-        const cO = buildCandidate(recBase, "OU2.5", "O2.5", "Over 2.5", mo.medBy.O, pO, mo.countsBy.O||0);
+        const cO = buildCandidate(recBase, "OU2.5", "O2.5", "Over 2.5", mo.medBy.O, pO, mo.countsBy.O||0, needBooks);
         if (cO) out.push(cO);
-        const cU = buildCandidate(recBase, "OU2.5", "U2.5", "Under 2.5", mo.medBy.U, pU, mo.countsBy.U||0);
+        const cU = buildCandidate(recBase, "OU2.5", "U2.5", "Under 2.5", mo.medBy.U, pU, mo.countsBy.U||0, needBooks);
         if (cU) out.push(cU);
         return out;
       }
 
-      // --- HT-FT (zahtev minimalne “punine” tržišta)
+      // --- HT-FT (punina tržišta: ≥3 strict / ≥2 relaxed; per selekcija books i spread po režimu)
       const mh = extractHTFT(oddsArr);
       function candidatesHTFT(strict=true){
         const out=[];
-        // izaberi validne kombinacije po pravilima
+        const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX;
+        const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
+
         const valid = [];
         const labels = { HH:"Home/Home", HD:"Home/Draw", HA:"Home/Away", DH:"Draw/Home", DD:"Draw/Draw", DA:"Draw/Away", AH:"Away/Home", AD:"Away/Draw", AA:"Away/Away" };
         for (const k of Object.keys(mh.medBy)) {
           const price = mh.medBy[k];
           const books = mh.countsBy[k]||0;
           const spr = mh.spreadBy[k]||0;
-          const ok = Number.isFinite(price) && books>=MIN_BOOKS_PER_SEL && (strict ? spr<=SPREAD_STRICT : spr<=SPREAD_LOOSE);
+          const ok = Number.isFinite(price) && books>=needBooks && spr<=sprLimit;
           if (ok) valid.push(k);
         }
         const need = strict ? HTFT_MIN_COMBOS_STRICT : HTFT_MIN_COMBOS_RELAX;
         if (valid.length < need) return out;
 
-        // implied-normalize kroz dostupne
         let sum=0; const imp = {};
         for (const k of valid) { const p = 1/mh.medBy[k]; imp[k]=p; sum+=p; }
         if (sum<=0) return out;
 
         for (const k of valid) {
           const prob = imp[k]/sum;
-          const c = buildCandidate(recBase, "HT-FT", k, labels[k]||k, mh.medBy[k], prob, mh.countsBy[k]||0);
+          const c = buildCandidate(recBase, "HT-FT", k, labels[k]||k, mh.medBy[k], prob, mh.countsBy[k]||0, needBooks);
           if (c) out.push(c);
         }
         return out;
