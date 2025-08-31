@@ -97,11 +97,33 @@ async function fetchPredictionForFixture(fixtureId){
 
 // ------------------------------ 1X2 obrada ------------------------------
 function median(nums){ const a = nums.filter(Number.isFinite).sort((x,y)=>x-y); if (!a.length) return NaN; const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; }
+
+/**
+ * API-Football odds response oblici:
+ *  A) response = [{ bookmakers: [{ id,name,bets:[{id,name,values:[]},...] }, ...] }, ...]
+ *  B) response = [{ bookmaker:{id,name}, bets:[...] }, ...]  (legacy)
+ *  C) response = [{ id,name,bets:[...] }, ...]               (bookmaker-level)
+ * Ovaj ekstraktor podržava sva tri.
+ */
 function extract1X2FromOdds(oddsPayload){
   const priceBy = { "1":[], "X":[], "2":[] };
   const seenBook = { "1":new Set(), "X":new Set(), "2":new Set() };
-  for (const row of (Array.isArray(oddsPayload)?oddsPayload:[])){
-    const bkm = row?.bookmaker?.name || row?.bookmaker?.id || "";
+
+  const roots = Array.isArray(oddsPayload) ? oddsPayload : [];
+  // flatten na bookmaker-level
+  const rows = [];
+  for (const root of roots){
+    if (!root) continue;
+    if (Array.isArray(root.bookmakers)) {
+      for (const bk of root.bookmakers) rows.push(bk);
+      continue;
+    }
+    if (Array.isArray(root.bets)) { rows.push(root); continue; }
+    if (root.bookmaker && Array.isArray(root.bookmaker.bets)) { rows.push(root.bookmaker); continue; }
+  }
+
+  for (const row of rows){
+    const bkmName = String(row?.name ?? row?.bookmaker?.name ?? row?.id ?? row?.bookmaker ?? "");
     const bets = Array.isArray(row?.bets) ? row.bets : [];
     for (const bet of bets){
       const name = (bet?.name || "").toLowerCase();
@@ -117,25 +139,26 @@ function extract1X2FromOdds(oddsPayload){
         const price = Number(v?.odd ?? v?.price ?? v?.odds);
         if (!Number.isFinite(price) || price < MIN_ODDS) continue;
         priceBy[code].push(price);
-        if (bkm) seenBook[code].add(bkm);
+        if (bkmName) seenBook[code].add(bkmName);
       }
     }
   }
+
   const med = { "1": median(priceBy["1"]), "X": median(priceBy["X"]), "2": median(priceBy["2"]) };
   const books_count = { "1": seenBook["1"].size, "X": seenBook["X"].size, "2": seenBook["2"].size };
   return { med, books_count };
 }
+
 function fromPickCodeToLabel(code){ if (code==="1") return "Home"; if (code==="2") return "Away"; if (code==="X") return "Draw"; return String(code||""); }
 function normalizeTeams(t){ const home = t?.home?.name || t?.home || t?.homeTeam || ""; const away = t?.away?.name || t?.away || t?.awayTeam || ""; return { home, away }; }
 
-// ✅ Heuristika za ženske lige/timove (bez lažnih pogodaka na “FF/IF/F”)
+// ✅ Heuristika za ženske lige/timove
 function isWomenString(s=""){
-  // eksplicitni markeri
   if (/\b(women|women's|ladies)\b/i.test(s)) return true;
   if (/\b(femenina|feminine|feminin|femminile)\b/i.test(s)) return true;
   if (/\b(dames|dam|kvinner|kvinn|kvinnor)\b/i.test(s)) return true;
   if (/\(w\)/i.test(s)) return true;
-  if (/\sW$/i.test(s)) return true; // npr. "Chelsea W"
+  if (/\sW$/i.test(s)) return true; // "Chelsea W"
   if (/女子|여자/.test(s)) return true;
   return false;
 }
@@ -147,7 +170,6 @@ async function kvSetJSON_safe(key, value, ttlSec = null) {
   const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
   if (!base || !token) throw new Error("KV_REST_API_URL / KV_REST_API_TOKEN nisu postavljeni");
 
-  // 1) Pokušaj preporučeni način: POST body
   const urlPOST = ttlSec!=null
     ? `${base.replace(/\/+$/,"")}/setex/${encodeURIComponent(key)}/${ttlSec}`
     : `${base.replace(/\/+$/,"")}/set/${encodeURIComponent(key)}`;
@@ -157,14 +179,11 @@ async function kvSetJSON_safe(key, value, ttlSec = null) {
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "text/plain;charset=UTF-8" },
     body: JSON.stringify(value)
   }).catch(()=>null);
-
   if (r && r.ok) return true;
 
-  // 2) Fallback na path varijantu
   const urlPATH = ttlSec!=null
     ? `${base.replace(/\/+$/,"")}/setex/${encodeURIComponent(key)}/${ttlSec}/${encodeURIComponent(JSON.stringify(value))}`
     : `${base.replace(/\/+$/,"")}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}`;
-
   r = await fetch(urlPATH, { method: "POST", headers: { Authorization: `Bearer ${token}` } }).catch(()=>null);
   if (r && r.ok) return true;
 
@@ -181,7 +200,6 @@ export default async function handler(req, res){
     const slotWin = windowForSlot(qSlot);
     const wantDebug = String(req.query.debug||"") === "1";
 
-    // limiti
     let slotLimit = qSlot==="late"
       ? (isWeekend(now, TZ) ? DEFAULT_LIMIT_WEEKEND : LIMIT_LATE_WEEKDAY)
       : (isWeekend(now, TZ) ? DEFAULT_LIMIT_WEEKEND : DEFAULT_LIMIT_WEEKDAY);
@@ -230,7 +248,7 @@ export default async function handler(req, res){
         const oddsPayload = await fetchOddsForFixture(fx.fixture_id);
         const oddsArr = Array.isArray(oddsPayload) ? oddsPayload : [];
 
-        // ❗ FIX: koristimo CEO payload za 1X2, ne "slice"
+        // ❗ FIX: koristimo CEO payload i podržavamo API-Football "bookmakers[]" oblik
         const { med, books_count: booksCountAll } = extract1X2FromOdds(oddsArr);
         if (!Number.isFinite(med["1"]) && !Number.isFinite(med["X"]) && !Number.isFinite(med["2"])) continue;
 
