@@ -1,7 +1,7 @@
 // pages/api/cron/rebuild.js
 // Rebuild job: računa value-bets za današnji slot (late/am/pm),
 // upisuje ih u KV (vbl:<YMD>:<slot> i vbl_full:<YMD>:<slot>)
-// i vraća JSON kompatibilan sa postojećim UI-em – ali
+// i vraća JSON kompatibilan sa UI-em – ali
 // ➜ NIKAD ne briše postojeće KV ako danas nema rezultata (count=0).
 
 export const config = { api: { bodyParser: false } };
@@ -48,7 +48,6 @@ const DEFAULT_LIMIT_WEEKEND = envNum("SLOT_WEEKEND_LIMIT", 25);
 const LIMIT_LATE_WEEKDAY    = envNum("SLOT_LATE_WEEKDAY_LIMIT", DEFAULT_LIMIT_WEEKDAY);
 const VB_LIMIT              = envNum("VB_LIMIT", 0); // 0 = no cap
 
-const PER_FIXTURE_ODDS_CAP  = envNum("ODDS_PER_FIXTURE_CAP", 1);
 const MIN_ODDS              = envNum("MIN_ODDS", 1.01);
 const EXCLUDE_WOMEN         = envBool("EXCLUDE_WOMEN", true);
 
@@ -161,7 +160,7 @@ async function kvSetJSON_safe(key, value, ttlSec = null) {
 
   if (r && r.ok) return true;
 
-  // 2) Fallback na path varijantu (nekim setapima radi samo ovako)
+  // 2) Fallback na path varijantu
   const urlPATH = ttlSec!=null
     ? `${base.replace(/\/+$/,"")}/setex/${encodeURIComponent(key)}/${ttlSec}/${encodeURIComponent(JSON.stringify(value))}`
     : `${base.replace(/\/+$/,"")}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}`;
@@ -169,7 +168,6 @@ async function kvSetJSON_safe(key, value, ttlSec = null) {
   r = await fetch(urlPATH, { method: "POST", headers: { Authorization: `Bearer ${token}` } }).catch(()=>null);
   if (r && r.ok) return true;
 
-  // 3) Ako i to ne uspe, baci jasan error
   const msg = r ? await r.text().catch(()=>String(r.status)) : "network-error";
   throw new Error(`KV set failed: ${msg.slice(0,200)}`);
 }
@@ -226,13 +224,14 @@ export default async function handler(req, res){
     debug.considered = fixtures.length;
 
     // 2) odds/predictions → EV
-    const perFixtureCap = Math.max(1, PER_FIXTURE_ODDS_CAP);
     const recs = [];
     for (const fx of fixtures){
       try {
         const oddsPayload = await fetchOddsForFixture(fx.fixture_id);
-        const oddsRows = Array.isArray(oddsPayload) ? oddsPayload.slice(0, perFixtureCap) : [];
-        const { med, books_count: booksCountSlice } = extract1X2FromOdds(oddsRows);
+        const oddsArr = Array.isArray(oddsPayload) ? oddsPayload : [];
+
+        // ❗ FIX: koristimo CEO payload za 1X2, ne "slice"
+        const { med, books_count: booksCountAll } = extract1X2FromOdds(oddsArr);
         if (!Number.isFinite(med["1"]) && !Number.isFinite(med["X"]) && !Number.isFinite(med["2"])) continue;
 
         let model = { "1": null, "X": null, "2": null };
@@ -271,7 +270,7 @@ export default async function handler(req, res){
           selection_label: fromPickCodeToLabel(best),
           model_prob: Number(mp.toFixed(4)),
           confidence_pct,
-          odds: { price: Number(bestPrice), books_count: 0 },
+          odds: { price: Number(bestPrice), books_count: booksCountAll[best] || 0 },
           league: { id: fx.league?.id, name: leagueName, country: leagueCountry },
           league_name: leagueName, league_country: leagueCountry,
           teams: { home: fx.teams.home, away: fx.teams.away },
@@ -279,16 +278,11 @@ export default async function handler(req, res){
           kickoff: fx.local_str, kickoff_utc: fx.date_utc,
           _implied: Number((1/Number(bestPrice)).toFixed(4)),
           _ev: Number((bestPrice * mp - 1).toFixed(12)),
-          source_meta: { books_counts_raw: {} }
-        };
-
-        // precizniji books_count na celom payloadu
-        const { books_count: booksCountAll } = extract1X2FromOdds(Array.isArray(oddsPayload) ? oddsPayload : []);
-        rec.odds.books_count = (booksCountAll[best] || booksCountSlice[best] || 0);
-        rec.source_meta.books_counts_raw = {
-          "1": (booksCountAll["1"] ?? booksCountSlice["1"] ?? 0),
-          "X": (booksCountAll["X"] ?? booksCountSlice["X"] ?? 0),
-          "2": (booksCountAll["2"] ?? booksCountSlice["2"] ?? 0)
+          source_meta: { books_counts_raw: {
+            "1": booksCountAll["1"] || 0,
+            "X": booksCountAll["X"] || 0,
+            "2": booksCountAll["2"] || 0
+          } }
         };
 
         recs.push(rec);
