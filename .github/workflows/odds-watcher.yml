@@ -1,8 +1,8 @@
-name: Odds watcher
+name: "Odds watcher"
 
 on:
   schedule:
-    - cron: "*/15 8-23 * * *"
+    - cron: "*/15 * * * *"   # svaka 15 min (UTC); slot odlučujemo u samom jobu
   workflow_dispatch: {}
 
 concurrency:
@@ -12,26 +12,35 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 5
     steps:
-      - name: Refresh odds window for current slot
+      - name: Refresh odds for current slot
+        env:
+          BASE_FROM_VARS: ${{ vars.BASE_URL }}     # repo/org Variable (po želji)
+          BASE_FROM_SECRETS: ${{ secrets.BASE_URL }}  # ili Secret (po želji)
         run: |
           set -euo pipefail
 
+          # Odredi slot po Europe/Belgrade lokalnom vremenu
           TZZ="Europe/Belgrade"
           H=$(TZ=$TZZ date +%H)
           if   [ "$H" -lt 10 ]; then SLOT=late
           elif [ "$H" -lt 15 ]; then SLOT=am
           else SLOT=pm; fi
-          echo "Slot: $SLOT"
 
+          # BASE: koristi repo/org Variable ili Secret; fallback na prod domen
+          BASE="${BASE_FROM_VARS:-${BASE_FROM_SECRETS:-https://predictscores.vercel.app}}"
+
+          echo "Resolved: BASE=$BASE, SLOT=$SLOT"
+
+          # Robustan poziv: kratki timeout, retry, bez output buke
           curl -fsS \
             --connect-timeout 10 \
-            --max-time 240 \
+            --max-time 120 \
             --retry 3 \
             --retry-all-errors \
-            --retry-delay 8 \
-            --retry-max-time 300 \
-            "https://predictscores.vercel.app/api/cron/refresh-odds?slot=$SLOT"
-
-          echo "✅ refresh-odds done for slot=$SLOT" >> $GITHUB_STEP_SUMMARY
+            --retry-delay 5 \
+            --retry-max-time 150 \
+            "$BASE/api/cron/refresh-odds?slot=$SLOT"
