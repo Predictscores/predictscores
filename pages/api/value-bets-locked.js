@@ -1,6 +1,6 @@
 // pages/api/value-bets-locked.js
 // KV-only shortlist sa pametnim fallbackom (danas/slot→ostali slotovi→juče→prekjuče)
-// + robustan parser koji razume JSON string, base64-gzip JSON i više naziva polja.
+// + robustan parser: JSON string, base64, base64-gzip + rekurzivno otkrivanje nizova sa utakmicama.
 // Ne zove spoljne API-je.
 
 const TZ = "Europe/Belgrade";
@@ -26,23 +26,21 @@ function gunzipBase64ToString(b64){
   } catch { return null; }
 }
 function tryDecode(raw){
-  // 1) već je objekt ili niz
   if (raw && typeof raw === "object") return raw;
   if (Array.isArray(raw)) return raw;
-  // 2) string → pokušaj JSON
   if (typeof raw === "string") {
-    // probaj direktni JSON
-    try { return JSON.parse(raw); } catch {/*not json*/}
-    // probaj base64-gzip JSON
+    // JSON string?
+    try { return JSON.parse(raw); } catch {}
+    // base64-gzip JSON?
     const maybe = gunzipBase64ToString(raw);
-    if (maybe) { try { return JSON.parse(maybe); } catch {/*ignore*/} }
-    // probaj base64 *bez* gzip (retko)
+    if (maybe){ try { return JSON.parse(maybe); } catch {} }
+    // plain base64 JSON?
     try {
       const dec = Buffer.from(raw, "base64").toString("utf8");
-      try { return JSON.parse(dec); } catch {/*ignore*/}
-    } catch {/*ignore*/}
+      try { return JSON.parse(dec); } catch {}
+    } catch {}
   }
-  return raw; // kao fallback
+  return raw;
 }
 
 async function kvFetch(key){
@@ -58,6 +56,45 @@ async function kvFetch(key){
   return { exists:true, value: tryDecode(raw) };
 }
 
+function looksLikeBet(o){
+  if (!o || typeof o !== "object") return false;
+  const keys = Object.keys(o);
+  const must = ["fixture_id","teams","home","away","selection","pick","market","kickoff","confidence_pct","model_prob"];
+  let score = 0;
+  for (const k of must){
+    if (k in o) score++;
+  }
+  // prag fleksibilan: ako ima bar 2-3 od navedenih + nije trivijalan
+  return score >= 2 || ("league" in o && ("teams" in o || "home" in o || "away" in o));
+}
+function collectCandidateArrays(x, limit = 500){
+  const out = [];
+  const seen = new Set();
+  const stack = [x];
+  let guard = 0;
+  while (stack.length && out.length < limit && guard < 2000){
+    guard++;
+    const cur = stack.pop();
+    if (!cur) continue;
+    if (Array.isArray(cur)){
+      if (cur.length && typeof cur[0] === "object" && looksLikeBet(cur[0])) {
+        const id = `arr:${cur.length}:${Object.keys(cur[0]).slice(0,5).join(",")}`;
+        if (!seen.has(id)){ seen.add(id); out.push(cur); }
+        continue;
+      }
+      for (const it of cur){ if (it && (typeof it==="object" || Array.isArray(it))) stack.push(it); }
+      continue;
+    }
+    if (typeof cur === "object"){
+      for (const k in cur){
+        const v = cur[k];
+        if (v && (typeof v==="object" || Array.isArray(v))) stack.push(v);
+      }
+    }
+  }
+  return out;
+}
+
 function toArrayAny(x){
   if (!x) return [];
   if (Array.isArray(x)) return x;
@@ -67,25 +104,28 @@ function toArrayAny(x){
   if (Array.isArray(x.value_bets)) return x.value_bets;
   if (Array.isArray(x.football)) return x.football;
 
-  // česti wrapperi
+  // wrapperi
   if (Array.isArray(x.data?.items)) return x.data.items;
   if (Array.isArray(x.data?.value_bets)) return x.data.value_bets;
   if (Array.isArray(x.data?.football)) return x.data.football;
 
-  // moguće varijante iz rebuild-a
+  // druge varijante
   if (Array.isArray(x.full)) return x.full;
   if (Array.isArray(x.slim)) return x.slim;
   if (Array.isArray(x.list)) return x.list;
   if (Array.isArray(x.arr)) return x.arr;
   if (Array.isArray(x.recs)) return x.recs;
   if (Array.isArray(x.recommendations)) return x.recommendations;
-  if (Array.isArray(x.shortlist)) return x.shortlist;
   if (Array.isArray(x.football_full)) return x.football_full;
   if (Array.isArray(x.football_slim)) return x.football_slim;
 
-  // embedovani pointer { key: "vbl:..." } ili { target:"..." }
+  // pointer { key: "vbl:..." } ili { target:"..." }
   if (typeof x.key === "string") return [{ __pointer: x.key }];
   if (typeof x.target === "string") return [{ __pointer: x.target }];
+
+  // poslednja šansa: rekurzivno pretraži sve nizove
+  const found = collectCandidateArrays(x);
+  if (found.length) return found[0];
 
   return [];
 }
