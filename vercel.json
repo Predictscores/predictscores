@@ -1,4 +1,16 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "crons": []
+  "crons": [
+    // LATE (00:05 lokalno)
+    { "path": "/api/cron/rebuild?slot=late", "schedule": "5 22 * * *" }, // leto (CEST = UTC+2)  -> 22:05 UTC
+    { "path": "/api/cron/rebuild?slot=late", "schedule": "5 23 * * *" }, // zima (CET  = UTC+1)  -> 23:05 UTC
+
+    // AM (10:05 lokalno)
+    { "path": "/api/cron/rebuild?slot=am",   "schedule": "5 8  * * *" }, // leto -> 08:05 UTC
+    { "path": "/api/cron/rebuild?slot=am",   "schedule": "5 9  * * *" }, // zima -> 09:05 UTC
+
+    // PM (15:05 lokalno)
+    { "path": "/api/cron/rebuild?slot=pm",   "schedule": "5 13 * * *" }, // leto -> 13:05 UTC
+    { "path": "/api/cron/rebuild?slot=pm",   "schedule": "5 14 * * *" }  // zima -> 14:05 UTC
+  ]
 }
