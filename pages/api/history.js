@@ -1,10 +1,8 @@
 // pages/api/history.js
-// Legacy-adapter: čita hist:index + hist:<YMD>:<slot> i vraća polja `items` i `history`
-// koja očekuje stari UI. Nema spoljnog API-ja.
+// Legacy adapter: čita hist:index + hist:<YMD>:<slot> i vraća `items` i `history`.
 
 export const config = { runtime: "nodejs" };
 
-const TZ = "Europe/Belgrade";
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN_RO = process.env.KV_REST_API_READ_ONLY_TOKEN;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN || KV_TOKEN_RO;
@@ -28,14 +26,12 @@ function daysAgoUTC(d){ const now = new Date(); return (now - d) / 86400000; }
 
 export default async function handler(req, res) {
   try {
-    const days = Math.max(1, Math.min(60, Number(req.query.days || 14))); // default 14 dana
+    const days = Math.max(1, Math.min(60, Number(req.query.days || 14)));
     const index = await kvGet("hist:index");
     const tags = Array.isArray(index) ? index : [];
 
-    // uzmi samo poslednje zapise u okviru `days`
     const selected = [];
     for (const tag of tags) {
-      // tag format: YYYY-MM-DD:slot
       const dt = parseYMD(tag);
       if (!dt) continue;
       if (daysAgoUTC(dt) <= days) selected.push(tag);
@@ -45,21 +41,16 @@ export default async function handler(req, res) {
     const flat = buckets
       .filter(Array.isArray)
       .flat()
-      .map(it => ({
-        ...it,
-        pick: typeof it.pick === "string" ? it.pick :
-              (it.selection_label || (it.pick_code==="1"?"Home":it.pick_code==="2"?"Away":"Draw")),
-        home: it.home || it?.teams?.home || "",
-        away: it.away || it?.teams?.away || "",
-      }));
+      .map(it => {
+        const raw = it?.pick;
+        const str = typeof raw === "string" ? raw :
+          (it?.selection_label || (it?.pick_code==="1"?"Home":it?.pick_code==="2"?"Away":"Draw"));
+        const home = it.home || it?.teams?.home || "";
+        const away = it.away || it?.teams?.away || "";
+        return { ...it, pick: str, selection: str, home, away };
+      });
 
-    return res.status(200).json({
-      ok: true,
-      items: flat,    // stariji front
-      history: flat,  // noviji front
-      count: flat.length,
-      index: selected
-    });
+    return res.status(200).json({ ok: true, items: flat, history: flat, count: flat.length, index: selected });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
