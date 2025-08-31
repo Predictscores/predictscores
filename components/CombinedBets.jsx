@@ -5,9 +5,17 @@ import React, { useEffect, useMemo, useState } from "react";
 import HistoryPanel from "./HistoryPanel";
 
 const TZ = "Europe/Belgrade";
+
+// late = 00:00–09:59, am = 10:00–14:59, pm = 15:00–23:59
 function currentSlot(tz = TZ) {
-  const h = Number(new Intl.DateTimeFormat("en-GB", { hour: "2-digit", hour12: false, timeZone: tz }).format(new Date()));
-  return h < 12 ? "am" : h < 20 ? "pm" : "late";
+  const h = Number(
+    new Intl.DateTimeFormat("en-GB", {
+      hour: "2-digit",
+      hour12: false,
+      timeZone: tz,
+    }).format(new Date())
+  );
+  return h < 10 ? "late" : h < 15 ? "am" : "pm";
 }
 
 /* ---------------- helpers ---------------- */
@@ -18,9 +26,13 @@ async function safeJson(url) {
     const ct = r.headers.get("content-type") || "";
     if (ct.includes("application/json")) return await r.json();
     const t = await r.text();
-    try { return JSON.parse(t); } catch { return { ok:false, error:"non-JSON", raw:t }; }
+    try {
+      return JSON.parse(t);
+    } catch {
+      return { ok: false, error: "non-JSON", raw: t };
+    }
   } catch (e) {
-    return { ok:false, error: String(e?.message || e) };
+    return { ok: false, error: String(e?.message || e) };
   }
 }
 
@@ -33,21 +45,41 @@ function toISO(x) {
     null
   );
 }
-function fmtLocal(iso, timeZone = TZ) {
-  if (!iso) return "—";
-  const d = new Date(iso.includes("T") ? iso : iso.replace(" ", "T"));
-  return new Intl.DateTimeFormat("sv-SE", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
+
+function fmtLocal(iso, tz = TZ) {
+  if (!iso) return "";
+  const d = new Date(iso.replace(" ", "T") + "Z");
+  const f = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz,
     hour: "2-digit",
     minute: "2-digit",
-  }).format(d);
+    day: "2-digit",
+    month: "2-digit",
+  });
+  return f.format(d);
 }
-function teamName(side) {
-  if (!side) return "—";
-  if (typeof side === "string") return side || "—";
+
+function pct(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? Math.round(n) : 0;
+}
+
+/* ---------------- football block ---------------- */
+function FootballPanel({ list }) {
+  if (!Array.isArray(list) || list.length === 0) {
+    return <div className="text-sm text-slate-400">Nema dostupnih predloga.</div>;
+  }
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+      {list.map((it, idx) => (
+        <FootballCard key={it.fixture_id || idx} it={it} />
+      ))}
+    </div>
+  );
+}
+
+function sideName(side) {
+  if (typeof side === "string") return side;
   if (typeof side === "object") return side.name || "—";
   return "—";
 }
@@ -60,30 +92,36 @@ function ConfidenceBar({ pct }) {
     </div>
   );
 }
+
 function WhyLine({ explain }) {
   const bullets = Array.isArray(explain?.bullets) ? explain.bullets : [];
-  const text = bullets.filter(b => !/^forma:|^h2h/i.test((b||"").trim())).slice(0, 2).join(" · ");
+  const text = bullets
+    .filter((b) => !/^forma:|^h2h/i.test((b || "").trim()))
+    .slice(0, 2)
+    .join(" · ");
   const forma = (() => {
-    const f = bullets.find(b => /^forma:/i.test((b||"").trim()));
-    const h = bullets.find(b => /^h2h/i.test((b||"").trim()));
-    let s = "";
-    if (f) s += f.replace(/^forma:\s*/i, "").trim();
-    if (h) s += (s ? "  " : "") + h.replace(/^h2h\s*/i, "H2H ").replace(/^h2h \(l5\):\s*/i, "H2H (L5): ").trim();
-    return s ? `Forma: ${s}` : "";
+    const x = bullets.find((b) => /^forma:/i.test((b || "").trim()));
+    return x ? x.replace(/^forma:\s*/i, "").trim() : "";
   })();
+  const h2h = (() => {
+    const x = bullets.find((b) => /^h2h/i.test((b || "").trim()));
+    return x ? x.replace(/^h2h:\s*/i, "").trim() : "";
+  })();
+  if (!text && !forma && !h2h) return null;
   return (
-    <div className="text-xs text-slate-300 space-y-1">
-      {text ? <div>{text}</div> : null}
-      {forma ? <div className="opacity-80">{forma}</div> : null}
+    <div className="text-xs text-slate-400">
+      {text}
+      {forma ? (text ? " · " : "") + `Forma: ${forma}` : ""}
+      {h2h ? ((text || forma) ? " · " : "") + `H2H: ${h2h}` : ""}
     </div>
   );
 }
 
-function Card({ it }) {
-  const league = it?.league?.name || "—";
+function FootballCard({ it }) {
   const iso = toISO(it);
-  const home = teamName(it?.teams?.home || it?.home);
-  const away = teamName(it?.teams?.away || it?.away);
+  const home = sideName(it?.home || it?.teams?.home);
+  const away = sideName(it?.away || it?.teams?.away);
+  const league = it?.league_name || it?.league?.name || "";
   const market = it?.market_label || it?.market || "";
   const sel = it?.selection || "";
   const odds = Number.isFinite(it?.market_odds) ? it.market_odds : it?.odds;
@@ -91,288 +129,130 @@ function Card({ it }) {
 
   return (
     <div className="p-4 rounded-xl bg-[#1f2339]">
-      <div className="text-xs text-slate-400">{league} · {fmtLocal(iso)}</div>
+      <div className="text-xs text-slate-400">
+        {league} · {fmtLocal(iso)}
+      </div>
       <div className="font-semibold mt-0.5">
         {home} <span className="text-slate-400">vs</span> {away}
       </div>
       <div className="text-sm text-slate-200 mt-1">
         <span className="font-semibold">{market}</span>
-        {market ? " → " : ""}{sel}
-        {Number.isFinite(odds) ? <span className="text-slate-300"> ({Number(odds).toFixed(2)})</span> : null}
+        {market ? " → " : ""}
+        {sel}
+        {Number.isFinite(odds) ? (
+          <span className="text-slate-300"> ({Number(odds).toFixed(2)})</span>
+        ) : (
+          <span className="text-slate-500"> (—)</span>
+        )}
       </div>
-      <div className="mt-2"><WhyLine explain={it?.explain} /></div>
       <div className="mt-2">
-        <div className="flex items-center gap-2 text-xs text-slate-400">
-          <span>Confidence</span>
-          <span className="text-white font-semibold">{Math.round(conf)}%</span>
-        </div>
-        <div className="mt-1"><ConfidenceBar pct={conf} /></div>
+        <ConfidenceBar pct={conf} />
       </div>
-    </div>
-  );
-}
-
-/* ----------- data hooks ----------- */
-
-function useLockedFeed() {
-  const [state, setState] = useState({ items: [], built_at: null, day: null, error: null });
-
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      const slot = currentSlot(TZ);
-      let j = await safeJson(`/api/value-bets-locked?slot=${slot}`);
-      if (!alive) return;
-      if (j?.ok === false) {
-        setState((s) => ({ ...s, error: j.error || "Greška", items: [] }));
-        return;
-      }
-      let items = Array.isArray(j?.items) ? j.items
-        : Array.isArray(j?.value_bets) ? j.value_bets
-        : [];
-      if (!items.length) {
-        const fb = await safeJson(`/api/football?slot=${slot}&norebuild=1`);
-        const fitems = Array.isArray(fb?.football) ? fb.football : Array.isArray(fb) ? fb : [];
-        if (fitems.length) items = fitems;
-      }
-      const built_at = j?.built_at || j?.builtAt || null;
-      const day = j?.ymd || j?.day || null;
-      setState({ items, built_at, day, error: null });
-    })();
-    return () => { alive = false; };
-  }, []);
-
-  return state;
-}
-
-function useCryptoTop3() {
-  const [items, setItems] = useState([]);
-  const [error, setError] = useState(null);
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      const j = await safeJson("/api/crypto");
-      if (!alive) return;
-      if (j?.ok === false) setError(j.error || "Greška");
-      const arr = Array.isArray(j?.items) ? j.items
-        : Array.isArray(j?.signals) ? j.signals
-        : Array.isArray(j?.crypto) ? j.crypto
-        : Array.isArray(j) ? j
-        : [];
-      setItems(arr.slice(0, 3));
-    })();
-    return () => { alive = false; };
-  }, []);
-  return { items, error };
-}
-
-/* ----------- Football helpers (sub-tabovi i 3× tiketi samo ovde) ----------- */
-
-function keyOf(p, i) {
-  const fid = p?.fixture_id ?? p?.id ?? i;
-  const sel = p?.selection ?? "";
-  const iso = String(
-    p?.datetime_local?.starting_at?.date_time ||
-    p?.datetime_local?.date_time ||
-    p?.kickoff || ""
-  ).replace(" ", "T");
-  return `${fid}-${sel}-${iso}`;
-}
-
-function Section({ title, rows = [] }) {
-  return (
-    <div className="rounded-2xl bg-[#15182a] p-4">
-      <div className="text-base font-semibold text-white mb-3">{title}</div>
-      {!rows.length ? (
-        <div className="text-slate-400 text-sm">Trenutno nema predloga.</div>
-      ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-          {rows.map((p, i) => <Card key={keyOf(p, i)} it={p} />)}
+      {it?.explain ? (
+        <div className="mt-2">
+          <WhyLine explain={it.explain} />
         </div>
-      )}
+      ) : null}
     </div>
   );
 }
 
-function TicketsPanel({ items }) {
-  // grupiši po tržištima i uzmi top 3 po svakom
-  const byMarket = useMemo(() => {
-    const res = { "1X2": [], "BTTS": [], "OU 2.5": [], "HT-FT": [] };
-    for (const it of items) {
-      const m = String(it?.market_label || it?.market || "").toUpperCase();
-      if (m.includes("1X2") || m === "1X2" || m.includes("MATCH WINNER")) res["1X2"].push(it);
-      else if (m.includes("BTTS") || m.includes("BOTH TEAMS TO SCORE")) res["BTTS"].push(it);
-      else if (m.includes("OU 2.5") || m.includes("OVER") || m.includes("UNDER")) res["OU 2.5"].push(it);
-      else if (m.includes("HT-FT") || m.includes("HT/FT")) res["HT-FT"].push(it);
-    }
-    for (const k of Object.keys(res)) res[k] = res[k].slice(0, 3);
-    return res;
-  }, [items]);
-
+/* ---------------- crypto block ---------------- */
+function CryptoPanel({ list }) {
+  if (!Array.isArray(list) || list.length === 0) {
+    return <div className="text-sm text-slate-400">Nema kripto signala.</div>;
+  }
   return (
-    <div className="rounded-2xl bg-[#15182a] p-4">
-      <div className="text-base font-semibold text-white mb-3">Top tiketi (3× po marketu)</div>
-      {Object.entries(byMarket).map(([cat, arr]) => (
-        <div key={cat} className="mb-3">
-          <div className="text-sm font-semibold text-white mb-2">{cat} (3)</div>
-          {!arr.length ? (
-            <div className="text-xs text-slate-400">Nema kandidata.</div>
-          ) : (
-            <div className="grid grid-cols-1 gap-2">
-              {arr.map((it, i) => <Card key={`${cat}-${keyOf(it, i)}`} it={it} />)}
-            </div>
-          )}
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+      {list.map((c, idx) => (
+        <div key={c.symbol || idx} className="p-4 rounded-xl bg-[#1f2339]">
+          <div className="text-xs text-slate-400">{c.symbol}</div>
+          <div className="font-semibold">{c.name}</div>
+          <div className="text-sm text-slate-200 mt-1">
+            Signal: <b>{c.signal}</b> · Conf {Math.round(Number(c.confidence_pct || 0))}%
+          </div>
         </div>
       ))}
     </div>
   );
 }
 
-/* ---------------- main ---------------- */
+/* ---------------- body ---------------- */
+function CombinedBody() {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [football, setFootball] = useState([]);
+  const [crypto, setCrypto] = useState([]);
 
-export default function CombinedBets() {
-  const [tab, setTab] = useState("Combined"); // Combined | Football | Crypto
-  const locked = useLockedFeed();
-  const crypto = useCryptoTop3();
+  async function load() {
+    try {
+      setLoading(true);
+      setError(null);
+      const slot = currentSlot();
 
-  /* ---------- Football sub-tabovi ---------- */
-  const [fTab, setFTab] = useState("ko"); // ko | conf | hist
+      // locked shortlist (KV only)
+      let j = await safeJson(`/api/value-bets-locked?slot=${slot}`);
+      const fitems = Array.isArray(j?.items) ? j.items : Array.isArray(j) ? j : [];
 
-  const koRows = useMemo(() => {
-    return [...(locked.items || [])].sort((a,b) => {
-      const ta = Date.parse(toISO(a)?.replace(" ", "T") || "") || 9e15;
-      const tb = Date.parse(toISO(b)?.replace(" ", "T") || "") || 9e15;
-      return ta - tb;
-    });
-  }, [locked.items]);
+      // full feed (KV only, with light merge)
+      const fb = await safeJson(`/api/football?slot=${slot}&norebuild=1`);
+      const f2 = Array.isArray(fb?.football) ? fb.football : Array.isArray(fb) ? fb : [];
 
-  const confRows = useMemo(() => {
-    return [...(locked.items || [])].sort((a,b) =>
-      Number(b?.confidence_pct || b?.model_prob || 0) - Number(a?.confidence_pct || a?.model_prob || 0)
-    );
-  }, [locked.items]);
+      const merged = [...fitems];
+      for (const x of f2) {
+        if (!merged.find((y) => (y.fixture_id || y.id) === (x.fixture_id || x.id))) merged.push(x);
+      }
+      setFootball(merged.slice(0, 15));
 
-  function CombinedBody() {
-    const list = locked.items || [];
-    return (
-      <div className="space-y-4">
-        {/* GRID: leva lista, desno HISTORY  (NEMA 3× tiketa na Combined) */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <div className="lg:col-span-2">
-            {locked.error ? (
-              <div className="p-4 rounded-xl bg-[#1f2339] text-red-300 text-sm">Greška: {String(locked.error)}</div>
-            ) : list.length === 0 ? (
-              <div className="p-4 rounded-xl bg-[#1f2339] text-slate-300 text-sm">Trenutno nema predloga.</div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-                {list.map((it, i) => <Card key={keyOf(it, i)} it={it} />)}
-              </div>
-            )}
-          </div>
-          <div className="lg:col-span-1">
-            <HistoryPanel />
-          </div>
+      const cj = await safeJson(`/api/crypto`);
+      const cl = Array.isArray(cj?.signals) ? cj.signals : Array.isArray(cj) ? cj : [];
+      setCrypto(cl.slice(0, 6));
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  if (loading) return <div className="text-sm text-slate-400">Učitavam…</div>;
+  if (error) return <div className="text-sm text-red-400">Greška: {error}</div>;
+
+  const top = football.slice(0, 3);
+  const rest = football.slice(3);
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div>
+        <div className="text-sm font-semibold mb-2">Football – Top 3</div>
+        <div className="space-y-3">
+          {top.map((it, idx) => (
+            <FootballCard key={it.fixture_id || idx} it={it} />
+          ))}
         </div>
-
-        {/* Donji red: Crypto top 3 */}
-        <div className="rounded-2xl bg-[#15182a] p-4">
-          <div className="text-base font-semibold text-white mb-2">Crypto — Top 3</div>
-          {crypto.error ? (
-            <div className="text-red-300 text-sm">Greška: {String(crypto.error)}</div>
-          ) : !crypto.items.length ? (
-            <div className="text-slate-300 text-sm">Trenutno nema signala.</div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              {crypto.items.map((c, i) => (
-                <div key={i} className="p-3 rounded-xl bg-[#1f2339]">
-                  <div className="text-sm font-semibold">{c.symbol}</div>
-                  <div className="text-xs text-slate-400">{c.name}</div>
-                  <div className="mt-1 text-sm">Signal: <b>{c.signal}</b> · Conf {c.confidence_pct}%</div>
-                  <div className="text-xs text-slate-400">
-                    1h: {Math.round((c.h1_pct ?? 0)*10)/10}% · 24h: {Math.round((c.d24_pct ?? 0)*10)/10}%
-                  </div>
-                </div>
+        {rest.length > 0 && (
+          <div className="mt-4">
+            <div className="text-sm font-semibold mb-2">Još predloga</div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {rest.map((it, idx) => (
+                <FootballCard key={it.fixture_id || it.id || idx} it={it} />
               ))}
             </div>
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  function FootballBody() {
-    const list = locked.items || [];
-    return (
-      <div className="space-y-4">
-        {/* TAB dugmad (Kick-Off / Confidence / History) */}
-        <div className="flex items-center gap-2">
-          <button className={`px-3 py-1.5 rounded-lg text-sm ${fTab==="ko"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`} onClick={()=>setFTab("ko")} type="button">Kick-Off</button>
-          <button className={`px-3 py-1.5 rounded-lg text-sm ${fTab==="conf"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`} onClick={()=>setFTab("conf")} type="button">Confidence</button>
-          <button className={`px-3 py-1.5 rounded-lg text-sm ${fTab==="hist"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`} onClick={()=>setFTab("hist")} type="button">History</button>
-        </div>
-
-        {/* GRID: levo lista po tabu, desno 3× tiketi (SAMO ovde) */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <div className="lg:col-span-2 space-y-4">
-            {fTab === "ko"   && <Section title="Kick-Off" rows={koRows} />}
-            {fTab === "conf" && <Section title="Confidence" rows={confRows} />}
-            {fTab === "hist" && (
-              <div className="rounded-2xl p-4 border border-neutral-800 bg-neutral-900/60 text-sm opacity-80">
-                History (14d) prikaz ostaje isti — puni se iz nightly procesa.
-              </div>
-            )}
-          </div>
-          <div className="lg:col-span-1">
-            <TicketsPanel items={list} />
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  function CryptoBody() {
-    const citems = crypto.items || [];
-    return (
-      <div className="rounded-2xl bg-[#15182a] p-4">
-        <div className="text-base font-semibold text-white mb-2">Crypto — Top 3</div>
-        {crypto.error ? (
-          <div className="text-red-300 text-sm">Greška: {String(crypto.error)}</div>
-        ) : !citems.length ? (
-          <div className="text-slate-300 text-sm">Trenutno nema signala.</div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            {citems.map((c, i) => (
-              <div key={i} className="p-3 rounded-xl bg-[#1f2339]">
-                <div className="text-sm font-semibold">{c.symbol}</div>
-                <div className="text-xs text-slate-400">{c.name}</div>
-                <div className="mt-1 text-sm">Signal: <b>{c.signal}</b> · Conf {c.confidence_pct}%</div>
-                <div className="text-xs text-slate-400">
-                  1h: {Math.round((c.h1_pct ?? 0)*10)/10}% · 24h: {Math.round((c.d24_pct ?? 0)*10)/10}%
-                </div>
-              </div>
-            ))}
           </div>
         )}
       </div>
-    );
-  }
 
-  return (
-    <div className="mt-4 space-y-4">
-      <div className="flex items-center gap-2">
-        {["Combined","Football","Crypto"].map((name) => (
-          <button
-            key={name}
-            onClick={() => setTab(name)}
-            className={`px-3 py-1.5 rounded-lg text-sm ${tab===name?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
-            type="button"
-          >
-            {name}
-          </button>
-        ))}
+      <div>
+        <div className="text-sm font-semibold mb-2">Crypto – Top 6</div>
+        <CryptoPanel list={crypto} />
       </div>
-
-      {tab === "Combined" ? <CombinedBody /> : tab === "Football" ? <FootballBody /> : <CryptoBody /> }
     </div>
   );
+}
+
+export default function CombinedBets() {
+  return <CombinedBody />;
 }
