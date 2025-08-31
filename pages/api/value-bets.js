@@ -1,4 +1,7 @@
 // pages/api/value-bets.js
+// KV-only feed: bez ikakvog fallbacka na rebuild ili spoljne API-je.
+// Vraća value_bets sa pick=string i home/away na vrhu.
+
 export const config = { runtime: "nodejs" };
 
 const TZ = "Europe/Belgrade";
@@ -9,24 +12,17 @@ const KV_TOKEN = process.env.KV_REST_API_TOKEN || KV_TOKEN_RO;
 async function kvGet(key) {
   if (!KV_URL || (!KV_TOKEN && !KV_TOKEN_RO)) return null;
   const token = KV_TOKEN_RO || KV_TOKEN;
-  const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${token}` }, cache: "no-store",
-  }).catch(() => null);
-  if (!r || !r.ok) return null;
-  const j = await r.json().catch(() => null);
-  if (!j || typeof j.result === "undefined") return null;
-  try { return JSON.parse(j.result); } catch { return j.result; }
+  try {
+    const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${token}` }, cache: "no-store",
+    });
+    if (!r.ok) return null;
+    const j = await r.json().catch(() => null);
+    if (!j || typeof j.result === "undefined") return null;
+    try { return JSON.parse(j.result); } catch { return j.result; }
+  } catch { return null; }
 }
-async function kvSet(key, value, ttlSec = 0) {
-  if (!KV_URL || !KV_TOKEN) return false;
-  const body = new URLSearchParams();
-  body.set("value", typeof value === "string" ? value : JSON.stringify(value));
-  if (ttlSec > 0) body.set("ex", String(ttlSec));
-  const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
-    method: "POST", headers: { Authorization: `Bearer ${KV_TOKEN}` }, body,
-  }).catch(() => null);
-  return !!(r && r.ok);
-}
+
 function ymdInTZ(d = new Date(), tz = TZ) {
   const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
   return fmt.format(d);
@@ -41,15 +37,26 @@ function autoSlot(tz = TZ) {
   if (h < 15) return "am";
   return "pm";
 }
-function safeNumber(x, d=0){ const n = Number(x); return Number.isFinite(n)?n:d; }
+function labelForPick(code){ return code==="1"?"Home":code==="2"?"Away":code==="X"?"Draw":String(code||""); }
 
-async function loadCalibration() {
-  const calib = (await kvGet("vb:learn:calib:latest")) || {};
-  const overlay = (await kvGet("learn:overlay:v1")) || {};
-  const evmin = (await kvGet("learn:evmin:v1")) || {};
-  return { calib, overlay, evmin };
+function normalize(it) {
+  const raw = it?.pick;
+  let code = it?.pick_code;
+  let pickStr = "";
+  if (typeof raw === "string") {
+    pickStr = ["1","X","2"].includes(raw) ? labelForPick(raw) : raw;
+  } else if (raw && typeof raw === "object") {
+    code = code || raw.code;
+    pickStr = raw.label || it?.selection_label || labelForPick(code);
+  } else {
+    pickStr = it?.selection_label || labelForPick(code);
+  }
+  const home = it.home || it?.teams?.home || "";
+  const away = it.away || it?.teams?.away || "";
+  const league_name = it.league_name || it?.league?.name || "";
+  const league_country = it.league_country || it?.league?.country || "";
+  return { ...it, pick: pickStr, pick_code: code || it?.pick_code || null, home, away, league_name, league_country };
 }
-function labelForPick(k){ return k==="1"?"Home":k==="2"?"Away":k==="X"?"Draw":String(k||""); }
 
 export default async function handler(req, res) {
   try {
@@ -57,55 +64,17 @@ export default async function handler(req, res) {
     const slot = ["am","pm","late"].includes(qslot) ? qslot : autoSlot();
     const ymd = ymdInTZ();
 
-    const proto = req.headers["x-forwarded-proto"] || "https";
-    const host = req.headers.host;
-    const SELF_BASE = `${proto}://${host}`;
+    const full = await kvGet(`vbl_full:${ymd}:${slot}`);
+    const slim = await kvGet(`vbl:${ymd}:${slot}`);
+    const base = Array.isArray(full) ? full : (Array.isArray(slim) ? slim : []);
 
-    let base =
-      (await kvGet(`vbl_full:${ymd}:${slot}`)) ||
-      (await kvGet(`vbl:${ymd}:${slot}`));
-
-    const src = [];
-    if (!Array.isArray(base)) {
-      const r = await fetch(`${SELF_BASE}/api/cron/rebuild?slot=${slot}&dry=1`, { cache: "no-store" }).catch(() => null);
-      const j = r && (await r.json().catch(() => null));
-      base = Array.isArray(j?.football) ? j.football : [];
-      src.push(j?.source || "rebuild(dry)");
-    } else {
-      src.push("kv");
-    }
-
-    const { overlay, evmin } = await loadCalibration();
-
-    const out = base.map(it => {
-      // pick normalizacija za UI:
-      const code = it.pick_code || (typeof it.pick === "string" && ["1","X","2"].includes(it.pick) ? it.pick : "");
-      const pickLabel = it.selection_label || (typeof it.pick === "string" && !["1","X","2"].includes(it.pick) ? it.pick : labelForPick(code));
-      let conf = safeNumber(it?.confidence_pct ?? it?.confidence ?? 0);
-
-      // per-bucket overlay/evmin — jednostavno: ako postoji ključ “1X2:*”, primeni ga
-      const market = (it?.market || "UNK").toUpperCase();
-      const bucketKey = `${market}:*`;
-      if (typeof overlay[bucketKey] === "number") conf = Math.max(0, Math.min(100, conf + overlay[bucketKey]));
-
-      return {
-        ...it,
-        pick: pickLabel,      // <<< string koji UI lepo prikaže
-        pick_code: code,      // originalni kod ako ti treba
-        home: it.home || it?.teams?.home || "",
-        away: it.away || it?.teams?.away || "",
-        league_name: it.league_name || it?.league?.name || "",
-        league_country: it.league_country || it?.league?.country || "",
-      };
-    });
-
-    await kvSet(`vb:decorated:${ymd}:${slot}`, { ts: Date.now(), count: out.length }, 120);
+    const out = base.map(normalize);
 
     return res.status(200).json({
       ok: true,
       slot,
       value_bets: out,
-      source: `base:${src.join("+")}·learning:on`,
+      source: `kv:${Array.isArray(base) ? "hit" : "miss"}`,
     });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
