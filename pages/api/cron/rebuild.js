@@ -1,8 +1,7 @@
 // pages/api/cron/rebuild.js
 // Rebuild job: računa value-bets za današnji slot (late/am/pm),
-// upisuje ih u KV (vbl:<YMD>:<slot> i vbl_full:<YMD>:<slot>)
-// i vraća JSON kompatibilan sa UI-em – ali
-// ➜ NIKAD ne briše postojeće KV ako danas nema rezultata (count=0).
+// upisuje ih u KV (vbl:<YMD>:<slot> i vbl_full:<YMD>:<slot> + alias ključeve za watchere)
+// i vraća JSON kompatibilan sa UI-em – ne briše postojeće KV ako nema rezultata.
 
 export const config = { api: { bodyParser: false } };
 
@@ -103,21 +102,16 @@ function median(nums){ const a = nums.filter(Number.isFinite).sort((x,y)=>x-y); 
  *  A) response = [{ bookmakers: [{ id,name,bets:[{id,name,values:[]},...] }, ...] }, ...]
  *  B) response = [{ bookmaker:{id,name}, bets:[...] }, ...]  (legacy)
  *  C) response = [{ id,name,bets:[...] }, ...]               (bookmaker-level)
- * Ovaj ekstraktor podržava sva tri.
  */
 function extract1X2FromOdds(oddsPayload){
   const priceBy = { "1":[], "X":[], "2":[] };
   const seenBook = { "1":new Set(), "X":new Set(), "2":new Set() };
 
   const roots = Array.isArray(oddsPayload) ? oddsPayload : [];
-  // flatten na bookmaker-level
   const rows = [];
   for (const root of roots){
     if (!root) continue;
-    if (Array.isArray(root.bookmakers)) {
-      for (const bk of root.bookmakers) rows.push(bk);
-      continue;
-    }
+    if (Array.isArray(root.bookmakers)) { for (const bk of root.bookmakers) rows.push(bk); continue; }
     if (Array.isArray(root.bets)) { rows.push(root); continue; }
     if (root.bookmaker && Array.isArray(root.bookmaker.bets)) { rows.push(root.bookmaker); continue; }
   }
@@ -152,7 +146,7 @@ function extract1X2FromOdds(oddsPayload){
 function fromPickCodeToLabel(code){ if (code==="1") return "Home"; if (code==="2") return "Away"; if (code==="X") return "Draw"; return String(code||""); }
 function normalizeTeams(t){ const home = t?.home?.name || t?.home || t?.homeTeam || ""; const away = t?.away?.name || t?.away || t?.awayTeam || ""; return { home, away }; }
 
-// ✅ Heuristika za ženske lige/timove
+// Heuristika za ženske lige/timove
 function isWomenString(s=""){
   if (/\b(women|women's|ladies)\b/i.test(s)) return true;
   if (/\b(femenina|feminine|feminin|femminile)\b/i.test(s)) return true;
@@ -248,7 +242,7 @@ export default async function handler(req, res){
         const oddsPayload = await fetchOddsForFixture(fx.fixture_id);
         const oddsArr = Array.isArray(oddsPayload) ? oddsPayload : [];
 
-        // ❗ FIX: koristimo CEO payload i podržavamo API-Football "bookmakers[]" oblik
+        // CEO payload i "bookmakers[]" oblik
         const { med, books_count: booksCountAll } = extract1X2FromOdds(oddsArr);
         if (!Number.isFinite(med["1"]) && !Number.isFinite(med["X"]) && !Number.isFinite(med["2"])) continue;
 
@@ -316,16 +310,32 @@ export default async function handler(req, res){
     const fullList = byEV.slice(0, fullCount);
     const slimList = byEV.slice(0, slimCount);
 
-    // 4) Upis u KV – SAMO ako imamo bar nešto (ne praznimo KV kad je 0!)
+    // 4) Upis u KV – SAMO ako imamo nešto (ne praznimo KV kad je 0!)
     let wrote = false;
     if (slimList.length > 0 || fullList.length > 0) {
-      const keySlim = `vbl:${ymd}:${qSlot}`;
-      const keyFull = `vbl_full:${ymd}:${qSlot}`;
+      const keySlim  = `vbl:${ymd}:${qSlot}`;
+      const keyFull  = `vbl_full:${ymd}:${qSlot}`;
+
       const payloadSlim = { items: slimList, football: slimList, value_bets: slimList };
       const payloadFull = { items: fullList, football: fullList, value_bets: fullList };
-      await kvSetJSON_safe(keySlim, payloadSlim /*, 72*3600 */);
-      await kvSetJSON_safe(keyFull, payloadFull /*, 72*3600 */);
-      await kvSetJSON_safe(`vb:day:${ymd}:last`, { key: keySlim });
+
+      await kvSetJSON_safe(keySlim, payloadSlim);
+      await kvSetJSON_safe(keyFull, payloadFull);
+
+      // Alias ključevi za watchere (razni nazivi koje drugi delovi sistema očekuju)
+      const keyLockedDash   = `vb-locked:${ymd}:${qSlot}`;
+      const keyLockedColon  = `vb:locked:${ymd}:${qSlot}`;
+      const keyLockedUnder  = `vb_locked:${ymd}:${qSlot}`;
+      const keyLockedVbl    = `locked:vbl:${ymd}:${qSlot}`;
+
+      await kvSetJSON_safe(keyLockedDash,  payloadSlim);
+      await kvSetJSON_safe(keyLockedColon, payloadSlim);
+      await kvSetJSON_safe(keyLockedUnder, payloadSlim);
+      await kvSetJSON_safe(keyLockedVbl,   payloadSlim);
+
+      // Pointer na "last" (ostavljen radi kompatibilnosti)
+      await kvSetJSON_safe(`vb:day:${ymd}:last`, { key: keyLockedDash, alt: [keySlim, keyFull, keyLockedColon, keyLockedUnder, keyLockedVbl] });
+
       wrote = true;
     }
 
@@ -336,7 +346,7 @@ export default async function handler(req, res){
       ymd,
       count: slimList.length,
       count_full: fullList.length,
-      wrote, // da znaš da li je KV zaista ažuriran
+      wrote,
       football: slimList,
       ...(wantDebug ? { debug } : {})
     });
