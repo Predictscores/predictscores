@@ -1,307 +1,136 @@
 // pages/api/value-bets-locked.js
-// KV-only čitanje value-bets feeda (vbl / vbl_full / pointer varijante).
-// ❗ Nema automatskog poziva /api/cron/rebuild (da se ne troše API pozivi).
-// Fallback na rebuild je opciono: LOCKED_FALLBACK_TO_LIVE=1 ili query ?live=1.
+// KV-only fetch za UI (Combined/Football/History).
+// Combined: vrati TAČNO 3 najviša "confidence" predloga preko svih marketa,
+// ali bez menjanja fronta: koristimo polje `items`.
+// - Kao bazu koristimo 1X2 iz vbl/vbl_full (football).
+// - Ako vbl_full sadrži `extras_by_fixture` (BTTS/OU2.5/HT-FT), po svakoj utakmici biramo
+//   najkonfidentniji pick među {1X2, extras...}, pa globalno uzmemo TOP-3 i stavimo u `items`.
+// - `football` ostaje cela 1X2 lista (25), da Football tab radi isto kao i do sada.
 
 export const config = { api: { bodyParser: false } };
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-const ALLOW_FALLBACK = /^(1|true|yes|on)$/i.test(String(process.env.LOCKED_FALLBACK_TO_LIVE || "0"));
-const FALLBACK_TTL_MS = 5 * 60 * 1000; // 5 min ako ručno koristiš fallback
-const FALLBACK_CACHE = Object.create(null); // in-memory cache (best-effort)
 
 function ymdInTZ(d = new Date(), tz = TZ) {
   try {
-    const fmt = new Intl.DateTimeFormat("sv-SE", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
-    const parts = fmt.formatToParts(d).reduce((a,p)=> (a[p.type]=p.value, a), {});
-    return `${parts.year}-${parts.month}-${parts.day}`;
+    const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
+    return fmt.format(d);
   } catch {
-    const y = d.getUTCFullYear(), m = String(d.getUTCMonth()+1).padStart(2,"0"), dd = String(d.getUTCDate()).padStart(2,"0");
+    const y = d.getUTCFullYear(), m = String(d.getUTCMonth() + 1).padStart(2, "0"), dd = String(d.getUTCDate()).padStart(2, "0");
     return `${y}-${m}-${dd}`;
   }
 }
-function shiftDays(d, days) { const nd = new Date(d.getTime()); nd.setUTCDate(nd.getUTCDate()+days); return nd; }
-function currentHour(tz = TZ){ return Number(new Intl.DateTimeFormat("en-GB",{hour:"2-digit",hour12:false,timeZone:tz}).format(new Date())); }
-function slotOfHour(h){ return h < 10 ? "late" : h < 15 ? "am" : "pm"; } // late 00–09, am 10–14, pm 15–23
-function currentSlot(tz = TZ){ return slotOfHour(currentHour(tz)); }
-function orderForSlot(slot){ return slot==="late" ? ["late","am","pm"] : slot==="am" ? ["am","pm","late"] : ["pm","am","late"]; }
-function getBaseFromReq(req){
-  const proto = req.headers["x-forwarded-proto"] || "https";
-  const host  = req.headers["x-forwarded-host"] || req.headers.host || "localhost:3000";
-  return `${proto}://${host}`;
+function slotOfHour(h) { return h < 10 ? "late" : (h < 15 ? "am" : "pm"); }
+function localHour(tz = TZ) {
+  try { return Number(new Intl.DateTimeFormat("sv-SE", { timeZone: tz, hour: "2-digit", hour12: false }).format(new Date())); }
+  catch { return new Date().getUTCHours(); }
 }
 
-/* ---------- dekoderi ---------- */
-function gunzipBase64ToString(b64){
-  try {
-    const zlib = require("zlib");
-    const buf = Buffer.from(b64, "base64");
-    const out = zlib.gunzipSync(buf);
-    return out.toString("utf8");
-  } catch { return null; }
-}
-function tryDecode(raw){
-  if (raw && typeof raw === "object") return raw;
-  if (Array.isArray(raw)) return raw;
-  if (typeof raw === "string") {
-    // 1) JSON string
-    try { return JSON.parse(raw); } catch {}
-    // 2) NDJSON
-    if (raw.includes("\n") && raw.includes("{")) {
-      const lines = raw.split("\n").map(s=>s.trim()).filter(Boolean);
-      const arr = [];
-      for (const ln of lines){ try { arr.push(JSON.parse(ln)); } catch {} }
-      if (arr.length) return arr;
-    }
-    // 3) base64+gzip JSON
-    const maybe = gunzipBase64ToString(raw);
-    if (maybe){ try { return JSON.parse(maybe); } catch {} }
-    // 4) base64 JSON
-    try {
-      const dec = Buffer.from(raw, "base64").toString("utf8");
-      try { return JSON.parse(dec); } catch {}
-    } catch {}
-  }
-  return raw;
-}
-
-async function kvFetch(key){
+async function kvGETraw(key){
   const base = process.env.KV_REST_API_URL || process.env.KV_URL || process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-  if(!base || !token) return { exists:false, value:null };
-  const url = `${base.replace(/\/+$/,"")}/get/${encodeURIComponent(key)}`;
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (!r.ok) return { exists:false, value:null };
-  const j = await r.json().catch(()=>null);
-  const raw = j?.result ?? null;
-  if (raw == null) return { exists:false, value:null };
-  return { exists:true, value: tryDecode(raw) };
+  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!base || !token) return null;
+  const r = await fetch(`${base.replace(/\/+$/, "")}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  }).catch(()=>null);
+  if (!r || !r.ok) return null;
+  const ct = r.headers.get("content-type") || "";
+  const body = ct.includes("application/json") ? await r.json().catch(()=>null) : await r.text().catch(()=>null);
+  return (body && typeof body==="object" && "result" in body) ? body.result : body;
 }
 
-/* ---------- prepoznavanje i ekstrakcija niza ---------- */
-function looksLikeBet(o){
-  if (!o || typeof o !== "object") return false;
-  const must = ["fixture_id","teams","home","away","market","kickoff"];
-  let score = 0; for (const k of must){ if (k in o) score++; }
-  return score >= 2;
+function toObj(v){
+  try { return typeof v==="string" ? JSON.parse(v) : v; } catch { return null; }
 }
-function collectCandidateArrays(x, limit = 500){
-  const out = [];
-  const seen = new Set();
-  const stack = [x];
-  let guard = 0;
-  while (stack.length && out.length < limit && guard < 2000){
-    guard++;
-    const cur = stack.pop();
-    if (!cur) continue;
-    if (Array.isArray(cur)){
-      if (cur.length && typeof cur[0] === "object" && looksLikeBet(cur[0])) {
-        const id = `arr:${cur.length}:${Object.keys(cur[0]).slice(0,5).join(",")}`;
-        if (!seen.has(id)){ seen.add(id); out.push(cur); }
-        continue;
-      }
-      for (const it of cur){ if (it && (typeof it==="object" || Array.isArray(it))) stack.push(it); }
-      continue;
-    }
-    if (typeof cur === "object"){
-      for (const k in cur){
-        const v = cur[k];
-        if (v && (typeof v==="object" || Array.isArray(v))) stack.push(v);
-      }
-    }
-  }
-  return out;
-}
-function toArrayAny(x){
-  if (!x) return [];
-  if (Array.isArray(x)) return x;
-
-  // tipična polja
-  if (Array.isArray(x.items)) return x.items;
-  if (Array.isArray(x.value_bets)) return x.value_bets;
-  if (Array.isArray(x.football)) return x.football;
-
-  // wrapperi
-  if (Array.isArray(x.data?.items)) return x.data.items;
-  if (Array.isArray(x.data?.value_bets)) return x.data.value_bets;
-  if (Array.isArray(x.data?.football)) return x.data.football;
-
-  // druge varijante
-  if (Array.isArray(x.full)) return x.full;
-  if (Array.isArray(x.slim)) return x.slim;
-  if (Array.isArray(x.list)) return x.list;
-  if (Array.isArray(x.arr)) return x.arr;
-  if (Array.isArray(x.recs)) return x.recs;
-  if (Array.isArray(x.recommendations)) return x.recommendations;
-  if (Array.isArray(x.football_full)) return x.football_full;
-  if (Array.isArray(x.football_slim)) return x.football_slim;
-
-  // pointer { key: "vbl:..." } ili { target:"..." }
-  if (typeof x.key === "string") return [{ __pointer: x.key }];
-  if (typeof x.target === "string") return [{ __pointer: x.target }];
-
-  // rekurzivno
-  const found = collectCandidateArrays(x);
-  if (found.length) return found[0];
-
-  return [];
-}
-function uniqueByFixture(arr){
-  const seen = new Set();
-  const out = [];
-  for (const it of arr){
-    const id =
-      it?.fixture_id ??
-      it?.fixture?.id ??
-      `${it?.league?.id || ""}:${it?.teams?.home?.name || it?.home}-${it?.teams?.away?.name || it?.away}`;
-    if (!seen.has(id)){ seen.add(id); out.push(it); }
-  }
-  return out;
+function arrFromAny(o){
+  if (!o || typeof o!=="object") return [];
+  return Array.isArray(o.items) ? o.items :
+         Array.isArray(o.value_bets) ? o.value_bets :
+         Array.isArray(o.football) ? o.football :
+         Array.isArray(o.arr) ? o.arr :
+         Array.isArray(o.data) ? o.data : [];
 }
 
-async function tryKey(key, tried){
-  tried.push(key);
-  const r = await kvFetch(key);
-  if (!r.exists) return { ok:false, why:"missing" };
-  const val = r.value;
-  const arr = toArrayAny(val);
-
-  // pointer deref
-  if (arr.length === 1 && arr[0]?.__pointer){
-    const ptr = arr[0].__pointer;
-    tried.push(`→ ${ptr}`);
-    const r2 = await kvFetch(ptr);
-    if (r2.exists) {
-      const a2 = toArrayAny(r2.value);
-      if (a2.length) return { ok:true, items: uniqueByFixture(a2), source:`ptr:${ptr}` };
-    }
-    return { ok:false, why:"ptr-empty" };
-  }
-
-  if (arr.length) return { ok:true, items: uniqueByFixture(arr), source:key };
-  return { ok:false, why:"no-array" };
-}
-
-/* ---------- fakultativni (ručni) fallback na rebuild ---------- */
-async function fetchLiveFromRebuild(req, slot, n){
-  try{
-    const base = getBaseFromReq(req);
-    const url  = `${base}/api/cron/rebuild?slot=${encodeURIComponent(slot)}&kv=0`;
-    const r = await fetch(url, { headers: { "x-internal": "vbl-fallback" } });
-    const ct = r.headers.get("content-type") || "";
-    const j = ct.includes("application/json") ? await r.json() : JSON.parse(await r.text());
-    let arr = [];
-    if (Array.isArray(j?.items)) arr = j.items;
-    else if (Array.isArray(j?.football)) arr = j.football;
-    if (n>0 && arr.length>n) arr = arr.slice(0,n);
-    return arr;
-  }catch{ return []; }
-}
-
-/* ---------- Handler ---------- */
 export default async function handler(req, res){
-  try{
+  try {
     const now = new Date();
-    const ymd = (req.query.ymd && String(req.query.ymd)) || ymdInTZ(now, TZ);
-    const qSlot = (req.query.slot && String(req.query.slot)) || currentSlot(TZ);
-    const n = Math.max(0, Math.min(200, Number(req.query.n ?? 0)));
-    const debug = String(req.query.debug||"") === "1";
-    const wantLive = String(req.query.live||"") === "1";
+    const ymd = ymdInTZ(now, TZ);
+    const slot = (req.query.slot && String(req.query.slot)) || slotOfHour(localHour(TZ));
+    const nMax = Math.max(1, Math.min( Number(req.query.n || 3), 50 ));
 
-    const tried = [];
-    let items = [];
-    let src = "miss";
-
-    // 1) danas: preferirani slot → ostali (vbl, vbl_full)
-    for (const s of orderForSlot(qSlot)){
-      for (const prefix of ["vbl","vbl_full"]){
-        const k = `${prefix}:${ymd}:${s}`;
-        const got = await tryKey(k, tried);
-        if (got.ok){ items = got.items; src = got.source; break; }
-      }
-      if (items.length) break;
+    // 1) probaj prvo "full" zbog extras_by_fixture
+    const keys = [
+      `vbl_full:${ymd}:${slot}`,
+      `vbl:${ymd}:${slot}`,
+      `vb-locked:${ymd}:${slot}`,
+      `vb:locked:${ymd}:${slot}`,
+      `vb_locked:${ymd}:${slot}`,
+      `locked:vbl:${ymd}:${slot}`
+    ];
+    let gotFull=null, gotSlim=null, picked=null;
+    for (const k of keys) {
+      const raw = await kvGETraw(k);
+      if (!raw) continue;
+      const obj = toObj(raw);
+      if (!obj) continue;
+      if (!picked) picked=k;
+      if (!gotFull && /vbl_full:/.test(k)) gotFull=obj;
+      if (!gotSlim && /^(vbl:|vb-locked:|vb:locked:|vb_locked:|locked:vbl:)/.test(k)) gotSlim=obj;
+      if (gotFull && gotSlim) break;
     }
 
-    // 2) juče & 3) prekjuče
-    for (const delta of [-1, -2]){
-      if (items.length) break;
-      const y = ymdInTZ(shiftDays(now, delta), TZ);
-      for (const s of ["pm","am","late"]){
-        for (const prefix of ["vbl","vbl_full"]){
-          const k = `${prefix}:${y}:${s}`;
-          const got = await tryKey(k, tried);
-          if (got.ok){ items = got.items; src = got.source; break; }
-        }
-        if (items.length) break;
-      }
-    }
+    const fullArr = arrFromAny(gotFull);
+    const slimArr = arrFromAny(gotSlim) || fullArr;
+    const football = slimArr; // 1X2 lista koja puni Football tab
 
-    // 4) pointer vb:day:<ymd>:last + locked varijante
-    if (!items.length){
-      const kDay = `vb:day:${ymd}:last`;
-      const g1 = await tryKey(kDay, tried);
-      if (g1.ok){ items = g1.items; src = g1.source; }
-    }
-    if (!items.length){
-      const vars = ["vb:locked","vb_locked","vb-locked","locked:vbl"];
-      for (const delta of [0,-1,-2]){
-        if (items.length) break;
-        const y = ymdInTZ(shiftDays(now, delta), TZ);
-        for (const s of ["pm","am","late"]){
-          for (const v of vars){
-            const k = `${v}:${y}:${s}`;
-            const g = await tryKey(k, tried);
-            if (g.ok){ items = g.items; src = g.source; break; }
-          }
-          if (items.length) break;
-        }
-      }
-    }
-
-    // 5) Opcioni FALLBACK (samo ako je eksplicitno traženo ili dozvoljeno ENV-om)
-    if (!items.length && (wantLive || ALLOW_FALLBACK)) {
-      const cacheKey = `${ymd}:${qSlot}`;
-      const nowMs = Date.now();
-      const cached = FALLBACK_CACHE[cacheKey];
-      if (cached && (nowMs - cached.ts) < FALLBACK_TTL_MS) {
-        items = cached.items.slice();
-        src = "vb-locked:fallback→cache";
-      } else {
-        const live = await fetchLiveFromRebuild(req, qSlot, n || 50);
-        if (live.length){
-          FALLBACK_CACHE[cacheKey] = { ts: nowMs, items: live.slice() };
-          items = live;
-          src = "vb-locked:fallback→live:rebuild";
-        }
-      }
-    }
-
-    if (!items.length){
+    // Ako nemamo ništa, vrati prazno kao i ranije
+    if (!Array.isArray(football) || football.length === 0) {
       return res.status(200).json({
-        ok: true,
-        slot: qSlot,
-        ymd,
-        items: [],
-        value_bets: [],
-        football: [],
-        source: "vb-locked:kv:miss·robust",
-        ...(debug ? { debug_tried: tried } : {})
+        ok:true, slot, ymd, items:[], value_bets:[], football:[], source:"vb-locked:kv:miss·robust"
       });
     }
 
-    if (n>0 && items.length>n) items = items.slice(0,n);
+    // 2) Combined: TOP-3 po confidence preko svih marketa, po jednoj utakmici
+    // Najpre skupimo najbolje po utakmici: among {1X2, extras...} uzmi onaj sa max confidence_pct
+    const extras = gotFull && typeof gotFull==="object" ? gotFull.extras_by_fixture || {} : {};
 
+    const byFixtureBest = [];
+    const idxByFixture = new Map();
+    for (const r of football) {
+      if (!r || !r.fixture_id) continue;
+      const fid = r.fixture_id;
+
+      // kandidati za ovaj fixture: bazni 1X2 + extras (ako ih ima)
+      const cands = [r];
+      if (Array.isArray(extras[fid])) cands.push(...extras[fid]);
+
+      // izaberi onaj sa najvećim confidence_pct
+      let best = null;
+      for (const c of cands) {
+        if (!c || !Number.isFinite(c.confidence_pct)) continue;
+        if (!best || c.confidence_pct > best.confidence_pct) best = c;
+      }
+      if (best) {
+        byFixtureBest.push(best);
+        idxByFixture.set(fid, best);
+      }
+    }
+
+    // globalno sortiraj po confidence i uzmi top nMax (default 3)
+    const combined = byFixtureBest
+      .sort((a,b)=> (b.confidence_pct - a.confidence_pct) || (Number(b._ev||-9) - Number(a._ev||-9)))
+      .slice(0, nMax);
+
+    // 3) Response: items = combined(3), football = cela 1X2 lista (25)
     return res.status(200).json({
-      ok: true,
-      slot: qSlot,
-      ymd,
-      items,
-      value_bets: items,
-      football: items,
-      source: src.startsWith("vb-locked") ? src : `vb-locked:kv:hit·${src}`,
-      ...(debug ? { debug_tried: tried, size: items.length } : {})
+      ok:true, slot, ymd,
+      items: combined,
+      value_bets: combined,
+      football,
+      source: gotFull ? `vb-locked:kv:hit·full` : `vb-locked:kv:hit`,
     });
-  }catch(e){
-    return res.status(500).json({ ok:false, error:String(e?.message||e) });
+
+  } catch (e) {
+    return res.status(200).json({ ok:true, slot: (req.query.slot||""), ymd: ymdInTZ(new Date(), TZ), items:[], value_bets:[], football:[], source:`vb-locked:error ${String(e?.message||e)}` });
   }
 }
