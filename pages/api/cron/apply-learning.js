@@ -1,13 +1,16 @@
 // pages/api/cron/apply-learning.js
-// Svrha: popuni istoriju za learning iz "locked" feed-a.
-// Ako nema vb:day:<YMD>:<slot>, kopira iz vbl:<YMD>:<slot> (ili aliasa) i upisuje:
-//   - vb:day:<YMD>:<slot>  (DIREKTNA LISTA predloga kao niz)
-//   - hist:<YMD>:<slot>    (snapshot za learn)
-//   - hist:index           (indeks YMD-ova, max 90, ultra-safe update)
-// NOTE: vb:day:<YMD>:last upisuje listu SAMO ako pointer ne postoji (kompatibilno sa rebuild.js).
+// Svrha: popuni istoriju za learning iz "locked" feed-a" i održi HISTORY indeks koji UI koristi.
+// Ako nema vb:day:<YMD>:<slot>, kopira iz vbl:<YMD>:<slot> (ili aliasa) i upiše:
+//   - vb:day:<YMD>:<slot>        (direktna LISTA predloga kao niz)
+// U SVAKOM SLUČAJU (bez obzira da li je postojalo ili ne), obezbedi:
+//   - hist:<YMD>:<slot>          (snapshot za history/learn UI)
+//   - hist:index                 (lista TAG-ova 'YYYY-MM-DD:slot', najnoviji prvi, max 90)
 //
-// Poziv: bez parametara (danas, sva tri slota) ili ?ymd=YYYY-MM-DD&slot=am|pm|late ili ?days=N
-// Debug: ?debug=1 -> response ubacuje dijagnostiku šta je nađeno i šta je pisano.
+// Kompatibilno sa rebuild.js koji ponekad piše vb:day:<YMD>:last kao { key, alt } pointer.
+// Ovu vrednost NE diramo.
+//
+// Parametri: bez parametara (danas sva tri slota) ili ?ymd=YYYY-MM-DD&slot=am|pm|late ili ?days=N
+// Debug: ?debug=1 ubacuje dijagnostiku po slotu (izvorni ključ, dužine, itd.)
 
 export const config = { api: { bodyParser: false } };
 
@@ -18,7 +21,7 @@ const KV_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST
 export default async function handler(req, res) {
   try {
     const qDays = toInt(req.query?.days, 0);
-    const qYMD = normalizeYMD(String(req.query?.ymd || "") || ymdInTZ(new Date(), TZ));
+    const qYMD  = normalizeYMD(String(req.query?.ymd || "") || ymdInTZ(new Date(), TZ));
     const qSlot = normalizeSlot(String(req.query?.slot || "") || "");
     const wantDebug = String(req.query?.debug || "") === "1";
 
@@ -30,101 +33,136 @@ export default async function handler(req, res) {
         const ymd = ymdMinusDays(qYMD, d);
         const slots = qSlot ? [qSlot] : ["am", "pm", "late"];
         for (const slot of slots) {
-          const info = await ensureDaySlot(ymd, slot, wantDebug);
+          const info = await ensureDaySlotAndHistory(ymd, slot, wantDebug);
           processed.push(info);
-          if (info.wrote) totalWritten++;
+          if (info.vbday_written || info.hist_written || info.index_updated) totalWritten++;
         }
       }
       return res.status(200).json(
         wantDebug
           ? { ok: true, days: qDays, count_written: totalWritten, processed }
-          : { ok: true, days: qDays, count_written: totalWritten, processed: processed.map(x => ({ ymd: x.ymd, slot: x.slot, wrote: x.wrote })) }
+          : { ok: true, days: qDays, count_written: totalWritten, processed: processed.map(x => ({ ymd: x.ymd, slot: x.slot, wrote: !!(x.vbday_written || x.hist_written || x.index_updated) })) }
       );
     }
 
     const slots = qSlot ? [qSlot] : ["am", "pm", "late"];
     for (const slot of slots) {
-      const info = await ensureDaySlot(qYMD, slot, wantDebug);
+      const info = await ensureDaySlotAndHistory(qYMD, slot, wantDebug);
       processed.push(info);
-      if (info.wrote) totalWritten++;
+      if (info.vbday_written || info.hist_written || info.index_updated) totalWritten++;
     }
 
     return res.status(200).json(
       wantDebug
         ? { ok: true, ymd: qYMD, count_written: totalWritten, processed }
-        : { ok: true, ymd: qYMD, count_written: totalWritten, processed: processed.map(x => ({ ymd: x.ymd, slot: x.slot, wrote: x.wrote })) }
+        : { ok: true, ymd: qYMD, count_written: totalWritten, processed: processed.map(x => ({ ymd: x.ymd, slot: x.slot, wrote: !!(x.vbday_written || x.hist_written || x.index_updated) })) }
     );
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
 }
 
-async function ensureDaySlot(ymd, slot, wantDebug=false) {
-  const info = { ymd, slot, wrote: false, reason: "", source_key: null, counts: {}, exist_vb_day_len: 0 };
+async function ensureDaySlotAndHistory(ymd, slot, wantDebug=false) {
+  const tag = `${ymd}:${slot}`;
+  const info = {
+    ymd, slot, tag,
+    vbday_len: 0, vbday_written: false, vbday_source: null, vbday_reason: "",
+    hist_len: 0, hist_written: false,
+    index_before: 0, index_after: 0, index_updated: false,
+    debug_locked_counts: {}
+  };
 
-  // 1) već postoji direktna lista?
-  const existingRaw = await kvGet(`vb:day:${ymd}:${slot}`);
-  const existing = ensureArray(existingRaw);
-  info.exist_vb_day_len = existing.length;
-  if (existing.length) {
-    info.reason = "vb:day already exists";
-    return info;
-  }
+  // 1) Pročitaj postojeći vb:day:<ymd>:<slot>
+  const vbdayRaw = await kvGet(`vb:day:${ymd}:${slot}`);
+  let vbday = ensureArray(vbdayRaw);
+  info.vbday_len = vbday.length;
 
-  // 2) probaj da nađeš locked payload (više ključeva, sa prebrojavanjem)
-  const keys = [
-    `vbl:${ymd}:${slot}`,
-    `vb-locked:${ymd}:${slot}`,
-    `vb:locked:${ymd}:${slot}`,
-    `locked:vbl:${ymd}:${slot}`,
-    `vbl_full:${ymd}:${slot}`
-  ];
-
-  let pickedArr = [];
-  for (const k of keys) {
-    const v = await kvGet(k);
-    const arr = ensureArray(v);
-    info.counts[k] = Array.isArray(arr) ? arr.length : 0;
-    if (!pickedArr.length && arr.length) {
-      pickedArr = arr;
-      info.source_key = k;
+  if (!vbday.length) {
+    // 2) Pokušaj iz locked payload-a (razni ključevi)
+    const keys = [
+      `vbl:${ymd}:${slot}`,
+      `vb-locked:${ymd}:${slot}`,
+      `vb:locked:${ymd}:${slot}`,
+      `locked:vbl:${ymd}:${slot}`,
+      `vbl_full:${ymd}:${slot}`
+    ];
+    for (const k of keys) {
+      const v = await kvGet(k);
+      const arr = ensureArray(v);
+      if (wantDebug) info.debug_locked_counts[k] = Array.isArray(arr) ? arr.length : 0;
+      if (!vbday.length && arr.length) {
+        vbday = arr;
+        info.vbday_source = k;
+      }
     }
+    // 2a) Ako smo našli izvor — upiši vb:day:<ymd>:<slot> kao DIREKTNU LISTU
+    if (vbday.length) {
+      await kvSet(`vb:day:${ymd}:${slot}`, JSON.stringify(vbday));
+      info.vbday_written = true;
+    } else {
+      info.vbday_reason = "no vb:day and no locked source";
+    }
+  } else {
+    info.vbday_reason = "vb:day already exists";
   }
 
-  if (!pickedArr.length) {
-    info.reason = "no locked key found (or empty)";
-    return info;
+  // 3) U SVAKOM SLUČAJU — obezbedi hist:<ymd>:<slot> snapshot (ako ne postoji)
+  const histRaw = await kvGet(`hist:${tag}`);
+  const histArr = ensureArray(histRaw);
+  info.hist_len = histArr.length;
+  if (!histArr.length && vbday.length) {
+    await kvSet(`hist:${tag}`, JSON.stringify(vbday));
+    info.hist_written = true;
   }
 
-  // 3) upiši direktnu LISTU (ne pointer/objekat)
-  const json = JSON.stringify(pickedArr);
-  await kvSet(`vb:day:${ymd}:${slot}`, json);
-  await kvSet(`hist:${ymd}:${slot}`, json);
-
-  // 3a) vb:day:<ymd>:last — upiši listu SAMO ako pointer ne postoji
+  // 3a) vb:day:<ymd>:last — upiši listu SAMO ako pointer ne postoji (kompat sa rebuild aliasima)
   const lastRaw = await kvGet(`vb:day:${ymd}:last`);
-  if (shouldWriteLastAsList(lastRaw)) {
-    await kvSet(`vb:day:${ymd}:last`, json);
+  if (shouldWriteLastAsList(lastRaw) && vbday.length) {
+    await kvSet(`vb:day:${ymd}:last`, JSON.stringify(vbday));
   }
 
-  // 4) ultra-safe ažuriranje hist:index (nikad ne puca)
-  try {
-    const idxRaw = await kvGet(`hist:index`);
-    const prev = parseIndexArray(idxRaw);                  // uvek niz
-    const filtered = prev.filter(d => d !== ymd);          // uvek niz
-    const newIdx = [ymd].concat(filtered).slice(0, 90);    // bez spread-a
-    await kvSet(`hist:index`, JSON.stringify(newIdx));
-    info.hist_index = { before_len: prev.length, after_len: newIdx.length };
-  } catch (e) {
-    info.hist_index_error = String(e?.message || e);
+  // 4) Ultra-safe update hist:index — lista TAG-ova `YYYY-MM-DD:slot`
+  const idxRaw = await kvGet(`hist:index`);
+  const before = parseIndexTags(idxRaw);
+  info.index_before = before.length;
+  const after = pushTag(before, tag, 90);
+  info.index_after = after.length;
+  if (JSON.stringify(before) !== JSON.stringify(after)) {
+    await kvSet(`hist:index`, JSON.stringify(after));
+    info.index_updated = true;
   }
 
-  // 5) markeri (opciono)
-  await kvSet(`vb:last:${slot}`, JSON.stringify({ ymd, slot, count: pickedArr.length, at: new Date().toISOString() }));
+  // 5) Marker
+  if (vbday.length) {
+    await kvSet(`vb:last:${slot}`, JSON.stringify({ ymd, slot, count: vbday.length, at: new Date().toISOString() }));
+  }
 
-  info.wrote = true;
-  info.copied_len = pickedArr.length;
   return info;
+}
+
+// --- helpers: hist:index (TAG lista) ---
+function parseIndexTags(raw){
+  try{
+    if (!raw) return [];
+    if (Array.isArray(raw)) return raw.filter(x => typeof x === "string" && x.includes(":"));
+    if (typeof raw === "string") {
+      const v = JSON.parse(raw);
+      return Array.isArray(v) ? v.filter(x => typeof x === "string" && x.includes(":")) : [];
+    }
+    if (typeof raw === "object" && typeof raw.value === "string") {
+      try {
+        const v = JSON.parse(raw.value);
+        return Array.isArray(v) ? v.filter(x => typeof x === "string" && x.includes(":")) : [];
+      } catch { return []; }
+    }
+    return [];
+  }catch{ return []; }
+}
+function pushTag(arr, tag, cap=90){
+  const out = Array.isArray(arr) ? arr.filter(t => t !== tag) : [];
+  out.unshift(tag);
+  if (out.length > cap) out.length = cap;
+  return out;
 }
 
 function shouldWriteLastAsList(raw){
@@ -143,32 +181,7 @@ function shouldWriteLastAsList(raw){
   }
 }
 
-function parseIndexArray(raw){
-  try{
-    if (!raw) return [];
-    if (Array.isArray(raw)) return raw.filter(x => typeof x === "string");
-    if (typeof raw === "string") {
-      const v = JSON.parse(raw);
-      return Array.isArray(v) ? v.filter(x => typeof x === "string") : [];
-    }
-    // ponekad backend vraća {result: "..."} već raspakovano — treat as empty
-    if (typeof raw === "object") {
-      // dozvoli i varijante { value: "[]"} itd.
-      if (typeof raw.value === "string") {
-        try {
-          const v = JSON.parse(raw.value);
-          return Array.isArray(v) ? v.filter(x => typeof x === "string") : [];
-        } catch { return []; }
-      }
-      return [];
-    }
-    return [];
-  }catch{
-    return [];
-  }
-}
-
-// --- helpers: locked list ---
+// --- generic array extraction ---
 function ensureArray(v) {
   try {
     if (v == null) return [];
@@ -207,13 +220,12 @@ function ensureArray(v) {
   }
 }
 
-// --- KV ---
+// --- KV minimal ---
 async function kvGet(key) {
   if (!KV_URL || !KV_TOKEN) return null;
   try {
     const r = await fetch(`${KV_URL.replace(/\/+$/, "")}/get/${encodeURIComponent(key)}`, {
-      headers: { Authorization: `Bearer ${KV_TOKEN}` },
-      cache: "no-store",
+      headers: { Authorization: `Bearer ${KV_TOKEN}` }, cache: "no-store",
     });
     if (!r.ok) return null;
     const j = await r.json().catch(() => null);
@@ -249,9 +261,6 @@ function ymdInTZ(d = new Date(), tz = TZ) {
     const y=d.getUTCFullYear(), m=String(d.getUTCMonth()+1).padStart(2,"0"), dd=String(d.getUTCDate()).padStart(2,"0");
     return `${y}-${m}-${dd}`;
   }
-}
-function normalizeYMD(s) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ymdInTZ(new Date(), TZ);
 }
 function ymdMinusDays(ymd, daysBack) {
   try {
