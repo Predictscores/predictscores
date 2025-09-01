@@ -1,12 +1,13 @@
 // pages/api/cron/apply-learning.js
 // Svrha: popuni istoriju za learning iz "locked" feed-a.
-// Ako nema vb:day:<YMD>:<slot>, kopira iz vbl:<YMD>:<slot> (ili drugih aliasa) i upisuje:
+// Ako nema vb:day:<YMD>:<slot>, kopira iz vbl:<YMD>:<slot> (ili aliasa) i upisuje:
 //   - vb:day:<YMD>:<slot>  (DIREKTNA LISTA predloga kao niz)
 //   - hist:<YMD>:<slot>    (snapshot za learn)
-//   - hist:index           (indeks YMD-ova, max 90)
-// NOTE: vb:day:<YMD>:last upisuje SAMO ako već ne postoji pointer objekat {key, alt}.
+//   - hist:index           (indeks YMD-ova, max 90, ultra-safe update)
+// NOTE: vb:day:<YMD>:last upisuje listu SAMO ako pointer ne postoji (kompatibilno sa rebuild.js).
 //
 // Poziv: bez parametara (danas, sva tri slota) ili ?ymd=YYYY-MM-DD&slot=am|pm|late ili ?days=N
+// Debug: ?debug=1 -> response ubacuje dijagnostiku šta je nađeno i šta je pisano.
 
 export const config = { api: { bodyParser: false } };
 
@@ -19,93 +20,58 @@ export default async function handler(req, res) {
     const qDays = toInt(req.query?.days, 0);
     const qYMD = normalizeYMD(String(req.query?.ymd || "") || ymdInTZ(new Date(), TZ));
     const qSlot = normalizeSlot(String(req.query?.slot || "") || "");
+    const wantDebug = String(req.query?.debug || "") === "1";
 
-    let totalWritten = 0;
     const processed = [];
+    let totalWritten = 0;
 
     if (qDays && qDays > 0) {
       for (let d = 0; d < qDays; d++) {
         const ymd = ymdMinusDays(qYMD, d);
         const slots = qSlot ? [qSlot] : ["am", "pm", "late"];
         for (const slot of slots) {
-          const wrote = await ensureDaySlot(ymd, slot);
-          processed.push({ ymd, slot, wrote });
-          if (wrote) totalWritten++;
+          const info = await ensureDaySlot(ymd, slot, wantDebug);
+          processed.push(info);
+          if (info.wrote) totalWritten++;
         }
       }
-      return res.status(200).json({ ok: true, days: qDays, count_written: totalWritten, processed });
+      return res.status(200).json(
+        wantDebug
+          ? { ok: true, days: qDays, count_written: totalWritten, processed }
+          : { ok: true, days: qDays, count_written: totalWritten, processed: processed.map(x => ({ ymd: x.ymd, slot: x.slot, wrote: x.wrote })) }
+      );
     }
 
     const slots = qSlot ? [qSlot] : ["am", "pm", "late"];
     for (const slot of slots) {
-      const wrote = await ensureDaySlot(qYMD, slot);
-      processed.push({ ymd: qYMD, slot, wrote });
-      if (wrote) totalWritten++;
+      const info = await ensureDaySlot(qYMD, slot, wantDebug);
+      processed.push(info);
+      if (info.wrote) totalWritten++;
     }
 
-    return res.status(200).json({ ok: true, ymd: qYMD, count_written: totalWritten, processed });
+    return res.status(200).json(
+      wantDebug
+        ? { ok: true, ymd: qYMD, count_written: totalWritten, processed }
+        : { ok: true, ymd: qYMD, count_written: totalWritten, processed: processed.map(x => ({ ymd: x.ymd, slot: x.slot, wrote: x.wrote })) }
+    );
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
 }
 
-async function ensureDaySlot(ymd, slot) {
+async function ensureDaySlot(ymd, slot, wantDebug=false) {
+  const info = { ymd, slot, wrote: false, reason: "", source_key: null, counts: {}, exist_vb_day_len: 0 };
+
   // 1) već postoji direktna lista?
-  const existing = ensureArray(await kvGet(`vb:day:${ymd}:${slot}`));
-  if (existing.length) return false;
-
-  // 2) probaj da pročitaš locked payload (više ključeva)
-  const arr = await readLockedList(ymd, slot);
-  if (!arr.length) return false;
-
-  // 3) upiši direktnu LISTU (ne pointer/objekat)
-  await kvSet(`vb:day:${ymd}:${slot}`, JSON.stringify(arr));
-  await kvSet(`hist:${ymd}:${slot}`, JSON.stringify(arr));
-
-  // 3a) vb:day:<ymd>:last — upiši listu SAMO ako pointer ne postoji
-  const lastRaw = await kvGet(`vb:day:${ymd}:last`);
-  if (shouldWriteLastAsList(lastRaw)) {
-    await kvSet(`vb:day:${ymd}:last`, JSON.stringify(arr));
+  const existingRaw = await kvGet(`vb:day:${ymd}:${slot}`);
+  const existing = ensureArray(existingRaw);
+  info.exist_vb_day_len = existing.length;
+  if (existing.length) {
+    info.reason = "vb:day already exists";
+    return info;
   }
 
-  // 4) ažuriraj indeks poslednjih dana (max 90)
-  const idxRaw = await kvGet(`hist:index`);
-  let idxArr = [];
-  try {
-    idxArr = Array.isArray(idxRaw) ? idxRaw : (typeof idxRaw === "string" ? JSON.parse(idxRaw) : []);
-  } catch {}
-  const newIdx = [ymd, ...((idxArr || []).filter(d => d !== ymd))].slice(0, 90);
-  await kvSet(`hist:index`, JSON.stringify(newIdx));
-
-  // 5) markeri (opciono)
-  await kvSet(`vb:last:${slot}`, JSON.stringify({ ymd, slot, count: arr.length, at: new Date().toISOString() }));
-
-  return true;
-}
-
-function shouldWriteLastAsList(raw){
-  if (!raw) return true; // nema ničega — slobodno napiši listu
-  try{
-    const v = typeof raw === "string" ? JSON.parse(raw) : raw;
-
-    // Ako izgleda kao pointer objekat { key, alt }, NE diraj.
-    const looksPointer = !!(v && !Array.isArray(v) && (v.key || v.alt));
-    if (looksPointer) return false;
-
-    // Ako je već lista (ili objekat sa items/football/value_bets), možeš prepisati listom.
-    const listy = Array.isArray(v) ||
-                  Array.isArray(v?.items) ||
-                  Array.isArray(v?.football) ||
-                  Array.isArray(v?.value_bets);
-    return listy;
-  }catch{
-    // Ako ne možemo da parsiramo, radije NEMOJ prepisivati.
-    return false;
-  }
-}
-
-// --- helpers: locked list ---
-async function readLockedList(ymd, slot){
+  // 2) probaj da nađeš locked payload (više ključeva, sa prebrojavanjem)
   const keys = [
     `vbl:${ymd}:${slot}`,
     `vb-locked:${ymd}:${slot}`,
@@ -113,14 +79,96 @@ async function readLockedList(ymd, slot){
     `locked:vbl:${ymd}:${slot}`,
     `vbl_full:${ymd}:${slot}`
   ];
-  for (const k of keys){
+
+  let pickedArr = [];
+  for (const k of keys) {
     const v = await kvGet(k);
     const arr = ensureArray(v);
-    if (arr.length) return arr;
+    info.counts[k] = Array.isArray(arr) ? arr.length : 0;
+    if (!pickedArr.length && arr.length) {
+      pickedArr = arr;
+      info.source_key = k;
+    }
   }
-  return [];
+
+  if (!pickedArr.length) {
+    info.reason = "no locked key found (or empty)";
+    return info;
+  }
+
+  // 3) upiši direktnu LISTU (ne pointer/objekat)
+  const json = JSON.stringify(pickedArr);
+  await kvSet(`vb:day:${ymd}:${slot}`, json);
+  await kvSet(`hist:${ymd}:${slot}`, json);
+
+  // 3a) vb:day:<ymd>:last — upiši listu SAMO ako pointer ne postoji
+  const lastRaw = await kvGet(`vb:day:${ymd}:last`);
+  if (shouldWriteLastAsList(lastRaw)) {
+    await kvSet(`vb:day:${ymd}:last`, json);
+  }
+
+  // 4) ultra-safe ažuriranje hist:index (nikad ne puca)
+  try {
+    const idxRaw = await kvGet(`hist:index`);
+    const prev = parseIndexArray(idxRaw);                  // uvek niz
+    const filtered = prev.filter(d => d !== ymd);          // uvek niz
+    const newIdx = [ymd].concat(filtered).slice(0, 90);    // bez spread-a
+    await kvSet(`hist:index`, JSON.stringify(newIdx));
+    info.hist_index = { before_len: prev.length, after_len: newIdx.length };
+  } catch (e) {
+    info.hist_index_error = String(e?.message || e);
+  }
+
+  // 5) markeri (opciono)
+  await kvSet(`vb:last:${slot}`, JSON.stringify({ ymd, slot, count: pickedArr.length, at: new Date().toISOString() }));
+
+  info.wrote = true;
+  info.copied_len = pickedArr.length;
+  return info;
 }
 
+function shouldWriteLastAsList(raw){
+  if (!raw) return true; // nema ničega — slobodno napiši listu
+  try{
+    const v = typeof raw === "string" ? JSON.parse(raw) : raw;
+    const looksPointer = !!(v && !Array.isArray(v) && (v.key || v.alt));
+    if (looksPointer) return false;
+    const listy = Array.isArray(v) ||
+                  Array.isArray(v?.items) ||
+                  Array.isArray(v?.football) ||
+                  Array.isArray(v?.value_bets);
+    return listy;
+  }catch{
+    return false; // ako ne možemo da parsiramo, ne diraj
+  }
+}
+
+function parseIndexArray(raw){
+  try{
+    if (!raw) return [];
+    if (Array.isArray(raw)) return raw.filter(x => typeof x === "string");
+    if (typeof raw === "string") {
+      const v = JSON.parse(raw);
+      return Array.isArray(v) ? v.filter(x => typeof x === "string") : [];
+    }
+    // ponekad backend vraća {result: "..."} već raspakovano — treat as empty
+    if (typeof raw === "object") {
+      // dozvoli i varijante { value: "[]"} itd.
+      if (typeof raw.value === "string") {
+        try {
+          const v = JSON.parse(raw.value);
+          return Array.isArray(v) ? v.filter(x => typeof x === "string") : [];
+        } catch { return []; }
+      }
+      return [];
+    }
+    return [];
+  }catch{
+    return [];
+  }
+}
+
+// --- helpers: locked list ---
 function ensureArray(v) {
   try {
     if (v == null) return [];
