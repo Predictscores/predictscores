@@ -2,9 +2,9 @@
 // Svrha: popuni istoriju za learning iz "locked" feed-a.
 // Ako nema vb:day:<YMD>:<slot>, kopira iz vbl:<YMD>:<slot> (ili drugih aliasa) i upisuje:
 //   - vb:day:<YMD>:<slot>  (DIREKTNA LISTA predloga kao niz)
-//   - vb:day:<YMD>:last    (takođe direktna LISTA, ne pointer/objekat)
 //   - hist:<YMD>:<slot>    (snapshot za learn)
 //   - hist:index           (indeks YMD-ova, max 90)
+// NOTE: vb:day:<YMD>:last upisuje SAMO ako već ne postoji pointer objekat {key, alt}.
 //
 // Poziv: bez parametara (danas, sva tri slota) ili ?ymd=YYYY-MM-DD&slot=am|pm|late ili ?days=N
 
@@ -60,8 +60,13 @@ async function ensureDaySlot(ymd, slot) {
 
   // 3) upiši direktnu LISTU (ne pointer/objekat)
   await kvSet(`vb:day:${ymd}:${slot}`, JSON.stringify(arr));
-  await kvSet(`vb:day:${ymd}:last`, JSON.stringify(arr));
   await kvSet(`hist:${ymd}:${slot}`, JSON.stringify(arr));
+
+  // 3a) vb:day:<ymd>:last — upiši listu SAMO ako pointer ne postoji
+  const lastRaw = await kvGet(`vb:day:${ymd}:last`);
+  if (shouldWriteLastAsList(lastRaw)) {
+    await kvSet(`vb:day:${ymd}:last`, JSON.stringify(arr));
+  }
 
   // 4) ažuriraj indeks poslednjih dana (max 90)
   const idxRaw = await kvGet(`hist:index`);
@@ -76,6 +81,27 @@ async function ensureDaySlot(ymd, slot) {
   await kvSet(`vb:last:${slot}`, JSON.stringify({ ymd, slot, count: arr.length, at: new Date().toISOString() }));
 
   return true;
+}
+
+function shouldWriteLastAsList(raw){
+  if (!raw) return true; // nema ničega — slobodno napiši listu
+  try{
+    const v = typeof raw === "string" ? JSON.parse(raw) : raw;
+
+    // Ako izgleda kao pointer objekat { key, alt }, NE diraj.
+    const looksPointer = !!(v && !Array.isArray(v) && (v.key || v.alt));
+    if (looksPointer) return false;
+
+    // Ako je već lista (ili objekat sa items/football/value_bets), možeš prepisati listom.
+    const listy = Array.isArray(v) ||
+                  Array.isArray(v?.items) ||
+                  Array.isArray(v?.football) ||
+                  Array.isArray(v?.value_bets);
+    return listy;
+  }catch{
+    // Ako ne možemo da parsiramo, radije NEMOJ prepisivati.
+    return false;
+  }
 }
 
 // --- helpers: locked list ---
