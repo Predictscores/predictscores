@@ -2,13 +2,14 @@
 // Slot rebuild (15/25 po slotu), objedinjeno biranje NAJBOLJEG predloga po utakmici
 // preko 4 tržišta: 1X2, BTTS, OU 2.5, HT-FT.
 //
-// Ova verzija ublažava RELAXED pass pragove da bi slot (15–23:59) davao više realnih parova:
-// - BTTS/OU2.5 i dalje zahtevaju OBE strane, ali u relaxed pass-u je min. books ≥2 (strogo je ≥3)
-// - 1X2 relaxed: books ≥2 (strogo ≥3)
-// - SPREAD_LOOSE podignut na 0.55 (strogo ostaje 0.25)
-// - HT-FT: minimalno 3 validne kombinacije (strict) / 2 (relaxed)
-// - Best-of-market po fixture-u ostaje: max confidence (tie-break EV). Globalni rang: EV → confidence.
-// - Two-pass: ako strict ne vrati dovoljno, relaxed koristi iste payload-e (bez dodatnih API poziva).
+// NOVO: pre fetch-a kvota/predikcija pravimo "considered" listu stratifikovanu po satima
+// (round-robin kroz sve sate u slotu), da lista nije bias-ovana na 15:00.
+//
+// RELAXED pass pragovi (da ne ostanemo na 3-4 predloga):
+// - BTTS/OU2.5: obe strane i min. books >= 2 (strict je >=3), spread do 0.55 (strict 0.25)
+// - 1X2 relaxed: books >= 2 (strict >= 3)
+// - HT-FT: min kombinacija 2 (strict 3)
+// Globalni rang: EV → confidence.
 
 export const config = { api: { bodyParser: false } };
 
@@ -85,7 +86,7 @@ const DEFAULT_LIMIT_WEEKEND = envNum("SLOT_WEEKEND_LIMIT", 25);
 const LIMIT_LATE_WEEKDAY = envNum("SLOT_LATE_WEEKDAY_LIMIT", DEFAULT_LIMIT_WEEKDAY);
 const VB_LIMIT = envNum("VB_LIMIT", 0); // 0 = no extra cap
 
-// filter/guardrails (ugrađene default vrednosti)
+// filter/guardrails
 const MIN_ODDS = envNum("MIN_ODDS", 1.01);
 const MODEL_ALPHA = envNum("MODEL_ALPHA", 0.4);
 const EXCLUDE_WOMEN = envBool("EXCLUDE_WOMEN", true);
@@ -93,13 +94,13 @@ const TRUSTED_ONLY = envBool("ODDS_TRUSTED_ONLY", false);
 const TRUSTED_LIST = envList("TRUSTED_BOOKMAKERS", "TRUSTED_BOOKIES");
 
 // kvalitet selekcije
-const MIN_BOOKS_STRICT = 3;      // strogo: min broj knjiga po selekciji
-const MIN_BOOKS_RELAX  = 2;      // relaxed: blaže
-const EV_FLOOR = 0.02;           // minimalni EV za ulaz u listu (2%)
-const SPREAD_STRICT = 0.25;      // spread (mx/mn - 1) strogo
-const SPREAD_LOOSE  = 0.55;      // spread opušteno (povišen radi pokrivanja kasnijih mečeva)
+const MIN_BOOKS_STRICT = 3;
+const MIN_BOOKS_RELAX  = 2;
+const EV_FLOOR = 0.02;
+const SPREAD_STRICT = 0.25;
+const SPREAD_LOOSE  = 0.55;
 
-// HT-FT “punina” tržišta
+// HT-FT “punina”
 const HTFT_MIN_COMBOS_STRICT = 3;
 const HTFT_MIN_COMBOS_RELAX  = 2;
 
@@ -179,7 +180,7 @@ function spreadOf(arr) {
   return (mx / mn) - 1;
 }
 
-// --- market extractors (vraćaju {by, medBy, countsBy, spreadBy})
+// --- market extractors
 function extract1X2(oddsPayload) {
   const rows = extractRows(oddsPayload);
   const by = { "1": [], "X": [], "2": [] };
@@ -427,13 +428,43 @@ export default async function handler(req, res){
     fixtures = fixtures.filter(fx => !isWomensLeague(fx.league?.name, fx.teams));
     debug.after_gender_filter = fixtures.length;
 
-    // cap kandidata radi troška (3x limit je obično dosta)
-    const considered = Math.min(fixtures.length, Math.max(slotLimit*3, slotLimit+10));
-    fixtures = fixtures.slice(0, considered);
-    debug.considered = fixtures.length;
+    // --- STRATIFIKACIJA PO SATIMA (ROUND-ROBIN KROZ SLOT) ---
+    // Umesto "slice(0, N)" po originalnom sortu, pravimo fer miks sati.
+    const hours = [];
+    for (let h = slotWin.hmin; h <= slotWin.hmax; h++) hours.push(h);
+    const byHour = new Map(hours.map(h => [h, []]));
+    for (const fx of fixtures) {
+      if (byHour.has(fx.local_hour)) byHour.get(fx.local_hour).push(fx);
+    }
+    // zadrži isti redosled unutar sata (kako dolazi iz API-ja)
+    const presentHours = hours.filter(h => (byHour.get(h)||[]).length > 0);
+    const hoursCount = presentHours.length || 1;
 
-    const bestPerFixture_strict = [];
-    theLoop:
+    // broj kandidata koje ćemo analizirati (API trošak ostaje kontrolisan)
+    const consideredTarget = Math.min(fixtures.length, Math.max(slotLimit * 3, slotLimit + 10));
+
+    const stratified = [];
+    let round = 0;
+    while (stratified.length < consideredTarget) {
+      let progressed = false;
+      for (const h of presentHours) {
+        const bucket = byHour.get(h);
+        if (bucket && round < bucket.length) {
+          stratified.push(bucket[round]);
+          progressed = true;
+          if (stratified.length >= consideredTarget) break;
+        }
+      }
+      if (!progressed) break; // nema više ničega u bucket-ima
+      round++;
+    }
+
+    fixtures = stratified.length ? stratified : fixtures.slice(0, consideredTarget);
+    debug.considered = fixtures.length;
+    debug.strat_hours = { hours: hoursCount, perHourApprox: Math.ceil(consideredTarget / hoursCount) };
+
+    const bestPerFixture = [];
+
     for (const fx of fixtures) {
       // payloadi (jednom po fixture-u)
       const oddsPayload = await fetchOddsForFixture(fx.fixture_id);
@@ -484,7 +515,7 @@ export default async function handler(req, res){
       }
       { const s = (model1["1"]||0)+(model1["X"]||0)+(model1["2"]||0); if (s>0){ model1={"1":model1["1"]/s,"X":model1["X"]/s,"2":model1["2"]/s}; } }
 
-      function candidates1X2(strict=true){
+      function build1X2(strict=true){
         const out=[];
         const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX;
         const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
@@ -492,10 +523,9 @@ export default async function handler(req, res){
           const price = m1.medBy[k]; if (!Number.isFinite(price)) continue;
           const books = m1.countsBy[k]||0;
           const spr = m1.spreadBy[k]||0;
-          const prob = model1[k];
           if (books < needBooks || spr > sprLimit) continue;
           const lab = pickLabel1X2(k);
-          const c = buildCandidate(recBase, "1X2", k, lab, price, prob, books, needBooks);
+          const c = buildCandidate(recBase, "1X2", k, lab, price, model1[k], books, needBooks);
           if (c) out.push(c);
         }
         return out;
@@ -503,7 +533,7 @@ export default async function handler(req, res){
 
       // --- BTTS
       const mb = extractBTTS(oddsArr);
-      function candidatesBTTS(strict=true){
+      function buildBTTS(strict=true){
         const out=[];
         const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX;
         const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
@@ -527,7 +557,7 @@ export default async function handler(req, res){
 
       // --- OU 2.5
       const mo = extractOU25(oddsArr);
-      function candidatesOU(strict=true){
+      function buildOU(strict=true){
         const out=[];
         const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX;
         const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
@@ -551,7 +581,7 @@ export default async function handler(req, res){
 
       // --- HT-FT
       const mh = extractHTFT(oddsArr);
-      function candidatesHTFT(strict=true){
+      function buildHTFT(strict=true){
         const out=[];
         const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX;
         const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
@@ -580,30 +610,32 @@ export default async function handler(req, res){
       }
 
       const strictCands = [
-        ...candidates1X2(true),
-        ...candidatesBTTS(true),
-        ...candidatesOU(true),
-        ...candidatesHTFT(true),
+        ...build1X2(true),
+        ...buildBTTS(true),
+        ...buildOU(true),
+        ...buildHTFT(true),
       ];
+      let pick = null;
       if (strictCands.length) {
         strictCands.sort((a,b)=> (b.confidence_pct - a.confidence_pct) || (b._ev - a._ev));
-        bestPerFixture_strict.push(strictCands[0]);
+        pick = strictCands[0];
       } else {
         const relaxedCands = [
-          ...candidates1X2(false),
-          ...candidatesBTTS(false),
-          ...candidatesOU(false),
-          ...candidatesHTFT(false),
+          ...build1X2(false),
+          ...buildBTTS(false),
+          ...buildOU(false),
+          ...buildHTFT(false),
         ];
         if (relaxedCands.length){
           relaxedCands.sort((a,b)=> (b.confidence_pct - a.confidence_pct) || (b._ev - a._ev));
-          bestPerFixture_strict.push(relaxedCands[0]); // koristimo isti skup
+          pick = relaxedCands[0];
         }
       }
+      if (pick) bestPerFixture.push(pick);
     }
 
     // rangiranje i preseci
-    const sorted = bestPerFixture_strict.sort((a,b)=> (b._ev - a._ev) || (b.confidence_pct - a.confidence_pct));
+    const sorted = bestPerFixture.sort((a,b)=> (b._ev - a._ev) || (b.confidence_pct - a.confidence_pct));
     const fullCount = Math.max(slotLimit, Math.min(sorted.length, 100));
     const slimCount = Math.min(slotLimit, sorted.length);
     const fullList = sorted.slice(0, fullCount);
@@ -635,7 +667,8 @@ export default async function handler(req, res){
     return res.status(200).json({
       ok:true, slot:slotQ, ymd,
       count: slimList.length, count_full: fullList.length, wrote,
-      football: slimList
+      football: slimList,
+      ...(wantDebug ? { debug } : {})
     });
 
   } catch(e){
