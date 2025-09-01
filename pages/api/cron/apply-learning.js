@@ -14,15 +14,15 @@ const UP_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
 export default async function handler(req, res) {
   try {
-    const qDays = toInt(req.query?.days, 0);
-    const qYMD = normalizeYMD(String(req.query?.ymd || "") || ymdInTZ(new Date(), TZ));
-    const qSlot = normalizeSlot(String(req.query?.slot || "") || "");
+    const qYMD = normalizeYMD(req.query.ymd) || ymdInTZ(new Date(), TZ);
+    const qSlot = normalizeSlot(req.query.slot);
+    const qDays = Math.max(1, Math.min(31, toInt(req.query.days, 0)));
 
+    const processed = [];
     let totalWritten = 0;
-    let processed = [];
 
-    if (qDays && qDays > 0) {
-      // Obradi poslednjih N dana (uključujući danas)
+    // Ako je prosleđen ?days=N → uzmi sve dane [0..N-1] od qYMD unazad
+    if (qDays > 1) {
       for (let d = 0; d < qDays; d++) {
         const ymd = ymdMinusDays(qYMD, d);
         const slots = qSlot ? [qSlot] : ["am", "pm", "late"];
@@ -42,14 +42,11 @@ export default async function handler(req, res) {
       processed.push({ ymd: qYMD, slot, wrote });
       if (wrote) totalWritten++;
     }
-
     return res.status(200).json({ ok: true, ymd: qYMD, count_written: totalWritten, processed });
   } catch (e) {
-    return res.status(200).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 }
-
-/* ================= helpers ================= */
 
 async function ensureDaySlot(ymd, slot) {
   // 1) postoji li vb:day:<ymd>:<slot> ?
@@ -64,6 +61,19 @@ async function ensureDaySlot(ymd, slot) {
 
   // 3) upiši u vb:day:<ymd>:<slot> (kao JSON string top-level niza)
   await kvSet(`vb:day:${ymd}:${slot}`, JSON.stringify(items));
+
+  // 3a) upiši i "last" LISTU za taj dan (za report i learn build)
+  await kvSet(`vb:day:${ymd}:last`, JSON.stringify(items));
+
+  // 3b) upiši history snapshot kompatibilan sa /api/cron/learn
+  await kvSet(`hist:${ymd}:${slot}`, JSON.stringify(items));
+  const idxRaw = await kvGet(`hist:index`);
+  let idxArr = [];
+  try{
+    idxArr = Array.isArray(idxRaw) ? idxRaw : (typeof idxRaw === "string" ? JSON.parse(idxRaw) : []);
+  }catch{}
+  const newIdx = [ymd, ...idxArr.filter(d => d !== ymd)].slice(0, 90);
+  await kvSet(`hist:index`, JSON.stringify(newIdx));
 
   // 4) opcionalno zapamti "last" markere
   await kvSet(`vb:last:${slot}`, JSON.stringify({ ymd, slot, count: items.length, at: new Date().toISOString() }));
@@ -118,8 +128,7 @@ async function kvGet(key) {
   if (UP_URL && UP_TOKEN) {
     try {
       const r = await fetch(`${UP_URL}/get/${encodeURIComponent(key)}`, {
-        headers: { Authorization: `Bearer ${UP_TOKEN}` },
-        cache: "no-store",
+        headers: { Authorization: `Bearer ${UP_TOKEN}` }
       });
       if (r.ok) {
         const j = await r.json().catch(() => null);
@@ -162,24 +171,29 @@ async function kvSet(key, valueJSON) {
   return false;
 }
 
-function ymdInTZ(d = new Date(), tz = TZ) {
-  const s = d.toLocaleString("en-CA", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  return (s.split(",")[0] || s).trim();
-}
 function normalizeYMD(s) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ymdInTZ(new Date(), TZ);
+  const m = String(s || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return "";
+  return `${m[1]}-${m[2]}-${m[3]}`;
+}
+function ymdInTZ(d = new Date(), tz = TZ) {
+  try {
+    const fmt = new Intl.DateTimeFormat("sv-SE", {
+      timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit"
+    });
+    const p = fmt.formatToParts(d).reduce((a, x) => (a[x.type] = x.value, a), {});
+    return `${p.year}-${p.month}-${p.day}`;
+  } catch {
+    const y = d.getUTCFullYear(), m = String(d.getUTCMonth()+1).padStart(2,"0"), dd = String(d.getUTCDate()).padStart(2,"0");
+    return `${y}-${m}-${dd}`;
+  }
 }
 function ymdMinusDays(ymd, daysBack) {
   try {
-    const [Y, M, D] = ymd.split("-").map((n) => parseInt(n, 10));
-    const d = new Date(Date.UTC(Y, (M - 1), D));
-    d.setUTCDate(d.getUTCDate() - daysBack);
-    return ymdInTZ(d, TZ);
+    const [y,m,d] = ymd.split("-").map(n=>parseInt(n,10));
+    const dt = new Date(Date.UTC(y, m-1, d, 12, 0, 0));
+    dt.setUTCDate(dt.getUTCDate() - daysBack);
+    return ymdInTZ(dt, TZ);
   } catch {
     return ymd;
   }
