@@ -17,4 +17,4 @@ jobs:
         run: |
           set -euo pipefail
           B="${BASE:-$FALLBACK_BASE}"
-          curl -fsS "$B/api/history-check?days=2"
+          curl -fsS "$B/api/score-sync?days=2"
