@@ -1,20 +1,124 @@
-name: Nightly Learning (14d)
+name: Learning & Slots Automation
 
 on:
   schedule:
-    - cron: "15 22 * * *"   # 00:15 Europe/Belgrade
-  workflow_dispatch: {}
+    # REBUILD slotova (UTC)
+    - cron: "55 8 * * *"   # ≈ 10:55 Belgrade (AM)
+    - cron: "55 13 * * *"  # ≈ 15:55 Belgrade (PM)
+    - cron: "55 20 * * *"  # ≈ 22:55 Belgrade (LATE)
+    # APPLY-LEARNING 5 min posle svakog REBUILD-a (UTC)
+    - cron: "0 9 * * *"    # ≈ 11:00 Belgrade (AM apply)
+    - cron: "0 14 * * *"   # ≈ 16:00 Belgrade (PM apply)
+    - cron: "0 21 * * *"   # ≈ 23:00 Belgrade (LATE apply)
+    # NIGHTLY LEARN (UTC)
+    - cron: "20 0 * * *"   # ≈ 02:20 Belgrade
+  workflow_dispatch:
 
 env:
   BASE: ${{ secrets.BASE_URL }}
   FALLBACK_BASE: https://predictscores.vercel.app
+  # pragovi za nightly learn (po želji prilagodi)
+  LEARN_MINN: 10
+  LEARN_Q: 0.35
+
+concurrency:
+  group: learning-slots
+  cancel-in-progress: true
 
 jobs:
-  run:
+  # -------------------------
+  # REBUILD — AM
+  # -------------------------
+  rebuild_am:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '55 8 * * *' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Learn over last 14 days
+      - name: Rebuild AM
         run: |
           set -euo pipefail
           B="${BASE:-$FALLBACK_BASE}"
-          curl -fsS "$B/api/cron/learn?days=14"
+          curl -fsS "$B/api/cron/rebuild?slot=am"
+
+  # -------------------------
+  # REBUILD — PM
+  # -------------------------
+  rebuild_pm:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '55 13 * * *' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rebuild PM
+        run: |
+          set -euo pipefail
+          B="${BASE:-$FALLBACK_BASE}"
+          curl -fsS "$B/api/cron/rebuild?slot=pm"
+
+  # -------------------------
+  # REBUILD — LATE
+  # -------------------------
+  rebuild_late:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '55 20 * * *' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rebuild LATE
+        run: |
+          set -euo pipefail
+          B="${BASE:-$FALLBACK_BASE}"
+          curl -fsS "$B/api/cron/rebuild?slot=late"
+
+  # -------------------------
+  # APPLY-LEARNING — AM
+  # -------------------------
+  apply_am:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '0 9 * * *' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply-learning for AM (today)
+        run: |
+          set -euo pipefail
+          B="${BASE:-$FALLBACK_BASE}"
+          curl -fsS "$B/api/cron/apply-learning?slot=am"
+
+  # -------------------------
+  # APPLY-LEARNING — PM
+  # -------------------------
+  apply_pm:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '0 14 * * *' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply-learning for PM (today)
+        run: |
+          set -euo pipefail
+          B="${BASE:-$FALLBACK_BASE}"
+          curl -fsS "$B/api/cron/apply-learning?slot=pm"
+
+  # -------------------------
+  # APPLY-LEARNING — LATE
+  # -------------------------
+  apply_late:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '0 21 * * *' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply-learning for LATE (today)
+        run: |
+          set -euo pipefail
+          B="${BASE:-$FALLBACK_BASE}"
+          curl -fsS "$B/api/cron/apply-learning?slot=late"
+
+  # -------------------------
+  # NIGHTLY LEARN
+  # -------------------------
+  nightly_learn:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '20 0 * * *' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure snapshots exist (last day)
+        run: |
+          set -euo pipefail
+          B="${BASE:-$FALLBACK_BASE}"
+          # kopira današnje (ako postoji locked) u vb:day
+          curl -fsS "$B/api/cron/apply-learning?days=1"
+      - name: Build learn:evmin:v1 (last 14 days)
+        run: |
+          set -euo pipefail
+          B="${BASE:-$FALLBACK_BASE}"
+          curl -fsS "$B/api/cron/learn?days=14&minn=${LEARN_MINN:-10}&q=${LEARN_Q:-0.35}"
