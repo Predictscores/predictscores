@@ -10,6 +10,11 @@
 // - 1X2 relaxed: books >= 2 (strict >= 3)
 // - HT-FT: min kombinacija 2 (strict 3)
 // Globalni rang: EV → confidence.
+//
+// DODATO: bezbedan learning filter (read-only):
+// - učitava learn:evmin:v1 (ako postoji) i odbacuje kandidate sa EV ispod naučenog minimuma
+//   po bucket-u: MARKET | OPSEG KVOTA | VREME DO KO
+// - ako learn:evmin:v1 ne postoji -> ponašanje je identično kao pre (no-op)
 
 export const config = { api: { bodyParser: false } };
 
@@ -333,7 +338,7 @@ function isWomensLeague(leagueName = "", teams = { home: "", away: "" }) {
   return EXCLUDE_WOMEN ? (womenMention(leagueName) || womenMention(teams.home) || womenMention(teams.away)) : false;
 }
 
-// KV
+// KV (set)
 async function kvSetJSON_safe(key, value, ttlSec = null) {
   const base = process.env.KV_REST_API_URL || process.env.KV_URL || process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -358,6 +363,27 @@ async function kvSetJSON_safe(key, value, ttlSec = null) {
   throw new Error(`KV set failed: ${msg.slice(0,200)}`);
 }
 
+// --- LEARNING: safe read helpers (no-op if nema podataka) ---
+let LEARN_EVMIN = null;
+
+async function kvGetJSON_safe(key){
+  const base = process.env.KV_REST_API_URL || process.env.KV_URL || process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!base || !token) return null;
+  try{
+    const r = await fetch(`${base.replace(/\/+$/, "")}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!r.ok) return null;
+    const j = await r.json().catch(()=>null);
+    const v = j?.result ?? null;
+    try{ return typeof v==="string" ? JSON.parse(v) : v; } catch { return v; }
+  }catch{ return null; }
+}
+function bandOdds(o){ if (!Number.isFinite(o)) return "UNK"; if (o<1.8) return "1.50-1.79"; if (o<2.2) return "1.80-2.19"; if (o<3.0) return "2.20-2.99"; return "3.00+"; }
+function bandTTKO(mins){ if (!Number.isFinite(mins)) return "UNK"; if (mins<=180) return "≤3h"; if (mins<=1440) return "≤24h"; return ">24h"; }
+function bucketKey(market, odds, ttko){ return `${String(market||"").toUpperCase()}|${bandOdds(odds)}|${bandTTKO(ttko)}`; }
+
 // evaluacija kandidata po tržištu za jedan fixture
 function buildCandidate(recBase, market, code, label, price, prob, booksCount, minBooksNeeded) {
   if (!Number.isFinite(price) || price < MIN_ODDS) return null;
@@ -368,6 +394,16 @@ function buildCandidate(recBase, market, code, label, price, prob, booksCount, m
   const _implied = Number((1/price).toFixed(4));
   const _ev = Number((price*prob - 1).toFixed(12));
   if (!Number.isFinite(_ev) || _ev < EV_FLOOR) return null;
+
+  // --- learning-based minimum EV per bucket (no-op ako LEARN_EVMIN ne postoji) ---
+  try {
+    const tko = Date.parse(recBase.kickoff_utc || recBase.kickoff);
+    const ttko = Number.isFinite(tko) ? Math.max(0, Math.round((tko - Date.now())/60000)) : null;
+    const bkey = bucketKey(market, price, ttko);
+    const evReqRaw = LEARN_EVMIN && LEARN_EVMIN[bkey];
+    const evReq = Number.isFinite(Number(evReqRaw)) ? Number(evReqRaw) : 0;
+    if (_ev < evReq) return null;
+  } catch {}
 
   return {
     fixture_id: recBase.fixture_id,
@@ -396,6 +432,9 @@ export default async function handler(req, res){
 
     const wantDebug = String(req.query.debug||"") === "1";
     const debug = { ymd, slot: slotQ };
+
+    // --- LEARNING EVMIN LOAD (bezbedno; ako nema ključa, ostaje prazan objekat) ---
+    LEARN_EVMIN = (await kvGetJSON_safe("learn:evmin:v1")) || {};
 
     // 1) fixtures u slotu
     const raw = await fetchFixturesByDate(ymd);
@@ -429,18 +468,15 @@ export default async function handler(req, res){
     debug.after_gender_filter = fixtures.length;
 
     // --- STRATIFIKACIJA PO SATIMA (ROUND-ROBIN KROZ SLOT) ---
-    // Umesto "slice(0, N)" po originalnom sortu, pravimo fer miks sati.
     const hours = [];
     for (let h = slotWin.hmin; h <= slotWin.hmax; h++) hours.push(h);
     const byHour = new Map(hours.map(h => [h, []]));
     for (const fx of fixtures) {
       if (byHour.has(fx.local_hour)) byHour.get(fx.local_hour).push(fx);
     }
-    // zadrži isti redosled unutar sata (kako dolazi iz API-ja)
     const presentHours = hours.filter(h => (byHour.get(h)||[]).length > 0);
     const hoursCount = presentHours.length || 1;
 
-    // broj kandidata koje ćemo analizirati (API trošak ostaje kontrolisan)
     const consideredTarget = Math.min(fixtures.length, Math.max(slotLimit * 3, slotLimit + 10));
 
     const stratified = [];
@@ -455,7 +491,7 @@ export default async function handler(req, res){
           if (stratified.length >= consideredTarget) break;
         }
       }
-      if (!progressed) break; // nema više ničega u bucket-ima
+      if (!progressed) break;
       round++;
     }
 
