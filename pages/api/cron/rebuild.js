@@ -1,19 +1,18 @@
 // pages/api/cron/rebuild.js
-// Slot rebuild (15/25 po slotu), objedinjeno biranje NAJBOLJEG predloga po utakmici
-// preko 4 tržišta: 1X2, BTTS, OU 2.5, HT-FT.
-//
-// Ova verzija ublažava RELAXED pass pragove da bi slot (15–23:59) davao više realnih parova:
-// - BTTS/OU2.5 i dalje zahtevaju OBE strane, ali u relaxed pass-u je min. books ≥2 (strogo je ≥3)
-// - 1X2 relaxed: books ≥2 (strogo ≥3)
-// - SPREAD_LOOSE podignut na 0.55 (strogo ostaje 0.25)
-// - HT-FT: minimalno 3 validne kombinacije (strict) / 2 (relaxed)
-// - Best-of-market po fixture-u ostaje: max confidence (tie-break EV). Globalni rang: EV → confidence.
-// - Two-pass: ako strict ne vrati dovoljno, relaxed koristi iste payload-e (bez dodatnih API poziva).
+// Slot rebuild: bira NAJBOLJI predlog po utakmici preko 4 tržišta (1X2, BTTS, OU2.5, HT-FT)
+// Poboljšanja u ovoj verziji:
+// - "Fair" (verovatnoće) računamo iz SHARP bukija (PS3838/Pinnacle/SBO/Exchange/Matchbook...)
+// - Najbolju kvotu uzimamo iz šire liste (TRUSTED_BOOKIES, uključuje Mozzart/Meridian/Maxbet...)
+// - Clamp posle stat-mixa da 1X2 (posebno X) ne ode predaleko od implied-a (realniji EV)
+// - Relaxed min knjiga za 1X2 = 3 (ostalo 2)
+// - Filter za youth/reserve/U21/U23/II/B timove i lige
+// - EV-LB (donja granica EV) ostaje aktivna
 
 export const config = { api: { bodyParser: false } };
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
+/* ---------------- time helpers ---------------- */
 function ymdInTZ(d = new Date(), tz = TZ) {
   try {
     const fmt = new Intl.DateTimeFormat("sv-SE", {
@@ -47,6 +46,7 @@ function toLocal(dateIso, tz = TZ) {
   }
 }
 
+/* ---------------- env helpers ---------------- */
 function envNum(name, def=0){
   const v = Number(process.env[name]);
   return Number.isFinite(v) ? v : def;
@@ -64,39 +64,88 @@ function envList(nameA, nameB) {
     .filter(Boolean)
     .map(s => s.toLowerCase());
 }
+function inListLowerIncludes(nameLower, list) {
+  if (!list || !list.length) return true;
+  const n = String(nameLower||"").toLowerCase();
+  return list.some(t => n.includes(t));
+}
 
-// limiti po danu/slotu
+/* ---------------- global knobs ---------------- */
 const DEFAULT_LIMIT_WEEKDAY = envNum("SLOT_WEEKDAY_LIMIT", 15);
 const DEFAULT_LIMIT_WEEKEND = envNum("SLOT_WEEKEND_LIMIT", 25);
-const LIMIT_LATE_WEEKDAY = envNum("SLOT_LATE_WEEKDAY_LIMIT", DEFAULT_LIMIT_WEEKDAY);
-const VB_LIMIT = envNum("VB_LIMIT", 0); // 0 = no extra cap
+const LIMIT_LATE_WEEKDAY    = envNum("SLOT_LATE_WEEKDAY_LIMIT", DEFAULT_LIMIT_WEEKDAY);
+const VB_LIMIT              = envNum("VB_LIMIT", 0); // 0 = no extra cap
 
-// filter/guardrails (ugrađene default vrednosti)
 const MIN_ODDS = envNum("MIN_ODDS", 1.01);
 const MODEL_ALPHA = envNum("MODEL_ALPHA", 0.4);
-const EXCLUDE_WOMEN = envBool("EXCLUDE_WOMEN", true);
-const TRUSTED_ONLY = envBool("ODDS_TRUSTED_ONLY", false);
-const TRUSTED_LIST = envList("TRUSTED_BOOKMAKERS", "TRUSTED_BOOKIES");
 
-// kvalitet selekcije
-const MIN_BOOKS_STRICT = 3;      // strogo: min broj knjiga po selekciji
-const MIN_BOOKS_RELAX  = 2;      // relaxed: blaže
-const EV_FLOOR = 0.02;           // minimalni EV za ulaz u listu (2%)
-const SPREAD_STRICT = 0.25;      // spread (mx/mn - 1) strogo
-const SPREAD_LOOSE  = 0.55;      // spread opušteno (povišen radi pokrivanja kasnijih mečeva)
+const EXCLUDE_WOMEN   = envBool("EXCLUDE_WOMEN", true);
+const EXCLUDE_LOW_TIERS = envBool("EXCLUDE_LOW_TIERS", true);
 
-// --- EV konzervativni parametri (donja granica) + težina za stat sloj ---
-const EV_Z = envNum("EV_Z", 0.67);                // z-score penal za nesigurnost p
-const EV_LB_FLOOR = envNum("EV_LB_FLOOR", 0.005); // minimalni EV-LB (0.5%)
+const ODDS_TRUSTED_ONLY = envBool("ODDS_TRUSTED_ONLY", true);
+// "Price" skup (širok: uključuje i domaće bukije)
+const TRUSTED_BOOKIES = envList("TRUSTED_BOOKIES", "TRUSTED_BOOKMAKERS");
+// "Fair" skup (oštri: PS3838/Pinnacle/SBO/Exchange/Matchbook) – koristi se za verovatnoće
+let SHARP_BOOKIES = envList("SHARP_BOOKIES", "");
+if (!SHARP_BOOKIES.length) {
+  SHARP_BOOKIES = ["ps3838","pinnacle","sbo","sbobet","betfair","exchange","matchbook"];
+}
 
-// Statistika: uključivanje + težine i limit
-const STATS_ENABLED = envBool("STATS_ENABLED", true);
-const STATS_WEIGHT  = Math.max(0, Math.min(0.5, envNum("STATS_WEIGHT", 0.35)));
-const H2H_WEIGHT    = Math.max(0, Math.min(0.4, envNum("H2H_WEIGHT", 0.15)));
-const STATS_TEAM_LAST = Math.max(5, envNum("STATS_TEAM_LAST", 12)); // poslednjih N mečeva
+/* strogo/opusteno pragovi */
+const MIN_BOOKS_STRICT      = 3;
+const MIN_BOOKS_RELAX       = 2;
+const MIN_BOOKS_RELAX_1X2   = envNum("MIN_BOOKS_RELAX_1X2", 3); // ← strože samo za 1X2
+
+const EV_FLOOR       = envNum("EV_FLOOR", 0.02);
+const SPREAD_STRICT  = 0.25;
+const SPREAD_LOOSE   = 0.55;
+
+/* EV donja granica */
+const EV_Z        = envNum("EV_Z", 0.67);
+const EV_LB_FLOOR = envNum("EV_LB_FLOOR", 0.005);
+
+/* Statistika */
+const STATS_ENABLED   = envBool("STATS_ENABLED", true);
+const STATS_WEIGHT    = Math.max(0, Math.min(0.5, envNum("STATS_WEIGHT", 0.35)));
+const H2H_WEIGHT      = Math.max(0, Math.min(0.4,  envNum("H2H_WEIGHT", 0.15)));
+const STATS_TEAM_LAST = Math.max(5, envNum("STATS_TEAM_LAST", 12));
 const CONSIDER_ALL_FIXTURES = envBool("CONSIDER_ALL_FIXTURES", true);
 
-// helper: najbolja dostupna kvota za datu selekciju (fallback na medijanu)
+/* ---------------- utils ---------------- */
+function trimmedMedian(a) {
+  const x = a.filter(Number.isFinite).sort((p, q) => p - q);
+  if (x.length >= 5) { x.shift(); x.pop(); }
+  if (!x.length) return NaN;
+  const m = Math.floor(x.length / 2);
+  return x.length % 2 ? x[m] : (x[m - 1] + x[m]) / 2;
+}
+function spreadOf(arr) {
+  const a = arr.filter(Number.isFinite);
+  if (a.length < 2) return 0;
+  const mn = Math.min(...a); const mx = Math.max(...a);
+  if (!mn) return 0;
+  return mx / mn - 1;
+}
+function norm3(a, b, c) {
+  const s = (a||0) + (b||0) + (c||0);
+  if (s <= 0) return { A: 0, B: 0, C: 0 };
+  return { A: a/s, B: b/s, C: c/s };
+}
+function pickLabel1X2(k){ return k==="1" ? "Home" : k==="X" ? "Draw" : "Away"; }
+
+function evLowerBound(price, prob, booksCount){
+  const N = Math.max(1, booksCount||0);
+  const sigma = Math.sqrt(Math.max(1e-9, prob*(1-prob)/N));
+  const p_lb = Math.max(0, prob - EV_Z * sigma);
+  return price * p_lb - 1;
+}
+
+function dynamicUpliftCap(books, spread) {
+  const b = Math.min(1, (books||0)/6);
+  const s = 1 / (1 + 4*(spread||0));
+  return Math.max(0.05, 0.20 * b * s); // max 20pp
+}
+
 function bestPrice(m, k) {
   try {
     const arr = (m?.by?.[k] || []).filter(Number.isFinite);
@@ -106,17 +155,20 @@ function bestPrice(m, k) {
   } catch { return null; }
 }
 
-// EV-LB: donja granica EV-a, penalizuje p po broju knjiga (jednostavno, stabilno)
-function evLowerBound(price, prob, booksCount){
-  const N = Math.max(1, booksCount||0);
-  const sigma = Math.sqrt(Math.max(1e-9, prob*(1-prob)/N));
-  const p_lb = Math.max(0, prob - EV_Z * sigma);
-  return price * p_lb - 1;
+function isWomensLeague(leagueName="", teams={home:"",away:""}) {
+  const s = `${leagueName} ${teams.home} ${teams.away}`.toLowerCase();
+  return /\b(women|femin|femen|w\s*league|ladies|girls|女子|жен)\b/.test(s);
+}
+function lowTierMention(s=""){
+  return /\b(U1[7-9]|U2[0-3]|U-1[7-9]|U-2[0-3]|Youth|Reserves|Reserve|II\b| B\b|B Team|Academy|U21|U23)\b/i.test(s);
+}
+function isLowTier(leagueName="", teams={home:"",away:""}){
+  return lowTierMention(leagueName) || lowTierMention(teams.home||"") || lowTierMention(teams.away||"");
 }
 
-// API-Football
+/* ---------------- API-Football ---------------- */
 const API_BASE = process.env.API_FOOTBALL_BASE_URL || process.env.API_FOOTBALL || "https://v3.football.api-sports.io";
-const API_KEY  = process.env.API_FOOTBALL_KEY || process.env.API_FOOTBALL || "";
+const API_KEY  = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.env.API_FOOTBALL || "";
 function afHeaders() {
   const h = {};
   if (API_KEY) {
@@ -154,8 +206,7 @@ async function fetchPredictionForFixture(fixtureId) {
   } catch { return null; }
 }
 
-// --- Statističke funkcije (veselo trošimo API pozive da dobijemo jači signal) ---
-
+/* ---------------- Statistike ---------------- */
 async function fetchRecentForTeam(leagueId, season, teamId, lastN = STATS_TEAM_LAST) {
   if (!API_KEY || !teamId || !leagueId || !season) return null;
   try {
@@ -164,7 +215,6 @@ async function fetchRecentForTeam(leagueId, season, teamId, lastN = STATS_TEAM_L
     return Array.isArray(j?.response) ? j.response : [];
   } catch { return null; }
 }
-
 function computeTeamRecentStats(list, teamId) {
   const L = Array.isArray(list) ? list : [];
   let games=0, btts=0, over25=0, pts=0;
@@ -180,7 +230,6 @@ function computeTeamRecentStats(list, teamId) {
     const sum = gh + ga;
     if (gh>0 && ga>0) btts++;
     if (sum>=3) over25++;
-    // form points for the specific team
     const winnerHome = r?.teams?.home?.winner === true;
     const winnerAway = r?.teams?.away?.winner === true;
     if (homeId === teamId) {
@@ -199,7 +248,6 @@ function computeTeamRecentStats(list, teamId) {
     formPct: pts/(games*3)
   };
 }
-
 async function fetchH2H(homeId, awayId, lastN = 10) {
   if (!API_KEY || !homeId || !awayId) return null;
   try {
@@ -208,7 +256,6 @@ async function fetchH2H(homeId, awayId, lastN = 10) {
     return Array.isArray(j?.response) ? j.response : [];
   } catch { return null; }
 }
-
 function computeRatesFromFixtures(list) {
   const L = Array.isArray(list) ? list : [];
   let games=0, btts=0, over25=0;
@@ -226,14 +273,12 @@ function computeRatesFromFixtures(list) {
   if (!games) return null;
   return { games, bttsRate: btts/games, over25Rate: over25/games };
 }
-
 function combineTeamRates(homeRate, awayRate) {
   if (!Number.isFinite(homeRate) && !Number.isFinite(awayRate)) return null;
   if (!Number.isFinite(homeRate)) return awayRate;
   if (!Number.isFinite(awayRate)) return homeRate;
   return (homeRate + awayRate) / 2;
 }
-
 function formTo1X2Prob(homeFormPct, awayFormPct) {
   if (!Number.isFinite(homeFormPct) || !Number.isFinite(awayFormPct)) return null;
   const adv = 0.08; // home advantage ~8pp
@@ -246,30 +291,18 @@ function formTo1X2Prob(homeFormPct, awayFormPct) {
   const k = (1 - pD) / (pH + pA);
   return { H: pH * k, D: pD, A: pA * k };
 }
-
 function mixProb(oddsProb, statProb, w = STATS_WEIGHT) {
   if (!Number.isFinite(statProb)) return oddsProb;
   const p = (1 - w) * oddsProb + w * statProb;
   return Math.max(0.02, Math.min(0.98, p));
 }
 
-// helpers
-function trimmedMedian(a) {
-  const x = a.filter(Number.isFinite).sort((p, q) => p - q);
-  if (x.length >= 5) { x.shift(); x.pop(); }
-  if (!x.length) return NaN;
-  const m = Math.floor(x.length / 2);
-  return x.length % 2 ? x[m] : (x[m - 1] + x[m]) / 2;
-}
-function uniqueName(row) {
-  return String(row?.name ?? row?.bookmaker?.name ?? row?.id ?? row?.bookmaker ?? "").toLowerCase();
-}
-function isTrustedBook(name) {
-  if (!TRUSTED_ONLY) return true;
-  if (!TRUSTED_LIST.length) return true;
-  const n = String(name || "").toLowerCase().trim();
-  return TRUSTED_LIST.some(t => n.includes(t));
-}
+/* ---------------- odds extraction (FAIR vs PRICE) ---------------- */
+// Extractori vraćaju:
+// - by:       PRICE skup (širi, za best price)
+// - medBy:    FAIR medijane (iz "sharp" bukija) za verovatnoće
+// - countsBy: broj FAIR knjiga po selekciji
+// - spreadBy: spread FAIR knjiga
 function extractRows(oddsPayload) {
   const roots = Array.isArray(oddsPayload) ? oddsPayload : [];
   const rows = [];
@@ -281,22 +314,20 @@ function extractRows(oddsPayload) {
   }
   return rows;
 }
-function spreadOf(arr) {
-  const a = arr.filter(Number.isFinite);
-  if (a.length < 2) return 0;
-  const mn = Math.min(...a); const mx = Math.max(...a);
-  if (!mn) return 0;
-  return mx / mn - 1;
+function uniqueName(row) {
+  return String(row?.name ?? row?.bookmaker?.name ?? row?.id ?? row?.bookmaker ?? "").toLowerCase();
 }
 
-// 1X2
 function extract1X2(oddsPayload) {
   const rows = extractRows(oddsPayload);
-  const by = { "1": [], "X": [], "2": [] };
-  const seen = { "1": new Set(), "X": new Set(), "2": new Set() };
+  const anyBy  = { "1": [], "X": [], "2": [] };
+  const fairBy = { "1": [], "X": [], "2": [] };
+  const fairSeen = { "1": new Set(), "X": new Set(), "2": new Set() };
+
   for (const row of rows) {
     const bkm = uniqueName(row);
-    if (!isTrustedBook(bkm)) continue;
+    const allowAny  = !ODDS_TRUSTED_ONLY || inListLowerIncludes(bkm, TRUSTED_BOOKIES);
+    const allowFair = inListLowerIncludes(bkm, SHARP_BOOKIES);
     const bets = Array.isArray(row?.bets) ? row.bets : [];
     for (const bet of bets) {
       const nm = (bet?.name || "").toLowerCase();
@@ -311,22 +342,26 @@ function extract1X2(oddsPayload) {
         if (!code) continue;
         const price = Number(v?.odd ?? v?.price ?? v?.odds);
         if (!Number.isFinite(price) || price < MIN_ODDS) continue;
-        by[code].push(price);
-        seen[code].add(bkm);
+        if (allowAny)  anyBy[code].push(price);
+        if (allowFair) { fairBy[code].push(price); fairSeen[code].add(bkm); }
       }
     }
   }
-  const medBy = { "1": trimmedMedian(by["1"]), "X": trimmedMedian(by["X"]), "2": trimmedMedian(by["2"]) };
-  const countsBy = { "1": seen["1"].size, "X": seen["X"].size, "2": seen["2"].size };
-  const spreadBy = { "1": spreadOf(by["1"]), "X": spreadOf(by["X"]), "2": spreadOf(by["2"]) };
-  return { by, medBy, countsBy, spreadBy };
+  const medBy    = { "1": trimmedMedian(fairBy["1"]), "X": trimmedMedian(fairBy["X"]), "2": trimmedMedian(fairBy["2"]) };
+  const countsBy = { "1": fairSeen["1"].size,          "X": fairSeen["X"].size,          "2": fairSeen["2"].size };
+  const spreadBy = { "1": spreadOf(fairBy["1"]),       "X": spreadOf(fairBy["X"]),       "2": spreadOf(fairBy["2"]) };
+  return { by: anyBy, medBy, countsBy, spreadBy };
 }
 function extractBTTS(oddsPayload) {
   const rows = extractRows(oddsPayload);
-  const by = { Y: [], N: [] }, seen = { Y: new Set(), N: new Set() };
+  const anyBy  = { Y: [], N: [] };
+  const fairBy = { Y: [], N: [] };
+  const fairSeen = { Y: new Set(), N: new Set() };
+
   for (const row of rows) {
     const bkm = uniqueName(row);
-    if (!isTrustedBook(bkm)) continue;
+    const allowAny  = !ODDS_TRUSTED_ONLY || inListLowerIncludes(bkm, TRUSTED_BOOKIES);
+    const allowFair = inListLowerIncludes(bkm, SHARP_BOOKIES);
     const bets = Array.isArray(row?.bets) ? row.bets : [];
     for (const bet of bets) {
       const nm = (bet?.name || "").toLowerCase();
@@ -340,22 +375,26 @@ function extractBTTS(oddsPayload) {
         if (!code) continue;
         const price = Number(v?.odd ?? v?.price ?? v?.odds);
         if (!Number.isFinite(price) || price < MIN_ODDS) continue;
-        by[code].push(price);
-        seen[code].add(bkm);
+        if (allowAny)  anyBy[code].push(price);
+        if (allowFair) { fairBy[code].push(price); fairSeen[code].add(bkm); }
       }
     }
   }
-  const medBy = { Y: trimmedMedian(by.Y), N: trimmedMedian(by.N) };
-  const countsBy = { Y: seen.Y.size, N: seen.N.size };
-  const spreadBy = { Y: spreadOf(by.Y), N: spreadOf(by.N) };
-  return { by, medBy, countsBy, spreadBy };
+  const medBy    = { Y: trimmedMedian(fairBy.Y), N: trimmedMedian(fairBy.N) };
+  const countsBy = { Y: fairSeen.Y.size,         N: fairSeen.N.size };
+  const spreadBy = { Y: spreadOf(fairBy.Y),      N: spreadOf(fairBy.N) };
+  return { by: anyBy, medBy, countsBy, spreadBy };
 }
 function extractOU25(oddsPayload) {
   const rows = extractRows(oddsPayload);
-  const by = { O: [], U: [] }, seen = { O: new Set(), U: new Set() };
+  const anyBy  = { O: [], U: [] };
+  const fairBy = { O: [], U: [] };
+  const fairSeen = { O: new Set(), U: new Set() };
+
   for (const row of rows) {
     const bkm = uniqueName(row);
-    if (!isTrustedBook(bkm)) continue;
+    const allowAny  = !ODDS_TRUSTED_ONLY || inListLowerIncludes(bkm, TRUSTED_BOOKIES);
+    const allowFair = inListLowerIncludes(bkm, SHARP_BOOKIES);
     const bets = Array.isArray(row?.bets) ? row.bets : [];
     for (const bet of bets) {
       const nm = (bet?.name || "").toLowerCase();
@@ -368,24 +407,27 @@ function extractOU25(oddsPayload) {
         const code = isOver ? "O" : "U";
         const price = Number(v?.odd ?? v?.price ?? v?.odds);
         if (!Number.isFinite(price) || price < MIN_ODDS) continue;
-        by[code].push(price);
-        seen[code].add(bkm);
+        if (allowAny)  anyBy[code].push(price);
+        if (allowFair) { fairBy[code].push(price); fairSeen[code].add(bkm); }
       }
     }
   }
-  const medBy = { O: trimmedMedian(by.O), U: trimmedMedian(by.U) };
-  const countsBy = { O: seen.O.size, U: seen.U.size };
-  const spreadBy = { O: spreadOf(by.O), U: spreadOf(by.U) };
-  return { by, medBy, countsBy, spreadBy };
+  const medBy    = { O: trimmedMedian(fairBy.O), U: trimmedMedian(fairBy.U) };
+  const countsBy = { O: fairSeen.O.size,         U: fairSeen.U.size };
+  const spreadBy = { O: spreadOf(fairBy.O),      U: spreadOf(fairBy.U) };
+  return { by: anyBy, medBy, countsBy, spreadBy };
 }
 function extractHTFT(oddsPayload) {
   const rows = extractRows(oddsPayload);
   const keys = ["HH","HD","HA","DH","DD","DA","AH","AD","AA"];
-  const by = Object.fromEntries(keys.map(k => [k, []]));
-  const seen = Object.fromEntries(keys.map(k => [k, new Set()]));
+  const anyBy  = Object.fromEntries(keys.map(k => [k, []]));
+  const fairBy = Object.fromEntries(keys.map(k => [k, []]));
+  const fairSeen = Object.fromEntries(keys.map(k => [k, new Set()]));
+
   for (const row of rows) {
     const bkm = uniqueName(row);
-    if (!isTrustedBook(bkm)) continue;
+    const allowAny  = !ODDS_TRUSTED_ONLY || inListLowerIncludes(bkm, TRUSTED_BOOKIES);
+    const allowFair = inListLowerIncludes(bkm, SHARP_BOOKIES);
     const bets = Array.isArray(row?.bets) ? row.bets : [];
     for (const bet of bets) {
       const nm = (bet?.name || "").toLowerCase();
@@ -406,33 +448,18 @@ function extractHTFT(oddsPayload) {
         if (!code) continue;
         const price = Number(v?.odd ?? v?.price ?? v?.odds);
         if (!Number.isFinite(price) || price < MIN_ODDS) continue;
-        by[code].push(price);
-        seen[code].add(uniqueName(row));
+        if (allowAny)  anyBy[code].push(price);
+        if (allowFair) { fairBy[code].push(price); fairSeen[code].add(bkm); }
       }
     }
   }
-  const medBy = Object.fromEntries(Object.keys(by).map(k => [k, trimmedMedian(by[k])]));
-  const countsBy = Object.fromEntries(Object.keys(by).map(k => [k, seen[k].size]));
-  const spreadBy = Object.fromEntries(Object.keys(by).map(k => [k, spreadOf(by[k])]));
-  return { by, medBy, countsBy, spreadBy };
+  const medBy    = Object.fromEntries(keys.map(k => [k, trimmedMedian(fairBy[k])]));
+  const countsBy = Object.fromEntries(keys.map(k => [k, fairSeen[k].size]));
+  const spreadBy = Object.fromEntries(keys.map(k => [k, spreadOf(fairBy[k])]));
+  return { by: anyBy, medBy, countsBy, spreadBy };
 }
 
-function norm3(a, b, c) {
-  const s = (a||0) + (b||0) + (c||0);
-  if (s <= 0) return { A: 0, B: 0, C: 0 };
-  return { A: a/s, B: b/s, C: c/s };
-}
-function pickLabel1X2(k){
-  return k==="1" ? "Home" : k==="X" ? "Draw" : "Away";
-}
-function dynamicUpliftCap(books, spread) {
-  // blagi limiter da ne beži od implied
-  const b = Math.min(1, (books||0)/6);
-  const s = 1 / (1 + 4*(spread||0));
-  return Math.max(0.05, 0.20 * b * s); // max 20pp, često 5–12pp
-}
-
-// KV helperi
+/* ---------------- KV ---------------- */
 async function kvGetJSON(key) {
   const base = process.env.KV_REST_API_URL || "";
   const token = process.env.KV_REST_API_TOKEN || "";
@@ -452,7 +479,6 @@ async function kvSetJSON(key, value) {
   let r = await fetch(urlA, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body }).catch(()=>null);
   if (r && r.ok) return true;
 
-  // fallback forma
   const urlB = `${base.replace(/\/+$/, "")}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}`;
   r = await fetch(urlB, { method: "POST", headers: { Authorization: `Bearer ${token}` } }).catch(()=>null);
   if (r && r.ok) return true;
@@ -461,7 +487,7 @@ async function kvSetJSON(key, value) {
   throw new Error(`KV set failed: ${msg.slice(0,200)}`);
 }
 
-// evaluacija kandidata po tržištu za jedan fixture
+/* ---------------- candidate builder ---------------- */
 function buildCandidate(recBase, market, code, label, price, prob, booksCount, minBooksNeeded) {
   if (!Number.isFinite(price) || price < MIN_ODDS) return null;
   if (!Number.isFinite(prob)) return null;
@@ -472,7 +498,6 @@ function buildCandidate(recBase, market, code, label, price, prob, booksCount, m
   const _ev = Number((price*prob - 1).toFixed(12));
   if (!Number.isFinite(_ev) || _ev < EV_FLOOR) return null;
 
-  // konzervativna donja granica EV-a (EV-LB)
   const _ev_lb = Number(evLowerBound(price, prob, booksCount).toFixed(12));
   if (_ev_lb < EV_LB_FLOOR) return null;
 
@@ -489,11 +514,7 @@ function buildCandidate(recBase, market, code, label, price, prob, booksCount, m
   };
 }
 
-function isWomensLeague(leagueName="", teams={home:"",away:""}) {
-  const s = `${leagueName} ${teams.home} ${teams.away}`.toLowerCase();
-  return /\b(women|femin|femen|w\s*league|ladies|girls|女子|жен)\b/.test(s);
-}
-
+/* ---------------- handler ---------------- */
 export default async function handler(req, res) {
   try {
     const ymd = ymdInTZ();
@@ -503,17 +524,12 @@ export default async function handler(req, res) {
       ? LIMIT_LATE_WEEKDAY
       : (isWeekend ? DEFAULT_LIMIT_WEEKEND : DEFAULT_LIMIT_WEEKDAY);
 
-    const debug = { slotQ, slotLimit };
-
-    // slot window
     const slotWin = slotQ === "am" ? { hmin: 8, hmax: 13 }
                   : slotQ === "pm" ? { hmin: 13, hmax: 22 }
                   : { hmin: 22, hmax: 23 };
 
-    // 1) fixtures u slotu
+    // fixtures
     const raw = await fetchFixturesByDate(ymd);
-    debug.fixtures_total = Array.isArray(raw) ? raw.length : 0;
-
     let fixtures = (Array.isArray(raw) ? raw : [])
       .map((r) => {
         const fx = r?.fixture || {};
@@ -539,28 +555,24 @@ export default async function handler(req, res) {
       })
       .filter(fx => fx.fixture_id && fx.date_utc != null);
 
-    debug.after_basic = fixtures.length;
-
+    // slot filter
     fixtures = fixtures.filter(fx => fx.local_hour >= slotWin.hmin && fx.local_hour <= slotWin.hmax);
-    debug.after_slot = fixtures.length;
 
-    fixtures = fixtures.filter(fx => !isWomensLeague(fx.league?.name, fx.teams));
-    debug.after_gender_filter = fixtures.length;
+    // women / low tiers
+    fixtures = fixtures.filter(fx => !(EXCLUDE_WOMEN && isWomensLeague(fx.league?.name, fx.teams)));
+    fixtures = fixtures.filter(fx => !(EXCLUDE_LOW_TIERS && isLowTier(fx.league?.name || "", fx.teams)));
 
-    // cap kandidata radi troška (opciono). Ako je CONSIDER_ALL_FIXTURES=1, ne sečemo listu.
+    // cap (ako je uključeno)
     let considered = fixtures.length;
     if (!CONSIDER_ALL_FIXTURES) {
       considered = Math.min(fixtures.length, Math.max(slotLimit*6, slotLimit+40));
     }
     fixtures = fixtures.slice(0, considered);
-    debug.considered = fixtures.length;
 
-    const bestPerFixture_strict = [];
-    theLoop:
+    const bestPerFixture = [];
+
     for (const fx of fixtures) {
-      // payloadi (jednom po fixture-u)
       const oddsPayload = await fetchOddsForFixture(fx.fixture_id);
-
       const oddsArr = Array.isArray(oddsPayload) ? oddsPayload : [];
       if (!oddsArr.length) continue;
 
@@ -577,7 +589,7 @@ export default async function handler(req, res) {
         kickoff: fx.local_str, kickoff_utc: fx.date_utc
       };
 
-      // --- 1X2
+      /* ---------- 1X2 ---------- */
       const m1 = extract1X2(oddsArr);
       const imp1 = {
         "1": Number.isFinite(m1.medBy["1"]) ? 1/m1.medBy["1"] : 0,
@@ -586,6 +598,7 @@ export default async function handler(req, res) {
       };
       const n1 = norm3(imp1["1"], imp1["X"], imp1["2"]);
       let model1 = { "1": n1.A, "X": n1.B, "2": n1.C };
+
       if (Number.isFinite(pHome) || Number.isFinite(pDraw) || Number.isFinite(pAway)) {
         const ph = Number.isFinite(pHome) ? (pHome/100) : model1["1"];
         const pd = Number.isFinite(pDraw) ? (pDraw/100) : model1["X"];
@@ -610,7 +623,7 @@ export default async function handler(req, res) {
 
       function candidates1X2(strict=true){
         const out=[];
-        const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX;
+        const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX_1X2; // ← strože u relaxed
         const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
         for (const k of ["1","X","2"]) {
           const price = bestPrice(m1, k); if (!Number.isFinite(price)) continue;
@@ -625,7 +638,7 @@ export default async function handler(req, res) {
         return out;
       }
 
-      // --- BTTS
+      /* ---------- BTTS ---------- */
       const mb = extractBTTS(oddsArr);
       function candidatesBTTS(strict=true){
         const out=[];
@@ -649,7 +662,7 @@ export default async function handler(req, res) {
         return out;
       }
 
-      // --- OU 2.5
+      /* ---------- OU 2.5 ---------- */
       const mo = extractOU25(oddsArr);
       function candidatesOU(strict=true){
         const out=[];
@@ -673,7 +686,7 @@ export default async function handler(req, res) {
         return out;
       }
 
-      // --- HT-FT
+      /* ---------- HT-FT ---------- */
       const mh = extractHTFT(oddsArr);
       function candidatesHTFT(strict=true){
         const out=[];
@@ -691,7 +704,6 @@ export default async function handler(req, res) {
         const minCombos = strict ? 3 : 2;
         if (valid.length < minCombos) return out;
 
-        // raspodela iz 1X2 kao rudimentarna verovatnoća HT-FT (zadrži tržišnu dominaciju)
         const approxProb = { HH: 0.34, HD: 0.11, HA: 0.06, DH: 0.13, DD: 0.14, DA: 0.08, AH: 0.06, AD: 0.08, AA: 0.10 };
         for (const k of valid) {
           const prob = approxProb[k] ?? 0.05;
@@ -707,8 +719,11 @@ export default async function handler(req, res) {
         ...candidatesOU(true),
         ...candidatesHTFT(true),
       ];
-      // --- STAT BOOST (skupo, ali preciznije): kombinuje odds-prob sa timskim i H2H metrikama
-      if (STATS_ENABLED) {
+
+      /* ---------- STAT MIX + CLAMP za 1X2 ---------- */
+      const applyStatsWithClamp = async (arr) => {
+        if (!STATS_ENABLED || !arr.length) return;
+
         try {
           const leagueId = fx.league?.id;
           const season   = fx.season || fx.league?.season;
@@ -735,47 +750,56 @@ export default async function handler(req, res) {
           }
           const form1x2 = (hs?.formPct != null && as?.formPct != null) ? formTo1X2Prob(hs.formPct, as.formPct) : null;
 
-          // primeni na kandidate ovog fixture-a
-          const applyStats = (arr) => {
-            for (const c of arr) {
-              if (!c || c.fixture_id !== fx.fixture_id) continue;
-              const price = c?.odds?.price;
-              const books = c?.odds?.books_count || 1;
+          for (const c of arr) {
+            if (!c || c.fixture_id !== fx.fixture_id) continue;
+            const price = c?.odds?.price;
+            const books = c?.odds?.books_count || 1;
 
-              if (c.market === "BTTS") {
-                const p_odds = c.model_prob;
-                const p_stat = (c.pick_code === "Y") ? pBTTS_stat : (Number.isFinite(pBTTS_stat) ? (1 - pBTTS_stat) : null);
-                c.model_prob = Number(mixProb(p_odds, p_stat).toFixed(4));
-                c._ev = Number((price * c.model_prob - 1).toFixed(12));
-                c._ev_lb = Number(evLowerBound(price, c.model_prob, books).toFixed(12));
-              }
-              if (c.market === "OU2.5") {
-                const p_odds = c.model_prob;
-                let p_stat = pOU25_stat;
-                if (Number.isFinite(p_stat) && c.pick_code === "U2.5") p_stat = 1 - p_stat;
-                c.model_prob = Number(mixProb(p_odds, p_stat).toFixed(4));
-                c._ev = Number((price * c.model_prob - 1).toFixed(12));
-                c._ev_lb = Number(evLowerBound(price, c.model_prob, books).toFixed(12));
-              }
-              if (c.market === "1X2" && form1x2) {
-                const p_odds = c.model_prob;
-                const p_stat = (c.pick_code === "1") ? form1x2.H
-                              : (c.pick_code === "X") ? form1x2.D
-                              : (c.pick_code === "2") ? form1x2.A : null;
-                c.model_prob = Number(mixProb(p_odds, p_stat).toFixed(4));
-                c._ev = Number((price * c.model_prob - 1).toFixed(12));
-                c._ev_lb = Number(evLowerBound(price, c.model_prob, books).toFixed(12));
-              }
+            if (c.market === "BTTS") {
+              const p_odds = c.model_prob;
+              const p_stat = (c.pick_code === "Y") ? pBTTS_stat : (Number.isFinite(pBTTS_stat) ? (1 - pBTTS_stat) : null);
+              c.model_prob = Number(mixProb(p_odds, p_stat).toFixed(4));
+              c._ev = Number((price * c.model_prob - 1).toFixed(12));
+              c._ev_lb = Number(evLowerBound(price, c.model_prob, books).toFixed(12));
             }
-          };
-          applyStats(strictCands);
-        } catch(e) {
-          // ne rušimo slot ako stat pozivi omanu
-        }
-      }
+            if (c.market === "OU2.5") {
+              const p_odds = c.model_prob;
+              let p_stat = pOU25_stat;
+              if (Number.isFinite(p_stat) && c.pick_code === "U2.5") p_stat = 1 - p_stat;
+              c.model_prob = Number(mixProb(p_odds, p_stat).toFixed(4));
+              c._ev = Number((price * c.model_prob - 1).toFixed(12));
+              c._ev_lb = Number(evLowerBound(price, c.model_prob, books).toFixed(12));
+            }
+            if (c.market === "1X2" && form1x2) {
+              const p_odds = c.model_prob;
+              const p_stat = (c.pick_code === "1") ? form1x2.H
+                            : (c.pick_code === "X") ? form1x2.D
+                            : (c.pick_code === "2") ? form1x2.A : null;
+
+              // stat mix
+              c.model_prob = Number(mixProb(p_odds, p_stat).toFixed(4));
+
+              // ---- CLAMP posle stat-mixa (graničimo odstupanje od implied-a iz CENE) ----
+              const impliedApprox = Math.max(0.01, Math.min(0.97, 1 / (price || 99)));
+              const capAbs = (c.pick_code === "X") ? 0.18 : 0.22; // X malo strožije
+              const hi = Math.min(0.98, impliedApprox + capAbs);
+              const lo = Math.max(0.02, impliedApprox - capAbs);
+              if (c.model_prob > hi) c.model_prob = hi;
+              if (c.model_prob < lo) c.model_prob = lo;
+
+              // recompute EV i EV-LB
+              c._ev = Number((price * c.model_prob - 1).toFixed(12));
+              c._ev_lb = Number(evLowerBound(price, c.model_prob, books).toFixed(12));
+            }
+          }
+        } catch (_) { /* fail-safe */ }
+      };
+
+      // strict → stat → top-1; ako nema, relaxed → stat → top-1
       if (strictCands.length) {
+        await applyStatsWithClamp(strictCands);
         strictCands.sort((a,b)=> ( (b._ev_lb ?? b._ev) - (a._ev_lb ?? a._ev) ) || (b.confidence_pct - a.confidence_pct));
-        bestPerFixture_strict.push(strictCands[0]);
+        bestPerFixture.push(strictCands[0]);
       } else {
         const relaxedCands = [
           ...candidates1X2(false),
@@ -783,98 +807,37 @@ export default async function handler(req, res) {
           ...candidatesOU(false),
           ...candidatesHTFT(false),
         ];
-        if (STATS_ENABLED) {
-          try {
-            const leagueId = fx.league?.id;
-            const season   = fx.season || fx.league?.season;
-            const homeId   = fx?.teams?.home_id;
-            const awayId   = fx?.teams?.away_id;
-
-            const [homeList, awayList, h2hList] = await Promise.all([
-              fetchRecentForTeam(leagueId, season, homeId, STATS_TEAM_LAST),
-              fetchRecentForTeam(leagueId, season, awayId, STATS_TEAM_LAST),
-              fetchH2H(homeId, awayId, Math.min(10, STATS_TEAM_LAST))
-            ]);
-
-            const hs = computeTeamRecentStats(homeList, homeId);
-            const as = computeTeamRecentStats(awayList, awayId);
-            const hh = computeRatesFromFixtures(h2hList);
-
-            let pBTTS_stat = combineTeamRates(hs?.bttsRate, as?.bttsRate);
-            let pOU25_stat = combineTeamRates(hs?.over25Rate, as?.over25Rate);
-            if (hh) {
-              if (Number.isFinite(pBTTS_stat)) pBTTS_stat = (1 - H2H_WEIGHT) * pBTTS_stat + H2H_WEIGHT * hh.bttsRate;
-              else pBTTS_stat = hh.bttsRate;
-              if (Number.isFinite(pOU25_stat)) pOU25_stat = (1 - H2H_WEIGHT) * pOU25_stat + H2H_WEIGHT * hh.over25Rate;
-              else pOU25_stat = hh.over25Rate;
-            }
-            const form1x2 = (hs?.formPct != null && as?.formPct != null) ? formTo1X2Prob(hs.formPct, as.formPct) : null;
-
-            for (const c of relaxedCands) {
-              if (!c || c.fixture_id !== fx.fixture_id) continue;
-              const price = c?.odds?.price;
-              const books = c?.odds?.books_count || 1;
-
-              if (c.market === "BTTS") {
-                const p_odds = c.model_prob;
-                const p_stat = (c.pick_code === "Y") ? pBTTS_stat : (Number.isFinite(pBTTS_stat) ? (1 - pBTTS_stat) : null);
-                c.model_prob = Number(mixProb(p_odds, p_stat).toFixed(4));
-                c._ev = Number((price * c.model_prob - 1).toFixed(12));
-                c._ev_lb = Number(evLowerBound(price, c.model_prob, books).toFixed(12));
-              }
-              if (c.market === "OU2.5") {
-                const p_odds = c.model_prob;
-                let p_stat = pOU25_stat;
-                if (Number.isFinite(p_stat) && c.pick_code === "U2.5") p_stat = 1 - p_stat;
-                c.model_prob = Number(mixProb(p_odds, p_stat).toFixed(4));
-                c._ev = Number((price * c.model_prob - 1).toFixed(12));
-                c._ev_lb = Number(evLowerBound(price, c.model_prob, books).toFixed(12));
-              }
-              if (c.market === "1X2" && form1x2) {
-                const p_odds = c.model_prob;
-                const p_stat = (c.pick_code === "1") ? form1x2.H
-                              : (c.pick_code === "X") ? form1x2.D
-                              : (c.pick_code === "2") ? form1x2.A : null;
-                c.model_prob = Number(mixProb(p_odds, p_stat).toFixed(4));
-                c._ev = Number((price * c.model_prob - 1).toFixed(12));
-                c._ev_lb = Number(evLowerBound(price, c.model_prob, books).toFixed(12));
-              }
-            }
-          } catch(e) {}
-        }
+        await applyStatsWithClamp(relaxedCands);
         if (relaxedCands.length){
           relaxedCands.sort((a,b)=> ( (b._ev_lb ?? b._ev) - (a._ev_lb ?? a._ev) ) || (b.confidence_pct - a.confidence_pct));
-          bestPerFixture_strict.push(relaxedCands[0]); // koristimo isti skup
+          bestPerFixture.push(relaxedCands[0]);
         }
       }
     }
 
-    // rangiranje i preseci
-    const sorted = bestPerFixture_strict.sort((a,b)=> ((b._ev_lb ?? b._ev) - (a._ev_lb ?? a._ev)) || (b.confidence_pct - a.confidence_pct));
+    // rang + preseci
+    const sorted = bestPerFixture.sort((a,b)=> ((b._ev_lb ?? b._ev) - (a._ev_lb ?? a._ev)) || (b.confidence_pct - a.confidence_pct));
     const fullCount = Math.max(slotLimit, Math.min(sorted.length, 100));
     const slimCount = Math.min(slotLimit, sorted.length);
     const fullList = sorted.slice(0, fullCount);
     const slimList = sorted.slice(0, slimCount);
 
-    // upis u KV
-    let wrote=false;
-    if (slimList.length>0) {
-      const keySlim = `vbl:${ymd}:${slotQ}`;
-      const keyFull = `vbl_full:${ymd}:${slotQ}`;
-      const payloadSlim = { items: slimList, at: new Date().toISOString(), ymd, slot: slotQ };
-      const payloadFull = { items: fullList, at: new Date().toISOString(), ymd, slot: slotQ };
-      await kvSetJSON(keySlim, payloadSlim);
-      await kvSetJSON(keyFull, payloadFull);
-      // union touch
-      const unionKey = `vb:day:${ymd}:union`;
-      const union = Array.from(new Map(sorted.map(x => [x.fixture_id, x])).values());
-      await kvSetJSON(unionKey, union);
-      wrote = true;
-    }
+    // upis
+    const keySlim = `vbl:${ymd}:${slotQ}`;
+    const keyFull = `vbl_full:${ymd}:${slotQ}`;
+    const payloadSlim = { items: slimList, at: new Date().toISOString(), ymd, slot: slotQ };
+    const payloadFull = { items: fullList, at: new Date().toISOString(), ymd, slot: slotQ };
+    await kvSetJSON(keySlim, payloadSlim);
+    await kvSetJSON(keyFull, payloadFull);
+
+    // union touch
+    const unionKey = `vb:day:${ymd}:union`;
+    const union = Array.from(new Map(sorted.map(x => [x.fixture_id, x])).values());
+    await kvSetJSON(unionKey, union);
 
     return res.status(200).json({
       ok:true, slot:slotQ, ymd,
-      count: slimList.length, count_full: fullList.length, wrote,
+      count: slimList.length, count_full: fullList.length, wrote:true,
       football: slimList
     });
 
