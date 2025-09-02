@@ -1,12 +1,7 @@
 // pages/api/cron/rebuild.js
-// Poboljšanja u ovoj verziji:
-// - EV po MEDIAN ceni (širi "price" skup), ne maksimum
-// - Stat-mix samo ako oba tima imaju ≥5 FT mečeva; H2H tek kad ima ≥4 FT meča
-// - 1X2: sum-safe RELATIVNI clamp posle stat-mixa (projekcija delta na sumu 0)
-// - Post-mix post-filter: drop ako EV/EV-LB padnu, uz safety-valve za jaka tržišta
-// - OU/BTTS fallback: ako fali jedan pol u fair medijani, koristi anyBy medijanu za implied
-// - Fill-to-limit: garantuje 15 predloga popunom iz “loose” pool-a bez stat-mixa
-// - OU/BTTS relaxed ostaje 2 knjige (zbog volumena)
+// Slot rebuild sa 3 slota (late/am/pm), realnijim EV-om (median price),
+// sum-safe clamp-om za 1X2, fallback-om za OU/BTTS, fill-to-limit (tačno 15),
+// i blagom "learning" kalibracijom (čitanje iz vb:cal:v1).
 
 export const config = { api: { bodyParser: false } };
 
@@ -73,7 +68,6 @@ function inListLowerIncludes(nameLower, list) {
 /* ---------------- global knobs ---------------- */
 const DEFAULT_LIMIT_WEEKDAY = envNum("SLOT_WEEKDAY_LIMIT", 15);
 const DEFAULT_LIMIT_WEEKEND = envNum("SLOT_WEEKEND_LIMIT", 25);
-const LIMIT_LATE_WEEKDAY    = envNum("SLOT_LATE_WEEKDAY_LIMIT", DEFAULT_LIMIT_WEEKDAY);
 
 const MIN_ODDS = envNum("MIN_ODDS", 1.01);
 const MODEL_ALPHA = envNum("MODEL_ALPHA", 0.4);
@@ -167,19 +161,6 @@ function lowTierMention(s=""){
 }
 function isLowTier(leagueName="", teams={home:"",away:""}){
   return lowTierMention(leagueName) || lowTierMention(teams.home||"") || lowTierMention(teams.away||"");
-}
-
-// helperi za fallback na anyBy kad fali fair medijana
-function getBooksCount(m, k) {
-  const fair = Number(m?.countsBy?.[k] || 0);
-  const any  = Array.isArray(m?.by?.[k]) ? m.by[k].length : 0;
-  return Math.max(fair, any);
-}
-function getSpread(m, k) {
-  const fairSpread = m?.spreadBy?.[k];
-  if (Number.isFinite(fairSpread) && (m?.countsBy?.[k] || 0) > 0) return fairSpread;
-  const arr = (m?.by?.[k] || []).filter(Number.isFinite);
-  return spreadOf(arr);
 }
 
 /* ---------------- API-Football ---------------- */
@@ -471,6 +452,16 @@ function extractHTFT(oddsPayload) {
 }
 
 /* ---------------- KV ---------------- */
+async function kvGetJSON(key) {
+  const base = process.env.KV_REST_API_URL || "";
+  const token = process.env.KV_REST_API_TOKEN || "";
+  if (!base || !token) return null;
+  const urlA = `${base.replace(/\/+$/, "")}/get/${encodeURIComponent(key)}`;
+  const r = await fetch(urlA, { headers: { Authorization: `Bearer ${token}` } }).catch(()=>null);
+  if (!r || !r.ok) return null;
+  const raw = await r.text().catch(()=>null);
+  try { return JSON.parse(raw); } catch { return null; }
+}
 async function kvSetJSON(key, value) {
   const base = process.env.KV_REST_API_URL || "";
   const token = process.env.KV_REST_API_TOKEN || "";
@@ -479,13 +470,22 @@ async function kvSetJSON(key, value) {
   const urlA = `${base.replace(/\/+$/, "")}/set/${encodeURIComponent(key)}`;
   let r = await fetch(urlA, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body }).catch(()=>null);
   if (r && r.ok) return true;
-
   const urlB = `${base.replace(/\/+$/, "")}/set/${encodeURIComponent(key)}/${encodeURIComponent(JSON.stringify(value))}`;
   r = await fetch(urlB, { method: "POST", headers: { Authorization: `Bearer ${token}` } }).catch(()=>null);
   if (r && r.ok) return true;
-
   const msg = r ? await r.text().catch(()=>String(r.status)) : "network-error";
   throw new Error(`KV set failed: ${msg.slice(0,200)}`);
+}
+
+/* ---------------- Learning kalibracija ---------------- */
+function calFactor(cal, market, pick){
+  const node = cal?.[String(market).toUpperCase()]?.[String(pick).toUpperCase()];
+  if(!node || (node.n||0) < 50) return 1;
+  const meanObs  = (node.wins + 2) / (node.n + 4);           // Laplace smoothing
+  const meanPred = (node.sum_p + 1e-6) / (node.n + 1e-6);
+  let r = meanObs / Math.max(0.01, Math.min(0.99, meanPred));
+  r = Math.max(0.9, Math.min(1.1, r));                       // cap ±10%
+  return Math.pow(r, 0.5);                                   // blaga polovina
 }
 
 /* ---------------- candidate builder ---------------- */
@@ -540,12 +540,9 @@ function buildCandidateLoose(recBase, market, code, label, price, prob, booksCou
 
 /* ---------------- 1X2 sum-safe clamp ---------------- */
 function sumSafeClamp1x2(implied, proposed, isX) {
-  // implied/proposed: {H, D, A} sum to ~1
   const keys = ["H","D","A"];
   const impl = { H: implied.H, D: implied.D, A: implied.A };
   const prop = { H: proposed.H, D: proposed.D, A: proposed.A };
-
-  // relativne granice po komponentama
   const bounds = {};
   for (const k of keys) {
     const p0 = Math.max(0.01, Math.min(0.97, impl[k] || 0));
@@ -554,8 +551,6 @@ function sumSafeClamp1x2(implied, proposed, isX) {
     if (k === "D" && isX) { up = Math.max(0, up - 0.02); dn = Math.max(0, dn - 0.02); }
     bounds[k] = { up, dn };
   }
-
-  // clamp delte
   const delta = {};
   let sumDelta = 0;
   for (const k of keys) {
@@ -564,36 +559,26 @@ function sumSafeClamp1x2(implied, proposed, isX) {
     delta[k] = cl;
     sumDelta += cl;
   }
-  if (Math.abs(sumDelta) < 1e-12) {
-    return { H: impl.H + delta.H, D: impl.D + delta.D, A: impl.A + delta.A };
-  }
-
-  // projekcija: raspodeli residual po dostupnim headroom-ima
-  if (sumDelta > 0) {
-    // treba smanjiti (guramo delte ka -dn)
-    const room = keys.map(k => delta[k] - (-bounds[k].dn)); // koliko možemo naniže
-    let totalRoom = room.reduce((a,b)=>a+b,0) || 1;
-    for (let i=0;i<keys.length;i++){
-      const k = keys[i];
-      const take = Math.min(sumDelta * (room[i]/totalRoom), room[i]);
-      delta[k] -= take;
-    }
-  } else {
-    // sumDelta < 0: treba povećati (guramo delte ka +up)
-    const room = keys.map(k => bounds[k].up - delta[k]);
-    let totalRoom = room.reduce((a,b)=>a+b,0) || 1;
-    for (let i=0;i<keys.length;i++){
-      const k = keys[i];
-      const give = Math.min((-sumDelta) * (room[i]/totalRoom), room[i]);
-      delta[k] += give;
+  if (Math.abs(sumDelta) >= 1e-12) {
+    if (sumDelta > 0) {
+      const room = keys.map(k => delta[k] - (-bounds[k].dn));
+      let totalRoom = room.reduce((a,b)=>a+b,0) || 1;
+      for (let i=0;i<keys.length;i++){
+        const take = Math.min(sumDelta * (room[i]/totalRoom), room[i]);
+        delta[keys[i]] -= take;
+      }
+    } else {
+      const room = keys.map(k => bounds[k].up - delta[k]);
+      let totalRoom = room.reduce((a,b)=>a+b,0) || 1;
+      for (let i=0;i<keys.length;i++){
+        const give = Math.min((-sumDelta) * (room[i]/totalRoom), room[i]);
+        delta[keys[i]] += give;
+      }
     }
   }
-
   const out = { H: impl.H + delta.H, D: impl.D + delta.D, A: impl.A + delta.A };
-  // normalize defensive
   const s = out.H + out.D + out.A;
   if (s > 0) { out.H/=s; out.D/=s; out.A/=s; }
-  // clamp [0.02,0.98]
   for (const k of keys) out[k] = Math.max(0.02, Math.min(0.98, out[k]));
   return out;
 }
@@ -603,9 +588,13 @@ export default async function handler(req, res) {
   try {
     const ymd = ymdInTZ();
     const slotQ = String(req.query?.slot || "").toLowerCase() || "am";
+    const window =
+      slotQ === "late" ? { hmin: 0,  hmax: 9 }  :
+      slotQ === "am"   ? { hmin: 10, hmax: 14 } :
+                         { hmin: 15, hmax: 23 };
+
     const isWeekend = [0,6].includes(new Date().getDay());
-    const slotLimit = (slotQ === "pm" ? DEFAULT_LIMIT_WEEKDAY : DEFAULT_LIMIT_WEEKDAY); // zadrži isto
-    const window = slotQ === "am" ? { hmin: 8, hmax: 13 } : { hmin: 13, hmax: 22 };
+    const slotLimit = isWeekend ? DEFAULT_LIMIT_WEEKEND : DEFAULT_LIMIT_WEEKDAY;
 
     // fixtures
     const raw = await fetchFixturesByDate(ymd);
@@ -639,6 +628,9 @@ export default async function handler(req, res) {
 
     const bestPerFixture = [];
     const fillerByFixture = new Map();
+
+    // učitaj kalibraciju (learning)
+    const cal = await kvGetJSON('vb:cal:v1').catch(()=>null) || {};
 
     for (const fx of fixtures) {
       const oddsPayload = await fetchOddsForFixture(fx.fixture_id);
@@ -679,7 +671,6 @@ export default async function handler(req, res) {
           "2": MODEL_ALPHA*na + (1-MODEL_ALPHA)*model1["2"]
         };
       }
-      // dynamic cap vs fair implied
       for (const k of ["1","X","2"]) {
         const cap = dynamicUpliftCap(m1.countsBy[k]||0, m1.spreadBy[k]||0);
         const implied = (k==="1")? (n1.A||0) : (k==="X")? (n1.B||0) : (n1.C||0);
@@ -691,12 +682,24 @@ export default async function handler(req, res) {
       }
       { const s = (model1["1"]||0)+(model1["X"]||0)+(model1["2"]||0); if (s>0){ model1={"1":model1["1"]/s,"X":model1["X"]/s,"2":model1["2"]/s}; } }
 
+      function getBooksCount(m, k) {
+        const fair = Number(m?.countsBy?.[k] || 0);
+        const any  = Array.isArray(m?.by?.[k]) ? m.by[k].length : 0;
+        return Math.max(fair, any);
+      }
+      function getSpread(m, k) {
+        const fairSpread = m?.spreadBy?.[k];
+        if (Number.isFinite(fairSpread) && (m?.countsBy?.[k] || 0) > 0) return fairSpread;
+        const arr = (m?.by?.[k] || []).filter(Number.isFinite);
+        return spreadOf(arr);
+      }
+
       function candidates1X2(strict=true){
         const out=[];
         const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX_1X2;
         const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
         for (const k of ["1","X","2"]) {
-          const price = priceMedian(m1, k); if (!Number.isFinite(price)) continue;
+          const price = priceMedian(m1, k); if (!Number.isFinite(price)) continue; // MEDIAN price za EV
           const books = getBooksCount(m1, k);
           const spr = getSpread(m1, k);
           const prob = model1[k];
@@ -711,7 +714,6 @@ export default async function handler(req, res) {
       /* ---------- BTTS (sa fallback implied-a ako fali jedan pol) ---------- */
       const mb = extractBTTS(oddsArr);
       function impliedBTTS() {
-        // prob iz cene: pY = impY/(impY+impN)
         let mY = mb.medBy.Y, mN = mb.medBy.N;
         if (!Number.isFinite(mY)) { const any = (mb.by.Y||[]).filter(Number.isFinite); if (any.length) mY = trimmedMedian(any); }
         if (!Number.isFinite(mN)) { const any = (mb.by.N||[]).filter(Number.isFinite); if (any.length) mN = trimmedMedian(any); }
@@ -823,7 +825,7 @@ export default async function handler(req, res) {
         ...candidatesHTFT(true),
       ];
 
-      /* ---------- STAT MIX + SUM-SAFE CLAMP + POST-FILTER ---------- */
+      /* ---------- STAT MIX + SUM-SAFE CLAMP + POST-FILTER + LEARNING ---------- */
       const applyStatsWithClamp = async (arr) => {
         if (!STATS_ENABLED || !arr.length) return arr;
 
@@ -865,9 +867,13 @@ export default async function handler(req, res) {
               const p_odds = c.model_prob;
               const p_stat = (c.pick_code === "Y") ? pBTTS_stat : (Number.isFinite(pBTTS_stat) ? (1 - pBTTS_stat) : null);
               c.model_prob = Number(mixProb(p_odds, p_stat).toFixed(4));
+
+              // learning kalibracija
+              const f = calFactor(cal, c.market, c.pick_code);
+              c.model_prob = Math.max(0.02, Math.min(0.98, c.model_prob * f));
+
               c._ev = Number((price * c.model_prob - 1).toFixed(12));
               c._ev_lb = Number(evLowerBound(price, c.model_prob, books).toFixed(12));
-              // safety-valve
               const strongMarket = books >= 5 && c._ev >= EV_FLOOR * 1.5;
               if (!strongMarket && !(c._ev >= EV_FLOOR && c._ev_lb >= EV_LB_FLOOR)) c._drop = true;
             }
@@ -876,6 +882,11 @@ export default async function handler(req, res) {
               let p_stat = pOU25_stat;
               if (Number.isFinite(p_stat) && c.pick_code === "U2.5") p_stat = 1 - p_stat;
               c.model_prob = Number(mixProb(p_odds, p_stat).toFixed(4));
+
+              // learning kalibracija
+              const f = calFactor(cal, c.market, c.pick_code);
+              c.model_prob = Math.max(0.02, Math.min(0.98, c.model_prob * f));
+
               c._ev = Number((price * c.model_prob - 1).toFixed(12));
               c._ev_lb = Number(evLowerBound(price, c.model_prob, books).toFixed(12));
               const strongMarket = books >= 5 && c._ev >= EV_FLOOR * 1.5;
@@ -897,11 +908,12 @@ export default async function handler(req, res) {
                   A: (c.pick_code === "2") ? Number(mixProb(c.model_prob, form1x2.A).toFixed(4)) : model1["2"],
                 };
                 const out = sumSafeClamp1x2(implied, proposed, c.pick_code === "X");
-                // set model_prob samo za trenutni pick
                 c.model_prob = Number( (c.pick_code === "1") ? out.H : (c.pick_code === "X") ? out.D : out.A );
-              } else {
-                // bez stat-mixa: ostavi tržište
               }
+
+              // learning kalibracija
+              const f = calFactor(cal, c.market, c.pick_code);
+              c.model_prob = Math.max(0.02, Math.min(0.98, c.model_prob * f));
 
               // recompute EV/EV-LB i filter
               c._ev = Number((price * c.model_prob - 1).toFixed(12));
@@ -1049,13 +1061,17 @@ export default async function handler(req, res) {
       sorted.push(fillers.shift());
     }
 
-    // upis u KV
+    // upis u KV (slim 15, full širi, i union za settle)
     const keySlim = `vbl:${ymd}:${slotQ}`;
     const keyFull = `vbl_full:${ymd}:${slotQ}`;
     const payloadSlim = { items: sorted.slice(0, TARGET), at: new Date().toISOString(), ymd, slot: slotQ };
     const payloadFull = { items: sorted.slice(0, Math.max(TARGET, Math.min(sorted.length, 100))), at: new Date().toISOString(), ymd, slot: slotQ };
     await kvSetJSON(keySlim, payloadSlim);
     await kvSetJSON(keyFull, payloadFull);
+
+    // dnevni union (za learning settle) — koristimo slim listu (15)
+    const unionKey = `vb:day:${ymd}:union`;
+    await kvSetJSON(unionKey, payloadSlim.items);
 
     return res.status(200).json({
       ok:true, slot:slotQ, ymd,
