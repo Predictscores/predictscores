@@ -91,7 +91,7 @@ jobs:
     if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 9 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'apply_am' || github.event.inputs.run == 'settle_today_all')) }}
     runs-on: ubuntu-latest
     env:
-      KV_REST_API_URL: ${{ secrets.KV_REST_API_URL }}
+      KV_REST_API_URL: ${{ secrets.KV_REST_URL }}           # <-- mapirano na tvoj secret
       KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN }}
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL }}
@@ -183,7 +183,7 @@ jobs:
     if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 14 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'apply_pm' || github.event.inputs.run == 'settle_today_all')) }}
     runs-on: ubuntu-latest
     env:
-      KV_REST_API_URL: ${{ secrets.KV_REST_API_URL }}
+      KV_REST_API_URL: ${{ secrets.KV_REST_URL }}           # <-- mapirano na tvoj secret
       KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN }}
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL }}
@@ -275,7 +275,7 @@ jobs:
     if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 21 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'apply_late' || github.event.inputs.run == 'settle_today_all')) }}
     runs-on: ubuntu-latest
     env:
-      KV_REST_API_URL: ${{ secrets.KV_REST_API_URL }}
+      KV_REST_API_URL: ${{ secrets.KV_REST_URL }}           # <-- mapirano na tvoj secret
       KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN }}
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL }}
@@ -367,7 +367,7 @@ jobs:
     if: ${{ (github.event_name == 'schedule' && github.event.schedule == '20 0 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'nightly_learn' || github.event.inputs.run == 'settle_custom')) }}
     runs-on: ubuntu-latest
     env:
-      KV_REST_API_URL: ${{ secrets.KV_REST_API_URL }}
+      KV_REST_API_URL: ${{ secrets.KV_REST_URL }}           # <-- mapirano na tvoj secret
       KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN }}
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL }}
