@@ -10,14 +10,33 @@ on:
     - cron: "0 9 * * *"    # ≈ 11:00 Belgrade (AM apply)
     - cron: "0 14 * * *"   # ≈ 16:00 Belgrade (PM apply)
     - cron: "0 21 * * *"   # ≈ 23:00 Belgrade (LATE apply)
-    # NIGHTLY LEARN (UTC) — SETTLE za JUČE (zadrzali smo tvoj originalni termin)
+    # NIGHTLY LEARN (UTC) — SETTLE za JUČE (zadržali smo tvoj originalni termin)
     - cron: "20 0 * * *"   # ≈ 02:20 Belgrade
   workflow_dispatch:
+    inputs:
+      run:
+        description: "Koji job da pokrenem"
+        type: choice
+        required: true
+        options:
+          - rebuild_am
+          - rebuild_pm
+          - rebuild_late
+          - apply_am
+          - apply_pm
+          - apply_late
+          - nightly_learn
+          - settle_today_all
+          - settle_custom
+        default: settle_today_all
+      ymd:
+        description: "Datum za settle (YYYY-MM-DD). Koristi se kad je run=settle_custom"
+        required: false
+        type: string
 
 env:
   BASE: ${{ secrets.BASE_URL }}
   FALLBACK_BASE: https://predictscores.vercel.app
-  # zadržano iz originala (nije obavezno za novi settle, ali ne smeta)
   LEARN_MINN: 10
   LEARN_Q: 0.35
 
@@ -30,7 +49,7 @@ jobs:
   # REBUILD — AM
   # -------------------------
   rebuild_am:
-    if: ${{ github.event_name == 'schedule' && github.event.schedule == '55 8 * * *' }}
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '55 8 * * *') || (github.event_name == 'workflow_dispatch' && github.event.inputs.run == 'rebuild_am') }}
     runs-on: ubuntu-latest
     steps:
       - name: Rebuild AM
@@ -43,7 +62,7 @@ jobs:
   # REBUILD — PM
   # -------------------------
   rebuild_pm:
-    if: ${{ github.event_name == 'schedule' && github.event.schedule == '55 13 * * *' }}
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '55 13 * * *') || (github.event_name == 'workflow_dispatch' && github.event.inputs.run == 'rebuild_pm') }}
     runs-on: ubuntu-latest
     steps:
       - name: Rebuild PM
@@ -56,7 +75,7 @@ jobs:
   # REBUILD — LATE
   # -------------------------
   rebuild_late:
-    if: ${{ github.event_name == 'schedule' && github.event.schedule == '55 20 * * *' }}
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '55 20 * * *') || (github.event_name == 'workflow_dispatch' && github.event.inputs.run == 'rebuild_late') }}
     runs-on: ubuntu-latest
     steps:
       - name: Rebuild LATE
@@ -69,7 +88,7 @@ jobs:
   # APPLY-LEARNING — AM (SETTLE TODAY)
   # -------------------------
   apply_am:
-    if: ${{ github.event_name == 'schedule' && github.event.schedule == '0 9 * * *' }}
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 9 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'apply_am' || github.event.inputs.run == 'settle_today_all')) }}
     runs-on: ubuntu-latest
     env:
       KV_REST_API_URL: ${{ secrets.KV_REST_API_URL }}
@@ -161,7 +180,7 @@ jobs:
   # APPLY-LEARNING — PM (SETTLE TODAY)
   # -------------------------
   apply_pm:
-    if: ${{ github.event_name == 'schedule' && github.event.schedule == '0 14 * * *' }}
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 14 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'apply_pm' || github.event.inputs.run == 'settle_today_all')) }}
     runs-on: ubuntu-latest
     env:
       KV_REST_API_URL: ${{ secrets.KV_REST_API_URL }}
@@ -253,7 +272,7 @@ jobs:
   # APPLY-LEARNING — LATE (SETTLE TODAY)
   # -------------------------
   apply_late:
-    if: ${{ github.event_name == 'schedule' && github.event.schedule == '0 21 * * *' }}
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 21 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'apply_late' || github.event.inputs.run == 'settle_today_all')) }}
     runs-on: ubuntu-latest
     env:
       KV_REST_API_URL: ${{ secrets.KV_REST_API_URL }}
@@ -342,10 +361,10 @@ jobs:
           NODE
 
   # -------------------------
-  # NIGHTLY LEARN — SETTLE YESTERDAY
+  # NIGHTLY LEARN — SETTLE YESTERDAY (ili custom)
   # -------------------------
   nightly_learn:
-    if: ${{ github.event_name == 'schedule' && github.event.schedule == '20 0 * * *' }}
+    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '20 0 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'nightly_learn' || github.event.inputs.run == 'settle_custom')) }}
     runs-on: ubuntu-latest
     env:
       KV_REST_API_URL: ${{ secrets.KV_REST_API_URL }}
@@ -353,13 +372,17 @@ jobs:
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL }}
     steps:
-      - name: Izračunaj YMD (juče u Europe/Belgrade)
+      - name: Izračunaj YMD
         id: when
         run: |
-          TZ=Europe/Belgrade date -d "yesterday" +%F > ymd.txt || date -v-1d +%F > ymd.txt
-          echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.run }}" = "settle_custom" ] && [ -n "${{ github.event.inputs.ymd }}" ]; then
+            echo "ymd=${{ github.event.inputs.ymd }}" >> $GITHUB_OUTPUT
+          else
+            TZ=Europe/Belgrade date -d "yesterday" +%F > ymd.txt || date -v-1d +%F > ymd.txt
+            echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Settle YESTERDAY (glavna kalibracija vb:cal:v1)
+      - name: Settle (vb:day:$YMD:union -> vb:cal:v1)
         env:
           YMD: ${{ steps.when.outputs.ymd }}
         run: |
