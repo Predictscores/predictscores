@@ -6,22 +6,20 @@ on:
     - cron: "55 8 * * *"   # ≈ 10:55 Belgrade (AM)
     - cron: "55 13 * * *"  # ≈ 15:55 Belgrade (PM)
     - cron: "55 20 * * *"  # ≈ 22:55 Belgrade (LATE)
-    # APPLY-LEARNING 5 min posle svakog REBUILD-a (sada radi settle za TEKUĆI dan)
-    - cron: "0 9 * * *"    # ≈ 11:00 Belgrade (AM apply -> settle TODAY)
-    - cron: "0 14 * * *"   # ≈ 16:00 Belgrade (PM apply -> settle TODAY)
-    - cron: "0 21 * * *"   # ≈ 23:00 Belgrade (LATE apply -> settle TODAY)
-    # NIGHTLY SETTLE (glavni learning) (UTC)
-    - cron: "30 22 * * *"  # ≈ 00:30 Belgrade (juče)
+    # APPLY-LEARNING 5 min posle svakog REBUILD-a (UTC) — sada radi SETTLE za TEKUĆI dan
+    - cron: "0 9 * * *"    # ≈ 11:00 Belgrade (AM apply)
+    - cron: "0 14 * * *"   # ≈ 16:00 Belgrade (PM apply)
+    - cron: "0 21 * * *"   # ≈ 23:00 Belgrade (LATE apply)
+    # NIGHTLY LEARN (UTC) — SETTLE za JUČE (zadrzali smo tvoj originalni termin)
+    - cron: "20 0 * * *"   # ≈ 02:20 Belgrade
   workflow_dispatch:
-    inputs:
-      ymd:
-        description: 'Ručni settle za datum (YYYY-MM-DD). Prazno = juče po Europe/Belgrade'
-        required: false
-        type: string
 
 env:
   BASE: ${{ secrets.BASE_URL }}
   FALLBACK_BASE: https://predictscores.vercel.app
+  # zadržano iz originala (nije obavezno za novi settle, ali ne smeta)
+  LEARN_MINN: 10
+  LEARN_Q: 0.35
 
 concurrency:
   group: learning-slots
@@ -68,7 +66,7 @@ jobs:
           curl -fsS "$B/api/cron/rebuild?slot=late"
 
   # -------------------------
-  # APPLY-LEARNING — AM (settle TODAY)
+  # APPLY-LEARNING — AM (SETTLE TODAY)
   # -------------------------
   apply_am:
     if: ${{ github.event_name == 'schedule' && github.event.schedule == '0 9 * * *' }}
@@ -84,7 +82,8 @@ jobs:
         run: |
           TZ=Europe/Belgrade date +%F > ymd.txt || date +%F > ymd.txt
           echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
-      - name: Settle TODAY (može biti no-op ako nema završnih mečeva)
+
+      - name: Settle TODAY (može biti no-op ako nema FT mečeva)
         env:
           YMD: ${{ steps.when.outputs.ymd }}
         run: |
@@ -102,12 +101,12 @@ jobs:
             if (!ymd) fail("Missing YMD");
 
             const kvGet = async (key) => {
-              const r = await fetch(`${KV.replace(/\/+$/,"")}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
+              const r = await fetch(`${KV}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
               if (!r.ok) return null;
               const text = await r.text(); try { return JSON.parse(text); } catch { return null; }
             };
             const kvSet = async (key, value) => {
-              const r = await fetch(`${KV.replace(/\/+$/,"")}/set/${encodeURIComponent(key)}`, {
+              const r = await fetch(`${KV}/set/${encodeURIComponent(key)}`, {
                 method:"POST", headers:{ Authorization:`Bearer ${KT}`, "Content-Type":"application/json" }, body: JSON.stringify(value)
               });
               if (!r.ok) throw new Error(await r.text());
@@ -121,7 +120,7 @@ jobs:
               if (market === "1X2") { if (pick === "1") return gh > ga ? 1 : 0; if (pick === "X") return gh === ga ? 1 : 0; if (pick === "2") return ga > gh ? 1 : 0; }
               if (market === "BTTS") { const both = (gh > 0 && ga > 0); return pick === "Y" ? (both ? 1 : 0) : (both ? 0 : 1); }
               if (market === "OU2.5") { const over = (gh + ga) >= 3; return pick === "O2.5" ? (over ? 1 : 0) : (over ? 0 : 1); }
-              return null; // HT-FT ne ulazi u kalibraciju
+              return null; // HT-FT ne kalibrišemo
             };
 
             const unionKey = `vb:day:${ymd}:union`;
@@ -159,7 +158,7 @@ jobs:
           NODE
 
   # -------------------------
-  # APPLY-LEARNING — PM (settle TODAY)
+  # APPLY-LEARNING — PM (SETTLE TODAY)
   # -------------------------
   apply_pm:
     if: ${{ github.event_name == 'schedule' && github.event.schedule == '0 14 * * *' }}
@@ -175,29 +174,31 @@ jobs:
         run: |
           TZ=Europe/Belgrade date +%F > ymd.txt || date +%F > ymd.txt
           echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
-      - name: Settle TODAY (može biti no-op)
+
+      - name: Settle TODAY (može biti no-op ako nema FT mečeva)
         env:
           YMD: ${{ steps.when.outputs.ymd }}
         run: |
           node <<'NODE'
-          // identičan kod kao u apply_am
           (async () => {
             const KV = process.env.KV_REST_API_URL;
             const KT = process.env.KV_REST_API_TOKEN;
             const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
             const API_KEY = process.env.API_FOOTBALL_KEY;
             const ymd = process.env.YMD;
+
             function fail(msg){ console.error(msg); process.exit(1); }
             if (!KV || !KT) fail("Missing KV_REST_API_URL or KV_REST_API_TOKEN");
             if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
             if (!ymd) fail("Missing YMD");
+
             const kvGet = async (key) => {
-              const r = await fetch(`${KV.replace(/\/+$/,"")}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
+              const r = await fetch(`${KV}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
               if (!r.ok) return null;
               const text = await r.text(); try { return JSON.parse(text); } catch { return null; }
             };
             const kvSet = async (key, value) => {
-              const r = await fetch(`${KV.replace(/\/+$/,"")}/set/${encodeURIComponent(key)}`, {
+              const r = await fetch(`${KV}/set/${encodeURIComponent(key)}`, {
                 method:"POST", headers:{ Authorization:`Bearer ${KT}`, "Content-Type":"application/json" }, body: JSON.stringify(value)
               });
               if (!r.ok) throw new Error(await r.text());
@@ -213,33 +214,35 @@ jobs:
               if (market === "OU2.5") { const over = (gh + ga) >= 3; return pick === "O2.5" ? (over ? 1 : 0) : (over ? 0 : 1); }
               return null;
             };
+
             const unionKey = `vb:day:${ymd}:union`;
             const union = await kvGet(unionKey) || [];
             if (!Array.isArray(union) || union.length === 0) { console.log(JSON.stringify({ ok:true, ymd, updated:false, reason:"no-picks" })); return; }
+
             const fj = await af(`/fixtures?date=${encodeURIComponent(ymd)}`);
             const map = new Map();
             for (const r of (fj.response || [])) {
               const id = r?.fixture?.id; if (!id) continue;
               map.set(id, { gh: Number(r?.goals?.home), ga: Number(r?.goals?.away), st: String(r?.fixture?.status?.short || "").toUpperCase() });
             }
+
             const calKey = "vb:cal:v1";
             const cal = await kvGet(calKey) || {};
             let touched = 0;
+
             for (const p of union) {
               const fxid = p?.fixture_id; if (!fxid) continue;
               const r = map.get(fxid); if (!r) continue;
               if (!/^FT|AET|PEN$/.test(r.st || "")) continue;
               const M = String(p?.market || "").toUpperCase();
               const P = String(p?.pick_code || "").toUpperCase();
+              const w = win(M, P, r.gh, r.ga); if (w == null) continue;
               const mp = Math.max(0, Math.min(1, Number(p?.model_prob) || 0));
-              const b = (gh,ga)=>{ if(M==="1X2"){ if(P==="1")return gh>ga?1:0; if(P==="X")return gh===ga?1:0; if(P==="2")return ga>gh?1:0; }
-                                   if(M==="BTTS"){ const both=(gh>0&&ga>0); return P==="Y"?(both?1:0):(both?0:1); }
-                                   if(M==="OU2.5"){ const over=(gh+ga)>=3; return P==="O2.5"?(over?1:0):(over?0:1); } return null; };
-              const w = b(r.gh, r.ga); if (w == null) continue;
               cal[M] = cal[M] || {};
               const node = cal[M][P] = cal[M][P] || { n: 0, wins: 0, sum_p: 0 };
               node.n += 1; node.wins += w; node.sum_p += mp; touched++;
             }
+
             if (!touched) { console.log(JSON.stringify({ ok:true, ymd, updated:false, reason:"no-final-matches" })); return; }
             await kvSet(calKey, cal);
             console.log(JSON.stringify({ ok:true, ymd, updated:true, touched }));
@@ -247,7 +250,7 @@ jobs:
           NODE
 
   # -------------------------
-  # APPLY-LEARNING — LATE (settle TODAY)
+  # APPLY-LEARNING — LATE (SETTLE TODAY)
   # -------------------------
   apply_late:
     if: ${{ github.event_name == 'schedule' && github.event.schedule == '0 21 * * *' }}
@@ -263,64 +266,8 @@ jobs:
         run: |
           TZ=Europe/Belgrade date +%F > ymd.txt || date +%F > ymd.txt
           echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
-      - name: Settle TODAY (može biti no-op)
-        env:
-          YMD: ${{ steps.when.outputs.ymd }}
-        run: |
-          node <<'NODE'
-          // isti settle kod kao gore (skraćeno radi preglednosti)
-          (async () => {
-            const KV = process.env.KV_REST_API_URL;
-            const KT = process.env.KV_REST_API_TOKEN;
-            const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
-            const API_KEY = process.env.API_FOOTBALL_KEY;
-            const ymd = process.env.YMD;
-            if (!KV || !KT || !API_KEY || !ymd) { console.error("Missing env"); process.exit(1); }
-            const kvGet = async (k)=>{ const r=await fetch(`${KV}/get/${encodeURIComponent(k)}`,{headers:{Authorization:`Bearer ${KT}`}}); if(!r.ok)return null; try{return await r.json();}catch{return null;} };
-            const kvSet = async (k,v)=>{ const r=await fetch(`${KV}/set/${encodeURIComponent(k)}`,{method:"POST",headers:{Authorization:`Bearer ${KT}`,"Content-Type":"application/json"},body:JSON.stringify(v)}); if(!r.ok) throw new Error(await r.text()); };
-            const af = async (p)=>{ const r=await fetch(`${API_BASE}${p}`,{headers:{"x-apisports-key":API_KEY,"x-rapidapi-key":API_KEY}}); const t=await r.text(); if(!r.ok) throw new Error(t||r.statusText); return JSON.parse(t); };
-            const win=(M,P,gh,ga)=>{ if(!Number.isFinite(gh)||!Number.isFinite(ga)) return null;
-              if(M==="1X2"){ if(P==="1")return gh>ga?1:0; if(P==="X")return gh===ga?1:0; if(P==="2")return ga>gh?1:0; }
-              if(M==="BTTS"){ const b=(gh>0&&ga>0); return P==="Y"?(b?1:0):(b?0:1); }
-              if(M==="OU2.5"){ const over=(gh+ga)>=3; return P==="O2.5"?(over?1:0):(over?0:1); } return null; };
-            const union = await kvGet(`vb:day:${ymd}:union`) || [];
-            if(!Array.isArray(union) || !union.length){ console.log(JSON.stringify({ ok:true, ymd, updated:false, reason:"no-picks" })); return; }
-            const fj = await af(`/fixtures?date=${encodeURIComponent(ymd)}`);
-            const map = new Map((fj.response||[]).map(r=>[r?.fixture?.id,{gh:+r?.goals?.home,ga:+r?.goals?.away,st:String(r?.fixture?.status?.short||"").toUpperCase()}]));
-            const calKey="vb:cal:v1"; const cal=await kvGet(calKey)||{}; let touched=0;
-            for(const p of union){ const r=map.get(p?.fixture_id); if(!r) continue; if(!/^FT|AET|PEN$/.test(r.st||"")) continue;
-              const M=String(p?.market||"").toUpperCase(), P=String(p?.pick_code||"").toUpperCase();
-              const w=win(M,P,r.gh,r.ga); if(w==null) continue;
-              const mp=Math.max(0,Math.min(1,Number(p?.model_prob)||0));
-              cal[M]=cal[M]||{}; const node=cal[M][P]=cal[M][P]||{n:0,wins:0,sum_p:0};
-              node.n++; node.wins+=w; node.sum_p+=mp; touched++; }
-            if(!touched){ console.log(JSON.stringify({ ok:true, ymd, updated:false, reason:"no-final-matches" })); return; }
-            await kvSet(calKey,cal); console.log(JSON.stringify({ ok:true, ymd, updated:true, touched }));
-          })().catch(e=>{ console.error(e); process.exit(1); });
-          NODE
 
-  # -------------------------
-  # NIGHTLY SETTLE — glavna kalibracija (JUČE)
-  # -------------------------
-  nightly_learn:
-    if: ${{ (github.event_name == 'schedule' && github.event.schedule == '30 22 * * *') || github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
-    env:
-      KV_REST_API_URL: ${{ secrets.KV_REST_API_URL }}
-      KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN }}
-      API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
-      API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL }}
-    steps:
-      - name: Izračunaj YMD (default juče u Europe/Belgrade; override ako je workflow_dispatch sa inputom)
-        id: when
-        run: |
-          if [ -n "${{ github.event.inputs.ymd }}" ]; then
-            echo "ymd=${{ github.event.inputs.ymd }}" >> $GITHUB_OUTPUT
-          else
-            TZ=Europe/Belgrade date -d "yesterday" +%F > ymd.txt || date -v-1d +%F > ymd.txt
-            echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
-          fi
-      - name: Settle YESTERDAY (glavni update vb:cal:v1)
+      - name: Settle TODAY (može biti no-op)
         env:
           YMD: ${{ steps.when.outputs.ymd }}
         run: |
@@ -338,12 +285,12 @@ jobs:
             if (!ymd) fail("Missing YMD");
 
             const kvGet = async (key) => {
-              const r = await fetch(`${KV.replace(/\/+$/,"")}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
+              const r = await fetch(`${KV}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
               if (!r.ok) return null;
               const text = await r.text(); try { return JSON.parse(text); } catch { return null; }
             };
             const kvSet = async (key, value) => {
-              const r = await fetch(`${KV.replace(/\/+$/,"")}/set/${encodeURIComponent(key)}`, {
+              const r = await fetch(`${KV}/set/${encodeURIComponent(key)}`, {
                 method:"POST", headers:{ Authorization:`Bearer ${KT}`, "Content-Type":"application/json" }, body: JSON.stringify(value)
               });
               if (!r.ok) throw new Error(await r.text());
@@ -358,6 +305,98 @@ jobs:
               if (market === "BTTS") { const both = (gh > 0 && ga > 0); return pick === "Y" ? (both ? 1 : 0) : (both ? 0 : 1); }
               if (market === "OU2.5") { const over = (gh + ga) >= 3; return pick === "O2.5" ? (over ? 1 : 0) : (over ? 0 : 1); }
               return null;
+            };
+
+            const unionKey = `vb:day:${ymd}:union`;
+            const union = await kvGet(unionKey) || [];
+            if (!Array.isArray(union) || union.length === 0) { console.log(JSON.stringify({ ok:true, ymd, updated:false, reason:"no-picks" })); return; }
+
+            const fj = await af(`/fixtures?date=${encodeURIComponent(ymd)}`);
+            const map = new Map();
+            for (const r of (fj.response || [])) {
+              const id = r?.fixture?.id; if (!id) continue;
+              map.set(id, { gh: Number(r?.goals?.home), ga: Number(r?.goals?.away), st: String(r?.fixture?.status?.short || "").toUpperCase() });
+            }
+
+            const calKey = "vb:cal:v1";
+            const cal = await kvGet(calKey) || {};
+            let touched = 0;
+
+            for (const p of union) {
+              const fxid = p?.fixture_id; if (!fxid) continue;
+              const r = map.get(fxid); if (!r) continue;
+              if (!/^FT|AET|PEN$/.test(r.st || "")) continue;
+              const M = String(p?.market || "").toUpperCase();
+              const P = String(p?.pick_code || "").toUpperCase();
+              const w = win(M, P, r.gh, r.ga); if (w == null) continue;
+              const mp = Math.max(0, Math.min(1, Number(p?.model_prob) || 0));
+              cal[M] = cal[M] || {};
+              const node = cal[M][P] = cal[M][P] || { n: 0, wins: 0, sum_p: 0 };
+              node.n += 1; node.wins += w; node.sum_p += mp; touched++;
+            }
+
+            if (!touched) { console.log(JSON.stringify({ ok:true, ymd, updated:false, reason:"no-final-matches" })); return; }
+            await kvSet(calKey, cal);
+            console.log(JSON.stringify({ ok:true, ymd, updated:true, touched }));
+          })().catch(err => { console.error(err); process.exit(1); });
+          NODE
+
+  # -------------------------
+  # NIGHTLY LEARN — SETTLE YESTERDAY
+  # -------------------------
+  nightly_learn:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '20 0 * * *' }}
+    runs-on: ubuntu-latest
+    env:
+      KV_REST_API_URL: ${{ secrets.KV_REST_API_URL }}
+      KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN }}
+      API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+      API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL }}
+    steps:
+      - name: Izračunaj YMD (juče u Europe/Belgrade)
+        id: when
+        run: |
+          TZ=Europe/Belgrade date -d "yesterday" +%F > ymd.txt || date -v-1d +%F > ymd.txt
+          echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
+
+      - name: Settle YESTERDAY (glavna kalibracija vb:cal:v1)
+        env:
+          YMD: ${{ steps.when.outputs.ymd }}
+        run: |
+          node <<'NODE'
+          (async () => {
+            const KV = process.env.KV_REST_API_URL;
+            const KT = process.env.KV_REST_API_TOKEN;
+            const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
+            const API_KEY = process.env.API_FOOTBALL_KEY;
+            const ymd = process.env.YMD;
+
+            function fail(msg){ console.error(msg); process.exit(1); }
+            if (!KV || !KT) fail("Missing KV_REST_API_URL or KV_REST_API_TOKEN");
+            if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
+            if (!ymd) fail("Missing YMD");
+
+            const kvGet = async (key) => {
+              const r = await fetch(`${KV}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
+              if (!r.ok) return null;
+              const text = await r.text(); try { return JSON.parse(text); } catch { return null; }
+            };
+            const kvSet = async (key, value) => {
+              const r = await fetch(`${KV}/set/${encodeURIComponent(key)}`, {
+                method:"POST", headers:{ Authorization:`Bearer ${KT}`, "Content-Type":"application/json" }, body: JSON.stringify(value)
+              });
+              if (!r.ok) throw new Error(await r.text());
+            };
+            const af = async (path) => {
+              const r = await fetch(`${API_BASE}${path}`, { headers:{ "x-apisports-key": API_KEY, "x-rapidapi-key": API_KEY } });
+              const text = await r.text(); if (!r.ok) throw new Error(text || r.statusText); return JSON.parse(text);
+            };
+            const win = (market, pick, gh, ga) => {
+              if (!Number.isFinite(gh) || !Number.isFinite(ga)) return null;
+              if (market === "1X2") { if (pick === "1") return gh > ga ? 1 : 0; if (pick === "X") return gh === ga ? 1 : 0; if (pick === "2") return ga > gh ? 1 : 0; }
+              if (market === "BTTS") { const both = (gh > 0 && ga > 0); return pick === "Y" ? (both ? 1 : 0) : (both ? 0 : 1); }
+              if (market === "OU2.5") { const over = (gh + ga) >= 3; return pick === "O2.5" ? (over ? 1 : 0) : (over ? 0 : 1); }
+              return null; // HT-FT ne kalibrišemo
             };
 
             const unionKey = `vb:day:${ymd}:union`;
