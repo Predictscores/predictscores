@@ -3,8 +3,8 @@
 // - čita /api/value-bets-locked?slot=… (ne menja je)
 // - prikači META iz KV (što je /api/cron/enrich već upisao)
 // - blago koriguje confidence (±1–3 p.p.) na osnovu injuries + H2H%
-// - izračuna EV iz p_eff i izabere do 2 top tržišta po meču
-// - globalno preseče na ~15 (možeš promeniti LIMIT_TOP)
+// - izračuna EV iz p_eff i izabere globalno najbolje (bez per-fixture limita)
+// - globalno preseče na ~15 (LIMIT_TOP)
 // Bezbedno: read-only, ne piše u KV, ne dira postojeće liste/EV u bazi.
 
 function toRestBase(s) {
@@ -134,9 +134,9 @@ export default async function handler(req, res) {
         confAdj = clamp(confAdj + adjPP, 30, 85);
       }
 
-      // EV iz p_eff (koristimo model_prob kao osnovu; ne diramo ga, ovo je lokalni p_eff)
+      // EV iz p_eff (koristimo model_prob kao osnovu; ovo je lokalni p_eff)
       const p_model = Number(it?.model_prob) || 0;
-      const p_eff = clamp(p_model + (adjPP / 100), 0, 1); // pretvori p.p. u apsolutnu promenu
+      const p_eff = clamp(p_model + (adjPP / 100), 0, 1); // p.p. → apsolutno
       const price = Number(it?.odds?.price) || NaN;
       const books = Number(it?.odds?.books_count) || 0;
 
@@ -147,7 +147,7 @@ export default async function handler(req, res) {
         _confidence_pct_adj: confAdj,
         _p_eff: p_eff,
         _ev_eff: Number.isFinite(price) ? (price * p_eff - 1) : -Infinity,
-        _books_ok: books >= 3,
+        _books_ok: books >= 2,                // <<< prag spušten: 2 (pre je bilo 3)
         _price_ok: priceCapOK(String(it.market).toUpperCase(), price),
       });
     }
@@ -155,24 +155,10 @@ export default async function handler(req, res) {
     // 3) Filtri & rangiranje
     const filtered = enriched.filter(x => x._books_ok && x._price_ok);
 
-    // per-fixture top-2 po EV
-    const byFixture = new Map();
-    for (const x of filtered) {
-      const k = x.fixture_id || `${x.home} vs ${x.away}`;
-      const arr = byFixture.get(k) || [];
-      arr.push(x);
-      byFixture.set(k, arr);
-    }
-    const pickPerFixture = [];
-    for (const [k, arr] of byFixture.entries()) {
-      arr.sort((a,b) => (b._ev_eff - a._ev_eff));
-      pickPerFixture.push(...arr.slice(0, 2)); // max 2 tržišta po meču
-    }
-
-    // globalno top N (možeš podesiti LIMIT_TOP)
+    // UKINUT per-fixture limit: svi marketi konkurišu globalno
     const LIMIT_TOP = 15;
-    pickPerFixture.sort((a,b) => (b._ev_eff - a._ev_eff));
-    const chosen = pickPerFixture.slice(0, LIMIT_TOP);
+    filtered.sort((a,b) => (b._ev_eff - a._ev_eff));
+    const chosen = filtered.slice(0, LIMIT_TOP);
 
     // 4) Očisti pomoćna polja u izlazu (ostavimo _ev_eff i _confidence_pct_adj radi transparentnosti)
     const out = chosen.map(it => ({
