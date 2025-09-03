@@ -1,7 +1,7 @@
 // pages/api/cron/enrich.js
 // Enrichment za zaključane predloge (stats / injuries / H2H -> meta u KV)
-// SADA: uvek upišemo meta zapis (stub) čak i kad fale ID/season,
-//       kako bi value-bets-meta mogla da prikači `meta` za sve stavke.
+// UVEK pišemo meta (stub kad fale ID/season), a kad imamo H2H,
+// izračunamo procentualne “hintove” (over2_5_pct, btts_pct, draw_pct).
 // Bezbedno: ne menja liste; samo piše meta ključeve.
 
 const { afxTeamStats, afxInjuries, afxH2H } = require("../../../lib/sources/apiFootball");
@@ -16,7 +16,6 @@ function toRestBase(s) {
 }
 const KV_BASE_RAW = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
 const KV_BASE = toRestBase(KV_BASE_RAW);
-// Preferiramo write token; ako ga nema, probaće sa RO (Upstash će odbiti, ali bez lomljenja)
 const KV_TOKEN = (process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || "").trim();
 
 async function kvGet(key) {
@@ -47,6 +46,11 @@ function ymdBelgrade(d = new Date()) {
   return d.toLocaleString("sv-SE", { timeZone: "Europe/Belgrade" }).slice(0, 10);
 }
 
+function isFinalStatus(s) {
+  const x = String(s || "").toUpperCase();
+  return /^FT|AET|PEN$/.test(x);
+}
+
 export default async function handler(req, res) {
   try {
     const { slot = "am" } = req.query || {};
@@ -59,7 +63,7 @@ export default async function handler(req, res) {
     const items = Array.isArray(data?.items) ? data.items : [];
 
     if (!items.length) {
-      return res.status(200).json({ ok: true, slot, ymd, enriched: 0, reason: "no-items" });
+      return res.status(200).json({ ok: true, slot, ymd, enriched: 0, enriched_full: 0, stubbed: 0, reason: "no-items" });
     }
 
     let enriched = 0;        // ukupno zapisanih meta (stub + full)
@@ -68,7 +72,6 @@ export default async function handler(req, res) {
     const metaKeys = [];
     const metaListKey = `vb:meta:list:${ymd}:${slot}`;
 
-    // 2) Obrada svakog picka
     for (const p of items) {
       try {
         const fixture_id = p?.fixture_id;
@@ -77,7 +80,8 @@ export default async function handler(req, res) {
         const leagueId = p?.league?.id || p?.league_id;
         const season = p?.league?.season || p?.season;
 
-        // Osnovni “header” meta zapisa (uvek prisutan)
+        if (!fixture_id) continue; // bez stabilnog ID-a nema ključa
+
         const baseMeta = {
           ts: Date.now(),
           market: p?.market,
@@ -87,18 +91,14 @@ export default async function handler(req, res) {
           season,
         };
 
-        // Ako nema fixture_id — ne možemo stabilno da indeksiramo -> preskačemo
-        if (!fixture_id) continue;
-
-        let meta;
+        // STUB meta ako fale identifikatori
         if (!homeId || !awayId || !leagueId || !season) {
-          // 2a) STUB meta (fale identifikatori/season)
-          meta = {
+          const meta = {
             ...baseMeta,
             reason: "missing_ids",
             stats: { haveHome: false, haveAway: false },
             injuries: { homeCount: 0, awayCount: 0 },
-            h2h: { have: false, count: 0 },
+            h2h: { have: false, count: 0, over2_5_pct: 0, btts_pct: 0, draw_pct: 0 },
             confidence_adj_pp: 0,
           };
           const ok = await kvSet(`vb:meta:${ymd}:${slot}:${fixture_id}`, meta);
@@ -106,7 +106,7 @@ export default async function handler(req, res) {
           continue;
         }
 
-        // 2b) Puni enrichment (sa wrapper-om: keš + budžet)
+        // Puni enrichment
         const [statsH, statsA, injH, injA, h2h] = await Promise.all([
           afxTeamStats(leagueId, homeId, season).catch(() => null),
           afxTeamStats(leagueId, awayId, season).catch(() => null),
@@ -115,40 +115,50 @@ export default async function handler(req, res) {
           afxH2H(homeId, awayId, 10).catch(() => null),
         ]);
 
-        meta = {
+        // H2H procente računamo lokalno (bezbedno)
+        let h2hCount = 0, over25 = 0, btts = 0, draws = 0;
+        const H = Array.isArray(h2h?.response) ? h2h.response : [];
+        for (const m of H) {
+          const st = m?.fixture?.status?.short;
+          const gh = Number(m?.goals?.home);
+          const ga = Number(m?.goals?.away);
+          if (!isFinalStatus(st) || !Number.isFinite(gh) || !Number.isFinite(ga)) continue;
+          h2hCount++;
+          if (gh + ga >= 3) over25++;
+          if (gh > 0 && ga > 0) btts++;
+          if (gh === ga) draws++;
+        }
+        const pct = (num, den) => (den > 0 ? Math.round((100 * num) / den) : 0);
+
+        const meta = {
           ...baseMeta,
-          stats: { haveHome: !!statsH, haveAway: !!statsA },
+          stats: { haveHome: !!statsH, haveAway: !!statsA }, // i dalje lagano; ne uvlačimo celu statistiku
           injuries: {
             homeCount: Array.isArray(injH?.response) ? injH.response.length : 0,
             awayCount: Array.isArray(injA?.response) ? injA.response.length : 0,
           },
           h2h: {
-            have: !!(Array.isArray(h2h?.response) && h2h.response.length),
-            count: Array.isArray(h2h?.response) ? h2h.response.length : 0,
+            have: h2hCount > 0,
+            count: h2hCount,
+            over2_5_pct: pct(over25, h2hCount),
+            btts_pct: pct(btts, h2hCount),
+            draw_pct: pct(draws, h2hCount),
           },
           confidence_adj_pp: 0,
         };
 
         const ok = await kvSet(`vb:meta:${ymd}:${slot}:${fixture_id}`, meta);
         if (ok) { enriched++; enriched_full++; metaKeys.push(`vb:meta:${ymd}:${slot}:${fixture_id}`); }
-      } catch (_) {
+      } catch {
         // tiho preskoči pojedinačni fail
       }
     }
 
-    // 3) Zapiši listu meta ključeva radi debug-a (ako išta imamo)
     if (enriched && metaKeys.length) {
       await kvSet(metaListKey, { ymd, slot, keys: metaKeys, n: metaKeys.length, ts: Date.now() });
     }
 
-    return res.status(200).json({
-      ok: true,
-      slot,
-      ymd,
-      enriched,        // ukupno meta zapisa (stub + full)
-      enriched_full,   // koliko je imalo pune podatke
-      stubbed,         // koliko je bilo stubova
-    });
+    return res.status(200).json({ ok: true, slot, ymd, enriched, enriched_full, stubbed });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
