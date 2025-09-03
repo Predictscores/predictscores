@@ -37,12 +37,13 @@ on:
 env:
   BASE: ${{ secrets.BASE_URL || vars.BASE_URL }}
   FALLBACK_BASE: https://predictscores.vercel.app
-  LEARN_MINN: 10
-  LEARN_Q: 0.35
 
 concurrency:
   group: learning-slots
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   # -------------------------
@@ -91,36 +92,40 @@ jobs:
     if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 9 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'apply_am' || github.event.inputs.run == 'settle_today_all')) }}
     runs-on: ubuntu-latest
     env:
-      # BAŠ OVI NAZIVI koje si naveo
       KV_REST_API_URL: ${{ secrets.KV_REST_API_URL || vars.KV_REST_API_URL || secrets.KV_URL || vars.KV_URL }}
       KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN || vars.KV_REST_API_TOKEN || secrets.KV_REST_API_READ_ONLY_TOKEN || vars.KV_REST_API_READ_ONLY_TOKEN }}
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
     steps:
-      - name: Sanity env
-        run: |
-          [ -n "${KV_REST_API_URL:-}" ] && echo "KV_REST_API_URL: SET" || echo "KV_REST_API_URL: MISSING"
-          [ -n "${KV_REST_API_TOKEN:-}" ] && echo "KV_REST_API_TOKEN: SET" || echo "KV_REST_API_TOKEN: MISSING"
-          [ -n "${API_FOOTBALL_KEY:-}" ] && echo "API_FOOTBALL_KEY: SET" || echo "API_FOOTBALL_KEY: MISSING"
       - name: Izračunaj YMD (danas u Europe/Belgrade)
         id: when
         run: |
           TZ=Europe/Belgrade date +%F > ymd.txt || date +%F > ymd.txt
           echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
-      - name: Settle TODAY (može biti no-op)
+      - name: Settle TODAY (vb:day -> vb:cal)
         env:
           YMD: ${{ steps.when.outputs.ymd }}
         run: |
           node <<'NODE'
           (async () => {
-            const KV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
+            const rawKV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
             const KT = (process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || "").trim();
             const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
             const API_KEY = (process.env.API_FOOTBALL_KEY || "").trim();
             const ymd = (process.env.YMD || "").trim();
 
+            function toRestBase(s) {
+              if (!s) return "";
+              if (/^https?:\/\//i.test(s)) return s.replace(/\/+$/,"");
+              const m = s.match(/^rediss?:\/\/[^@]+@([^:/?#]+)(?::\d+)?/i);
+              if (m) return `https://${m[1]}`;
+              return "";
+            }
+            const KV = toRestBase(rawKV);
+
             function fail(msg){ console.error(msg); process.exit(1); }
-            if (!KV || !KT) fail("Missing KV_REST_API_URL/KV_URL or KV token");
+            if (!KV) fail("KV base missing or not HTTP. Provide KV_REST_API_URL=https://... or KV_URL=rediss://...");
+            if (!KT) fail("Missing KV_REST_API_TOKEN / KV_REST_API_READ_ONLY_TOKEN");
             if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
             if (!ymd) fail("Missing YMD");
 
@@ -143,7 +148,7 @@ jobs:
               if (market === "1X2") { if (pick === "1") return gh > ga ? 1 : 0; if (pick === "X") return gh === ga ? 1 : 0; if (pick === "2") return ga > gh ? 1 : 0; }
               if (market === "BTTS") { const b = (gh > 0 && ga > 0); return pick === "Y" ? (b ? 1 : 0) : (b ? 0 : 1); }
               if (market === "OU2.5") { const over = (gh + ga) >= 3; return pick === "O2.5" ? (over ? 1 : 0) : (over ? 0 : 1); }
-              return null; // HT-FT ne kalibrišemo
+              return null;
             };
 
             const unionKey = `vb:day:${ymd}:union`;
@@ -191,30 +196,35 @@ jobs:
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
     steps:
-      - name: Sanity env
-        run: |
-          [ -n "${KV_REST_API_URL:-}" ] && echo "KV_REST_API_URL: SET" || echo "KV_REST_API_URL: MISSING"
-          [ -n "${KV_REST_API_TOKEN:-}" ] && echo "KV_REST_API_TOKEN: SET" || echo "KV_REST_API_TOKEN: MISSING"
-          [ -n "${API_FOOTBALL_KEY:-}" ] && echo "API_FOOTBALL_KEY: SET" || echo "API_FOOTBALL_KEY: MISSING"
       - name: Izračunaj YMD (danas u Europe/Belgrade)
         id: when
         run: |
           TZ=Europe/Belgrade date +%F > ymd.txt || date +%F > ymd.txt
           echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
-      - name: Settle TODAY (može biti no-op)
+      - name: Settle TODAY (vb:day -> vb:cal)
         env:
           YMD: ${{ steps.when.outputs.ymd }}
         run: |
           node <<'NODE'
           (async () => {
-            const KV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
+            const rawKV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
             const KT = (process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || "").trim();
             const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
             const API_KEY = (process.env.API_FOOTBALL_KEY || "").trim();
             const ymd = (process.env.YMD || "").trim();
 
+            function toRestBase(s) {
+              if (!s) return "";
+              if (/^https?:\/\//i.test(s)) return s.replace(/\/+$/,"");
+              const m = s.match(/^rediss?:\/\/[^@]+@([^:/?#]+)(?::\d+)?/i);
+              if (m) return `https://${m[1]}`;
+              return "";
+            }
+            const KV = toRestBase(rawKV);
+
             function fail(msg){ console.error(msg); process.exit(1); }
-            if (!KV || !KT) fail("Missing KV_REST_API_URL/KV_URL or KV token");
+            if (!KV) fail("KV base missing or not HTTP. Provide KV_REST_API_URL=https://... or KV_URL=rediss://...");
+            if (!KT) fail("Missing KV_REST_API_TOKEN / KV_REST_API_READ_ONLY_TOKEN");
             if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
             if (!ymd) fail("Missing YMD");
 
@@ -285,30 +295,35 @@ jobs:
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
     steps:
-      - name: Sanity env
-        run: |
-          [ -n "${KV_REST_API_URL:-}" ] && echo "KV_REST_API_URL: SET" || echo "KV_REST_API_URL: MISSING"
-          [ -n "${KV_REST_API_TOKEN:-}" ] && echo "KV_REST_API_TOKEN: SET" || echo "KV_REST_API_TOKEN: MISSING"
-          [ -n "${API_FOOTBALL_KEY:-}" ] && echo "API_FOOTBALL_KEY: SET" || echo "API_FOOTBALL_KEY: MISSING"
       - name: Izračunaj YMD (danas u Europe/Belgrade)
         id: when
         run: |
           TZ=Europe/Belgrade date +%F > ymd.txt || date +%F > ymd.txt
           echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
-      - name: Settle TODAY (može biti no-op)
+      - name: Settle TODAY (vb:day -> vb:cal)
         env:
           YMD: ${{ steps.when.outputs.ymd }}
         run: |
           node <<'NODE'
           (async () => {
-            const KV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
+            const rawKV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
             const KT = (process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || "").trim();
             const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
             const API_KEY = (process.env.API_FOOTBALL_KEY || "").trim();
             const ymd = (process.env.YMD || "").trim();
 
+            function toRestBase(s) {
+              if (!s) return "";
+              if (/^https?:\/\//i.test(s)) return s.replace(/\/+$/,"");
+              const m = s.match(/^rediss?:\/\/[^@]+@([^:/?#]+)(?::\d+)?/i);
+              if (m) return `https://${m[1]}`;
+              return "";
+            }
+            const KV = toRestBase(rawKV);
+
             function fail(msg){ console.error(msg); process.exit(1); }
-            if (!KV || !KT) fail("Missing KV_REST_API_URL/KV_URL or KV token");
+            if (!KV) fail("KV base missing or not HTTP. Provide KV_REST_API_URL=https://... or KV_URL=rediss://...");
+            if (!KT) fail("Missing KV_REST_API_TOKEN / KV_REST_API_READ_ONLY_TOKEN");
             if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
             if (!ymd) fail("Missing YMD");
 
@@ -379,11 +394,6 @@ jobs:
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
     steps:
-      - name: Sanity env
-        run: |
-          [ -n "${KV_REST_API_URL:-}" ] && echo "KV_REST_API_URL: SET" || echo "KV_REST_API_URL: MISSING"
-          [ -n "${KV_REST_API_TOKEN:-}" ] && echo "KV_REST_API_TOKEN: SET" || echo "KV_REST_API_TOKEN: MISSING"
-          [ -n "${API_FOOTBALL_KEY:-}" ] && echo "API_FOOTBALL_KEY: SET" || echo "API_FOOTBALL_KEY: MISSING"
       - name: Izračunaj YMD (juče ili custom)
         id: when
         run: |
@@ -393,20 +403,30 @@ jobs:
             TZ=Europe/Belgrade date -d "yesterday" +%F > ymd.txt || date -v-1d +%F > ymd.txt
             echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
           fi
-      - name: Settle (vb:day:$YMD:union -> vb:cal:v1)
+      - name: Settle YESTERDAY (vb:day -> vb:cal)
         env:
           YMD: ${{ steps.when.outputs.ymd }}
         run: |
           node <<'NODE'
           (async () => {
-            const KV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
+            const rawKV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
             const KT = (process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || "").trim();
             const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
             const API_KEY = (process.env.API_FOOTBALL_KEY || "").trim();
             const ymd = (process.env.YMD || "").trim();
 
+            function toRestBase(s) {
+              if (!s) return "";
+              if (/^https?:\/\//i.test(s)) return s.replace(/\/+$/,"");
+              const m = s.match(/^rediss?:\/\/[^@]+@([^:/?#]+)(?::\d+)?/i);
+              if (m) return `https://${m[1]}`;
+              return "";
+            }
+            const KV = toRestBase(rawKV);
+
             function fail(msg){ console.error(msg); process.exit(1); }
-            if (!KV || !KT) fail("Missing KV_REST_API_URL/KV_URL or KV token");
+            if (!KV) fail("KV base missing or not HTTP. Provide KV_REST_API_URL=https://... or KV_URL=rediss://...");
+            if (!KT) fail("Missing KV_REST_API_TOKEN / KV_REST_API_READ_ONLY_TOKEN");
             if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
             if (!ymd) fail("Missing YMD");
 
@@ -429,7 +449,7 @@ jobs:
               if (market === "1X2") { if (pick === "1") return gh > ga ? 1 : 0; if (pick === "X") return gh === ga ? 1 : 0; if (pick === "2") return ga > gh ? 1 : 0; }
               if (market === "BTTS") { const b = (gh > 0 && ga > 0); return pick === "Y" ? (b ? 1 : 0) : (b ? 0 : 1); }
               if (market === "OU2.5") { const over = (gh + ga) >= 3; return pick === "O2.5" ? (over ? 1 : 0) : (over ? 0 : 1); }
-              return null; // HT-FT ne kalibrišemo
+              return null;
             };
 
             const unionKey = `vb:day:${ymd}:union`;
