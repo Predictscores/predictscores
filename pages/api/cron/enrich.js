@@ -1,6 +1,8 @@
 // pages/api/cron/enrich.js
 // Enrichment za zaključane predloge (stats / injuries / H2H -> meta u KV)
-// Bezbedno: ne menja postojeće liste, samo dodaje meta ključeve.
+// SADA: uvek upišemo meta zapis (stub) čak i kad fale ID/season,
+//       kako bi value-bets-meta mogla da prikači `meta` za sve stavke.
+// Bezbedno: ne menja liste; samo piše meta ključeve.
 
 const { afxTeamStats, afxInjuries, afxH2H } = require("../../../lib/sources/apiFootball");
 
@@ -14,6 +16,7 @@ function toRestBase(s) {
 }
 const KV_BASE_RAW = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
 const KV_BASE = toRestBase(KV_BASE_RAW);
+// Preferiramo write token; ako ga nema, probaće sa RO (Upstash će odbiti, ali bez lomljenja)
 const KV_TOKEN = (process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || "").trim();
 
 async function kvGet(key) {
@@ -48,11 +51,9 @@ export default async function handler(req, res) {
   try {
     const { slot = "am" } = req.query || {};
     const ymd = ymdBelgrade();
+    const base = process.env.BASE_URL || `https://${req.headers.host || "predictscores.vercel.app"}`;
 
-    // 1) Uzmemo zaključane parove iz postojeće rute (najsigurnije, bez nagađanja ključeva)
-    const base =
-      process.env.BASE_URL ||
-      `https://${req.headers.host || "predictscores.vercel.app"}`;
+    // 1) Zaključani pickovi iz postojeće rute (ne diramo je)
     const r = await fetch(`${base}/api/value-bets-locked?slot=${encodeURIComponent(slot)}`, { cache: "no-store" });
     const data = await r.json().catch(() => ({ items: [] }));
     const items = Array.isArray(data?.items) ? data.items : [];
@@ -61,11 +62,13 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, slot, ymd, enriched: 0, reason: "no-items" });
     }
 
-    let enriched = 0;
-    const metaListKey = `vb:meta:list:${ymd}:${slot}`;
+    let enriched = 0;        // ukupno zapisanih meta (stub + full)
+    let enriched_full = 0;   // meta sa povučenim podacima (stats/inj/h2h)
+    let stubbed = 0;         // stub meta kad fale ID/season
     const metaKeys = [];
+    const metaListKey = `vb:meta:list:${ymd}:${slot}`;
 
-    // 2) Za svaki pick: povuci stats/H2H/injuries (sa TTL kešom iz lib/sources/apiFootball.js)
+    // 2) Obrada svakog picka
     for (const p of items) {
       try {
         const fixture_id = p?.fixture_id;
@@ -74,9 +77,36 @@ export default async function handler(req, res) {
         const leagueId = p?.league?.id || p?.league_id;
         const season = p?.league?.season || p?.season;
 
-        if (!fixture_id || !homeId || !awayId || !leagueId || !season) continue;
+        // Osnovni “header” meta zapisa (uvek prisutan)
+        const baseMeta = {
+          ts: Date.now(),
+          market: p?.market,
+          pick_code: p?.pick_code,
+          teams: { homeId, awayId },
+          leagueId,
+          season,
+        };
 
-        // Povuci podatke (wrapper već radi budžet+keš)
+        // Ako nema fixture_id — ne možemo stabilno da indeksiramo -> preskačemo
+        if (!fixture_id) continue;
+
+        let meta;
+        if (!homeId || !awayId || !leagueId || !season) {
+          // 2a) STUB meta (fale identifikatori/season)
+          meta = {
+            ...baseMeta,
+            reason: "missing_ids",
+            stats: { haveHome: false, haveAway: false },
+            injuries: { homeCount: 0, awayCount: 0 },
+            h2h: { have: false, count: 0 },
+            confidence_adj_pp: 0,
+          };
+          const ok = await kvSet(`vb:meta:${ymd}:${slot}:${fixture_id}`, meta);
+          if (ok) { enriched++; stubbed++; metaKeys.push(`vb:meta:${ymd}:${slot}:${fixture_id}`); }
+          continue;
+        }
+
+        // 2b) Puni enrichment (sa wrapper-om: keš + budžet)
         const [statsH, statsA, injH, injA, h2h] = await Promise.all([
           afxTeamStats(leagueId, homeId, season).catch(() => null),
           afxTeamStats(leagueId, awayId, season).catch(() => null),
@@ -85,18 +115,9 @@ export default async function handler(req, res) {
           afxH2H(homeId, awayId, 10).catch(() => null),
         ]);
 
-        // 3) Sažetak meta signala (bez agresivne logike – bezbedno)
-        const meta = {
-          ts: Date.now(),
-          market: p?.market,
-          pick_code: p?.pick_code,
-          teams: { homeId, awayId },
-          leagueId, season,
-          // samo lightweight info da ne "naduvamo" KV
-          stats: {
-            haveHome: !!statsH, haveAway: !!statsA,
-          },
-            // povrede: broj stavki danas (ako API vrati listu)
+        meta = {
+          ...baseMeta,
+          stats: { haveHome: !!statsH, haveAway: !!statsA },
           injuries: {
             homeCount: Array.isArray(injH?.response) ? injH.response.length : 0,
             awayCount: Array.isArray(injA?.response) ? injA.response.length : 0,
@@ -105,27 +126,29 @@ export default async function handler(req, res) {
             have: !!(Array.isArray(h2h?.response) && h2h.response.length),
             count: Array.isArray(h2h?.response) ? h2h.response.length : 0,
           },
-          // Za sada samo predlažemo 0 korekciju; u sledećem koraku možemo da dodamo ±1–3 p.p.
           confidence_adj_pp: 0,
         };
 
-        const k = `vb:meta:${ymd}:${slot}:${fixture_id}`;
-        const ok = await kvSet(k, meta);
-        if (ok) {
-          enriched += 1;
-          metaKeys.push(k);
-        }
+        const ok = await kvSet(`vb:meta:${ymd}:${slot}:${fixture_id}`, meta);
+        if (ok) { enriched++; enriched_full++; metaKeys.push(`vb:meta:${ymd}:${slot}:${fixture_id}`); }
       } catch (_) {
-        // nastavi dalje, bez bacanja
+        // tiho preskoči pojedinačni fail
       }
     }
 
-    // 4) Zapiši listu meta ključeva radi debug-a
+    // 3) Zapiši listu meta ključeva radi debug-a (ako išta imamo)
     if (enriched && metaKeys.length) {
       await kvSet(metaListKey, { ymd, slot, keys: metaKeys, n: metaKeys.length, ts: Date.now() });
     }
 
-    return res.status(200).json({ ok: true, slot, ymd, enriched });
+    return res.status(200).json({
+      ok: true,
+      slot,
+      ymd,
+      enriched,        // ukupno meta zapisa (stub + full)
+      enriched_full,   // koliko je imalo pune podatke
+      stubbed,         // koliko je bilo stubova
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
