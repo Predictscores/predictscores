@@ -3,46 +3,40 @@ name: Learning & Slots Automation
 on:
   schedule:
     # ---------------------------------------------
-    # LATE (Europe/Belgrade) — REBUILD 00:00 (+ fallback 00:05), APPLY 00:10
-    # CEST (UTC+2) => 00:00 -> 22:00 UTC (preth. dan), 00:05 -> 22:05 UTC, 00:10 -> 22:10 UTC
-    # CET  (UTC+1) => 00:00 -> 23:00 UTC (preth. dan), 00:05 -> 23:05 UTC, 00:10 -> 23:10 UTC
-    # Rebuild LATE @ 00:00 i 00:05 lokalno
+    # LATE (Europe/Belgrade) — REBUILD 00:00 (+ 00:05), APPLY 00:10
+    # CEST (UTC+2) => 00:00 -> 22:00 UTC (prev. day), 00:05 -> 22:05, 00:10 -> 22:10
+    # CET  (UTC+1) => 00:00 -> 23:00 UTC (prev. day), 00:05 -> 23:05, 00:10 -> 23:10
     - cron: "0 22 * * *"
     - cron: "5 22 * * *"
+    - cron: "10 22 * * *"
     - cron: "0 23 * * *"
     - cron: "5 23 * * *"
-    # Apply LATE @ 00:10 lokalno
-    - cron: "10 22 * * *"
     - cron: "10 23 * * *"
 
     # ---------------------------------------------
-    # AM (Europe/Belgrade) — REBUILD 10:00 (+ fallback 10:05), APPLY 10:10
-    # CEST (UTC+2) => 10:00 -> 08:00 UTC, 10:05 -> 08:05 UTC, 10:10 -> 08:10 UTC
-    # CET  (UTC+1) => 10:00 -> 09:00 UTC, 10:05 -> 09:05 UTC, 10:10 -> 09:10 UTC
-    # Rebuild AM @ 10:00 i 10:05 lokalno
+    # AM (Europe/Belgrade) — REBUILD 10:00 (+ 10:05), APPLY 10:10
+    # CEST (UTC+2) => 10:00 -> 08:00 UTC, 10:05 -> 08:05, 10:10 -> 08:10
+    # CET  (UTC+1) => 10:00 -> 09:00 UTC, 10:05 -> 09:05, 10:10 -> 09:10
     - cron: "0 8 * * *"
     - cron: "5 8 * * *"
+    - cron: "10 8 * * *"
     - cron: "0 9 * * *"
     - cron: "5 9 * * *"
-    # Apply AM @ 10:10 lokalno
-    - cron: "10 8 * * *"
     - cron: "10 9 * * *"
 
     # ---------------------------------------------
-    # PM (Europe/Belgrade) — REBUILD 15:00 (+ fallback 15:05), APPLY 15:10
-    # CEST (UTC+2) => 15:00 -> 13:00 UTC, 15:05 -> 13:05 UTC, 15:10 -> 13:10 UTC
-    # CET  (UTC+1) => 15:00 -> 14:00 UTC, 15:05 -> 14:05 UTC, 15:10 -> 14:10 UTC
-    # Rebuild PM @ 15:00 i 15:05 lokalno
+    # PM (Europe/Belgrade) — REBUILD 15:00 (+ 15:05), APPLY 15:10
+    # CEST (UTC+2) => 15:00 -> 13:00 UTC, 15:05 -> 13:05, 15:10 -> 13:10
+    # CET  (UTC+1) => 15:00 -> 14:00 UTC, 15:05 -> 14:05, 15:10 -> 14:10
     - cron: "0 13 * * *"
     - cron: "5 13 * * *"
+    - cron: "10 13 * * *"
     - cron: "0 14 * * *"
     - cron: "5 14 * * *"
-    # Apply PM @ 15:10 lokalno
-    - cron: "10 13 * * *"
     - cron: "10 14 * * *"
 
     # ---------------------------------------------
-    # NIGHTLY LEARN @ 02:20 Europe/Belgrade (ne diramo)
+    # NIGHTLY LEARN @ 02:20 Europe/Belgrade
     # CEST => 00:20 UTC, CET => 01:20 UTC
     - cron: "20 0 * * *"
     - cron: "20 1 * * *"
@@ -101,7 +95,7 @@ jobs:
           curl -fsS "$B/api/cron/rebuild?slot=late"
 
   # ==========================
-  # APPLY — LATE (00:10)
+  # APPLY — LATE (00:10) + ENRICH
   # ==========================
   apply_late:
     runs-on: ubuntu-latest
@@ -118,12 +112,22 @@ jobs:
           NOW=$(TZ=Europe/Belgrade date +%H:%M)
           echo "now=$NOW target=00:10"
           if [ "$NOW" = "00:10" ]; then echo "ok=true" >> $GITHUB_OUTPUT; else echo "ok=false" >> $GITHUB_OUTPUT; fi
+
+      # --- ENRICH PRE LEARN (NOVO) ---
+      - name: Enrich locked picks (LATE)
+        if: steps.guard.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          B="${BASE:-$FALLBACK_BASE}"
+          curl -fsS "$B/api/cron/enrich?slot=late"
+
       - name: YMD (danas, Europe/Belgrade)
         if: steps.guard.outputs.ok == 'true'
         id: when
         run: |
           TZ=Europe/Belgrade date +%F > ymd.txt || date +%F > ymd.txt
           echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
+
       - name: Settle TODAY (vb:day -> vb:cal)
         if: steps.guard.outputs.ok == 'true'
         env:
@@ -236,7 +240,7 @@ jobs:
           curl -fsS "$B/api/cron/rebuild?slot=am"
 
   # ==========================
-  # APPLY — AM (10:10)
+  # APPLY — AM (10:10) + ENRICH
   # ==========================
   apply_am:
     runs-on: ubuntu-latest
@@ -253,12 +257,22 @@ jobs:
           NOW=$(TZ=Europe/Belgrade date +%H:%M)
           echo "now=$NOW target=10:10"
           if [ "$NOW" = "10:10" ]; then echo "ok=true" >> $GITHUB_OUTPUT; else echo "ok=false" >> $GITHUB_OUTPUT; fi
+
+      # --- ENRICH PRE LEARN (NOVO) ---
+      - name: Enrich locked picks (AM)
+        if: steps.guard.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          B="${BASE:-$FALLBACK_BASE}"
+          curl -fsS "$B/api/cron/enrich?slot=am"
+
       - name: YMD (danas, Europe/Belgrade)
         if: steps.guard.outputs.ok == 'true'
         id: when
         run: |
           TZ=Europe/Belgrade date +%F > ymd.txt || date +%F > ymd.txt
           echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
+
       - name: Settle TODAY (vb:day -> vb:cal)
         if: steps.guard.outputs.ok == 'true'
         env:
@@ -371,7 +385,7 @@ jobs:
           curl -fsS "$B/api/cron/rebuild?slot=pm"
 
   # ==========================
-  # APPLY — PM (15:10)
+  # APPLY — PM (15:10) + ENRICH
   # ==========================
   apply_pm:
     runs-on: ubuntu-latest
@@ -388,12 +402,22 @@ jobs:
           NOW=$(TZ=Europe/Belgrade date +%H:%M)
           echo "now=$NOW target=15:10"
           if [ "$NOW" = "15:10" ]; then echo "ok=true" >> $GITHUB_OUTPUT; else echo "ok=false" >> $GITHUB_OUTPUT; fi
+
+      # --- ENRICH PRE LEARN (NOVO) ---
+      - name: Enrich locked picks (PM)
+        if: steps.guard.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          B="${BASE:-$FALLBACK_BASE}"
+          curl -fsS "$B/api/cron/enrich?slot=pm"
+
       - name: YMD (danas, Europe/Belgrade)
         if: steps.guard.outputs.ok == 'true'
         id: when
         run: |
           TZ=Europe/Belgrade date +%F > ymd.txt || date +%F > ymd.txt
           echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
+
       - name: Settle TODAY (vb:day -> vb:cal)
         if: steps.guard.outputs.ok == 'true'
         env:
@@ -486,7 +510,7 @@ jobs:
           NODE
 
   # ==========================
-  # NIGHTLY LEARN — 02:20 (yesterday)
+  # NIGHTLY LEARN — 02:20 (yesterday or custom)
   # ==========================
   nightly_learn:
     runs-on: ubuntu-latest
@@ -507,6 +531,7 @@ jobs:
             echo "now=$NOW target=02:20"
             if [ "$NOW" = "02:20" ]; then echo "ok=true" >> $GITHUB_OUTPUT; else echo "ok=false" >> $GITHUB_OUTPUT; fi
           fi
+
       - name: YMD (yesterday or custom)
         if: steps.guard.outputs.ok == 'true'
         id: when
@@ -517,6 +542,7 @@ jobs:
             TZ=Europe/Belgrade date -d "yesterday" +%F > ymd.txt || date -v-1d +%F > ymd.txt
             echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
           fi
+
       - name: Learn/Settle vb:day:$YMD:union -> vb:cal:v1
         if: steps.guard.outputs.ok == 'true'
         env:
