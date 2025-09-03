@@ -90,8 +90,8 @@ jobs:
   apply_am:
     if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 9 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'apply_am' || github.event.inputs.run == 'settle_today_all')) }}
     runs-on: ubuntu-latest
+    environment: production   # <-- promeni ako ti je environment drugo ime
     env:
-      # Fallback: Secrets ili Variables, i “KV_REST_URL” varijanta
       KV_REST_API_URL: ${{ secrets.KV_REST_URL || vars.KV_REST_URL || secrets.KV_REST_API_URL || vars.KV_REST_API_URL }}
       KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN || vars.KV_REST_API_TOKEN || secrets.UPSTASH_REDIS_REST_TOKEN || vars.UPSTASH_REDIS_REST_TOKEN }}
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
@@ -187,6 +187,7 @@ jobs:
   apply_pm:
     if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 14 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'apply_pm' || github.event.inputs.run == 'settle_today_all')) }}
     runs-on: ubuntu-latest
+    environment: production
     env:
       KV_REST_API_URL: ${{ secrets.KV_REST_URL || vars.KV_REST_URL || secrets.KV_REST_API_URL || vars.KV_REST_API_URL }}
       KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN || vars.KV_REST_API_TOKEN || secrets.UPSTASH_REDIS_REST_TOKEN || vars.UPSTASH_REDIS_REST_TOKEN }}
@@ -283,6 +284,7 @@ jobs:
   apply_late:
     if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 21 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'apply_late' || github.event.inputs.run == 'settle_today_all')) }}
     runs-on: ubuntu-latest
+    environment: production
     env:
       KV_REST_API_URL: ${{ secrets.KV_REST_URL || vars.KV_REST_URL || secrets.KV_REST_API_URL || vars.KV_REST_API_URL }}
       KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN || vars.KV_REST_API_TOKEN || secrets.UPSTASH_REDIS_REST_TOKEN || vars.UPSTASH_REDIS_REST_TOKEN }}
@@ -379,6 +381,7 @@ jobs:
   nightly_learn:
     if: ${{ (github.event_name == 'schedule' && github.event.schedule == '20 0 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'nightly_learn' || github.event.inputs.run == 'settle_custom')) }}
     runs-on: ubuntu-latest
+    environment: production
     env:
       KV_REST_API_URL: ${{ secrets.KV_REST_URL || vars.KV_REST_URL || secrets.KV_REST_API_URL || vars.KV_REST_API_URL }}
       KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN || vars.KV_REST_API_TOKEN || secrets.UPSTASH_REDIS_REST_TOKEN || vars.UPSTASH_REDIS_REST_TOKEN }}
