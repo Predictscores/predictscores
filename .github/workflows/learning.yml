@@ -2,15 +2,15 @@ name: Learning & Slots Automation
 
 on:
   schedule:
-    # REBUILD slotova (UTC)
+    # REBUILD slotovi (UTC)
     - cron: "55 8 * * *"   # ≈ 10:55 Belgrade (AM)
     - cron: "55 13 * * *"  # ≈ 15:55 Belgrade (PM)
     - cron: "55 20 * * *"  # ≈ 22:55 Belgrade (LATE)
-    # APPLY-LEARNING 5 min posle svakog REBUILD-a (UTC) — SETTLE za TEKUĆI dan
+    # APPLY (SETTLE) 5 min posle svakog REBUILD-a (UTC)
     - cron: "0 9 * * *"    # ≈ 11:00 Belgrade (AM apply)
     - cron: "0 14 * * *"   # ≈ 16:00 Belgrade (PM apply)
     - cron: "0 21 * * *"   # ≈ 23:00 Belgrade (LATE apply)
-    # NIGHTLY LEARN (UTC) — SETTLE za JUČE
+    # NIGHTLY LEARN (UTC) — juče
     - cron: "20 0 * * *"   # ≈ 02:20 Belgrade
   workflow_dispatch:
     inputs:
@@ -30,7 +30,7 @@ on:
           - settle_custom
         default: settle_today_all
       ymd:
-        description: "Datum za settle (YYYY-MM-DD). Koristi se kad je run=settle_custom"
+        description: "Datum za settle (YYYY-MM-DD) kada je run=settle_custom"
         required: false
         type: string
 
@@ -85,15 +85,15 @@ jobs:
           curl -fsS "$B/api/cron/rebuild?slot=late"
 
   # -------------------------
-  # APPLY-LEARNING — AM (SETTLE TODAY)
+  # APPLY (SETTLE) — AM (TODAY)
   # -------------------------
   apply_am:
     if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 9 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'apply_am' || github.event.inputs.run == 'settle_today_all')) }}
     runs-on: ubuntu-latest
-    environment: production   # <-- promeni ako ti je environment drugo ime
     env:
-      KV_REST_API_URL: ${{ secrets.KV_REST_URL || vars.KV_REST_URL || secrets.KV_REST_API_URL || vars.KV_REST_API_URL }}
-      KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN || vars.KV_REST_API_TOKEN || secrets.UPSTASH_REDIS_REST_TOKEN || vars.UPSTASH_REDIS_REST_TOKEN }}
+      # BAŠ OVI NAZIVI koje si naveo
+      KV_REST_API_URL: ${{ secrets.KV_REST_API_URL || vars.KV_REST_API_URL || secrets.KV_URL || vars.KV_URL }}
+      KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN || vars.KV_REST_API_TOKEN || secrets.KV_REST_API_READ_ONLY_TOKEN || vars.KV_REST_API_READ_ONLY_TOKEN }}
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
     steps:
@@ -102,33 +102,31 @@ jobs:
           [ -n "${KV_REST_API_URL:-}" ] && echo "KV_REST_API_URL: SET" || echo "KV_REST_API_URL: MISSING"
           [ -n "${KV_REST_API_TOKEN:-}" ] && echo "KV_REST_API_TOKEN: SET" || echo "KV_REST_API_TOKEN: MISSING"
           [ -n "${API_FOOTBALL_KEY:-}" ] && echo "API_FOOTBALL_KEY: SET" || echo "API_FOOTBALL_KEY: MISSING"
-
       - name: Izračunaj YMD (danas u Europe/Belgrade)
         id: when
         run: |
           TZ=Europe/Belgrade date +%F > ymd.txt || date +%F > ymd.txt
           echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
-
       - name: Settle TODAY (može biti no-op)
         env:
           YMD: ${{ steps.when.outputs.ymd }}
         run: |
           node <<'NODE'
           (async () => {
-            const KV = (process.env.KV_REST_API_URL || process.env.KV_REST_URL || process.env.UPSTASH_REDIS_REST_URL || "").trim();
-            const KT = (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || "").trim();
+            const KV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
+            const KT = (process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || "").trim();
             const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
             const API_KEY = (process.env.API_FOOTBALL_KEY || "").trim();
             const ymd = (process.env.YMD || "").trim();
 
             function fail(msg){ console.error(msg); process.exit(1); }
-            if (!KV || !KT) fail("Missing KV_REST_API_URL/KV_REST_URL or KV token");
+            if (!KV || !KT) fail("Missing KV_REST_API_URL/KV_URL or KV token");
             if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
             if (!ymd) fail("Missing YMD");
 
             const kvGet = async (key) => {
               const r = await fetch(`${KV}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
-              if (!r.ok) return null; const text = await r.text(); try { return JSON.parse(text); } catch { return null; }
+              if (!r.ok) return null; const t = await r.text(); try { return JSON.parse(t); } catch { return null; }
             };
             const kvSet = async (key, value) => {
               const r = await fetch(`${KV}/set/${encodeURIComponent(key)}`, {
@@ -138,7 +136,7 @@ jobs:
             };
             const af = async (path) => {
               const r = await fetch(`${API_BASE}${path}`, { headers:{ "x-apisports-key": API_KEY, "x-rapidapi-key": API_KEY } });
-              const text = await r.text(); if (!r.ok) throw new Error(text || r.statusText); return JSON.parse(text);
+              const t = await r.text(); if (!r.ok) throw new Error(t || r.statusText); return JSON.parse(t);
             };
             const win = (market, pick, gh, ga) => {
               if (!Number.isFinite(gh) || !Number.isFinite(ga)) return null;
@@ -182,15 +180,14 @@ jobs:
           NODE
 
   # -------------------------
-  # APPLY-LEARNING — PM (SETTLE TODAY)
+  # APPLY (SETTLE) — PM (TODAY)
   # -------------------------
   apply_pm:
     if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 14 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'apply_pm' || github.event.inputs.run == 'settle_today_all')) }}
     runs-on: ubuntu-latest
-    environment: production
     env:
-      KV_REST_API_URL: ${{ secrets.KV_REST_URL || vars.KV_REST_URL || secrets.KV_REST_API_URL || vars.KV_REST_API_URL }}
-      KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN || vars.KV_REST_API_TOKEN || secrets.UPSTASH_REDIS_REST_TOKEN || vars.UPSTASH_REDIS_REST_TOKEN }}
+      KV_REST_API_URL: ${{ secrets.KV_REST_API_URL || vars.KV_REST_API_URL || secrets.KV_URL || vars.KV_URL }}
+      KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN || vars.KV_REST_API_TOKEN || secrets.KV_REST_API_READ_ONLY_TOKEN || vars.KV_REST_API_READ_ONLY_TOKEN }}
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
     steps:
@@ -199,33 +196,31 @@ jobs:
           [ -n "${KV_REST_API_URL:-}" ] && echo "KV_REST_API_URL: SET" || echo "KV_REST_API_URL: MISSING"
           [ -n "${KV_REST_API_TOKEN:-}" ] && echo "KV_REST_API_TOKEN: SET" || echo "KV_REST_API_TOKEN: MISSING"
           [ -n "${API_FOOTBALL_KEY:-}" ] && echo "API_FOOTBALL_KEY: SET" || echo "API_FOOTBALL_KEY: MISSING"
-
       - name: Izračunaj YMD (danas u Europe/Belgrade)
         id: when
         run: |
           TZ=Europe/Belgrade date +%F > ymd.txt || date +%F > ymd.txt
           echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
-
       - name: Settle TODAY (može biti no-op)
         env:
           YMD: ${{ steps.when.outputs.ymd }}
         run: |
           node <<'NODE'
           (async () => {
-            const KV = (process.env.KV_REST_API_URL || process.env.KV_REST_URL || process.env.UPSTASH_REDIS_REST_URL || "").trim();
-            const KT = (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || "").trim();
+            const KV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
+            const KT = (process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || "").trim();
             const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
             const API_KEY = (process.env.API_FOOTBALL_KEY || "").trim();
             const ymd = (process.env.YMD || "").trim();
 
             function fail(msg){ console.error(msg); process.exit(1); }
-            if (!KV || !KT) fail("Missing KV_REST_API_URL/KV_REST_URL or KV token");
+            if (!KV || !KT) fail("Missing KV_REST_API_URL/KV_URL or KV token");
             if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
             if (!ymd) fail("Missing YMD");
 
             const kvGet = async (key) => {
               const r = await fetch(`${KV}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
-              if (!r.ok) return null; const text = await r.text(); try { return JSON.parse(text); } catch { return null; }
+              if (!r.ok) return null; const t = await r.text(); try { return JSON.parse(t); } catch { return null; }
             };
             const kvSet = async (key, value) => {
               const r = await fetch(`${KV}/set/${encodeURIComponent(key)}`, {
@@ -235,7 +230,7 @@ jobs:
             };
             const af = async (path) => {
               const r = await fetch(`${API_BASE}${path}`, { headers:{ "x-apisports-key": API_KEY, "x-rapidapi-key": API_KEY } });
-              const text = await r.text(); if (!r.ok) throw new Error(text || r.statusText); return JSON.parse(text);
+              const t = await r.text(); if (!r.ok) throw new Error(t || r.statusText); return JSON.parse(t);
             };
             const win = (market, pick, gh, ga) => {
               if (!Number.isFinite(gh) || !Number.isFinite(ga)) return null;
@@ -279,15 +274,14 @@ jobs:
           NODE
 
   # -------------------------
-  # APPLY-LEARNING — LATE (SETTLE TODAY)
+  # APPLY (SETTLE) — LATE (TODAY)
   # -------------------------
   apply_late:
     if: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 21 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'apply_late' || github.event.inputs.run == 'settle_today_all')) }}
     runs-on: ubuntu-latest
-    environment: production
     env:
-      KV_REST_API_URL: ${{ secrets.KV_REST_URL || vars.KV_REST_URL || secrets.KV_REST_API_URL || vars.KV_REST_API_URL }}
-      KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN || vars.KV_REST_API_TOKEN || secrets.UPSTASH_REDIS_REST_TOKEN || vars.UPSTASH_REDIS_REST_TOKEN }}
+      KV_REST_API_URL: ${{ secrets.KV_REST_API_URL || vars.KV_REST_API_URL || secrets.KV_URL || vars.KV_URL }}
+      KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN || vars.KV_REST_API_TOKEN || secrets.KV_REST_API_READ_ONLY_TOKEN || vars.KV_REST_API_READ_ONLY_TOKEN }}
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
     steps:
@@ -296,33 +290,31 @@ jobs:
           [ -n "${KV_REST_API_URL:-}" ] && echo "KV_REST_API_URL: SET" || echo "KV_REST_API_URL: MISSING"
           [ -n "${KV_REST_API_TOKEN:-}" ] && echo "KV_REST_API_TOKEN: SET" || echo "KV_REST_API_TOKEN: MISSING"
           [ -n "${API_FOOTBALL_KEY:-}" ] && echo "API_FOOTBALL_KEY: SET" || echo "API_FOOTBALL_KEY: MISSING"
-
       - name: Izračunaj YMD (danas u Europe/Belgrade)
         id: when
         run: |
           TZ=Europe/Belgrade date +%F > ymd.txt || date +%F > ymd.txt
           echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
-
       - name: Settle TODAY (može biti no-op)
         env:
           YMD: ${{ steps.when.outputs.ymd }}
         run: |
           node <<'NODE'
           (async () => {
-            const KV = (process.env.KV_REST_API_URL || process.env.KV_REST_URL || process.env.UPSTASH_REDIS_REST_URL || "").trim();
-            const KT = (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || "").trim();
+            const KV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
+            const KT = (process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || "").trim();
             const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
             const API_KEY = (process.env.API_FOOTBALL_KEY || "").trim();
             const ymd = (process.env.YMD || "").trim();
 
             function fail(msg){ console.error(msg); process.exit(1); }
-            if (!KV || !KT) fail("Missing KV_REST_API_URL/KV_REST_URL or KV token");
+            if (!KV || !KT) fail("Missing KV_REST_API_URL/KV_URL or KV token");
             if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
             if (!ymd) fail("Missing YMD");
 
             const kvGet = async (key) => {
               const r = await fetch(`${KV}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
-              if (!r.ok) return null; const text = await r.text(); try { return JSON.parse(text); } catch { return null; }
+              if (!r.ok) return null; const t = await r.text(); try { return JSON.parse(t); } catch { return null; }
             };
             const kvSet = async (key, value) => {
               const r = await fetch(`${KV}/set/${encodeURIComponent(key)}`, {
@@ -332,7 +324,7 @@ jobs:
             };
             const af = async (path) => {
               const r = await fetch(`${API_BASE}${path}`, { headers:{ "x-apisports-key": API_KEY, "x-rapidapi-key": API_KEY } });
-              const text = await r.text(); if (!r.ok) throw new Error(text || r.statusText); return JSON.parse(text);
+              const t = await r.text(); if (!r.ok) throw new Error(t || r.statusText); return JSON.parse(t);
             };
             const win = (market, pick, gh, ga) => {
               if (!Number.isFinite(gh) || !Number.isFinite(ga)) return null;
@@ -376,15 +368,14 @@ jobs:
           NODE
 
   # -------------------------
-  # NIGHTLY LEARN — SETTLE YESTERDAY (ili custom)
+  # NIGHTLY LEARN — YESTERDAY (ili custom)
   # -------------------------
   nightly_learn:
     if: ${{ (github.event_name == 'schedule' && github.event.schedule == '20 0 * * *') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'nightly_learn' || github.event.inputs.run == 'settle_custom')) }}
     runs-on: ubuntu-latest
-    environment: production
     env:
-      KV_REST_API_URL: ${{ secrets.KV_REST_URL || vars.KV_REST_URL || secrets.KV_REST_API_URL || vars.KV_REST_API_URL }}
-      KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN || vars.KV_REST_API_TOKEN || secrets.UPSTASH_REDIS_REST_TOKEN || vars.UPSTASH_REDIS_REST_TOKEN }}
+      KV_REST_API_URL: ${{ secrets.KV_REST_API_URL || vars.KV_REST_API_URL || secrets.KV_URL || vars.KV_URL }}
+      KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN || vars.KV_REST_API_TOKEN || secrets.KV_REST_API_READ_ONLY_TOKEN || vars.KV_REST_API_READ_ONLY_TOKEN }}
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
     steps:
@@ -393,8 +384,7 @@ jobs:
           [ -n "${KV_REST_API_URL:-}" ] && echo "KV_REST_API_URL: SET" || echo "KV_REST_API_URL: MISSING"
           [ -n "${KV_REST_API_TOKEN:-}" ] && echo "KV_REST_API_TOKEN: SET" || echo "KV_REST_API_TOKEN: MISSING"
           [ -n "${API_FOOTBALL_KEY:-}" ] && echo "API_FOOTBALL_KEY: SET" || echo "API_FOOTBALL_KEY: MISSING"
-
-      - name: Izračunaj YMD
+      - name: Izračunaj YMD (juče ili custom)
         id: when
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.run }}" = "settle_custom" ] && [ -n "${{ github.event.inputs.ymd }}" ]; then
@@ -403,27 +393,26 @@ jobs:
             TZ=Europe/Belgrade date -d "yesterday" +%F > ymd.txt || date -v-1d +%F > ymd.txt
             echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
           fi
-
       - name: Settle (vb:day:$YMD:union -> vb:cal:v1)
         env:
           YMD: ${{ steps.when.outputs.ymd }}
         run: |
           node <<'NODE'
           (async () => {
-            const KV = (process.env.KV_REST_API_URL || process.env.KV_REST_URL || process.env.UPSTASH_REDIS_REST_URL || "").trim();
-            const KT = (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || "").trim();
+            const KV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
+            const KT = (process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || "").trim();
             const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
             const API_KEY = (process.env.API_FOOTBALL_KEY || "").trim();
             const ymd = (process.env.YMD || "").trim();
 
             function fail(msg){ console.error(msg); process.exit(1); }
-            if (!KV || !KT) fail("Missing KV_REST_API_URL/KV_REST_URL or KV token");
+            if (!KV || !KT) fail("Missing KV_REST_API_URL/KV_URL or KV token");
             if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
             if (!ymd) fail("Missing YMD");
 
             const kvGet = async (key) => {
               const r = await fetch(`${KV}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
-              if (!r.ok) return null; const text = await r.text(); try { return JSON.parse(text); } catch { return null; }
+              if (!r.ok) return null; const t = await r.text(); try { return JSON.parse(t); } catch { return null; }
             };
             const kvSet = async (key, value) => {
               const r = await fetch(`${KV}/set/${encodeURIComponent(key)}`, {
@@ -433,7 +422,7 @@ jobs:
             };
             const af = async (path) => {
               const r = await fetch(`${API_BASE}${path}`, { headers:{ "x-apisports-key": API_KEY, "x-rapidapi-key": API_KEY } });
-              const text = await r.text(); if (!r.ok) throw new Error(text || r.statusText); return JSON.parse(text);
+              const t = await r.text(); if (!r.ok) throw new Error(t || r.statusText); return JSON.parse(t);
             };
             const win = (market, pick, gh, ga) => {
               if (!Number.isFinite(gh) || !Number.isFinite(ga)) return null;
