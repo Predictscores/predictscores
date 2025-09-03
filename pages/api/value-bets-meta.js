@@ -1,8 +1,8 @@
 // pages/api/value-bets-meta.js
-// Read-only “meta view”: vraća iste stavke kao /api/value-bets-locked,
-// prilaže meta (stats/injuries/H2H) ako postoji u KV,
-// i OPCIONO (query ?enrich=1) računa BLAGU korekciju confidence-a (±1–3 p.p.).
-// Ne menja broj/izbor parova; ništa ne piše u KV; potpuno bezbedno.
+// Read-only meta view: vraća iste stavke kao /api/value-bets-locked,
+// prilaže meta (stats/injuries/H2H) i OPCIONO (query ?enrich=1) računa BLAGU
+// korekciju confidence-a (±1–3 p.p.) na osnovu injuries + H2H procenata.
+// Ne menja broj/izbor parova; ne piše u KV; potpuno bezbedno.
 
 function toRestBase(s) {
   if (!s) return "";
@@ -33,25 +33,20 @@ async function kvGet(key) {
 function ymdBelgrade(d = new Date()) {
   return d.toLocaleString("sv-SE", { timeZone: "Europe/Belgrade" }).slice(0, 10);
 }
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
 
-function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
-
-// Mikro-korekcije na osnovu META (bezbedno, vrlo skromno)
 function computeAdjPP(item, meta) {
   if (!meta || typeof item?.confidence_pct !== "number") return 0;
 
   const market = String(item?.market || "").toUpperCase();
   const pick = String(item?.pick_code || item?.selection_code || "").toUpperCase();
 
+  // --- Injuries signal (kao i ranije) ---
   const injH = Number(meta?.injuries?.homeCount || 0);
   const injA = Number(meta?.injuries?.awayCount || 0);
   const injTotal = injH + injA;
 
   let adj = 0;
-
-  // Ako je dosta povreda ukupno, malo smanji "agresivne" ishode:
-  // - OU2.5 Over i BTTS Yes dobijaju najveći minus (manje golova očekujemo)
-  // - 1X2 dobijaju neznatan minus zbog neizvesnosti
   if (injTotal >= 4) {
     if (market === "OU2.5" && pick === "O2.5") adj -= 2;
     if (market === "BTTS" && (pick === "Y" || pick === "YES")) adj -= 2;
@@ -59,12 +54,43 @@ function computeAdjPP(item, meta) {
   } else if (injTotal >= 2) {
     if (market === "OU2.5" && pick === "O2.5") adj -= 1;
     if (market === "BTTS" && (pick === "Y" || pick === "YES")) adj -= 1;
-    // 1X2 ne diramo za “light” povrede
   }
 
-  // H2H signal zasad ne koristimo (u meti imamo samo count, bez distribucija) — bezbedno.
+  // --- H2H procente (NOVO): koristimo ih samo kad imamo ≥4 FT meča ---
+  const h2hCnt = Number(meta?.h2h?.count || 0);
+  const overPct = Number(meta?.h2h?.over2_5_pct || 0);
+  const bttsPct = Number(meta?.h2h?.btts_pct || 0);
+  const drawPct = Number(meta?.h2h?.draw_pct || 0);
 
-  // Ograniči korekciju na [-3, +3] p.p.
+  if (h2hCnt >= 4) {
+    // OU2.5
+    if (market === "OU2.5") {
+      if (pick === "O2.5") {
+        if (overPct >= 70) adj += 2; else if (overPct >= 60) adj += 1;
+        if (overPct <= 30) adj -= 2; else if (overPct <= 40) adj -= 1;
+      } else if (pick === "U2.5") {
+        if (overPct <= 30) adj += 2; else if (overPct <= 40) adj += 1;
+        if (overPct >= 70) adj -= 2; else if (overPct >= 60) adj -= 1;
+      }
+    }
+    // BTTS
+    if (market === "BTTS") {
+      const yes = (pick === "Y" || pick === "YES");
+      if (yes) {
+        if (bttsPct >= 65) adj += 2; else if (bttsPct >= 55) adj += 1;
+        if (bttsPct <= 35) adj -= 2; else if (bttsPct <= 45) adj -= 1;
+      } else {
+        if (bttsPct <= 35) adj += 2; else if (bttsPct <= 45) adj += 1;
+        if (bttsPct >= 65) adj -= 2; else if (bttsPct >= 55) adj -= 1;
+      }
+    }
+    // 1X2 — Draw samo (jer je robustno), ostale ne diramo
+    if (market === "1X2" && pick === "X") {
+      if (drawPct >= 40) adj += 2; else if (drawPct >= 33) adj += 1;
+      if (drawPct <= 20) adj -= 1; // blaga penalizacija ako retko nerešeno
+    }
+  }
+
   return clamp(adj, -3, 3);
 }
 
@@ -74,13 +100,11 @@ export default async function handler(req, res) {
     const wantEnrich = String(req.query?.enrich || "0") === "1";
     const base = process.env.BASE_URL || `https://${req.headers.host || "predictscores.vercel.app"}`;
 
-    // 1) Uzimamo zaključane pickove iz postojeće rute (ne diramo je)
     const r = await fetch(`${base}/api/value-bets-locked?slot=${encodeURIComponent(slot)}`, { cache: "no-store" });
     const vb = await r.json();
     const items = Array.isArray(vb?.items) ? vb.items : [];
     const ymd = String(vb?.ymd || ymdBelgrade());
 
-    // Ako nema stavki — samo prosledi original
     if (!items.length) {
       return res.status(200).json({ ...vb, with_meta: !!(KV_BASE && KV_TOKEN), meta_attached: 0, applied_enrich: false });
     }
@@ -97,12 +121,11 @@ export default async function handler(req, res) {
         if (meta && typeof meta === "object") attached++;
       }
 
-      // Ako je traženo enrich=1, primeni vrlo blage korekcije (±1–3 p.p.) — bezbedno
       if (wantEnrich && typeof it?.confidence_pct === "number") {
         const adj = computeAdjPP(it, meta);
         if (adj !== 0) {
           const baseConf = Number(it.confidence_pct) || 0;
-          const newConf = clamp(baseConf + adj, 30, 85); // čisto da ne ode u ekstrem
+          const newConf = clamp(baseConf + adj, 30, 85);
           out.push({
             ...it,
             confidence_pct_adj: newConf,
@@ -113,7 +136,6 @@ export default async function handler(req, res) {
         }
       }
 
-      // Default: bez promene confidence-a, samo priključi meta ako postoji
       if (meta) out.push({ ...it, meta: { ...meta, applied: false } });
       else out.push(it);
     }
