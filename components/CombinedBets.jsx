@@ -1,4 +1,4 @@
-// components/CombinedBets.js
+// components/CombinedBets.jsx
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
@@ -18,6 +18,19 @@ function currentSlot(tz = TZ) {
   return h < 10 ? "late" : h < 15 ? "am" : "pm";
 }
 
+// vikend + pravilo za broj stavki
+function isWeekend(tz = TZ) {
+  const wd = new Intl.DateTimeFormat("en-GB", {
+    weekday: "short",
+    timeZone: tz,
+  }).format(new Date());
+  return wd === "Sat" || wd === "Sun";
+}
+function desiredCountForSlot(slot, tz = TZ) {
+  if (slot === "late") return 6;
+  return isWeekend(tz) ? 20 : 15; // am/pm: 15 radnim danima, 20 vikendom
+}
+
 /* ===================== helpers ===================== */
 async function safeJson(url) {
   try {
@@ -25,9 +38,13 @@ async function safeJson(url) {
     const ct = r.headers.get("content-type") || "";
     if (ct.includes("application/json")) return await r.json();
     const t = await r.text();
-    try { return JSON.parse(t); } catch { return { ok:false, error:"non-JSON", raw:t }; }
+    try {
+      return JSON.parse(t);
+    } catch {
+      return { ok: false, error: "non-JSON", raw: t };
+    }
   } catch (e) {
-    return { ok:false, error:String(e?.message||e) };
+    return { ok: false, error: String(e?.message || e) };
   }
 }
 
@@ -192,8 +209,9 @@ function useFootballFeed() {
     try {
       setLoading(true);
       setErr(null);
-      const slot = currentSlot();
-      const j = await safeJson(`/api/value-bets-locked?slot=${slot}&n=200`);
+      const slot = currentSlot(TZ);
+      const n = desiredCountForSlot(slot, TZ);
+      const j = await safeJson(`/api/value-bets-locked?slot=${slot}&n=${n}`);
       const arr = Array.isArray(j?.items)
         ? j.items
         : Array.isArray(j?.football)
@@ -237,7 +255,9 @@ function useCryptoTop3() {
     }
   }
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+  }, []);
   return { items, err, loading };
 }
 
@@ -289,27 +309,33 @@ function FootballBody({ list }) {
     () => [...list].sort((a, b) => (a.date?.getTime?.() || 9e15) - (b.date?.getTime?.() || 9e15)),
     [list]
   );
-  const confRows = useMemo(
-    () => [...list].sort((a, b) => b.conf - a.conf),
-    [list]
-  );
+  const confRows = useMemo(() => [...list].sort((a, b) => b.conf - a.conf), [list]);
 
   return (
     <div className="space-y-4">
       {/* Unutrašnji tabovi */}
       <div className="flex items-center gap-2">
         <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${tab==="ko"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
-          onClick={()=>setTab("ko")} type="button"
-        >Kick-Off</button>
+          className={`px-3 py-1.5 rounded-lg text-sm ${tab === "ko" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"}`}
+          onClick={() => setTab("ko")}
+          type="button"
+        >
+          Kick-Off
+        </button>
         <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${tab==="conf"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
-          onClick={()=>setTab("conf")} type="button
-        ">Confidence</button>
+          className={`px-3 py-1.5 rounded-lg text-sm ${tab === "conf" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"}`}
+          onClick={() => setTab("conf")}
+          type="button"
+        >
+          Confidence
+        </button>
         <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${tab==="hist"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
-          onClick={()=>setTab("hist")} type="button"
-        >History</button>
+          className={`px-3 py-1.5 rounded-lg text-sm ${tab === "hist" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"}`}
+          onClick={() => setTab("hist")}
+          type="button"
+        >
+          History
+        </button>
       </div>
 
       {tab !== "hist" ? (
@@ -317,11 +343,13 @@ function FootballBody({ list }) {
           <div className="text-base font-semibold text-white mb-3">
             {tab === "ko" ? "Kick-Off" : "Confidence"}
           </div>
-          {! (tab==="ko"?koRows:confRows).length ? (
+          {! (tab === "ko" ? koRows : confRows).length ? (
             <div className="text-slate-400 text-sm">Trenutno nema predloga.</div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-              {(tab==="ko"?koRows:confRows).map((b) => <FootballCard key={b.id} bet={b} />)}
+              {(tab === "ko" ? koRows : confRows).map((b) => (
+                <FootballCard key={b.id} bet={b} />
+              ))}
             </div>
           )}
         </div>
@@ -365,7 +393,7 @@ export default function CombinedBets() {
 
   // Combined: Top 3 po confidence
   const top3Football = useMemo(
-    () => [...fb.list].sort((a,b)=> b.conf - a.conf).slice(0,3),
+    () => [...fb.list].sort((a, b) => b.conf - a.conf).slice(0, 3),
     [fb.list]
   );
 
@@ -373,11 +401,13 @@ export default function CombinedBets() {
     <div className="mt-4 space-y-4">
       {/* Gornji tabovi */}
       <div className="flex items-center gap-2">
-        {["Combined","Football","Crypto"].map((name) => (
+        {["Combined", "Football", "Crypto"].map((name) => (
           <button
             key={name}
             onClick={() => setTab(name)}
-            className={`px-3 py-1.5 rounded-lg text-sm ${tab===name?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
+            className={`px-3 py-1.5 rounded-lg text-sm ${
+              tab === name ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
+            }`}
             type="button"
           >
             {name}
@@ -386,35 +416,32 @@ export default function CombinedBets() {
       </div>
 
       {/* Sadržaj tabova */}
-      {tab === "Combined" && (
-        fb.loading ? (
+      {tab === "Combined" &&
+        (fb.loading ? (
           <div className="text-slate-400 text-sm">Učitavam…</div>
         ) : fb.err ? (
           <div className="text-red-400 text-sm">Greška: {fb.err}</div>
         ) : (
           <CombinedBody footballTop3={top3Football} cryptoTop3={crypto.items} />
-        )
-      )}
+        ))}
 
-      {tab === "Football" && (
-        fb.loading ? (
+      {tab === "Football" &&
+        (fb.loading ? (
           <div className="text-slate-400 text-sm">Učitavam…</div>
         ) : fb.err ? (
           <div className="text-red-400 text-sm">Greška: {fb.err}</div>
         ) : (
           <FootballBody list={fb.list} />
-        )
-      )}
+        ))}
 
-      {tab === "Crypto" && (
-        crypto.loading ? (
+      {tab === "Crypto" &&
+        (crypto.loading ? (
           <div className="text-slate-400 text-sm">Učitavam…</div>
         ) : crypto.err ? (
           <div className="text-red-400 text-sm">Greška: {crypto.err}</div>
         ) : (
           <CryptoBody list={crypto.items} />
-        )
-      )}
+        ))}
     </div>
   );
 }
