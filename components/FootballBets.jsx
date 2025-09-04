@@ -2,7 +2,6 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import HistoryPanel from "./HistoryPanel"; // ⬅️ dodatak
 
 const TZ = "Europe/Belgrade";
 
@@ -16,6 +15,16 @@ function currentSlot(tz = TZ) {
     }).format(new Date())
   );
   return h < 10 ? "late" : h < 15 ? "am" : "pm";
+}
+
+// ⬇️ Dodato: vikend i pravilo za N po slotu
+function isWeekend(tz = TZ) {
+  const wd = new Intl.DateTimeFormat("en-GB", { weekday: "short", timeZone: tz }).format(new Date());
+  return wd === "Sat" || wd === "Sun";
+}
+function desiredCountForSlot(slot, tz = TZ) {
+  if (slot === "late") return 6;
+  return isWeekend(tz) ? 20 : 15; // am/pm: 15 radnim danima, 20 vikendom
 }
 
 /* ===================== parsing ===================== */
@@ -117,7 +126,8 @@ function useLockedValueBets() {
       setLoading(true);
       setError(null);
       const slot = currentSlot(TZ);
-      const r = await fetch(`/api/value-bets-locked?slot=${slot}&n=200`, {
+      const n = desiredCountForSlot(slot, TZ); // ⬅️ Dodato: broj stavki po slotu/danu
+      const r = await fetch(`/api/value-bets-locked?slot=${slot}&n=${n}`, {
         cache: "no-store",
       });
       const ct = r.headers.get("content-type") || "";
@@ -259,7 +269,9 @@ export default function FootballBets() {
             {tab === "ko" && <Section title="Kick-Off" rows={koRows} />}
             {tab === "conf" && <Section title="Confidence" rows={confRows} />}
             {tab === "hist" && (
-              <HistoryPanel days={14} top={3} slots="am,pm,late" />
+              <div className="rounded-2xl p-4 border border-neutral-800 bg-neutral-900/60 text-sm opacity-80">
+                History (14d) puni se kada `history` job upiše rezultate u KV (hist:*).
+              </div>
             )}
           </div>
           <div className="lg:col-span-1">{/* desni panel po želji */}</div>
