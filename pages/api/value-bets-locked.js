@@ -1,8 +1,10 @@
 // pages/api/value-bets-locked.js
-// KV-only fetch za UI (Combined/Football).
-// - NE prelazi na druge slotove: traži samo današnji <slot>
-// - Combined (items) = TOP-N po confidence iz vbl_full liste (mešani marketi: 1X2/BTTS/OU/HT-FT)
-// - Football = TOP-N iz iste liste (N se ograničava server-side pravilom)
+// KV-only fetch za UI (Combined/Football) sa AUTO cap-om po slotu i vikendu.
+// - Preferira vbl_full:<YMD>:<slot> (fallback: vbl i aliasi)
+// - Cap: late=6, am/pm=15 (radni dan), am/pm=20 (vikend)
+// - Ako je prosleđen ?n=..., koristi min(n, cap); bez n => cap
+// - items = sortirano po confidence (tie EV) i isečeno na effN
+// - football = puna lista (bez sečenja); top3 = uvek dostupno
 
 export const config = { api: { bodyParser: false } };
 
@@ -10,10 +12,12 @@ const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
 function ymdInTZ(d = new Date(), tz = TZ) {
   try {
-    const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
-    return fmt.format(d);
+    const fmt = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit"
+    });
+    return fmt.format(d); // YYYY-MM-DD
   } catch {
-    const y = d.getUTCFullYear(), m = String(d.getUTCMonth() + 1).padStart(2, "0"), dd = String(d.getUTCDate()).padStart(2, "0");
+    const y = d.getUTCFullYear(), m = String(d.getUTCMonth()+1).padStart(2,"0"), dd = String(d.getUTCDate()).padStart(2,"0");
     return `${y}-${m}-${dd}`;
   }
 }
@@ -22,15 +26,20 @@ function localHour(tz = TZ) {
   try { return Number(new Intl.DateTimeFormat("sv-SE", { timeZone: tz, hour: "2-digit", hour12: false }).format(new Date())); }
   catch { return new Date().getUTCHours(); }
 }
-function isWeekend(tz = TZ) {
+function isWeekendLocal(tz = TZ) {
   try {
-    const wd = new Intl.DateTimeFormat("en-GB", { weekday: "short", timeZone: tz }).format(new Date());
+    const wd = new Intl.DateTimeFormat("en-GB", { timeZone: tz, weekday: "short" }).format(new Date());
     return wd === "Sat" || wd === "Sun";
-  } catch { return false; }
+  } catch {
+    const gd = new Date().getUTCDay(); return gd === 0 || gd === 6;
+  }
 }
-function policyCap(slot, tz = TZ) {
-  if (String(slot).toLowerCase() === "late") return 6;
-  return isWeekend(tz) ? 20 : 15; // am/pm
+function capFor(slot, tz = TZ) {
+  if (slot === "late") return Number(process.env.SLOT_LATE_LIMIT ?? 6);
+  const wk = isWeekendLocal(tz);
+  return wk
+    ? Number(process.env.SLOT_WEEKEND_LIMIT ?? 20)
+    : Number(process.env.SLOT_WEEKDAY_LIMIT ?? 15);
 }
 
 async function kvGETraw(key){
@@ -52,70 +61,72 @@ function arrFromAny(o){
          Array.isArray(o.value_bets) ? o.value_bets :
          Array.isArray(o.football) ? o.football :
          Array.isArray(o.arr) ? o.arr :
+         Array.isArray(o.data?.items) ? o.data.items :
+         Array.isArray(o.data?.football) ? o.data.football :
          Array.isArray(o.data) ? o.data : [];
+}
+function sortForCombined(arr){
+  return [...arr].sort((a,b)=>
+    (Number(b?.confidence_pct||0) - Number(a?.confidence_pct||0)) ||
+    (Number(b?._ev ?? b?.ev ?? -1) - Number(a?._ev ?? a?.ev ?? -1))
+  );
 }
 
 export default async function handler(req, res){
   try{
     const now = new Date();
     const ymd = ymdInTZ(now, TZ);
-    const slot = ((req.query.slot && String(req.query.slot)) || slotOfHour(localHour(TZ))).toLowerCase();
-
-    // korisnički zahtev (default 3), zatim server-side cap po pravilu 15/20/6
-    const askedN = Number(req.query.n);
-    const baseN = Number.isFinite(askedN) ? Math.max(1, Math.min(askedN, 50)) : 3;
-    const cap = policyCap(slot, TZ);
-    const nMax = Math.min(baseN, cap);
+    const slot = (req.query.slot && String(req.query.slot)) || slotOfHour(localHour(TZ));
+    const cap = Math.max(1, capFor(slot, TZ));
+    const nReq = Number(req.query.n);
+    const effN = Number.isFinite(nReq) ? Math.max(1, Math.min(nReq, cap)) : cap;
+    const wantDebug = String(req.query.debug||"") === "1";
 
     const keys = [
-      `vbl_full:${ymd}:${slot}`,
-      `vbl:${ymd}:${slot}`,
-      // aliasi: koristimo ih samo za ISTI slot i ISTI dan (bez cross-slot fallbacka)
-      `vb-locked:${ymd}:${slot}`,
+      `vbl_full:${ymd}:${slot}`,     // prefer full
+      `vbl:${ymd}:${slot}`,          // slim (Top-N) fallback
+      `vb-locked:${ymd}:${slot}`,    // aliasi
       `vb:locked:${ymd}:${slot}`,
       `vb_locked:${ymd}:${slot}`,
       `locked:vbl:${ymd}:${slot}`
     ];
 
-    let full=null, slim=null, picked=null;
+    let base=null, picked=null;
     for (const k of keys) {
       const raw = await kvGETraw(k);
       if (!raw) continue;
       const obj = toObj(raw);
-      if (!obj) continue;
-      if (!picked) picked=k;
-      if (!full && /vbl_full:/.test(k)) full=obj;
-      if (!slim && /^vbl:/.test(k)) slim=obj;
+      const arr = arrFromAny(obj);
+      if (arr && arr.length) { base = arr; picked = k; break; }
     }
 
-    const base = full || slim || null;
-    const football = arrFromAny(base);
-
-    if (!Array.isArray(football) || football.length===0) {
+    if (!Array.isArray(base) || base.length===0) {
       return res.status(200).json({
-        ok:true, slot, ymd, items:[], value_bets:[], football:[],
-        source: `vb-locked:kv:miss·${picked?picked:'none'}`
+        ok:true, slot, ymd, items:[], football:[], top3:[],
+        source: `vb-locked:kv:miss·${picked?picked:'none'}${wantDebug?':no-data':''}`,
+        policy_cap: cap
       });
     }
 
-    // TOP-N po confidence (tie-break EV), ograničeno server-side pravilom
-    const combined = [...football]
-      .sort((a,b)=> (Number(b?.confidence_pct||0) - Number(a?.confidence_pct||0)) || (Number(b?._ev||-1) - Number(a?._ev||-1)))
-      .slice(0, nMax);
+    const fullSorted = sortForCombined(base);
+    const top3 = fullSorted.slice(0, 3);
+    const items = fullSorted.slice(0, effN);
 
     return res.status(200).json({
       ok:true, slot, ymd,
-      items: combined,
-      value_bets: combined,
-      football,
-      source: full ? `vb-locked:kv:hit·full` : `vb-locked:kv:hit`
+      items,             // za UI (Football/Combined) - auto cap
+      football: base,    // puna lista (debug/ostalo)
+      top3,              // uvek dostupno (Combined može da koristi)
+      source: picked?.startsWith("vbl_full:") ? `vb-locked:kv:hit·full` : `vb-locked:kv:hit`,
+      policy_cap: cap,
+      ...(wantDebug ? { debug: { picked, effN, football_len: base.length } } : {})
     });
 
   } catch(e){
     return res.status(200).json({
       ok:true,
       slot: (req.query.slot||""), ymd: ymdInTZ(new Date(), TZ),
-      items:[], value_bets:[], football:[],
+      items:[], football:[], top3:[],
       source:`vb-locked:error ${String(e?.message||e)}`
     });
   }
