@@ -1,8 +1,8 @@
 // pages/api/value-bets-locked.js
 // KV-only fetch za UI (Combined/Football).
 // - NE prelazi na druge slotove: traži samo današnji <slot>
-// - Combined (items) = TOP-3 po confidence iz vbl_full liste (mešani marketi: 1X2/BTTS/OU/HT-FT)
-// - Football = ceo TOP (npr. 25) iz iste liste
+// - Combined (items) = TOP-N po confidence iz vbl_full liste (mešani marketi: 1X2/BTTS/OU/HT-FT)
+// - Football = TOP-N iz iste liste (N se ograničava server-side pravilom)
 
 export const config = { api: { bodyParser: false } };
 
@@ -21,6 +21,16 @@ function slotOfHour(h) { return h < 10 ? "late" : (h < 15 ? "am" : "pm"); }
 function localHour(tz = TZ) {
   try { return Number(new Intl.DateTimeFormat("sv-SE", { timeZone: tz, hour: "2-digit", hour12: false }).format(new Date())); }
   catch { return new Date().getUTCHours(); }
+}
+function isWeekend(tz = TZ) {
+  try {
+    const wd = new Intl.DateTimeFormat("en-GB", { weekday: "short", timeZone: tz }).format(new Date());
+    return wd === "Sat" || wd === "Sun";
+  } catch { return false; }
+}
+function policyCap(slot, tz = TZ) {
+  if (String(slot).toLowerCase() === "late") return 6;
+  return isWeekend(tz) ? 20 : 15; // am/pm
 }
 
 async function kvGETraw(key){
@@ -49,9 +59,13 @@ export default async function handler(req, res){
   try{
     const now = new Date();
     const ymd = ymdInTZ(now, TZ);
-    const slot = (req.query.slot && String(req.query.slot)) || slotOfHour(localHour(TZ));
-    const nMax = Math.max(1, Math.min(Number(req.query.n || 3), 50));
-    const wantDebug = String(req.query.debug||"") === "1";
+    const slot = ((req.query.slot && String(req.query.slot)) || slotOfHour(localHour(TZ))).toLowerCase();
+
+    // korisnički zahtev (default 3), zatim server-side cap po pravilu 15/20/6
+    const askedN = Number(req.query.n);
+    const baseN = Number.isFinite(askedN) ? Math.max(1, Math.min(askedN, 50)) : 3;
+    const cap = policyCap(slot, TZ);
+    const nMax = Math.min(baseN, cap);
 
     const keys = [
       `vbl_full:${ymd}:${slot}`,
@@ -80,11 +94,11 @@ export default async function handler(req, res){
     if (!Array.isArray(football) || football.length===0) {
       return res.status(200).json({
         ok:true, slot, ymd, items:[], value_bets:[], football:[],
-        source: `vb-locked:kv:miss·${picked?picked:'none'}${wantDebug?':no-data':''}`
+        source: `vb-locked:kv:miss·${picked?picked:'none'}`
       });
     }
 
-    // Combined: TOP-3 po confidence (tie-break EV)
+    // TOP-N po confidence (tie-break EV), ograničeno server-side pravilom
     const combined = [...football]
       .sort((a,b)=> (Number(b?.confidence_pct||0) - Number(a?.confidence_pct||0)) || (Number(b?._ev||-1) - Number(a?._ev||-1)))
       .slice(0, nMax);
@@ -94,8 +108,7 @@ export default async function handler(req, res){
       items: combined,
       value_bets: combined,
       football,
-      source: full ? `vb-locked:kv:hit·full` : `vb-locked:kv:hit`,
-      ...(wantDebug ? { debug: { picked, football_len: football.length } } : {})
+      source: full ? `vb-locked:kv:hit·full` : `vb-locked:kv:hit`
     });
 
   } catch(e){
