@@ -2,6 +2,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
+import HistoryPanel from "./HistoryPanel";
 
 const TZ = "Europe/Belgrade";
 
@@ -228,9 +229,7 @@ function useFootballFeed() {
     }
   }
 
-  useEffect(() => {
-    load();
-  }, []);
+  useEffect(() => { load(); }, []);
 
   return { list, err, loading, reload: load };
 }
@@ -255,9 +254,7 @@ function useCryptoTop3() {
     }
   }
 
-  useEffect(() => {
-    load();
-  }, []);
+  useEffect(() => { load(); }, []);
   return { items, err, loading };
 }
 
@@ -272,9 +269,7 @@ function CombinedBody({ footballTop3, cryptoTop3 }) {
           <div className="text-slate-400 text-sm">Trenutno nema predloga.</div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            {footballTop3.map((b) => (
-              <FootballCard key={b.id} bet={b} />
-            ))}
+            {footballTop3.map((b) => (<FootballCard key={b.id} bet={b} />))}
           </div>
         )}
       </div>
@@ -316,46 +311,33 @@ function FootballBody({ list }) {
       {/* Unutrašnji tabovi */}
       <div className="flex items-center gap-2">
         <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${tab === "ko" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"}`}
-          onClick={() => setTab("ko")}
-          type="button"
-        >
-          Kick-Off
-        </button>
+          className={`px-3 py-1.5 rounded-lg text-sm ${tab==="ko"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
+          onClick={()=>setTab("ko")} type="button"
+        >Kick-Off</button>
         <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${tab === "conf" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"}`}
-          onClick={() => setTab("conf")}
-          type="button"
-        >
-          Confidence
-        </button>
+          className={`px-3 py-1.5 rounded-lg text-sm ${tab==="conf"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
+          onClick={()=>setTab("conf")} type="button"
+        >Confidence</button>
         <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${tab === "hist" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"}`}
-          onClick={() => setTab("hist")}
-          type="button"
-        >
-          History
-        </button>
+          className={`px-3 py-1.5 rounded-lg text-sm ${tab==="hist"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
+          onClick={()=>setTab("hist")} type="button"
+        >History</button>
       </div>
 
-      {tab !== "hist" ? (
+      {tab === "hist" ? (
+        <HistoryPanel days={14} top={3} />
+      ) : (
         <div className="rounded-2xl bg-[#15182a] p-4">
           <div className="text-base font-semibold text-white mb-3">
             {tab === "ko" ? "Kick-Off" : "Confidence"}
           </div>
-          {! (tab === "ko" ? koRows : confRows).length ? (
+          {!(tab==="ko"?koRows:confRows).length ? (
             <div className="text-slate-400 text-sm">Trenutno nema predloga.</div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-              {(tab === "ko" ? koRows : confRows).map((b) => (
-                <FootballCard key={b.id} bet={b} />
-              ))}
+              {(tab==="ko"?koRows:confRows).map((b) => <FootballCard key={b.id} bet={b} />)}
             </div>
           )}
-        </div>
-      ) : (
-        <div className="rounded-2xl p-4 border border-neutral-800 bg-neutral-900/60 text-sm opacity-80">
-          History (14d) se puni iz KV `hist:*` kada job upiše rezultate posle završetka mečeva.
         </div>
       )}
     </div>
@@ -393,7 +375,7 @@ export default function CombinedBets() {
 
   // Combined: Top 3 po confidence
   const top3Football = useMemo(
-    () => [...fb.list].sort((a, b) => b.conf - a.conf).slice(0, 3),
+    () => [...fb.list].sort((a,b)=> b.conf - a.conf).slice(0,3),
     [fb.list]
   );
 
@@ -401,13 +383,11 @@ export default function CombinedBets() {
     <div className="mt-4 space-y-4">
       {/* Gornji tabovi */}
       <div className="flex items-center gap-2">
-        {["Combined", "Football", "Crypto"].map((name) => (
+        {["Combined","Football","Crypto"].map((name) => (
           <button
             key={name}
             onClick={() => setTab(name)}
-            className={`px-3 py-1.5 rounded-lg text-sm ${
-              tab === name ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
-            }`}
+            className={`px-3 py-1.5 rounded-lg text-sm ${tab===name?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
             type="button"
           >
             {name}
@@ -416,32 +396,35 @@ export default function CombinedBets() {
       </div>
 
       {/* Sadržaj tabova */}
-      {tab === "Combined" &&
-        (fb.loading ? (
+      {tab === "Combined" && (
+        fb.loading ? (
           <div className="text-slate-400 text-sm">Učitavam…</div>
         ) : fb.err ? (
           <div className="text-red-400 text-sm">Greška: {fb.err}</div>
         ) : (
           <CombinedBody footballTop3={top3Football} cryptoTop3={crypto.items} />
-        ))}
+        )
+      )}
 
-      {tab === "Football" &&
-        (fb.loading ? (
+      {tab === "Football" && (
+        fb.loading ? (
           <div className="text-slate-400 text-sm">Učitavam…</div>
         ) : fb.err ? (
           <div className="text-red-400 text-sm">Greška: {fb.err}</div>
         ) : (
           <FootballBody list={fb.list} />
-        ))}
+        )
+      )}
 
-      {tab === "Crypto" &&
-        (crypto.loading ? (
+      {tab === "Crypto" && (
+        crypto.loading ? (
           <div className="text-slate-400 text-sm">Učitavam…</div>
         ) : crypto.err ? (
           <div className="text-red-400 text-sm">Greška: {crypto.err}</div>
         ) : (
           <CryptoBody list={crypto.items} />
-        ))}
+        )
+      )}
     </div>
   );
 }
