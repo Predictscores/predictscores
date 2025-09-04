@@ -2,6 +2,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import HistoryPanel from "./HistoryPanel";
 
 const TZ = "Europe/Belgrade";
 
@@ -17,7 +18,7 @@ function currentSlot(tz = TZ) {
   return h < 10 ? "late" : h < 15 ? "am" : "pm";
 }
 
-// ⬇️ Dodato: vikend i pravilo za N po slotu
+// ⬇️ vikend i pravilo za N po slotu
 function isWeekend(tz = TZ) {
   const wd = new Intl.DateTimeFormat("en-GB", { weekday: "short", timeZone: tz }).format(new Date());
   return wd === "Sat" || wd === "Sun";
@@ -126,7 +127,7 @@ function useLockedValueBets() {
       setLoading(true);
       setError(null);
       const slot = currentSlot(TZ);
-      const n = desiredCountForSlot(slot, TZ); // ⬅️ Dodato: broj stavki po slotu/danu
+      const n = desiredCountForSlot(slot, TZ); // broj stavki po slotu/danu
       const r = await fetch(`/api/value-bets-locked?slot=${slot}&n=${n}`, {
         cache: "no-store",
       });
@@ -134,11 +135,7 @@ function useLockedValueBets() {
       const body = ct.includes("application/json")
         ? await r.json()
         : await r.text().then((t) => {
-            try {
-              return JSON.parse(t);
-            } catch {
-              return { ok: false, error: "non-JSON" };
-            }
+            try { return JSON.parse(t); } catch { return { ok: false, error: "non-JSON" }; }
           });
       const arr = Array.isArray(body?.items)
         ? body.items
@@ -156,9 +153,7 @@ function useLockedValueBets() {
     }
   }
 
-  useEffect(() => {
-    load();
-  }, []);
+  useEffect(() => { load(); }, []);
   return { items, loading, error, reload: load };
 }
 
@@ -263,16 +258,13 @@ export default function FootballBets() {
         <div className="text-slate-400 text-sm">Učitavam…</div>
       ) : error ? (
         <div className="text-red-400 text-sm">Greška: {String(error)}</div>
+      ) : tab === "hist" ? (
+        <HistoryPanel days={14} top={3} />
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <div className="lg:col-span-2 space-y-4">
             {tab === "ko" && <Section title="Kick-Off" rows={koRows} />}
             {tab === "conf" && <Section title="Confidence" rows={confRows} />}
-            {tab === "hist" && (
-              <div className="rounded-2xl p-4 border border-neutral-800 bg-neutral-900/60 text-sm opacity-80">
-                History (14d) puni se kada `history` job upiše rezultate u KV (hist:*).
-              </div>
-            )}
           </div>
           <div className="lg:col-span-1">{/* desni panel po želji */}</div>
         </div>
