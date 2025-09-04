@@ -1,4 +1,4 @@
-// components/HistoryPanel.jsx
+"use client";
 import React, { useEffect, useState } from "react";
 
 async function safeJson(url) {
@@ -15,7 +15,7 @@ async function safeJson(url) {
 
 function StatCard({ label, value, accent }) {
   return (
-    <div className="p-3 rounded-2xl border shadow-sm">
+    <div className="p-3 rounded-2xl border border-neutral-800 bg-neutral-900/40 shadow-sm">
       <div className="text-xs opacity-60">{label}</div>
       <div className={`text-lg font-semibold ${accent || ""}`}>{value}</div>
     </div>
@@ -23,7 +23,7 @@ function StatCard({ label, value, accent }) {
 }
 
 function StatusIcon({ status }) {
-  if (status === "win") return <span title="Win" aria-label="Win">✅</span>;
+  if (status === "win")  return <span title="Win"  aria-label="Win">✅</span>;
   if (status === "loss") return <span title="Loss" aria-label="Loss">❌</span>;
   if (status === "push") return <span title="Push" aria-label="Push">🟡</span>;
   return <span title="Pending" aria-label="Pending">⏳</span>;
@@ -35,26 +35,26 @@ export default function HistoryPanel({ days = 14, top = 3, slots = "am,pm,late" 
   const [err, setErr] = useState("");
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
       setErr("");
       setData(null);
 
-      // Fallback redosled: traženi -> 7 -> 1 (uz izbacivanje duplikata i out-of-range)
-      const tryDays = Array.from(
-        new Set([Number(days) || 14, 7, 1].filter(n => n >= 1 && n <= 60))
-      );
+      // Fallback redosled: trazeni -> 7 -> 1
+      const tryDays = Array.from(new Set([Number(days) || 14, 7, 1].filter(n => n >= 1 && n <= 60)));
 
       let found = null;
       for (const d of tryDays) {
         const url = `/api/history-roi?days=${encodeURIComponent(d)}&top=${encodeURIComponent(top)}&slots=${encodeURIComponent(slots)}`;
         const j = await safeJson(url);
+        if (cancelled) return;
+
         if (j?.ok && (j?.summary?.picks || 0) > 0) {
           found = j;
           setUsedDays(d);
           break;
         }
-        // ako je poslednji pokušaj, zapamti poslednji odgovor (za poruku)
-        if (d === tryDays[tryDays.length - 1] && j && !j.ok) setErr(j.error || "Greška u /api/history-roi");
+        if (!j?.ok) setErr(j?.error || "Greška u /api/history-roi");
       }
 
       if (!found) {
@@ -64,16 +64,16 @@ export default function HistoryPanel({ days = 14, top = 3, slots = "am,pm,late" 
       }
       setData(found);
     })();
+    return () => { cancelled = true; };
   }, [days, top, slots]);
 
-  if (err) return <div className="p-3 text-sm text-red-600">History: {err}</div>;
+  if (err) return <div className="p-3 text-sm text-red-400">History: {err}</div>;
   if (!data) return <div className="p-3 text-sm opacity-70">History: učitavam…</div>;
 
   const s = data.summary || {};
   const daysArr = data.days || [];
-
-  const wl = `${s.wins ?? 0}-${(s.settled ?? 0) - (s.wins ?? 0)}`;
-  const roiClass = (s.profit ?? 0) >= 0 ? "text-green-600" : "text-red-600";
+  const wl = `${s.wins ?? 0}-${Math.max(0, (s.settled ?? 0) - (s.wins ?? 0))}`;
+  const roiClass = (s.profit ?? 0) >= 0 ? "text-green-400" : "text-red-400";
 
   return (
     <div className="w-full">
@@ -83,40 +83,40 @@ export default function HistoryPanel({ days = 14, top = 3, slots = "am,pm,late" 
         <StatCard label="Top-N po slotu" value={s.top ?? top} />
         <StatCard label="Picks / Settled" value={`${s.picks ?? 0} / ${s.settled ?? 0}`} />
         <StatCard label="W/L" value={wl} />
-        <StatCard label="Win rate" value={`${(s.win_rate_pct ?? 0).toFixed(2)}%`} />
-        <StatCard label="ROI" value={`${(s.roi_pct ?? 0).toFixed(2)}%`} accent={roiClass} />
+        <StatCard label="Win rate" value={`${Number(s.win_rate_pct ?? 0).toFixed(2)}%`} />
+        <StatCard label="ROI" value={`${Number(s.roi_pct ?? 0).toFixed(2)}%`} accent={roiClass} />
       </div>
 
       {/* Days grouped list */}
       <div className="space-y-5">
         {daysArr.map(day => (
-          <div key={day.ymd} className="rounded-2xl border p-3">
+          <div key={day.ymd} className="rounded-2xl border border-neutral-800 bg-neutral-900/40 p-3">
             <div className="flex items-center justify-between mb-2">
               <div className="text-sm font-semibold">{day.ymd}</div>
               <div className="text-xs opacity-70">
                 Settled {day.settled ?? 0}/{day.picks ?? 0} •
-                {' '}Win {(day.win_rate_pct ?? 0).toFixed(2)}% •
-                {' '}ROI <span className={`${(day.profit ?? 0) >= 0 ? "text-green-600" : "text-red-600"}`}>
-                  {(day.roi_pct ?? 0).toFixed(2)}%
+                {" "}Win {Number(day.win_rate_pct ?? 0).toFixed(2)}% •
+                {" "}ROI <span className={`${(day.profit ?? 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  {Number(day.roi_pct ?? 0).toFixed(2)}%
                 </span>
               </div>
             </div>
 
-            <div className="divide-y">
+            <div className="divide-y divide-neutral-800/80">
               {(day.items || []).map((it, idx) => (
                 <div key={`${it.fixture_id || idx}`} className="py-2 flex items-center justify-between">
                   <div className="flex flex-col md:flex-row md:items-center gap-1 md:gap-3">
-                    <div className="text-xs opacity-70 w-16">{it.time_hhmm || "—"}</div>
+                    <div className="text-xs opacity-60 w-16">{it.time_hhmm || "—"}</div>
                     <div className="text-sm">
                       <span className="font-medium">{it.home}</span> — <span className="font-medium">{it.away}</span>
-                      <span className="ml-2 text-xs opacity-60">{it.league_name || ""}</span>
+                      {it.league_name ? <span className="ml-2 text-xs opacity-60">{it.league_name}</span> : null}
                     </div>
                   </div>
                   <div className="flex items-center gap-3">
                     <div className="text-xs md:text-sm opacity-80">
                       {String(it.market || "").toUpperCase()} • <span className="font-medium">{it.pick_code || it.selection_label || ""}</span>
                     </div>
-                    <div className="text-sm w-14 text-right">{Number.isFinite(it.odds) ? it.odds.toFixed(2) : "—"}</div>
+                    <div className="text-sm w-14 text-right">{Number.isFinite(it.odds) ? Number(it.odds).toFixed(2) : "—"}</div>
                     <div className="w-6 text-right"><StatusIcon status={it.status} /></div>
                   </div>
                 </div>
