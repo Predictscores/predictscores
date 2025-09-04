@@ -2,6 +2,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import HistoryPanel from "./HistoryPanel"; // ⬅️ dodatak
 
 const TZ = "Europe/Belgrade";
 
@@ -258,9 +259,7 @@ export default function FootballBets() {
             {tab === "ko" && <Section title="Kick-Off" rows={koRows} />}
             {tab === "conf" && <Section title="Confidence" rows={confRows} />}
             {tab === "hist" && (
-              <div className="rounded-2xl p-4 border border-neutral-800 bg-neutral-900/60 text-sm opacity-80">
-                History (14d) puni se kada `history` job upiše rezultate u KV (hist:*).
-              </div>
+              <HistoryPanel days={14} top={3} slots="am,pm,late" />
             )}
           </div>
           <div className="lg:col-span-1">{/* desni panel po želji */}</div>
