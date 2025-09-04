@@ -1,5 +1,9 @@
+// components/HistoryPanel.js
 "use client";
-import React, { useEffect, useState } from "react";
+
+import React, { useEffect, useMemo, useState } from "react";
+
+const TZ = "Europe/Belgrade";
 
 async function safeJson(url) {
   try {
@@ -9,128 +13,125 @@ async function safeJson(url) {
     const t = await r.text();
     try { return JSON.parse(t); } catch { return { ok:false, error:"non-JSON", raw:t }; }
   } catch (e) {
-    return { ok:false, error: String(e?.message || e) };
+    return { ok:false, error:String(e?.message||e) };
   }
 }
 
-function StatCard({ label, value, accent }) {
+function statusIcon(status) {
+  const s = String(status||"").toLowerCase();
+  if (s === "win") return "✅";
+  if (s === "loss") return "❌";
+  if (s === "push" || s === "void") return "⏸";
+  return "⏳"; // pending / unknown
+}
+
+function fmtOdd(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n.toFixed(2) : "—";
+}
+
+function Row({ it }) {
   return (
-    <div className="p-3 rounded-2xl border border-neutral-800 bg-neutral-900/40 shadow-sm">
-      <div className="text-xs opacity-60">{label}</div>
-      <div className={`text-lg font-semibold ${accent || ""}`}>{value}</div>
+    <div className="flex items-center justify-between p-3 rounded-xl bg-[#1f2339]">
+      <div className="min-w-0">
+        <div className="text-xs text-slate-400">
+          {it.ymd} {it.time_hhmm || ""} · {it.league_name || it.league_country || ""}
+        </div>
+        <div className="font-semibold truncate">
+          {it.home} <span className="text-slate-400">vs</span> {it.away}
+        </div>
+        <div className="text-sm text-slate-300">
+          {it.market || "—"}{it.selection_label ? " → " : ""}{it.selection_label || it.pick || "—"}{" "}
+          <span className="text-slate-400">({fmtOdd(it.odds)})</span>
+        </div>
+      </div>
+      <div className="text-xl pl-3 shrink-0">
+        {statusIcon(it.status)}
+      </div>
     </div>
   );
 }
 
-function StatusIcon({ status }) {
-  if (status === "win")  return <span title="Win"  aria-label="Win">✅</span>;
-  if (status === "loss") return <span title="Loss" aria-label="Loss">❌</span>;
-  if (status === "push") return <span title="Push" aria-label="Push">🟡</span>;
-  return <span title="Pending" aria-label="Pending">⏳</span>;
-}
-
-export default function HistoryPanel({ days = 14, top = 3, slots = "am,pm,late" }) {
+export default function HistoryPanel({ days = 14, top = 3 }) {
   const [data, setData] = useState(null);
-  const [usedDays, setUsedDays] = useState(days);
-  const [err, setErr] = useState("");
+  const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      setErr("");
+  async function load() {
+    setLoading(true);
+    setErr(null);
+    try {
+      const j = await safeJson(`/api/history-roi?days=${days}&top=${top}`);
+      if (j?.ok) setData(j);
+      else {
+        setErr(j?.error || "Greška u /api/history-roi");
+        setData(null);
+      }
+    } catch (e) {
+      setErr(String(e?.message || e));
       setData(null);
+    } finally {
+      setLoading(false);
+    }
+  }
 
-      // Fallback redosled: trazeni -> 7 -> 1
-      const tryDays = Array.from(new Set([Number(days) || 14, 7, 1].filter(n => n >= 1 && n <= 60)));
+  useEffect(() => { load(); }, [days, top]);
 
-      let found = null;
-      for (const d of tryDays) {
-        const url = `/api/history-roi?days=${encodeURIComponent(d)}&top=${encodeURIComponent(top)}&slots=${encodeURIComponent(slots)}`;
-        const j = await safeJson(url);
-        if (cancelled) return;
-
-        if (j?.ok && (j?.summary?.picks || 0) > 0) {
-          found = j;
-          setUsedDays(d);
-          break;
-        }
-        if (!j?.ok) setErr(j?.error || "Greška u /api/history-roi");
+  const flatItems = useMemo(() => {
+    const arr = [];
+    const daysArr = Array.isArray(data?.days) ? data.days : [];
+    for (const d of daysArr) {
+      const items = Array.isArray(d?.items) ? d.items : [];
+      for (const it of items) {
+        arr.push({
+          key: `${d.ymd}:${it.fixture_id || it.home+'-'+it.away}:${it.market || ""}:${it.pick_code || ""}`,
+          ymd: d.ymd,
+          ...it,
+        });
       }
+    }
+    return arr;
+  }, [data]);
 
-      if (!found) {
-        // nema istorije ni za 1 dan — prikaži prazno stanje
-        setData({ summary: { days: tryDays[0], top, picks: 0, settled: 0, wins: 0, pushes: 0, roi_pct: 0, win_rate_pct: 0 }, days: [] });
-        return;
-      }
-      setData(found);
-    })();
-    return () => { cancelled = true; };
-  }, [days, top, slots]);
-
-  if (err) return <div className="p-3 text-sm text-red-400">History: {err}</div>;
-  if (!data) return <div className="p-3 text-sm opacity-70">History: učitavam…</div>;
-
-  const s = data.summary || {};
-  const daysArr = data.days || [];
-  const wl = `${s.wins ?? 0}-${Math.max(0, (s.settled ?? 0) - (s.wins ?? 0))}`;
-  const roiClass = (s.profit ?? 0) >= 0 ? "text-green-400" : "text-red-400";
+  const summary = data?.summary || null;
 
   return (
-    <div className="w-full">
-      {/* Summary strip */}
-      <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mb-4">
-        <StatCard label="Period" value={`${usedDays} dana`} />
-        <StatCard label="Top-N po slotu" value={s.top ?? top} />
-        <StatCard label="Picks / Settled" value={`${s.picks ?? 0} / ${s.settled ?? 0}`} />
-        <StatCard label="W/L" value={wl} />
-        <StatCard label="Win rate" value={`${Number(s.win_rate_pct ?? 0).toFixed(2)}%`} />
-        <StatCard label="ROI" value={`${Number(s.roi_pct ?? 0).toFixed(2)}%`} accent={roiClass} />
-      </div>
-
-      {/* Days grouped list */}
-      <div className="space-y-5">
-        {daysArr.map(day => (
-          <div key={day.ymd} className="rounded-2xl border border-neutral-800 bg-neutral-900/40 p-3">
-            <div className="flex items-center justify-between mb-2">
-              <div className="text-sm font-semibold">{day.ymd}</div>
-              <div className="text-xs opacity-70">
-                Settled {day.settled ?? 0}/{day.picks ?? 0} •
-                {" "}Win {Number(day.win_rate_pct ?? 0).toFixed(2)}% •
-                {" "}ROI <span className={`${(day.profit ?? 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
-                  {Number(day.roi_pct ?? 0).toFixed(2)}%
-                </span>
-              </div>
-            </div>
-
-            <div className="divide-y divide-neutral-800/80">
-              {(day.items || []).map((it, idx) => (
-                <div key={`${it.fixture_id || idx}`} className="py-2 flex items-center justify-between">
-                  <div className="flex flex-col md:flex-row md:items-center gap-1 md:gap-3">
-                    <div className="text-xs opacity-60 w-16">{it.time_hhmm || "—"}</div>
-                    <div className="text-sm">
-                      <span className="font-medium">{it.home}</span> — <span className="font-medium">{it.away}</span>
-                      {it.league_name ? <span className="ml-2 text-xs opacity-60">{it.league_name}</span> : null}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <div className="text-xs md:text-sm opacity-80">
-                      {String(it.market || "").toUpperCase()} • <span className="font-medium">{it.pick_code || it.selection_label || ""}</span>
-                    </div>
-                    <div className="text-sm w-14 text-right">{Number.isFinite(it.odds) ? Number(it.odds).toFixed(2) : "—"}</div>
-                    <div className="w-6 text-right"><StatusIcon status={it.status} /></div>
-                  </div>
-                </div>
-              ))}
-              {(!day.items || day.items.length === 0) && (
-                <div className="py-2 text-sm opacity-60">Nema stavki za ovaj dan.</div>
-              )}
+    <div className="space-y-4">
+      {loading ? (
+        <div className="text-slate-400 text-sm">Učitavam…</div>
+      ) : err ? (
+        <div className="text-red-400 text-sm">Greška: {err}</div>
+      ) : !summary ? (
+        <div className="text-slate-400 text-sm">Nema podataka za poslednjih {days} dana.</div>
+      ) : (
+        <>
+          {/* Summary header */}
+          <div className="rounded-2xl bg-[#15182a] p-4">
+            <div className="flex flex-wrap items-center gap-4 text-sm text-slate-200">
+              <div className="font-semibold">History — {summary.days}d</div>
+              <div>Picks: <b>{summary.picks}</b></div>
+              <div>Settled: <b>{summary.settled}</b></div>
+              <div>W/L: <b>{summary.wins}</b> / <b>{Math.max(0, (summary.settled||0) - (summary.wins||0) - (summary.pushes||0))}</b></div>
+              <div>Push: <b>{summary.pushes}</b></div>
+              <div>Profit: <b>{Number(summary.profit||0).toFixed(3)}</b>u</div>
+              <div>ROI: <b>{Number(summary.roi_pct||0).toFixed(2)}%</b></div>
+              <div>Win%: <b>{Number(summary.win_rate_pct||0).toFixed(2)}%</b></div>
             </div>
           </div>
-        ))}
-        {daysArr.length === 0 && (
-          <div className="p-3 text-sm opacity-60">Nema istorije za prikaz.</div>
-        )}
-      </div>
+
+          {/* List */}
+          <div className="rounded-2xl bg-[#15182a] p-4">
+            <div className="text-base font-semibold text-white mb-3">Rezultati</div>
+            {!flatItems.length ? (
+              <div className="text-slate-400 text-sm">Još nema završenih mečeva u periodu.</div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                {flatItems.map((it) => <Row key={it.key} it={it} />)}
+              </div>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }
