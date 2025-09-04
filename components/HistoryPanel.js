@@ -31,15 +31,38 @@ function StatusIcon({ status }) {
 
 export default function HistoryPanel({ days = 14, top = 3, slots = "am,pm,late" }) {
   const [data, setData] = useState(null);
+  const [usedDays, setUsedDays] = useState(days);
   const [err, setErr] = useState("");
 
   useEffect(() => {
     (async () => {
-      // Prefer new ROI endpoint; if fails, we can fallback later if needed
-      const url = `/api/history-roi?days=${encodeURIComponent(days)}&top=${encodeURIComponent(top)}&slots=${encodeURIComponent(slots)}`;
-      const j = await safeJson(url);
-      if (!j?.ok) { setErr(j?.error || "Greška u /api/history-roi"); return; }
-      setData(j);
+      setErr("");
+      setData(null);
+
+      // Fallback redosled: traženi -> 7 -> 1 (uz izbacivanje duplikata i out-of-range)
+      const tryDays = Array.from(
+        new Set([Number(days) || 14, 7, 1].filter(n => n >= 1 && n <= 60))
+      );
+
+      let found = null;
+      for (const d of tryDays) {
+        const url = `/api/history-roi?days=${encodeURIComponent(d)}&top=${encodeURIComponent(top)}&slots=${encodeURIComponent(slots)}`;
+        const j = await safeJson(url);
+        if (j?.ok && (j?.summary?.picks || 0) > 0) {
+          found = j;
+          setUsedDays(d);
+          break;
+        }
+        // ako je poslednji pokušaj, zapamti poslednji odgovor (za poruku)
+        if (d === tryDays[tryDays.length - 1] && j && !j.ok) setErr(j.error || "Greška u /api/history-roi");
+      }
+
+      if (!found) {
+        // nema istorije ni za 1 dan — prikaži prazno stanje
+        setData({ summary: { days: tryDays[0], top, picks: 0, settled: 0, wins: 0, pushes: 0, roi_pct: 0, win_rate_pct: 0 }, days: [] });
+        return;
+      }
+      setData(found);
     })();
   }, [days, top, slots]);
 
@@ -56,7 +79,7 @@ export default function HistoryPanel({ days = 14, top = 3, slots = "am,pm,late" 
     <div className="w-full">
       {/* Summary strip */}
       <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mb-4">
-        <StatCard label="Period" value={`${s.days ?? days} dana`} />
+        <StatCard label="Period" value={`${usedDays} dana`} />
         <StatCard label="Top-N po slotu" value={s.top ?? top} />
         <StatCard label="Picks / Settled" value={`${s.picks ?? 0} / ${s.settled ?? 0}`} />
         <StatCard label="W/L" value={wl} />
@@ -93,7 +116,7 @@ export default function HistoryPanel({ days = 14, top = 3, slots = "am,pm,late" 
                     <div className="text-xs md:text-sm opacity-80">
                       {String(it.market || "").toUpperCase()} • <span className="font-medium">{it.pick_code || it.selection_label || ""}</span>
                     </div>
-                    <div className="text-sm w-14 text-right">{it.odds ? it.odds.toFixed(2) : "—"}</div>
+                    <div className="text-sm w-14 text-right">{Number.isFinite(it.odds) ? it.odds.toFixed(2) : "—"}</div>
                     <div className="w-6 text-right"><StatusIcon status={it.status} /></div>
                   </div>
                 </div>
