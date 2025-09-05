@@ -1,6 +1,6 @@
-// pages/api/cron/rebuild.js 
+// pages/api/cron/rebuild.js
 // Slot rebuild sa 3 slota (late/am/pm), realnijim EV-om (median price),
-// sum-safe clamp-om za 1X2, fallback-om za OU/BTTS, fill-to-limit (TARGET 15/20/6),
+// sum-safe clamp-om za 1X2, fallback-om za OU/BTTS, fill-to-limit,
 // i blagom "learning" kalibracijom (čitanje iz vb:cal:v1).
 
 export const config = { api: { bodyParser: false } };
@@ -42,22 +42,11 @@ function toLocal(dateIso, tz = TZ) {
 }
 
 /* ---------------- env helpers ---------------- */
-function envNum(name, def=0){
-  const v = Number(process.env[name]);
-  return Number.isFinite(v) ? v : def;
-}
-function envBool(name, def=false){
-  const v = process.env[name];
-  if (v == null) return def;
-  return /^(1|true|yes|on)$/i.test(String(v));
-}
+function envNum(name, def=0){ const v = Number(process.env[name]); return Number.isFinite(v) ? v : def; }
+function envBool(name, def=false){ const v = process.env[name]; if (v == null) return def; return /^(1|true|yes|on)$/i.test(String(v)); }
 function envList(nameA, nameB) {
   const raw = process.env[nameA] || process.env[nameB] || "";
-  return String(raw)
-    .split(/[,;|\n]/g)
-    .map(s => s.trim())
-    .filter(Boolean)
-    .map(s => s.toLowerCase());
+  return String(raw).split(/[,;|\n]/g).map(s=>s.trim()).filter(Boolean).map(s=>s.toLowerCase());
 }
 function inListLowerIncludes(nameLower, list) {
   if (!list || !list.length) return true;
@@ -67,7 +56,8 @@ function inListLowerIncludes(nameLower, list) {
 
 /* ---------------- global knobs ---------------- */
 const DEFAULT_LIMIT_WEEKDAY = envNum("SLOT_WEEKDAY_LIMIT", 15);
-const DEFAULT_LIMIT_WEEKEND = envNum("SLOT_WEEKEND_LIMIT", 20); // ⬅️ vikend 20 (po tvojoj želji)
+const DEFAULT_LIMIT_WEEKEND = envNum("SLOT_WEEKEND_LIMIT", 20); // vikend 20
+const LATE_LIMIT             = envNum("SLOT_LATE_LIMIT", 6);    // late 6
 
 const MIN_ODDS = envNum("MIN_ODDS", 1.01);
 const MODEL_ALPHA = envNum("MODEL_ALPHA", 0.4);
@@ -84,8 +74,8 @@ if (!SHARP_BOOKIES.length) {
 
 /* pragovi */
 const MIN_BOOKS_STRICT    = 3;
-const MIN_BOOKS_RELAX     = 2;                    // OU/BTTS relaxed = 2 (volumen)
-const MIN_BOOKS_RELAX_1X2 = envNum("MIN_BOOKS_RELAX_1X2", 3); // 1X2 relaxed = 3
+const MIN_BOOKS_RELAX     = 2;
+const MIN_BOOKS_RELAX_1X2 = envNum("MIN_BOOKS_RELAX_1X2", 3);
 
 const EV_FLOOR      = envNum("EV_FLOOR", 0.02);
 const SPREAD_STRICT = 0.25;
@@ -100,108 +90,21 @@ const H2H_WEIGHT      = Math.max(0, Math.min(0.4,  envNum("H2H_WEIGHT", 0.15)));
 const STATS_TEAM_LAST = Math.max(5, envNum("STATS_TEAM_LAST", 12));
 
 /* ---------------- utils ---------------- */
-function trimmedMedian(a) {
-  const x = a.filter(Number.isFinite).sort((p, q) => p - q);
-  if (x.length >= 5) { x.shift(); x.pop(); }
-  if (!x.length) return NaN;
-  const m = Math.floor(x.length / 2);
-  return x.length % 2 ? x[m] : (x[m - 1] + x[m]) / 2;
-}
-function spreadOf(arr) {
-  const a = arr.filter(Number.isFinite);
-  if (a.length < 2) return 0;
-  const mn = Math.min(...a); const mx = Math.max(...a);
-  if (!mn) return 0;
-  return mx / mn - 1;
-}
-function norm3(a, b, c) {
-  const s = (a||0) + (b||0) + (c||0);
-  if (s <= 0) return { A: 0, B: 0, C: 0 };
-  return { A: a/s, B: b/s, C: c/s };
-}
-function pickLabel1X2(k){ return k==="1" ? "Home" : k==="X" ? "Draw" : "Away"; }
-
-function evLowerBound(price, prob, booksCount){
-  const N = Math.max(1, booksCount||0);
-  const sigma = Math.sqrt(Math.max(1e-9, prob*(1-prob)/N));
-  const p_lb = Math.max(0, prob - EV_Z * sigma);
-  return price * p_lb - 1;
-}
-
-function dynamicUpliftCap(books, spread) {
-  const b = Math.min(1, (books||0)/6);
-  const s = 1 / (1 + 4*(spread||0));
-  return Math.max(0.05, 0.20 * b * s); // max 20pp
-}
-
-// MEDIAN cena za EV
-function priceMedian(m, k) {
-  try {
-    const arr = (m?.by?.[k] || []).filter(Number.isFinite);
-    if (arr.length) return trimmedMedian(arr);
-    const v = m?.medBy?.[k];
-    return Number.isFinite(v) ? v : null;
-  } catch { return null; }
-}
-function bestPrice(m, k) { // ostavljeno za reference
-  try {
-    const arr = (m?.by?.[k] || []).filter(Number.isFinite);
-    if (arr.length) return Math.max(...arr);
-    const v = m?.medBy?.[k];
-    return Number.isFinite(v) ? v : null;
-  } catch { return null; }
-}
-
-function isWomensLeague(leagueName="", teams={home:"",away:""}) {
-  const s = `${leagueName} ${teams.home} ${teams.away}`.toLowerCase();
-  return /\b(women|femin|femen|w\s*league|ladies|girls|女子|жен)\b/.test(s);
-}
-function lowTierMention(s=""){
-  return /\b(U1[7-9]|U2[0-3]|U-1[7-9]|U-2[0-3]|Youth|Reserves|Reserve|II\b| B\b|B Team|Academy|U21|U23)\b/i.test(s);
-}
-function isLowTier(leagueName="", teams={home:"",away:""}){
-  return lowTierMention(leagueName) || lowTierMention(teams.home||"") || lowTierMention(teams.away||"");
-}
+function trimmedMedian(a){ const x=a.filter(Number.isFinite).sort((p,q)=>p-q); if(x.length>=5){x.shift();x.pop();} if(!x.length) return NaN; const m=Math.floor(x.length/2); return x.length%2?x[m]:(x[m-1]+x[m])/2; }
+function spreadOf(arr){ const a=arr.filter(Number.isFinite); if(a.length<2) return 0; const mn=Math.min(...a), mx=Math.max(...a); if(!mn) return 0; return mx/mn-1; }
+function norm3(a,b,c){ const s=(a||0)+(b||0)+(c||0); if(s<=0) return {A:0,B:0,C:0}; return {A:a/s,B:b/s,C:c/s}; }
+function pickLabel1X2(k){ return k==="1"?"Home":k==="X"?"Draw":"Away"; }
+function evLowerBound(price, prob, booksCount){ const N=Math.max(1,booksCount||0); const sigma=Math.sqrt(Math.max(1e-9, prob*(1-prob)/N)); const p_lb=Math.max(0, prob - EV_Z*sigma); return price*p_lb - 1; }
+function dynamicUpliftCap(books, spread){ const b=Math.min(1,(books||0)/6); const s=1/(1+4*(spread||0)); return Math.max(0.05, 0.20*b*s); }
 
 /* ---------------- API-Football ---------------- */
 const API_BASE = process.env.API_FOOTBALL_BASE_URL || process.env.API_FOOTBALL || "https://v3.football.api-sports.io";
 const API_KEY  = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.env.API_FOOTBALL || "";
-function afHeaders() {
-  const h = {};
-  if (API_KEY) {
-    h["x-apisports-key"] = API_KEY;
-    h["x-rapidapi-key"] = API_KEY;
-  }
-  return h;
-}
-async function getJSON(url) {
-  const r = await fetch(url, { headers: afHeaders() });
-  const ct = r.headers.get("content-type") || "";
-  if (!r.ok) throw new Error(`AF ${r.status} ${await r.text().catch(() => r.statusText)}`);
-  return ct.includes("application/json") ? await r.json() : JSON.parse(await r.text());
-}
-async function fetchFixturesByDate(ymd) {
-  if (!API_KEY) return [];
-  try {
-    const j = await getJSON(`${API_BASE.replace(/\/+$/, "")}/fixtures?date=${encodeURIComponent(ymd)}`);
-    return Array.isArray(j?.response) ? j.response : [];
-  } catch { return []; }
-}
-async function fetchOddsForFixture(fixtureId) {
-  if (!API_KEY) return [];
-  try {
-    const j = await getJSON(`${API_BASE.replace(/\/+$/, "")}/odds?fixture=${encodeURIComponent(fixtureId)}`);
-    return Array.isArray(j?.response) ? j.response : [];
-  } catch { return []; }
-}
-async function fetchPredictionForFixture(fixtureId) {
-  if (!API_KEY) return null;
-  try {
-    const j = await getJSON(`${API_BASE.replace(/\/+$/, "")}/predictions?fixture=${encodeURIComponent(fixtureId)}`);
-    const arr = Array.isArray(j?.response) ? j.response : [];
-    return arr[0] || null;
-  } catch { return null; }
-}
+function afHeaders(){ const h={}; if(API_KEY){ h["x-apisports-key"]=API_KEY; h["x-rapidapi-key"]=API_KEY; } return h; }
+async function getJSON(url){ const r=await fetch(url,{headers:afHeaders()}); const ct=r.headers.get("content-type")||""; if(!r.ok) throw new Error(`AF ${r.status} ${await r.text().catch(()=>r.statusText)}`); return ct.includes("application/json")?await r.json():JSON.parse(await r.text()); }
+async function fetchFixturesByDate(ymd){ if(!API_KEY) return []; try{ const j=await getJSON(`${API_BASE.replace(/\/+$/,"")}/fixtures?date=${encodeURIComponent(ymd)}`); return Array.isArray(j?.response)?j.response:[]; } catch { return []; } }
+async function fetchOddsForFixture(fixtureId){ if(!API_KEY) return []; try{ const j=await getJSON(`${API_BASE.replace(/\/+$/,"")}/odds?fixture=${encodeURIComponent(fixtureId)}`); return Array.isArray(j?.response)?j.response:[]; } catch { return []; } }
+async function fetchPredictionForFixture(fixtureId){ if(!API_KEY) return null; try{ const j=await getJSON(`${API_BASE.replace(/\/+$/,"")}/predictions?fixture=${encodeURIComponent(fixtureId)}`); const arr=Array.isArray(j?.response)?j.response:[]; return arr[0]||null; } catch { return null; } }
 
 /* ---------------- Statistike ---------------- */
 async function fetchRecentForTeam(leagueId, season, teamId, lastN = STATS_TEAM_LAST) {
@@ -216,34 +119,25 @@ function computeTeamRecentStats(list, teamId) {
   const L = Array.isArray(list) ? list : [];
   let games=0, btts=0, over25=0, pts=0;
   for (const r of L) {
-    const gh = Number(r?.goals?.home);
-    const ga = Number(r?.goals?.away);
+    const gh = Number(r?.goals?.home); const ga = Number(r?.goals?.away);
     const st = (r?.fixture?.status?.short || "").toUpperCase();
     if (!Number.isFinite(gh) || !Number.isFinite(ga)) continue;
     if (!/^FT|AET|PEN$/.test(st)) continue;
     games++;
-    const homeId = r?.teams?.home?.id;
-    const awayId = r?.teams?.away?.id;
+    const homeId = r?.teams?.home?.id; const awayId = r?.teams?.away?.id;
     const sum = gh + ga;
     if (gh>0 && ga>0) btts++;
     if (sum>=3) over25++;
     const winnerHome = r?.teams?.home?.winner === true;
     const winnerAway = r?.teams?.away?.winner === true;
     if (homeId === teamId) {
-      if (winnerHome) pts += 3;
-      else if (!winnerHome && !winnerAway) pts += 1;
+      if (winnerHome) pts += 3; else if (!winnerHome && !winnerAway) pts += 1;
     } else if (awayId === teamId) {
-      if (winnerAway) pts += 3;
-      else if (!winnerHome && !winnerAway) pts += 1;
+      if (winnerAway) pts += 3; else if (!winnerHome && !winnerAway) pts += 1;
     }
   }
   if (!games) return null;
-  return {
-    games,
-    bttsRate: btts/games,
-    over25Rate: over25/games,
-    formPct: pts/(games*3)
-  };
+  return { games, bttsRate: btts/games, over25Rate: over25/games, formPct: pts/(games*3) };
 }
 async function fetchH2H(homeId, awayId, lastN = 10) {
   if (!API_KEY || !homeId || !awayId) return null;
@@ -257,13 +151,11 @@ function computeRatesFromFixtures(list) {
   const L = Array.isArray(list) ? list : [];
   let games=0, btts=0, over25=0;
   for (const r of L) {
-    const gh = Number(r?.goals?.home);
-    const ga = Number(r?.goals?.away);
+    const gh = Number(r?.goals?.home); const ga = Number(r?.goals?.away);
     const st = (r?.fixture?.status?.short || "").toUpperCase();
     if (!Number.isFinite(gh) || !Number.isFinite(ga)) continue;
     if (!/^FT|AET|PEN$/.test(st)) continue;
-    games++;
-    const sum = gh+ga;
+    games++; const sum = gh+ga;
     if (gh>0 && ga>0) btts++;
     if (sum>=3) over25++;
   }
@@ -278,13 +170,11 @@ function combineTeamRates(homeRate, awayRate) {
 }
 function formTo1X2Prob(homeFormPct, awayFormPct) {
   if (!Number.isFinite(homeFormPct) || !Number.isFinite(awayFormPct)) return null;
-  const adv = 0.08; // home advantage ~8pp
+  const adv = 0.08;
   const h = Math.max(0.01, Math.min(0.99, homeFormPct + adv));
   const a = Math.max(0.01, Math.min(0.99, awayFormPct));
   const s = h + a;
-  const pH = h / s;
-  const pA = a / s;
-  const pD = Math.max(0.05, 1 - (pH + pA));
+  const pH = h / s; const pA = a / s; const pD = Math.max(0.05, 1 - (pH + pA));
   const k = (1 - pD) / (pH + pA);
   return { H: pH * k, D: pD, A: pA * k };
 }
@@ -294,7 +184,7 @@ function mixProb(oddsProb, statProb, w = STATS_WEIGHT) {
   return Math.max(0.02, Math.min(0.98, p));
 }
 
-/* ---------------- odds extraction (FAIR vs PRICE) ---------------- */
+/* ---------------- odds extraction helpers (1X2/BTTS/OU/HT-FT) ---------------- */
 function extractRows(oddsPayload) {
   const roots = Array.isArray(oddsPayload) ? oddsPayload : [];
   const rows = [];
@@ -306,9 +196,7 @@ function extractRows(oddsPayload) {
   }
   return rows;
 }
-function uniqueName(row) {
-  return String(row?.name ?? row?.bookmaker?.name ?? row?.id ?? row?.bookmaker ?? "").toLowerCase();
-}
+function uniqueName(row) { return String(row?.name ?? row?.bookmaker?.name ?? row?.id ?? row?.bookmaker ?? "").toLowerCase(); }
 
 function extract1X2(oddsPayload) {
   const rows = extractRows(oddsPayload);
@@ -481,27 +369,24 @@ async function kvSetJSON(key, value) {
 function calFactor(cal, market, pick){
   const node = cal?.[String(market).toUpperCase()]?.[String(pick).toUpperCase()];
   if(!node || (node.n||0) < 50) return 1;
-  const meanObs  = (node.wins + 2) / (node.n + 4);           // Laplace smoothing
+  const meanObs  = (node.wins + 2) / (node.n + 4);
   const meanPred = (node.sum_p + 1e-6) / (node.n + 1e-6);
   let r = meanObs / Math.max(0.01, Math.min(0.99, meanPred));
-  r = Math.max(0.9, Math.min(1.1, r));                       // cap ±10%
-  return Math.pow(r, 0.5);                                   // blaga polovina
+  r = Math.max(0.9, Math.min(1.1, r));
+  return Math.pow(r, 0.5);
 }
 
-/* ---------------- candidate builder ---------------- */
+/* ---------------- candidate builders & 1X2 clamp ---------------- */
 function buildCandidate(recBase, market, code, label, price, prob, booksCount, minBooksNeeded) {
   if (!Number.isFinite(price) || price < MIN_ODDS) return null;
   if (!Number.isFinite(prob)) return null;
   if (!Number.isFinite(booksCount) || booksCount < (minBooksNeeded ?? MIN_BOOKS_STRICT)) return null;
-
   const confidence_pct = Math.round(Math.max(0, Math.min(100, prob*100)));
   const _implied = Number((1/price).toFixed(4));
   const _ev = Number((price*prob - 1).toFixed(12));
   if (!Number.isFinite(_ev) || _ev < EV_FLOOR) return null;
-
   const _ev_lb = Number(evLowerBound(price, prob, booksCount).toFixed(12));
   if (_ev_lb < EV_LB_FLOOR) return null;
-
   return {
     fixture_id: recBase.fixture_id,
     market, pick: label, pick_code: code, selection_label: label,
@@ -514,7 +399,6 @@ function buildCandidate(recBase, market, code, label, price, prob, booksCount, m
     _implied, _ev, _ev_lb,
   };
 }
-// Loose varijanta za fill-to-limit (bez EV-LB uslova, EV >= 0, blaži spread)
 function buildCandidateLoose(recBase, market, code, label, price, prob, booksCount, minBooksNeeded) {
   if (!Number.isFinite(price) || price < MIN_ODDS) return null;
   if (!Number.isFinite(prob)) return null;
@@ -537,8 +421,6 @@ function buildCandidateLoose(recBase, market, code, label, price, prob, booksCou
     _loose: true
   };
 }
-
-/* ---------------- 1X2 sum-safe clamp ---------------- */
 function sumSafeClamp1x2(implied, proposed, isX) {
   const keys = ["H","D","A"];
   const impl = { H: implied.H, D: implied.D, A: implied.A };
@@ -586,11 +468,7 @@ function sumSafeClamp1x2(implied, proposed, isX) {
 /* ---------------- handler ---------------- */
 export default async function handler(req, res) {
   try {
-    const now = new Date();
-    const ymdCET = ymdInTZ(now, TZ);
-    const ymdUTC = ymdInTZ(now, "UTC");
-    const ymd = ymdCET;
-
+    const ymd = ymdInTZ();
     const slotQ = String(req.query?.slot || "").toLowerCase() || "am";
     const window =
       slotQ === "late" ? { hmin: 0,  hmax: 9 }  :
@@ -598,8 +476,7 @@ export default async function handler(req, res) {
                          { hmin: 15, hmax: 23 };
 
     const isWeekend = [0,6].includes(new Date().getDay());
-    const slotLimit = isWeekend ? DEFAULT_LIMIT_WEEKEND : DEFAULT_LIMIT_WEEKDAY;
-    const TARGET = (slotQ === "late") ? 6 : slotLimit; // ⬅️ 6 za late, 15/20 za am/pm
+    const TARGET = slotQ === "late" ? LATE_LIMIT : (isWeekend ? DEFAULT_LIMIT_WEEKEND : DEFAULT_LIMIT_WEEKDAY);
 
     // fixtures
     const raw = await fetchFixturesByDate(ymd);
@@ -618,23 +495,17 @@ export default async function handler(req, res) {
           local_str: `${loc.ymd} ${loc.hm}`,
           league: { id: lg?.id, name: lg?.name, country: lg?.country, season: lg?.season },
           season: lg?.season,
-          teams: { 
-            home: home, 
-            away: away,
-            home_id: tm?.home?.id,
-            away_id: tm?.away?.id
-          }
+          teams: { home: home, away: away, home_id: tm?.home?.id, away_id: tm?.away?.id }
         };
       })
       .filter(fx => fx.fixture_id && fx.date_utc != null)
       .filter(fx => fx.local_hour >= window.hmin && fx.local_hour <= window.hmax)
-      .filter(fx => !(EXCLUDE_WOMEN && isWomensLeague(fx.league?.name, fx.teams)))
-      .filter(fx => !(EXCLUDE_LOW_TIERS && isLowTier(fx.league?.name || "", fx.teams)));
+      .filter(fx => !(EXCLUDE_WOMEN && (/\b(women|femin|femen|w\s*league|ladies|girls|女子|жен)\b/i).test(`${fx.league?.name} ${fx.teams.home} ${fx.teams.away}`)))
+      .filter(fx => !(EXCLUDE_LOW_TIERS && (/\b(U1[7-9]|U2[0-3]|U-1[7-9]|U-2[0-3]|Youth|Reserves|Reserve|II\b| B\b|B Team|Academy|U21|U23)\b/i).test(`${fx.league?.name||""} ${fx.teams.home} ${fx.teams.away}`)));
 
     const bestPerFixture = [];
     const fillerByFixture = new Map();
 
-    // učitaj kalibraciju (learning)
     const cal = await kvGetJSON('vb:cal:v1').catch(()=>null) || {};
 
     for (const fx of fixtures) {
@@ -687,24 +558,14 @@ export default async function handler(req, res) {
       }
       { const s = (model1["1"]||0)+(model1["X"]||0)+(model1["2"]||0); if (s>0){ model1={"1":model1["1"]/s,"X":model1["X"]/s,"2":model1["2"]/s}; } }
 
-      function getBooksCount(m, k) {
-        const fair = Number(m?.countsBy?.[k] || 0);
-        const any  = Array.isArray(m?.by?.[k]) ? m.by[k].length : 0;
-        return Math.max(fair, any);
-      }
-      function getSpread(m, k) {
-        const fairSpread = m?.spreadBy?.[k];
-        if (Number.isFinite(fairSpread) && (m?.countsBy?.[k] || 0) > 0) return fairSpread;
-        const arr = (m?.by?.[k] || []).filter(Number.isFinite);
-        return spreadOf(arr);
-      }
+      function getBooksCount(m, k){ const fair=Number(m?.countsBy?.[k]||0); const any=Array.isArray(m?.by?.[k])?m.by[k].length:0; return Math.max(fair, any); }
+      function getSpread(m, k){ const fairSpread=m?.spreadBy?.[k]; if (Number.isFinite(fairSpread) && (m?.countsBy?.[k]||0) > 0) return fairSpread; const arr=(m?.by?.[k]||[]).filter(Number.isFinite); return spreadOf(arr); }
 
       function candidates1X2(strict=true){
-        const out=[];
-        const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX_1X2;
-        const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
+        const out=[]; const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX_1X2; const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
         for (const k of ["1","X","2"]) {
-          const price = priceMedian(m1, k); if (!Number.isFinite(price)) continue; // MEDIAN price za EV
+          const price = Number.isFinite(m1.medBy[k]) ? m1.medBy[k] : trimmedMedian((m1.by[k]||[]).filter(Number.isFinite));
+          if (!Number.isFinite(price)) continue;
           const books = getBooksCount(m1, k);
           const spr = getSpread(m1, k);
           const prob = model1[k];
@@ -728,29 +589,21 @@ export default async function handler(req, res) {
         return { pY: impY/s, pN: impN/s };
       }
       function candidatesBTTS(strict=true){
-        const out=[];
-        const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX;
-        const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
-
-        const probs = impliedBTTS();
-        if (!probs) return out;
-
-        const booksY = getBooksCount(mb,"Y");
-        const booksN = getBooksCount(mb,"N");
-        const sprY = getSpread(mb,"Y");
-        const sprN = getSpread(mb,"N");
-        const okY = booksY >= needBooks && sprY <= sprLimit && Number.isFinite(priceMedian(mb,"Y"));
-        const okN = booksN >= needBooks && sprN <= sprLimit && Number.isFinite(priceMedian(mb,"N"));
+        const out=[]; const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX; const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
+        const probs = impliedBTTS(); if (!probs) return out;
+        const booksY = getBooksCount(mb,"Y"); const booksN = getBooksCount(mb,"N");
+        const sprY = getSpread(mb,"Y"); const sprN = getSpread(mb,"N");
+        const okY = booksY >= needBooks && sprY <= sprLimit && Number.isFinite(mb.medBy.Y || trimmedMedian((mb.by.Y||[]).filter(Number.isFinite)));
+        const okN = booksN >= needBooks && sprN <= sprLimit && Number.isFinite(mb.medBy.N || trimmedMedian((mb.by.N||[]).filter(Number.isFinite)));
         if (!okY && !okN) return out;
-
         if (okY) {
-          const cY = buildCandidate(recBase, "BTTS", "Y", "Yes",
-            priceMedian(mb,"Y"), probs.pY, booksY, needBooks);
+          const price = Number.isFinite(mb.medBy.Y) ? mb.medBy.Y : trimmedMedian((mb.by.Y||[]).filter(Number.isFinite));
+          const cY = buildCandidate(recBase, "BTTS", "Y", "Yes", price, probs.pY, booksY, needBooks);
           if (cY) out.push(cY);
         }
         if (okN) {
-          const cN = buildCandidate(recBase, "BTTS", "N", "No",
-            priceMedian(mb,"N"), probs.pN, booksN, needBooks);
+          const price = Number.isFinite(mb.medBy.N) ? mb.medBy.N : trimmedMedian((mb.by.N||[]).filter(Number.isFinite));
+          const cN = buildCandidate(recBase, "BTTS", "N", "No", price, probs.pN, booksN, needBooks);
           if (cN) out.push(cN);
         }
         return out;
@@ -768,29 +621,21 @@ export default async function handler(req, res) {
         return { pO: impO/s, pU: impU/s };
       }
       function candidatesOU(strict=true){
-        const out=[];
-        const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX;
-        const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
-
-        const probs = impliedOU();
-        if (!probs) return out;
-
-        const booksO = getBooksCount(mo,"O");
-        const booksU = getBooksCount(mo,"U");
-        const sprO = getSpread(mo,"O");
-        const sprU = getSpread(mo,"U");
-        const okO = booksO >= needBooks && sprO <= sprLimit && Number.isFinite(priceMedian(mo,"O"));
-        const okU = booksU >= needBooks && sprU <= sprLimit && Number.isFinite(priceMedian(mo,"U"));
+        const out=[]; const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX; const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
+        const probs = impliedOU(); if (!probs) return out;
+        const booksO = getBooksCount(mo,"O"); const booksU = getBooksCount(mo,"U");
+        const sprO = getSpread(mo,"O"); const sprU = getSpread(mo,"U");
+        const okO = booksO >= needBooks && sprO <= sprLimit && Number.isFinite(mo.medBy.O || trimmedMedian((mo.by.O||[]).filter(Number.isFinite)));
+        const okU = booksU >= needBooks && sprU <= sprLimit && Number.isFinite(mo.medBy.U || trimmedMedian((mo.by.U||[]).filter(Number.isFinite)));
         if (!okO && !okU) return out;
-
         if (okO) {
-          const cO = buildCandidate(recBase, "OU2.5", "O2.5", "Over 2.5",
-            priceMedian(mo,"O"), probs.pO, booksO, needBooks);
+          const price = Number.isFinite(mo.medBy.O) ? mo.medBy.O : trimmedMedian((mo.by.O||[]).filter(Number.isFinite));
+          const cO = buildCandidate(recBase, "OU2.5", "O2.5", "Over 2.5", price, probs.pO, booksO, needBooks);
           if (cO) out.push(cO);
         }
         if (okU) {
-          const cU = buildCandidate(recBase, "OU2.5", "U2.5", "Under 2.5",
-            priceMedian(mo,"U"), probs.pU, booksU, needBooks);
+          const price = Number.isFinite(mo.medBy.U) ? mo.medBy.U : trimmedMedian((mo.by.U||[]).filter(Number.isFinite));
+          const cU = buildCandidate(recBase, "OU2.5", "U2.5", "Under 2.5", price, probs.pU, booksU, needBooks);
           if (cU) out.push(cU);
         }
         return out;
@@ -799,25 +644,24 @@ export default async function handler(req, res) {
       /* ---------- HT-FT ---------- */
       const mh = extractHTFT(oddsArr);
       function candidatesHTFT(strict=true){
-        const out=[];
-        const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX;
-        const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
-
+        const out=[]; const needBooks = strict ? MIN_BOOKS_STRICT : MIN_BOOKS_RELAX; const sprLimit = strict ? SPREAD_STRICT : SPREAD_LOOSE;
         const valid = [];
         const labels = { HH:"Home/Home", HD:"Home/Draw", HA:"Home/Away", DH:"Draw/Home", DD:"Draw/Draw", DA:"Draw/Away", AH:"Away/Home", AD:"Away/Draw", AA:"Away/Away" };
         for (const k of Object.keys(mh.medBy)) {
-          const price = priceMedian(mh,k); if (!Number.isFinite(price)) continue;
+          const price = Number.isFinite(mh.medBy[k]) ? mh.medBy[k] : trimmedMedian((mh.by[k]||[]).filter(Number.isFinite));
+          if (!Number.isFinite(price)) continue;
           const books = getBooksCount(mh,k);
           const spr = getSpread(mh,k);
           if (books >= needBooks && spr <= sprLimit) valid.push(k);
         }
         const minCombos = strict ? 3 : 2;
         if (valid.length < minCombos) return out;
-
         const approxProb = { HH: 0.34, HD: 0.11, HA: 0.06, DH: 0.13, DD: 0.14, DA: 0.08, AH: 0.06, AD: 0.08, AA: 0.10 };
         for (const k of valid) {
           const prob = approxProb[k] ?? 0.05;
-          const c = buildCandidate(recBase, "HT-FT", k, labels[k]||k, priceMedian(mh,k), prob, getBooksCount(mh,k), needBooks);
+          const c = buildCandidate(recBase, "HT-FT", k, labels[k]||k,
+            (Number.isFinite(mh.medBy[k]) ? mh.medBy[k] : trimmedMedian((mh.by[k]||[]).filter(Number.isFinite))),
+            prob, getBooksCount(mh,k), needBooks);
           if (c) out.push(c);
         }
         return out;
@@ -830,7 +674,6 @@ export default async function handler(req, res) {
         ...candidatesHTFT(true),
       ];
 
-      /* ---------- STAT MIX + SUM-SAFE CLAMP + POST-FILTER + LEARNING ---------- */
       const applyStatsWithClamp = async (arr) => {
         if (!STATS_ENABLED || !arr.length) return arr;
 
@@ -850,8 +693,8 @@ export default async function handler(req, res) {
           const as = computeTeamRecentStats(awayList, awayId);
           const hh = computeRatesFromFixtures(h2hList);
 
-          const canUseTeams = (hs?.games >= 5 && as?.games >= 5);   // ≥5 FT po timu
-          const canUseH2H   = (hh && hh.games >= 4);                // ≥4 FT H2H
+          const canUseTeams = (hs?.games >= 5 && as?.games >= 5);
+          const canUseH2H   = (hh && hh.games >= 4);
 
           let pBTTS_stat = canUseTeams ? combineTeamRates(hs?.bttsRate, as?.bttsRate) : null;
           let pOU25_stat = canUseTeams ? combineTeamRates(hs?.over25Rate, as?.over25Rate) : null;
@@ -872,11 +715,8 @@ export default async function handler(req, res) {
               const p_odds = c.model_prob;
               const p_stat = (c.pick_code === "Y") ? pBTTS_stat : (Number.isFinite(pBTTS_stat) ? (1 - pBTTS_stat) : null);
               c.model_prob = Number(mixProb(p_odds, p_stat).toFixed(4));
-
-              // learning kalibracija
               const f = calFactor(cal, c.market, c.pick_code);
               c.model_prob = Math.max(0.02, Math.min(0.98, c.model_prob * f));
-
               c._ev = Number((price * c.model_prob - 1).toFixed(12));
               c._ev_lb = Number(evLowerBound(price, c.model_prob, books).toFixed(12));
               const strongMarket = books >= 5 && c._ev >= EV_FLOOR * 1.5;
@@ -887,25 +727,20 @@ export default async function handler(req, res) {
               let p_stat = pOU25_stat;
               if (Number.isFinite(p_stat) && c.pick_code === "U2.5") p_stat = 1 - p_stat;
               c.model_prob = Number(mixProb(p_odds, p_stat).toFixed(4));
-
-              // learning kalibracija
               const f = calFactor(cal, c.market, c.pick_code);
               c.model_prob = Math.max(0.02, Math.min(0.98, c.model_prob * f));
-
               c._ev = Number((price * c.model_prob - 1).toFixed(12));
               c._ev_lb = Number(evLowerBound(price, c.model_prob, books).toFixed(12));
               const strongMarket = books >= 5 && c._ev >= EV_FLOOR * 1.5;
               if (!strongMarket && !(c._ev >= EV_FLOOR && c._ev_lb >= EV_LB_FLOOR)) c._drop = true;
             }
             if (c.market === "1X2") {
-              // stat-mix samo ako ima form signal
               let proposed = { H: null, D: null, A: null };
               const implied = {
                 H: (1/m1.medBy["1"]) / ((1/m1.medBy["1"]) + (1/m1.medBy["X"]) + (1/m1.medBy["2"]) || 1),
                 D: (1/m1.medBy["X"]) / ((1/m1.medBy["1"]) + (1/m1.medBy["X"]) + (1/m1.medBy["2"]) || 1),
                 A: (1/m1.medBy["2"]) / ((1/m1.medBy["1"]) + (1/m1.medBy["X"]) + (1/m1.medBy["2"]) || 1)
               };
-
               if (form1x2) {
                 proposed = {
                   H: (c.pick_code === "1") ? Number(mixProb(c.model_prob, form1x2.H).toFixed(4)) : model1["1"],
@@ -915,12 +750,8 @@ export default async function handler(req, res) {
                 const out = sumSafeClamp1x2(implied, proposed, c.pick_code === "X");
                 c.model_prob = Number( (c.pick_code === "1") ? out.H : (c.pick_code === "X") ? out.D : out.A );
               }
-
-              // learning kalibracija
               const f = calFactor(cal, c.market, c.pick_code);
               c.model_prob = Math.max(0.02, Math.min(0.98, c.model_prob * f));
-
-              // recompute EV/EV-LB i filter
               c._ev = Number((price * c.model_prob - 1).toFixed(12));
               c._ev_lb = Number(evLowerBound(price, c.model_prob, books).toFixed(12));
               const strongMarket = books >= 5 && c._ev >= EV_FLOOR * 1.5;
@@ -930,11 +761,11 @@ export default async function handler(req, res) {
 
           return arr.filter(x => !x? false : !x._drop);
         } catch (_) {
-          return arr; // fail-safe
+          return arr;
         }
       };
 
-      // strict → stat → top-1; ako nema, relaxed → stat → top-1
+      // strict → stat → top-1; fallback relaxed → stat → top-1
       let pool = strictCands;
       if (pool.length) {
         pool = await applyStatsWithClamp(pool);
@@ -957,98 +788,88 @@ export default async function handler(req, res) {
         }
       }
 
-      // --- pripremi “loose” fallback za ovaj fixture (bez stat-mixa) ---
-      // 1X2
-      (function makeLoose1X2(){
-        const needBooks = MIN_BOOKS_RELAX_1X2;
-        const sprLimit = 0.70;
-        const imp = {
-          "1": Number.isFinite(m1.medBy["1"]) ? 1/m1.medBy["1"] : 0,
-          "X": Number.isFinite(m1.medBy["X"]) ? 1/m1.medBy["X"] : 0,
-          "2": Number.isFinite(m1.medBy["2"]) ? 1/m1.medBy["2"] : 0
-        };
-        const nn = norm3(imp["1"], imp["X"], imp["2"]);
-        for (const k of ["1","X","2"]) {
-          const price = priceMedian(m1,k); if (!Number.isFinite(price)) continue;
-          const books = getBooksCount(m1,k);
-          const spr = getSpread(m1,k);
-          if (books < needBooks || spr > sprLimit) continue;
-          const prob = (k==="1")? nn.A : (k==="X")? nn.B : nn.C;
-          const lab = pickLabel1X2(k);
-          const c = buildCandidateLoose(recBase, "1X2", k, lab, price, prob, books, needBooks);
-          if (c) {
-            const prev = fillerByFixture.get(fx.fixture_id);
-            if (!prev || (c._ev > prev._ev)) fillerByFixture.set(fx.fixture_id, c);
+      // pripremi “loose” fallback po fixture-u (bez stat-mixa)
+      (function makeLooseForFixture(){
+        // 1X2
+        (function(){
+          const m = m1; const needBooks = MIN_BOOKS_RELAX_1X2; const sprLimit = 0.70;
+          const imp = { "1": Number.isFinite(m.medBy["1"])?1/m.medBy["1"]:0, "X": Number.isFinite(m.medBy["X"])?1/m.medBy["X"]:0, "2": Number.isFinite(m.medBy["2"])?1/m.medBy["2"]:0 };
+          const nn = norm3(imp["1"], imp["X"], imp["2"]);
+          for (const k of ["1","X","2"]) {
+            const price = Number.isFinite(m.medBy[k]) ? m.medBy[k] : trimmedMedian((m.by[k]||[]).filter(Number.isFinite));
+            if (!Number.isFinite(price)) continue;
+            const books = getBooksCount(m,k);
+            const spr = getSpread(m,k);
+            if (books < needBooks || spr > sprLimit) continue;
+            const prob = (k==="1")? nn.A : (k==="X")? nn.B : nn.C;
+            const lab = pickLabel1X2(k);
+            const c = buildCandidateLoose(recBase, "1X2", k, lab, price, prob, books, needBooks);
+            if (c) { const prev = fillerByFixture.get(fx.fixture_id); if (!prev || c._ev > prev._ev) fillerByFixture.set(fx.fixture_id, c); }
           }
-        }
-      })();
-
-      // BTTS
-      (function makeLooseBTTS(){
-        const needBooks = MIN_BOOKS_RELAX;
-        const sprLimit = 0.70;
-        const probs = (function(){
-          let mY = mb.medBy.Y, mN = mb.medBy.N;
-          if (!Number.isFinite(mY)) { const any = (mb.by.Y||[]).filter(Number.isFinite); if (any.length) mY = trimmedMedian(any); }
-          if (!Number.isFinite(mN)) { const any = (mb.by.N||[]).filter(Number.isFinite); if (any.length) mN = trimmedMedian(any); }
-          if (!Number.isFinite(mY) || !Number.isFinite(mN)) return null;
-          const impY = 1/mY, impN = 1/mN; const s = impY+impN; if (s<=0) return null;
-          return { pY: impY/s, pN: impN/s };
         })();
-        if (!probs) return;
-        const booksY = getBooksCount(mb,"Y"), booksN = getBooksCount(mb,"N");
-        const sprY = getSpread(mb,"Y"),     sprN = getSpread(mb,"N");
-        if (booksY >= needBooks && sprY <= sprLimit && Number.isFinite(priceMedian(mb,"Y"))) {
-          const c = buildCandidateLoose(recBase, "BTTS", "Y", "Yes", priceMedian(mb,"Y"), probs.pY, booksY, needBooks);
-          if (c) { const prev = fillerByFixture.get(fx.fixture_id); if (!prev || c._ev > prev._ev) fillerByFixture.set(fx.fixture_id, c); }
-        }
-        if (booksN >= needBooks && sprN <= sprLimit && Number.isFinite(priceMedian(mb,"N"))) {
-          const c = buildCandidateLoose(recBase, "BTTS", "N", "No", priceMedian(mb,"N"), probs.pN, booksN, needBooks);
-          if (c) { const prev = fillerByFixture.get(fx.fixture_id); if (!prev || c._ev > prev._ev) fillerByFixture.set(fx.fixture_id, c); }
-        }
-      })();
-
-      // OU
-      (function makeLooseOU(){
-        const needBooks = MIN_BOOKS_RELAX;
-        const sprLimit = 0.70;
-        const probs = (function(){
-          let mO = mo.medBy.O, mU = mo.medBy.U;
-          if (!Number.isFinite(mO)) { const any = (mo.by.O||[]).filter(Number.isFinite); if (any.length) mO = trimmedMedian(any); }
-          if (!Number.isFinite(mU)) { const any = (mo.by.U||[]).filter(Number.isFinite); if (any.length) mU = trimmedMedian(any); }
-          if (!Number.isFinite(mO) || !Number.isFinite(mU)) return null;
-          const impO = 1/mO, impU = 1/mU; const s = impO+impU; if (s<=0) return null;
-          return { pO: impO/s, pU: impU/s };
+        // BTTS
+        (function(){
+          const m = mb; const needBooks = MIN_BOOKS_RELAX; const sprLimit = 0.70;
+          let mY = m.medBy.Y, mN = m.medBy.N;
+          if (!Number.isFinite(mY)) { const any = (m.by.Y||[]).filter(Number.isFinite); if (any.length) mY = trimmedMedian(any); }
+          if (!Number.isFinite(mN)) { const any = (m.by.N||[]).filter(Number.isFinite); if (any.length) mN = trimmedMedian(any); }
+          if (Number.isFinite(mY) && Number.isFinite(mN)) {
+            const impY = 1/mY, impN = 1/mN; const s = impY+impN;
+            const probs = s>0 ? {pY: impY/s, pN: impN/s} : null;
+            if (probs) {
+              const booksY = getBooksCount(m,"Y"), booksN = getBooksCount(m,"N");
+              const sprY = getSpread(m,"Y"),     sprN = getSpread(m,"N");
+              if (booksY >= needBooks && sprY <= sprLimit) {
+                const c = buildCandidateLoose(recBase, "BTTS", "Y", "Yes", mY, probs.pY, booksY, needBooks);
+                if (c) { const prev = fillerByFixture.get(fx.fixture_id); if (!prev || c._ev > prev._ev) fillerByFixture.set(fx.fixture_id, c); }
+              }
+              if (booksN >= needBooks && sprN <= sprLimit) {
+                const c = buildCandidateLoose(recBase, "BTTS", "N", "No", mN, probs.pN, booksN, needBooks);
+                if (c) { const prev = fillerByFixture.get(fx.fixture_id); if (!prev || c._ev > prev._ev) fillerByFixture.set(fx.fixture_id, c); }
+              }
+            }
+          }
         })();
-        if (!probs) return;
-        const booksO = getBooksCount(mo,"O"), booksU = getBooksCount(mo,"U");
-        const sprO = getSpread(mo,"O"),     sprU = getSpread(mo,"U");
-        if (booksO >= needBooks && sprO <= sprLimit && Number.isFinite(priceMedian(mo,"O"))) {
-          const c = buildCandidateLoose(recBase, "OU2.5", "O2.5", "Over 2.5", priceMedian(mo,"O"), probs.pO, booksO, needBooks);
-          if (c) { const prev = fillerByFixture.get(fx.fixture_id); if (!prev || c._ev > prev._ev) fillerByFixture.set(fx.fixture_id, c); }
-        }
-        if (booksU >= needBooks && sprU <= sprLimit && Number.isFinite(priceMedian(mo,"U"))) {
-          const c = buildCandidateLoose(recBase, "OU2.5", "U2.5", "Under 2.5", priceMedian(mo,"U"), probs.pU, booksU, needBooks);
-          if (c) { const prev = fillerByFixture.get(fx.fixture_id); if (!prev || c._ev > prev._ev) fillerByFixture.set(fx.fixture_id, c); }
-        }
-      })();
-
-      // HT-FT (loose)
-      (function makeLooseHTFT(){
-        const needBooks = MIN_BOOKS_RELAX;
-        const sprLimit = 0.70;
-        const keys = ["HH","HD","HA","DH","DD","DA","AH","AD","AA"];
-        const labels = { HH:"Home/Home", HD:"Home/Draw", HA:"Home/Away", DH:"Draw/Home", DD:"Draw/Draw", DA:"Draw/Away", AH:"Away/Home", AD:"Away/Draw", AA:"Away/Away" };
-        const approxProb = { HH: 0.34, HD: 0.11, HA: 0.06, DH: 0.13, DD: 0.14, DA: 0.08, AH: 0.06, AD: 0.08, AA: 0.10 };
-        for (const k of keys) {
-          const price = priceMedian(mh,k); if (!Number.isFinite(price)) continue;
-          const books = getBooksCount(mh,k);
-          const spr = getSpread(mh,k);
-          if (books < needBooks || spr > sprLimit) continue;
-          const prob = approxProb[k] ?? 0.05;
-          const c = buildCandidateLoose(recBase, "HT-FT", k, labels[k]||k, price, prob, books, needBooks);
-          if (c) { const prev = fillerByFixture.get(fx.fixture_id); if (!prev || c._ev > prev._ev) fillerByFixture.set(fx.fixture_id, c); }
-        }
+        // OU
+        (function(){
+          const m = mo; const needBooks = MIN_BOOKS_RELAX; const sprLimit = 0.70;
+          let mO = m.medBy.O, mU = m.medBy.U;
+          if (!Number.isFinite(mO)) { const any = (m.by.O||[]).filter(Number.isFinite); if (any.length) mO = trimmedMedian(any); }
+          if (!Number.isFinite(mU)) { const any = (m.by.U||[]).filter(Number.isFinite); if (any.length) mU = trimmedMedian(any); }
+          if (Number.isFinite(mO) && Number.isFinite(mU)) {
+            const impO = 1/mO, impU = 1/mU; const s = impO+impU;
+            const probs = s>0 ? {pO: impO/s, pU: impU/s} : null;
+            if (probs) {
+              const booksO = getBooksCount(m,"O"), booksU = getBooksCount(m,"U");
+              const sprO = getSpread(m,"O"),     sprU = getSpread(m,"U");
+              if (booksO >= needBooks && sprO <= sprLimit) {
+                const c = buildCandidateLoose(recBase, "OU2.5", "O2.5", "Over 2.5", mO, probs.pO, booksO, needBooks);
+                if (c) { const prev = fillerByFixture.get(fx.fixture_id); if (!prev || c._ev > prev._ev) fillerByFixture.set(fx.fixture_id, c); }
+              }
+              if (booksU >= needBooks && sprU <= sprLimit) {
+                const c = buildCandidateLoose(recBase, "OU2.5", "U2.5", "Under 2.5", mU, probs.pU, booksU, needBooks);
+                if (c) { const prev = fillerByFixture.get(fx.fixture_id); if (!prev || c._ev > prev._ev) fillerByFixture.set(fx.fixture_id, c); }
+              }
+            }
+          }
+        })();
+        // HT-FT
+        (function(){
+          const m = mh; const needBooks = MIN_BOOKS_RELAX; const sprLimit = 0.70;
+          const keys = ["HH","HD","HA","DH","DD","DA","AH","AD","AA"];
+          const labels = { HH:"Home/Home", HD:"Home/Draw", HA:"Home/Away", DH:"Draw/Home", DD:"Draw/Draw", DA:"Draw/Away", AH:"Away/Home", AD:"Away/Draw", AA:"Away/Away" };
+          const approxProb = { HH: 0.34, HD: 0.11, HA: 0.06, DH: 0.13, DD: 0.14, DA: 0.08, AH: 0.06, AD: 0.08, AA: 0.10 };
+          for (const k of keys) {
+            const price = Number.isFinite(m.medBy[k]) ? m.medBy[k] : trimmedMedian((m.by[k]||[]).filter(Number.isFinite));
+            if (!Number.isFinite(price)) continue;
+            const books = getBooksCount(m,k);
+            const spr = getSpread(m,k);
+            if (books < needBooks || spr > sprLimit) continue;
+            const prob = approxProb[k] ?? 0.05;
+            const c = buildCandidateLoose(recBase, "HT-FT", k, labels[k]||k, price, prob, books, needBooks);
+            if (c) { const prev = fillerByFixture.get(fx.fixture_id); if (!prev || c._ev > prev._ev) fillerByFixture.set(fx.fixture_id, c); }
+          }
+        })();
       })();
     }
 
@@ -1065,7 +886,7 @@ export default async function handler(req, res) {
       sorted.push(fillers.shift());
     }
 
-    // upis u KV (slim TARGET, full širi, i union za settle)
+    // upis u KV (slim = TARGET, full = do 100)
     const keySlim = `vbl:${ymd}:${slotQ}`;
     const keyFull = `vbl_full:${ymd}:${slotQ}`;
     const payloadSlim = { items: sorted.slice(0, TARGET), at: new Date().toISOString(), ymd, slot: slotQ };
@@ -1073,19 +894,12 @@ export default async function handler(req, res) {
     await kvSetJSON(keySlim, payloadSlim);
     await kvSetJSON(keyFull, payloadFull);
 
-    // dnevni union (za learning settle) — koristimo slim listu (TARGET)
-    const unionKeyCET = `vb:day:${ymdCET}:union`;
-    await kvSetJSON(unionKeyCET, payloadSlim.items);
+    // dnevni union (za learning/settle) + **JSON pointer** za danas
+    const unionKey = `vb:day:${ymd}:union`;
+    await kvSetJSON(unionKey, payloadSlim.items);
 
-    // (opciono) upiši i UTC dan za mirniji /api/debug/kv prikaz
-    const unionKeyUTC = `vb:day:${ymdUTC}:union`;
-    if (unionKeyUTC !== unionKeyCET) {
-      await kvSetJSON(unionKeyUTC, payloadSlim.items);
-    }
-
-    // POINTERI ZA DANAŠNJI DAN (CET i UTC)
-    await kvSetJSON(`vb:day:${ymdCET}:last`, { key: unionKeyCET });
-    await kvSetJSON(`vb:day:${ymdUTC}:last`, { key: unionKeyUTC });
+    // ⬇⬇⬇ KLJUČNA IZMJENA: pointer mora biti JSON objekat { key: "<target>" } ⬇⬇⬇
+    await kvSetJSON(`vb:day:${ymd}:last`, { key: unionKey });
 
     return res.status(200).json({
       ok:true, slot:slotQ, ymd,
