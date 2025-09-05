@@ -1,13 +1,14 @@
 // pages/api/cron/rebuild.js
-// Automatski napravi dnevni union i Combined tako da UI (Football/Combined tab) NIKAD ne ostane prazan.
-// Redosled:
-// 1) probaj iz vbl:<YMD>:{am,pm,late}
-// 2) ako prazno → pozovi /api/score-sync?ymd=<YMD> i ponovi (jer score-sync može da popuni podatke)
-// 3) ako i dalje prazno → fallback na vb:day:<YMD>:last (lista ili pointer na vbl:*)
-// Na kraju UVEK postavi:
-//   vb:day:<YMD>:union  = union (lista)
-//   vb:day:<YMD>:last   = union (LISTA, radi UI kompatibilnosti)
-//   vb:day:<YMD>:combined = Top 3 iz union-a
+// Robusno popunjavanje dnevnih ključeva za UI:
+// 1) vbl:<YMD>:{am,pm,late} → union
+// 2) ako prazno: /api/score-sync?ymd=<YMD> → probaj opet
+// 3) ako prazno: /api/score-sync?days=3 → probaj opet
+// 4) ako prazno: fallback iz vb:day:<YMD>:last (lista ili pointer)
+// 5) ako prazno: pogledaj vbl:<YMD+1>:* i zadrži samo one čiji kickoff_utc po Europe/Belgrade upada u <YMD>
+// Na kraju UVEK upisuje:
+//   vb:day:<YMD>:union    (LISTA)
+//   vb:day:<YMD>:last     (ISTO KAO union, LISTA – radi UI kompatibilnosti)
+//   vb:day:<YMD>:combined (Top 3)
 
 function kvEnv() {
   const url =
@@ -60,6 +61,10 @@ function ymdInTZ(tz = "Europe/Belgrade", d = new Date()) {
   const m = parts.find(p => p.type === "month")?.value;
   const dd = parts.find(p => p.type === "day")?.value;
   return `${y}-${m}-${dd}`;
+}
+function shiftYmd(ymd, delta) {
+  const d = new Date(`${ymd}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + delta);
+  return d.toISOString().slice(0,10);
 }
 
 function dedupeBySignature(items = []) {
@@ -121,28 +126,33 @@ async function buildUnionFromSlots(ymd) {
     const raw = out?.[i]?.result ?? null;
     if (!raw) continue;
     const arr = await readArrayMaybeJSON(raw);
-    if (arr.length) chunks.push(...arr); // ← obavezno spread; nema ".arr"
+    if (arr.length) chunks.push(...arr); // mora spread; nikakav ".arr"
   }
   return dedupeBySignature(chunks);
 }
 
-async function tryScoreSync(base, ymd) {
+function localYmdFromUTC(iso, tz = "Europe/Belgrade") {
   try {
-    const r = await fetch(`${base}/api/score-sync?ymd=${encodeURIComponent(ymd)}`, { cache: "no-store" });
-    await r.text(); // nije bitan sadržaj
-  } catch {}
+    const d = new Date(iso);
+    const parts = new Intl.DateTimeFormat("en-GB", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(d);
+    const y = parts.find(p => p.type === "year")?.value;
+    const m = parts.find(p => p.type === "month")?.value;
+    const dd = parts.find(p => p.type === "day")?.value;
+    return `${y}-${m}-${dd}`;
+  } catch { return null; }
+}
+function inLocalDay(it, ymd, tz = "Europe/Belgrade") {
+  const utc = it?.kickoff_utc || it?.kickoffUTC || it?.kickoffUtc || null;
+  if (utc) {
+    const ly = localYmdFromUTC(utc, tz);
+    return ly === ymd;
+  }
+  const k = (it?.kickoff || "").toString();
+  if (k.length >= 10) return k.slice(0,10) === ymd;
+  return false;
 }
 
-async function getUnionFromLast(ymd) {
-  // last može biti LISTA ili STRING (pointer ka vbl:<YMD>:slot)
-  const lastVal = await kvGetJSON(`vb:day:${ymd}:last`);
-  if (Array.isArray(lastVal)) return dedupeBySignature(lastVal);
-  if (typeof lastVal === "string") {
-    const arr = await readArrayKey(String(lastVal));
-    if (arr.length) return dedupeBySignature(arr);
-  }
-  return [];
-}
+async function tryHit(url) { try { await fetch(url, { cache: "no-store" }).then(r => r.text()); } catch {} }
 
 export default async function handler(req, res) {
   try {
@@ -153,23 +163,43 @@ export default async function handler(req, res) {
     const proto = (req.headers["x-forwarded-proto"] || "https");
     const base = `${proto}://${req.headers.host}`;
 
-    // 1) probaj union iz slotova
+    // 1) probaj slotove za YMD
     let union = await buildUnionFromSlots(ymd);
 
-    // 2) ako je prazan → pozovi score-sync pa probaj opet slotove
+    // 2) ako prazno → prvo score-sync za taj YMD
     if (!union.length) {
-      await tryScoreSync(base, ymd);
+      await tryHit(`${base}/api/score-sync?ymd=${encodeURIComponent(ymd)}`);
       union = await buildUnionFromSlots(ymd);
     }
 
-    // 3) ako i dalje prazan → uzmi iz :last (lista ili pointer)
+    // 3) ako prazno → probaj i varijantu koja puni po days (neki tokovi ignorišu ymd)
     if (!union.length) {
-      union = await getUnionFromLast(ymd);
+      await tryHit(`${base}/api/score-sync?days=3`);
+      union = await buildUnionFromSlots(ymd);
     }
 
-    // 4) upiši union, last(=lista), combined
+    // 4) ako prazno → fallback na vb:day:<YMD>:last (lista ili pointer)
+    if (!union.length) {
+      const lastVal = await kvGetJSON(`vb:day:${ymd}:last`);
+      if (Array.isArray(lastVal) && lastVal.length) {
+        union = dedupeBySignature(lastVal);
+      } else if (typeof lastVal === "string") {
+        const arr = await readArrayKey(String(lastVal));
+        if (arr.length) union = dedupeBySignature(arr);
+      }
+    }
+
+    // 5) ako prazno → pogledaj sutrašnje slotove i zadrži mečeve koji po lokalnom datumu spadaju u današnji YMD
+    if (!union.length) {
+      const ymdPlus = shiftYmd(ymd, +1);
+      const fromTomorrow = await buildUnionFromSlots(ymdPlus);
+      const filtered = fromTomorrow.filter(it => inLocalDay(it, ymd, "Europe/Belgrade"));
+      if (filtered.length) union = dedupeBySignature(filtered);
+    }
+
+    // 6) upiši ključeve za UI
     await kvSetJSON(`vb:day:${ymd}:union`, union);
-    await kvSetJSON(`vb:day:${ymd}:last`, union);       // LISTA — kompatibilno sa UI
+    await kvSetJSON(`vb:day:${ymd}:last`, union);            // LISTA (UI očekuje listu)
     const combined = top3Combined(union);
     await kvSetJSON(`vb:day:${ymd}:combined`, combined);
 
@@ -177,7 +207,6 @@ export default async function handler(req, res) {
       ok: true,
       ymd,
       counts: { union: union.length, last: union.length, combined: combined.length },
-      note: "Ako union ostane 0, proveri da li score-sync za taj YMD generiše kandidatae ili koristi drugi dan (UTC vs CEST).",
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err?.message || err) });
