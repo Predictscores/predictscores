@@ -12,21 +12,27 @@ export default function HistoryPanel({ days = 14 }) {
     const ac = new AbortController();
 
     (async () => {
+      let done = false;
       try {
         setLoading(true);
         setErr(null);
 
-        const r = await fetch(`/api/history?days=${days}`, {
-          cache: "no-store",
-          signal: ac.signal,
-        });
+        // Uvek gađaj isti origin (izbegava NEXT_PUBLIC_BASE_URL mismatch)
+        const href = `/api/history?days=${encodeURIComponent(days)}`;
+        const r = await fetch(href, { cache: "no-store", signal: ac.signal });
 
-        const ct = r.headers.get("content-type") || "";
-        const body = ct.includes("application/json")
-          ? await r.json()
-          : await r.text().then((t) => {
-              try { return JSON.parse(t); } catch { return { ok:false, error:"non-JSON", raw:t }; }
-            });
+        // Ako CDN/edge promeni header, i dalje pokušaj JSON
+        let body;
+        try {
+          const ct = (r.headers.get("content-type") || "").toLowerCase();
+          body = ct.includes("application/json") ? await r.json() : await r.text().then((t) => {
+            try { return JSON.parse(t); } catch { return { ok:false, error:"non-JSON", raw:t }; }
+          });
+        } catch (e) {
+          // fallback: tekst → JSON
+          const t = await r.text().catch(() => "");
+          try { body = JSON.parse(t); } catch { body = { ok:false, error: "parse-failed", raw:t }; }
+        }
 
         const arr =
           Array.isArray(body?.items) ? body.items :
@@ -34,11 +40,15 @@ export default function HistoryPanel({ days = 14 }) {
           Array.isArray(body) ? body : [];
 
         setItems(arr);
+        done = true;
       } catch (e) {
-        // Next/React često abortuju fetch pri re-renderu — to ignorišemo
         if (e && (e.name === "AbortError" || e.code === 20)) return;
         setErr(String(e?.message || e));
       } finally {
+        if (!done) {
+          // Ako je fetch pukao/presretnut, ipak spusti loading
+          setItems((prev) => Array.isArray(prev) ? prev : []);
+        }
         setLoading(false);
       }
     })();
@@ -58,10 +68,11 @@ export default function HistoryPanel({ days = 14 }) {
         const away = x?.away?.name || x?.away || "—";
         const market = x?.market || x?.market_label || "";
         const pick = x?.selection_label || x?.pick || x?.selection || "";
-        const price = Number(x?.odds?.price || x?.price);
-        const result = x?.result || x?.settle || "";
+        const price = Number(x?.odds?.price ?? x?.price);
+        const result = (x?.result || x?.outcome || x?.settle || "").toString().toUpperCase();
+
         return (
-          <div key={x?.id || x?.fixture_id || i} className="p-3 rounded-xl bg-[#1f2339] text-sm">
+          <div key={x?.id || x?.fixture_id || `${i}-${home}-${away}-${market}-${pick}`} className="p-3 rounded-xl bg-[#1f2339] text-sm">
             <div className="text-slate-400">{league}</div>
             <div className="font-semibold">
               {home} <span className="text-slate-400">vs</span> {away}
