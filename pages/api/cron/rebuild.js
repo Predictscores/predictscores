@@ -1,7 +1,7 @@
 // pages/api/cron/rebuild.js
-// Ovaj endpoint NE generiše pickove, već nakon što slotovi postoje u KV pod vbl:<YMD>:{am,pm,late},
-// održava dnevni union i snima snapshot Top 3 u vb:day:<YMD>:combined.
-// Ako dobije ?slot=am|pm|late, postavi vb:day:<YMD>:last kao POINTER na odgovarajući vbl:<...> ključ.
+// Održava dnevni union iz vbl:<YMD>:{am,pm,late} i snima Top 3 snapshot u vb:day:<YMD>:combined.
+// Ako union ispadne prazan, koristi fallback iz vb:day:<YMD>:last (pointer ili lista).
+// Opcioni ?slot=am|pm|late postavlja vb:day:<YMD>:last kao POINTER na odgovarajući vbl:<...> ključ.
 
 function kvEnv() {
   const url =
@@ -32,6 +32,7 @@ async function kvPipeline(cmds) {
   }
   return r.json();
 }
+
 async function kvGet(key) {
   const out = await kvPipeline([["GET", key]]);
   return out?.[0]?.result ?? null;
@@ -55,7 +56,8 @@ async function kvGetJSON(key) {
 async function kvSetJSON(key, obj) { return kvSet(key, JSON.stringify(obj)); }
 
 function dedupeBySignature(items = []) {
-  const out = []; const seen = new Set();
+  const out = [];
+  const seen = new Set();
   for (const it of Array.isArray(items) ? items : []) {
     const fid = it.fixture_id ?? it.id ?? it.fixtureId ?? "";
     const mkt = it.market ?? it.market_label ?? "";
@@ -65,13 +67,12 @@ function dedupeBySignature(items = []) {
   }
   return out;
 }
+
 function rankOf(it) {
-  // isti duh kao Combined: prioritet confidence_pct, zatim model_prob, zatim _ev_lb, pa _ev
-  const c = Number(it?.confidence_pct);    // veće je bolje
+  const c = Number(it?.confidence_pct);
   const p = Number(it?.model_prob);
   const evlb = Number(it?._ev_lb);
   const ev = Number(it?._ev);
-  // negiramo zbog sortiranja asc kasnije (manje → gore)
   return [
     - (Number.isFinite(c) ? c : -1),
     - (Number.isFinite(p) ? p : -1),
@@ -79,8 +80,8 @@ function rankOf(it) {
     - (Number.isFinite(ev) ? ev : -1),
   ];
 }
+
 function top3Combined(items) {
-  // po defaultu preferiramo različite fixture_id-e (pošto UI Combined obično bira 3 različita meča)
   const byRank = [...items].sort((a, b) => {
     const ra = rankOf(a), rb = rankOf(b);
     for (let i = 0; i < ra.length; i++) {
@@ -100,23 +101,49 @@ function top3Combined(items) {
   return out;
 }
 
-async function buildUnion(ymd) {
+function isPointerToSlot(x, ymd) {
+  return typeof x === "string" && new RegExp(`^vbl:${ymd}:(am|pm|late)$`).test(x);
+}
+
+async function readArrayKey(key) {
+  const val = await kvGetJSON(key);
+  if (Array.isArray(val)) return val;
+  if (typeof val === "string" && val.trim().startsWith("[")) {
+    try { return JSON.parse(val); } catch {}
+  }
+  return [];
+}
+
+async function buildUnionFromSlots(ymd) {
   const slots = ["am", "pm", "late"];
-  const chunks = [];
-  const cmds = slots.map((s) => ["GET", `vbl:${ymd}:${s}`]);
+  const cmds = slots.map(s => ["GET", `vbl:${ymd}:${s}`]);
   const out = await kvPipeline(cmds);
+  const chunks = [];
   for (let i = 0; i < slots.length; i++) {
     const raw = out?.[i]?.result ?? null;
     if (!raw) continue;
-    const arr =
-      typeof raw === "string" && raw.trim().startsWith("[")
-        ? JSON.parse(raw)
-        : Array.isArray(raw)
-        ? raw
-        : [];
-    if (arr.length) chunks.push(...arr);
+    let arr = [];
+    if (Array.isArray(raw)) arr = raw;
+    else if (typeof raw === "string" && raw.trim().startsWith("[")) { try { arr = JSON.parse(raw); } catch {} }
+    if (Array.isArray(arr) && arr.length) chunks.push(...arr); // ⬅️ ispravka: nema ".arr"
   }
   return dedupeBySignature(chunks);
+}
+
+async function buildUnionWithFallback(ymd) {
+  let union = await buildUnionFromSlots(ymd);
+  if (union.length > 0) return union;
+
+  // fallback iz :last (pointer ili lista)
+  const last = await kvGet(`vb:day:${ymd}:last`);
+  if (isPointerToSlot(last, ymd)) {
+    const list = await readArrayKey(String(last));
+    union = dedupeBySignature(list);
+  } else {
+    const maybeList = await kvGetJSON(`vb:day:${ymd}:last`);
+    if (Array.isArray(maybeList)) union = dedupeBySignature(maybeList);
+  }
+  return union;
 }
 
 export default async function handler(req, res) {
@@ -124,17 +151,17 @@ export default async function handler(req, res) {
     res.setHeader("Cache-Control", "no-store");
     const url = new URL(req.url, `http://${req.headers.host}`);
     const ymd = url.searchParams.get("ymd") || new Date().toISOString().slice(0, 10);
-    const slot = url.searchParams.get("slot"); // "am" | "pm" | "late" (opciono)
+    const slot = url.searchParams.get("slot"); // am|pm|late (opciono)
 
-    // 1) napravi/refreshuj union za dan
-    const union = await buildUnion(ymd);
+    // 1) napravi union (sa fallbackom na :last)
+    const union = await buildUnionWithFallback(ymd);
     await kvSetJSON(`vb:day:${ymd}:union`, union);
 
-    // 2) snimi Combined (Top 3) snapshot
+    // 2) Top 3 (Combined) snapshot
     const combined = top3Combined(union);
     await kvSetJSON(`vb:day:${ymd}:combined`, combined);
 
-    // 3) po želji, postavi :last kao POINTER na aktuelni slot (ako je prosleđen)
+    // 3) (opciono) postavi :last kao POINTER na slot
     if (slot && ["am", "pm", "late"].includes(slot)) {
       await kvSet(`vb:day:${ymd}:last`, `vbl:${ymd}:${slot}`);
     }
@@ -143,7 +170,7 @@ export default async function handler(req, res) {
       ok: true,
       ymd,
       counts: { union: union.length, combined: combined.length },
-      hint: "History koristi samo vb:day:<YMD>:combined; learn koristi vb:day:<YMD>:union.",
+      hint: "History koristi vb:day:<YMD>:combined; learning koristi vb:day:<YMD>:union.",
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err?.message || err) });
