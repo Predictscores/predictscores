@@ -11,6 +11,11 @@ const API_KEY = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOT
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 
+// --- timeouts & concurrency ---
+const FETCH_TIMEOUT_MS = Number(process.env.HISTORY_TIMEOUT_MS || 5500);
+const KV_TIMEOUT_MS = Number(process.env.HISTORY_KV_TIMEOUT_MS || 4500);
+const SCORE_CONCURRENCY = Math.max(2, Math.min(8, Number(process.env.HISTORY_SCORE_CONCURRENCY || 6)));
+
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 function ymd(dt = new Date()) {
   const s = new Intl.DateTimeFormat("sv-SE", { timeZone: TZ, dateStyle: "short" })
@@ -31,25 +36,39 @@ async function safeJson(r) {
   const t = await r.text(); try { return JSON.parse(t); } catch { return { ok:false, error:"non-json", raw:t }; }
 }
 
+// --- helpers: fetch with timeout ---
+async function fetchWithTimeout(url, opts={}, ms=FETCH_TIMEOUT_MS){
+  const c = new AbortController();
+  const id = setTimeout(()=>c.abort(new Error("timeout")), ms);
+  try {
+    return await fetch(url, { ...opts, signal: c.signal, cache: "no-store" });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
 // ---------------- Upstash KV ----------------
 async function kvGet(key) {
   if (!KV_URL || !KV_TOKEN) return null;
-  const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${KV_TOKEN}` },
-    cache: "no-store",
-  });
-  const j = await safeJson(r);
-  if (j && typeof j.result !== "undefined" && j.result !== null) {
-    try { return JSON.parse(j.result); } catch { return j.result; }
-  }
-  return null;
+  try {
+    const r = await fetchWithTimeout(`${KV_URL}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${KV_TOKEN}` }
+    }, KV_TIMEOUT_MS);
+    const j = await safeJson(r);
+    if (j && typeof j.result !== "undefined" && j.result !== null) {
+      try { return JSON.parse(j.result); } catch { return j.result; }
+    }
+    return null;
+  } catch { return null; }
 }
 async function kvSet(key, value, ttlSeconds = 21600) {
   if (!KV_URL || !KV_TOKEN) return false;
-  const val = typeof value === "string" ? value : JSON.stringify(value);
-  const url = `${KV_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}?EX=${ttlSeconds}`;
-  const r = await fetch(url, { method: "POST", headers: { Authorization: `Bearer ${KV_TOKEN}` } });
-  return r.ok;
+  try {
+    const val = typeof value === "string" ? value : JSON.stringify(value);
+    const url = `${KV_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}?EX=${ttlSeconds}`;
+    const r = await fetchWithTimeout(url, { method: "POST", headers: { Authorization: `Bearer ${KV_TOKEN}` } }, KV_TIMEOUT_MS);
+    return r.ok;
+  } catch { return false; }
 }
 
 // ---------------- Scores (prefer KV -> fallback API) ----------------
@@ -68,10 +87,9 @@ async function readScoreFromKV(fixtureId) {
 async function readScoreViaAPI(fixtureId) {
   if (!API_KEY) return null;
   try {
-    const r = await fetch(`${API_HOST}/fixtures?id=${fixtureId}`, {
-      headers: { "x-apisports-key": API_KEY, Accept: "application/json" },
-      cache: "no-store",
-    });
+    const r = await fetchWithTimeout(`${API_HOST}/fixtures?id=${fixtureId}`, {
+      headers: { "x-apisports-key": API_KEY, Accept: "application/json" }
+    }, FETCH_TIMEOUT_MS);
     const j = await safeJson(r);
     const it = j?.response?.[0];
     if (!it) return null;
@@ -82,6 +100,7 @@ async function readScoreViaAPI(fixtureId) {
       htHome: numOrNull(it?.score?.halftime?.home),
       htAway: numOrNull(it?.score?.halftime?.away),
     };
+    // cache quick
     await kvSet(`fx:${fixtureId}`, out, (out.statusShort === "FT" || out.statusShort === "AET" || out.statusShort === "PEN") ? 21600 : 900);
     return out;
   } catch { return null; }
@@ -182,6 +201,24 @@ async function getSnapshotItems(ymd, slot) {
   return [];
 }
 
+// --- simple concurrency limiter for getFinalScore ---
+async function runLimited(tasks, limit=SCORE_CONCURRENCY){
+  const out = [];
+  let i = 0, active = 0;
+  return await new Promise(resolve=>{
+    const next = () => {
+      while (active < limit && i < tasks.length){
+        const idx = i++;
+        active++;
+        tasks[idx]().then(v => { out[idx]=v; })
+          .catch(()=>{ out[idx]=null; })
+          .finally(()=>{ active--; if (i>=tasks.length && active===0) resolve(out); else next(); });
+      }
+    };
+    next();
+  });
+}
+
 // ---------------- main handler ----------------
 export default async function handler(req, res) {
   try {
@@ -204,22 +241,37 @@ export default async function handler(req, res) {
       const itemsOut = [];
       let day = { ymd: dateYMD, picks: 0, settled: 0, wins: 0, pushes: 0, stake: 0, payout: 0 };
 
+      // prvo skupi sve top picks po slotu
+      const perSlotTop = [];
       for (const slot of SLOTS) {
         const snap = await getSnapshotItems(dateYMD, slot);
         if (!Array.isArray(snap) || snap.length === 0) continue;
+        perSlotTop.push(...topNCombined(snap, top));
+      }
 
-        const topItems = topNCombined(snap, top);
-
-        for (const it of topItems) {
+      if (perSlotTop.length) {
+        // pripremi tasks za rezultat (sa limitiranom paralelom)
+        const tasks = perSlotTop.map((it) => async () => {
           const fixtureId = it?.fixture_id || it?.fixtureId || it?.fixture?.id;
-          if (!fixtureId) continue;
+          if (!fixtureId) return { it, fx: null };
 
+          const fx = await getFinalScore(fixtureId);
+          return { it, fx };
+        });
+
+        const scored = await runLimited(tasks, SCORE_CONCURRENCY);
+
+        for (const node of scored) {
+          if (!node || !node.it) continue;
+          const it = node.it;
+          const fx = node.fx;
+
+          const fixtureId = it?.fixture_id || it?.fixtureId || it?.fixture?.id;
           const timeLocal = it?.datetime_local?.starting_at?.date_time || it?.kickoff || it?.date || null;
           const oddsRaw = it?.odds?.price ?? it?.odds ?? null;
           const odds = Number(oddsRaw);
           const hasOdds = Number.isFinite(odds) && odds >= 1.01;
 
-          const fx = await getFinalScore(fixtureId);
           let status = "pending", win = false, push = false;
 
           if (fx && (fx.statusShort === "FT" || fx.statusShort === "AET" || fx.statusShort === "PEN")) {
@@ -231,15 +283,10 @@ export default async function handler(req, res) {
             if (st.settled) {
               status = st.push ? "push" : (st.won ? "win" : "loss");
               win = !!st.won; push = !!st.push;
-              // Win/Loss evidencija uvek
               day.settled += 1;
               if (win) day.wins += 1;
               if (push) day.pushes += 1;
-              // ROI samo ako imamo kvotu
-              if (hasOdds) {
-                day.stake += 1;
-                day.payout += unitReturn(odds, win, push);
-              }
+              if (hasOdds) { day.stake += 1; day.payout += unitReturn(odds, win, push); }
             }
           }
 
