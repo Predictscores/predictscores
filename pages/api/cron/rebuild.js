@@ -1,7 +1,7 @@
 // pages/api/cron/rebuild.js
-// Održava dnevni union iz vbl:<YMD>:{am,pm,late} i snima Top 3 snapshot u vb:day:<YMD>:combined.
-// Ako union ispadne prazan, koristi fallback iz vb:day:<YMD>:last (pointer ili lista).
-// Opcioni ?slot=am|pm|late postavlja vb:day:<YMD>:last kao POINTER na odgovarajući vbl:<...> ključ.
+// Gradi dnevni union iz vbl:<YMD>:{am,pm,late}, snima ga u vb:day:<YMD>:union,
+// UVEK postavlja vb:day:<YMD>:last kao LISTU (isti taj union, radi kompatibilnosti sa UI),
+// i snima Top 3 snapshot u vb:day:<YMD>:combined.
 
 function kvEnv() {
   const url =
@@ -101,10 +101,6 @@ function top3Combined(items) {
   return out;
 }
 
-function isPointerToSlot(x, ymd) {
-  return typeof x === "string" && new RegExp(`^vbl:${ymd}:(am|pm|late)$`).test(x);
-}
-
 async function readArrayKey(key) {
   const val = await kvGetJSON(key);
   if (Array.isArray(val)) return val;
@@ -125,25 +121,30 @@ async function buildUnionFromSlots(ymd) {
     let arr = [];
     if (Array.isArray(raw)) arr = raw;
     else if (typeof raw === "string" && raw.trim().startsWith("[")) { try { arr = JSON.parse(raw); } catch {} }
-    if (Array.isArray(arr) && arr.length) chunks.push(...arr); // ⬅️ ispravka: nema ".arr"
+    if (Array.isArray(arr) && arr.length) chunks.push(...arr); // ispravka: spread, nema ".arr"
   }
   return dedupeBySignature(chunks);
 }
 
 async function buildUnionWithFallback(ymd) {
+  // 1) probaj iz slotova
   let union = await buildUnionFromSlots(ymd);
   if (union.length > 0) return union;
 
-  // fallback iz :last (pointer ili lista)
-  const last = await kvGet(`vb:day:${ymd}:last`);
-  if (isPointerToSlot(last, ymd)) {
-    const list = await readArrayKey(String(last));
-    union = dedupeBySignature(list);
-  } else {
-    const maybeList = await kvGetJSON(`vb:day:${ymd}:last`);
-    if (Array.isArray(maybeList)) union = dedupeBySignature(maybeList);
+  // 2) fallback: ako postoji vb:day:<YMD>:last kao lista — uzmi je;
+  //    ako je string/pointer, dereferenciraj pa uzmi listu
+  const lastRaw = await kvGetJSON(`vb:day:${ymd}:last`);
+  if (Array.isArray(lastRaw) && lastRaw.length) {
+    return dedupeBySignature(lastRaw);
   }
-  return union;
+  if (typeof lastRaw === "string") {
+    // može biti pointer ka vbl:<YMD>:slot
+    const deref = await readArrayKey(String(lastRaw));
+    if (Array.isArray(deref) && deref.length) {
+      return dedupeBySignature(deref);
+    }
+  }
+  return [];
 }
 
 export default async function handler(req, res) {
@@ -151,26 +152,25 @@ export default async function handler(req, res) {
     res.setHeader("Cache-Control", "no-store");
     const url = new URL(req.url, `http://${req.headers.host}`);
     const ymd = url.searchParams.get("ymd") || new Date().toISOString().slice(0, 10);
-    const slot = url.searchParams.get("slot"); // am|pm|late (opciono)
 
-    // 1) napravi union (sa fallbackom na :last)
+    // 1) napravi union (sa fallbackom)
     const union = await buildUnionWithFallback(ymd);
+
+    // 2) snimi union
     await kvSetJSON(`vb:day:${ymd}:union`, union);
 
-    // 2) Top 3 (Combined) snapshot
+    // 3) UVEK postavi :last kao LISTU (kompatibilnost sa UI koji čita listu)
+    await kvSetJSON(`vb:day:${ymd}:last`, union);
+
+    // 4) Top 3 (Combined) snapshot
     const combined = top3Combined(union);
     await kvSetJSON(`vb:day:${ymd}:combined`, combined);
-
-    // 3) (opciono) postavi :last kao POINTER na slot
-    if (slot && ["am", "pm", "late"].includes(slot)) {
-      await kvSet(`vb:day:${ymd}:last`, `vbl:${ymd}:${slot}`);
-    }
 
     res.status(200).json({
       ok: true,
       ymd,
-      counts: { union: union.length, combined: combined.length },
-      hint: "History koristi vb:day:<YMD>:combined; learning koristi vb:day:<YMD>:union.",
+      counts: { union: union.length, combined: combined.length, last: union.length },
+      hint: "UI čita vb:day:<YMD>:last kao LISTU; Combined = vb:day:<YMD>:combined; learning koristi vb:day:<YMD>:union.",
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err?.message || err) });
