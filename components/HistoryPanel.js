@@ -25,19 +25,33 @@ export default function HistoryPanel({ days = 14 }) {
         let body;
         try {
           const ct = (r.headers.get("content-type") || "").toLowerCase();
-          body = ct.includes("application/json") ? await r.json() : await r.text().then((t) => {
-            try { return JSON.parse(t); } catch { return { ok:false, error:"non-JSON", raw:t }; }
-          });
+          body = ct.includes("application/json")
+            ? await r.json()
+            : await r.text().then((t) => {
+                try {
+                  return JSON.parse(t);
+                } catch {
+                  return { ok: false, error: "non-JSON", raw: t };
+                }
+              });
         } catch (e) {
           // fallback: tekst → JSON
           const t = await r.text().catch(() => "");
-          try { body = JSON.parse(t); } catch { body = { ok:false, error: "parse-failed", raw:t }; }
+          try {
+            body = JSON.parse(t);
+          } catch {
+            body = { ok: false, error: "parse-failed", raw: t };
+          }
         }
 
         const arr =
-          Array.isArray(body?.items) ? body.items :
-          Array.isArray(body?.history) ? body.history :
-          Array.isArray(body) ? body : [];
+          Array.isArray(body?.items)
+            ? body.items
+            : Array.isArray(body?.history)
+            ? body.history
+            : Array.isArray(body)
+            ? body
+            : [];
 
         setItems(arr);
         done = true;
@@ -47,7 +61,7 @@ export default function HistoryPanel({ days = 14 }) {
       } finally {
         if (!done) {
           // Ako je fetch pukao/presretnut, ipak spusti loading
-          setItems((prev) => Array.isArray(prev) ? prev : []);
+          setItems((prev) => (Array.isArray(prev) ? prev : []));
         }
         setLoading(false);
       }
@@ -57,13 +71,20 @@ export default function HistoryPanel({ days = 14 }) {
   }, [days]);
 
   if (loading) return <div className="text-slate-400 text-sm">History: učitavam…</div>;
-  if (err)      return <div className="text-red-400 text-sm">History greška: {err}</div>;
-  if (!items.length) return <div className="text-slate-400 text-sm">Nema istorije u poslednjih {days} dana.</div>;
+  if (err) return <div className="text-red-400 text-sm">History greška: {err}</div>;
+  if (!items.length)
+    return <div className="text-slate-400 text-sm">Nema istorije u poslednjih {days} dana.</div>;
 
   return (
     <div className="space-y-2">
-      {items.map((x, i) => {
-        const league = x?.league_name || x?.league || "";
+      {items.filter(Boolean).map((x, i) => {
+        // ⬇️ KLJUČNA IZMJENA: league uvek pretvori u string
+        const league =
+          x?.league_name ||
+          (typeof x?.league === "object"
+            ? x?.league?.name || x?.league?.league_name || x?.league?.competition || ""
+            : x?.league || "");
+
         const home = x?.home?.name || x?.home || "—";
         const away = x?.away?.name || x?.away || "—";
         const market = x?.market || x?.market_label || "";
@@ -72,13 +93,18 @@ export default function HistoryPanel({ days = 14 }) {
         const result = (x?.result || x?.outcome || x?.settle || "").toString().toUpperCase();
 
         return (
-          <div key={x?.id || x?.fixture_id || `${i}-${home}-${away}-${market}-${pick}`} className="p-3 rounded-xl bg-[#1f2339] text-sm">
-            <div className="text-slate-400">{league}</div>
+          <div
+            key={x?.id || x?.fixture_id || `${i}-${home}-${away}-${market}-${pick}`}
+            className="p-3 rounded-xl bg-[#1f2339] text-sm"
+          >
+            <div className="text-slate-400">{String(league || "")}</div>
             <div className="font-semibold">
               {home} <span className="text-slate-400">vs</span> {away}
             </div>
             <div className="text-slate-300">
-              {market}{market ? " → " : ""}{pick}
+              {market}
+              {market ? " → " : ""}
+              {pick}
               {Number.isFinite(price) ? ` (${price.toFixed(2)})` : ""}
               {result ? ` · ${result}` : ""}
             </div>
