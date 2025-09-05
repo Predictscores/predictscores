@@ -1,7 +1,7 @@
 // pages/api/cron/apply-learning.js
 // Settling i history SAMO nad vb:day:<YMD>:combined (Top 3).
-// NE dira vb:day:<YMD>:{last,union}. Ako combined nedostaje, izgradi ga iz union-a (a union iz vbl:* ili :last).
-// Presuđuje 1X2, OU, BTTS, HT-FT. API-FOOTBALL: ID i date ±1 fallback.
+// Ako combined nedostaje ili je prazan, SAM pokreće /api/cron/rebuild (koji po potrebi poziva /api/score-sync).
+// Podrazumevani YMD je Europe/Belgrade. Presuđuje 1X2, OU, BTTS, HT-FT.
 
 function kvEnv() {
   const url =
@@ -16,7 +16,6 @@ function kvEnv() {
     "";
   return { url, token };
 }
-
 async function kvPipeline(cmds) {
   const { url, token } = kvEnv();
   if (!url || !token) throw new Error("KV env not set (URL/TOKEN).");
@@ -45,11 +44,15 @@ async function kvGetJSON(key) {
 }
 async function kvSetJSON(key, obj) { return kvSet(key, JSON.stringify(obj)); }
 
-function apiFootballKey() {
-  return process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || "";
+function ymdInTZ(tz = "Europe/Belgrade", d = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(d);
+  const y = parts.find(p => p.type === "year")?.value;
+  const m = parts.find(p => p.type === "month")?.value;
+  const dd = parts.find(p => p.type === "day")?.value;
+  return `${y}-${m}-${dd}`;
 }
 
-/* ------------- helpers: combined/union/last ------------- */
+/* ---------- ranking / combined helpers ---------- */
 
 function dedupeBySignature(items = []) {
   const out = []; const seen = new Set();
@@ -62,7 +65,6 @@ function dedupeBySignature(items = []) {
   }
   return out;
 }
-
 function rankOf(it) {
   const c = Number(it?.confidence_pct);
   const p = Number(it?.model_prob);
@@ -92,62 +94,7 @@ function top3Combined(items) {
   return out;
 }
 
-function isPointerToSlot(x, ymd) {
-  return typeof x === "string" && new RegExp(`^vbl:${ymd}:(am|pm|late)$`).test(x);
-}
-
-async function readArrayKey(key) {
-  const val = await kvGetJSON(key);
-  if (Array.isArray(val)) return val;
-  if (typeof val === "string" && val.trim().startsWith("[")) { try { return JSON.parse(val); } catch {} }
-  return [];
-}
-
-async function buildUnionFromSlots(ymd) {
-  const slots = ["am", "pm", "late"];
-  const cmds = slots.map(s => ["GET", `vbl:${ymd}:${s}`]);
-  const out = await kvPipeline(cmds);
-  const chunks = [];
-  for (let i = 0; i < slots.length; i++) {
-    const raw = out?.[i]?.result ?? null;
-    if (!raw) continue;
-    let arr = [];
-    if (Array.isArray(raw)) arr = raw;
-    else if (typeof raw === "string" && raw.trim().startsWith("[")) { try { arr = JSON.parse(raw); } catch {} }
-    if (Array.isArray(arr) && arr.length) chunks.push(...arr);
-  }
-  return dedupeBySignature(chunks);
-}
-
-async function buildUnionWithFallback(ymd) {
-  let union = await buildUnionFromSlots(ymd);
-  if (union.length > 0) return union;
-
-  const last = await kvGet(`vb:day:${ymd}:last`);
-  if (isPointerToSlot(last, ymd)) {
-    const list = await readArrayKey(String(last));
-    union = dedupeBySignature(list);
-  } else {
-    const maybeList = await kvGetJSON(`vb:day:${ymd}:last`);
-    if (Array.isArray(maybeList)) union = dedupeBySignature(maybeList);
-  }
-  return union;
-}
-
-async function ensureCombinedForDay(ymd) {
-  const combined = await kvGetJSON(`vb:day:${ymd}:combined`);
-  if (Array.isArray(combined) && combined.length) return dedupeBySignature(combined);
-
-  const union = await kvGetJSON(`vb:day:${ymd}:union`);
-  let unionArr = Array.isArray(union) ? union : [];
-  if (!unionArr.length) unionArr = await buildUnionWithFallback(ymd);
-
-  const built = top3Combined(dedupeBySignature(unionArr));
-  await kvSetJSON(`vb:day:${ymd}:combined`, built);
-  return built;
-}
-
-/* ------------- settle rules ------------- */
+/* ---------- settle rules ---------- */
 
 function parseOUThreshold(it) {
   const s = (it.selection_label || it.pick || it.selection || it.pick_code || "").toString().toUpperCase();
@@ -170,7 +117,6 @@ function pickSide(it) {
   return p;
 }
 function winnerFromScore(h, a) { if (h > a) return "HOME"; if (a > h) return "AWAY"; return "DRAW"; }
-
 function decideOutcomeFromFinals(it, finals) {
   if (!finals || typeof finals !== "object") return "PENDING";
   const market = (it.market || it.market_label || "").toUpperCase();
@@ -218,8 +164,11 @@ function decideOutcomeFromFinals(it, finals) {
   return "PENDING";
 }
 
-/* ------------- API-FOOTBALL fetch (ids + date ±1) ------------- */
+/* ---------- API-FOOTBALL ---------- */
 
+function apiFootballKey() {
+  return process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || "";
+}
 function apiKey() { return apiFootballKey(); }
 function normalizeName(s) { return String(s||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().replace(/\s+/g," ").trim(); }
 function makePairKey(home, away) { return `${normalizeName(home)}|${normalizeName(away)}`; }
@@ -286,29 +235,46 @@ async function ensureFinalsFor(ymd, items) {
   return { byId, byPair };
 }
 
-/* ------------- handler ------------- */
+/* ---------- handler ---------- */
 
 export default async function handler(req, res) {
   try {
     res.setHeader("Cache-Control", "no-store");
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const ymdParam = url.searchParams.get("ymd");
-    const debug = url.searchParams.get("debug") === "1";
-    const days = Math.max(1, Math.min(14, parseInt(url.searchParams.get("days") || "1", 10)));
 
-    const today = new Date();
-    const ymds = [];
-    if (ymdParam) { ymds.push(ymdParam); }
-    else { for (let i = 0; i < days; i++) { const d = new Date(today); d.setDate(d.getDate() - i); ymds.push(d.toISOString().slice(0,10)); } }
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const tzYmd = ymdInTZ("Europe/Belgrade");
+    const ymd = url.searchParams.get("ymd") || tzYmd;
+    const proto = (req.headers["x-forwarded-proto"] || "https");
+    const base = `${proto}://${req.headers.host}`;
+    const debug = url.searchParams.get("debug") === "1";
+    const days = ymd ? 1 : Math.max(1, Math.min(14, parseInt(url.searchParams.get("days") || "1", 10)));
+
+    const ymds = ymd ? [ymd] : Array.from({ length: days }, (_, i) => {
+      const d = new Date(); d.setUTCDate(d.getUTCDate() - i);
+      return ymdInTZ("Europe/Belgrade", d);
+    });
 
     const reports = [];
 
-    for (const ymd of ymds) {
-      // 1) Combined (Top 3)
-      const items = await ensureCombinedForDay(ymd);
+    for (const theDay of ymds) {
+      // 1) pokušaj combined
+      let combined = await kvGetJSON(`vb:day:${theDay}:combined`);
+      if (!Array.isArray(combined) || !combined.length) {
+        // 1a) probaj rebuild (on po potrebi zove score-sync)
+        await fetch(`${base}/api/cron/rebuild?ymd=${encodeURIComponent(theDay)}`, { cache: "no-store" }).then(r => r.text()).catch(() => {});
+        combined = await kvGetJSON(`vb:day:${theDay}:combined`);
+      }
+      if (!Array.isArray(combined) || !combined.length) {
+        // 1b) kao poslednji fallback, pokušaj score-sync → rebuild
+        await fetch(`${base}/api/score-sync?ymd=${encodeURIComponent(theDay)}`, { cache: "no-store" }).then(r => r.text()).catch(() => {});
+        await fetch(`${base}/api/cron/rebuild?ymd=${encodeURIComponent(theDay)}`, { cache: "no-store" }).then(r => r.text()).catch(() => {});
+        combined = await kvGetJSON(`vb:day:${theDay}:combined`);
+      }
+
+      const items = Array.isArray(combined) ? dedupeBySignature(combined) : [];
 
       // 2) finalni rezultati
-      const { byId, byPair } = await ensureFinalsFor(ymd, items);
+      const { byId, byPair } = await ensureFinalsFor(theDay, items);
 
       let settled = 0, won = 0, lost = 0, voided = 0, pending = 0;
       let staked = 0, returned = 0;
@@ -345,30 +311,29 @@ export default async function handler(req, res) {
         else if (outcome === "VOID" || outcome === "PUSH") { settled += 1; voided += 1; }
         else { pending += 1; }
 
-        settledItems.push({ ...it, outcome, finals: finals || null, _day: ymd, _source: "combined", _settle_reason: reason });
+        settledItems.push({ ...it, outcome, finals: finals || null, _day: theDay, _source: "combined" });
       }
 
       const roi = staked > 0 ? (returned - staked) / staked : 0;
 
       const historyPayload = {
-        ymd,
+        ymd: theDay,
         counts: { total: items.length, settled, won, lost, voided, pending },
         roi: { staked, returned, roi },
         items: settledItems,
         meta: {
           builtAt: new Date().toISOString(),
           finals_by_id: Object.keys(byId).length,
-          finals_by_name: matchedByName,
           matchedById, matchedByName,
           source: "combined",
         },
       };
 
-      await kvSetJSON(`hist:${ymd}`, historyPayload);
-      await kvSetJSON(`hist:day:${ymd}`, historyPayload);
+      await kvSetJSON(`hist:${theDay}`, historyPayload);
+      await kvSetJSON(`hist:day:${theDay}`, historyPayload);
 
       reports.push({
-        ymd,
+        ymd: theDay,
         totals: historyPayload.counts,
         roi: historyPayload.roi,
         ...(debug ? { meta: historyPayload.meta } : {}),
