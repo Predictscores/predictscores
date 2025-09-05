@@ -1,7 +1,7 @@
 // pages/api/cron/rebuild.js
-// Gradi dnevni union iz vbl:<YMD>:{am,pm,late}, snima ga u vb:day:<YMD>:union,
-// UVEK postavlja vb:day:<YMD>:last kao LISTU (isti taj union, radi kompatibilnosti sa UI),
-// i snima Top 3 snapshot u vb:day:<YMD>:combined.
+// Automatski gradi dnevni union iz vbl:<YMD>:{am,pm,late}, postavlja vb:day:<YMD>:last kao LISTU (radi UI),
+// snima Top 3 u vb:day:<YMD>:combined. Ako union ispadne prazan, SAM pozove /api/score-sync pa ponovi.
+// Podrazumevani YMD je po Europe/Belgrade.
 
 function kvEnv() {
   const url =
@@ -32,15 +32,8 @@ async function kvPipeline(cmds) {
   }
   return r.json();
 }
-
-async function kvGet(key) {
-  const out = await kvPipeline([["GET", key]]);
-  return out?.[0]?.result ?? null;
-}
-async function kvSet(key, val) {
-  const out = await kvPipeline([["SET", key, val]]);
-  return out?.[0]?.result ?? "OK";
-}
+async function kvGet(key) { const out = await kvPipeline([["GET", key]]); return out?.[0]?.result ?? null; }
+async function kvSet(key, val) { const out = await kvPipeline([["SET", key, val]]); return out?.[0]?.result ?? "OK"; }
 async function kvGetJSON(key) {
   const raw = await kvGet(key);
   if (raw == null) return null;
@@ -55,9 +48,16 @@ async function kvGetJSON(key) {
 }
 async function kvSetJSON(key, obj) { return kvSet(key, JSON.stringify(obj)); }
 
+function ymdInTZ(tz = "Europe/Belgrade", d = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(d);
+  const y = parts.find(p => p.type === "year")?.value;
+  const m = parts.find(p => p.type === "month")?.value;
+  const dd = parts.find(p => p.type === "day")?.value;
+  return `${y}-${m}-${dd}`;
+}
+
 function dedupeBySignature(items = []) {
-  const out = [];
-  const seen = new Set();
+  const out = []; const seen = new Set();
   for (const it of Array.isArray(items) ? items : []) {
     const fid = it.fixture_id ?? it.id ?? it.fixtureId ?? "";
     const mkt = it.market ?? it.market_label ?? "";
@@ -80,17 +80,13 @@ function rankOf(it) {
     - (Number.isFinite(ev) ? ev : -1),
   ];
 }
-
 function top3Combined(items) {
   const byRank = [...items].sort((a, b) => {
     const ra = rankOf(a), rb = rankOf(b);
-    for (let i = 0; i < ra.length; i++) {
-      if (ra[i] !== rb[i]) return ra[i] - rb[i];
-    }
+    for (let i = 0; i < ra.length; i++) if (ra[i] !== rb[i]) return ra[i] - rb[i];
     return 0;
   });
-  const out = [];
-  const seenFixtures = new Set();
+  const out = []; const seenFixtures = new Set();
   for (const it of byRank) {
     const fid = it.fixture_id ?? it.id ?? it.fixtureId ?? it?.fixture?.id ?? null;
     if (fid != null && seenFixtures.has(fid)) continue;
@@ -104,9 +100,7 @@ function top3Combined(items) {
 async function readArrayKey(key) {
   const val = await kvGetJSON(key);
   if (Array.isArray(val)) return val;
-  if (typeof val === "string" && val.trim().startsWith("[")) {
-    try { return JSON.parse(val); } catch {}
-  }
+  if (typeof val === "string" && val.trim().startsWith("[")) { try { return JSON.parse(val); } catch {} }
   return [];
 }
 
@@ -121,56 +115,50 @@ async function buildUnionFromSlots(ymd) {
     let arr = [];
     if (Array.isArray(raw)) arr = raw;
     else if (typeof raw === "string" && raw.trim().startsWith("[")) { try { arr = JSON.parse(raw); } catch {} }
-    if (Array.isArray(arr) && arr.length) chunks.push(...arr); // ispravka: spread, nema ".arr"
+    if (Array.isArray(arr) && arr.length) chunks.push(...arr); // ← ispravno: spread
   }
   return dedupeBySignature(chunks);
 }
 
-async function buildUnionWithFallback(ymd) {
-  // 1) probaj iz slotova
-  let union = await buildUnionFromSlots(ymd);
-  if (union.length > 0) return union;
-
-  // 2) fallback: ako postoji vb:day:<YMD>:last kao lista — uzmi je;
-  //    ako je string/pointer, dereferenciraj pa uzmi listu
-  const lastRaw = await kvGetJSON(`vb:day:${ymd}:last`);
-  if (Array.isArray(lastRaw) && lastRaw.length) {
-    return dedupeBySignature(lastRaw);
-  }
-  if (typeof lastRaw === "string") {
-    // može biti pointer ka vbl:<YMD>:slot
-    const deref = await readArrayKey(String(lastRaw));
-    if (Array.isArray(deref) && deref.length) {
-      return dedupeBySignature(deref);
-    }
-  }
-  return [];
+async function tryScoreSync(base, ymd) {
+  try {
+    const r = await fetch(`${base}/api/score-sync?ymd=${encodeURIComponent(ymd)}`, { cache: "no-store" });
+    await r.text(); // ignoriši telo; bitno je da poziv prođe
+  } catch {}
 }
 
 export default async function handler(req, res) {
   try {
     res.setHeader("Cache-Control", "no-store");
+
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const ymd = url.searchParams.get("ymd") || new Date().toISOString().slice(0, 10);
+    const tzYmd = ymdInTZ("Europe/Belgrade");
+    const ymd = url.searchParams.get("ymd") || tzYmd;
+    const proto = (req.headers["x-forwarded-proto"] || "https");
+    const base = `${proto}://${req.headers.host}`;
 
-    // 1) napravi union (sa fallbackom)
-    const union = await buildUnionWithFallback(ymd);
+    // 1) union iz slotova
+    let union = await buildUnionFromSlots(ymd);
 
-    // 2) snimi union
+    // 2) ako prazan, automatski pokreni score-sync pa ponovo pročitaj slotove
+    if (!union.length) {
+      await tryScoreSync(base, ymd);
+      union = await buildUnionFromSlots(ymd);
+    }
+
+    // 3) upiši union + last (LISTA radi UI)
     await kvSetJSON(`vb:day:${ymd}:union`, union);
-
-    // 3) UVEK postavi :last kao LISTU (kompatibilnost sa UI koji čita listu)
     await kvSetJSON(`vb:day:${ymd}:last`, union);
 
-    // 4) Top 3 (Combined) snapshot
+    // 4) combined (Top 3)
     const combined = top3Combined(union);
     await kvSetJSON(`vb:day:${ymd}:combined`, combined);
 
     res.status(200).json({
       ok: true,
       ymd,
-      counts: { union: union.length, combined: combined.length, last: union.length },
-      hint: "UI čita vb:day:<YMD>:last kao LISTU; Combined = vb:day:<YMD>:combined; learning koristi vb:day:<YMD>:union.",
+      tz_default_used: !url.searchParams.get("ymd"),
+      counts: { union: union.length, last: union.length, combined: combined.length },
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err?.message || err) });
