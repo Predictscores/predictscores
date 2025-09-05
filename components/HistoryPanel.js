@@ -4,16 +4,21 @@
 import React, { useEffect, useMemo, useState } from "react";
 
 const TZ = "Europe/Belgrade";
+const CLIENT_TIMEOUT_MS = 8000;
 
-async function safeJson(url) {
+async function safeJson(url, ms = CLIENT_TIMEOUT_MS) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), ms);
   try {
-    const r = await fetch(url, { cache: "no-store" });
+    const r = await fetch(url, { cache: "no-store", signal: ctrl.signal });
     const ct = r.headers.get("content-type") || "";
     if (ct.includes("application/json")) return await r.json();
     const t = await r.text();
     try { return JSON.parse(t); } catch { return { ok:false, error:"non-JSON", raw:t }; }
   } catch (e) {
     return { ok:false, error:String(e?.message||e) };
+  } finally {
+    clearTimeout(id);
   }
 }
 
@@ -24,11 +29,7 @@ function statusIcon(status) {
   if (s === "push" || s === "void") return "⏸";
   return "⏳"; // pending / unknown
 }
-
-function fmtOdd(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n.toFixed(2) : "—";
-}
+function fmtOdd(x) { const n = Number(x); return Number.isFinite(n) ? n.toFixed(2) : "—"; }
 
 function Row({ it }) {
   return (
@@ -45,9 +46,7 @@ function Row({ it }) {
           <span className="text-slate-400">({fmtOdd(it.odds)})</span>
         </div>
       </div>
-      <div className="text-xl pl-3 shrink-0">
-        {statusIcon(it.status)}
-      </div>
+      <div className="text-xl pl-3 shrink-0">{statusIcon(it.status)}</div>
     </div>
   );
 }
@@ -61,7 +60,8 @@ export default function HistoryPanel({ days = 14, top = 3 }) {
     setLoading(true);
     setErr(null);
     try {
-      const j = await safeJson(`/api/history-roi?days=${days}&top=${top}`);
+      // dodaj lagani cache-bust da izbegnemo edge cache/servisne radnike
+      const j = await safeJson(`/api/history-roi?days=${days}&top=${top}&_=${Date.now()%1e7}`);
       if (j?.ok) setData(j);
       else {
         setErr(j?.error || "Greška u /api/history-roi");
@@ -105,7 +105,6 @@ export default function HistoryPanel({ days = 14, top = 3 }) {
         <div className="text-slate-400 text-sm">Nema podataka za poslednjih {days} dana.</div>
       ) : (
         <>
-          {/* Summary header */}
           <div className="rounded-2xl bg-[#15182a] p-4">
             <div className="flex flex-wrap items-center gap-4 text-sm text-slate-200">
               <div className="font-semibold">History — {summary.days}d</div>
@@ -119,7 +118,6 @@ export default function HistoryPanel({ days = 14, top = 3 }) {
             </div>
           </div>
 
-          {/* List */}
           <div className="rounded-2xl bg-[#15182a] p-4">
             <div className="text-base font-semibold text-white mb-3">Rezultati</div>
             {!flatItems.length ? (
