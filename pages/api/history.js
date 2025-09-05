@@ -1,57 +1,155 @@
 // pages/api/history.js
-// Legacy adapter: čita hist:index + hist:<YMD>:<slot> i vraća `items` i `history`.
+// NEW adapter: čita hist:<YMD> (primarno), pa hist:day:<YMD>, pa vb:day:<YMD>:last (fallback)
+// i vraća `items` (flat) tako da HistoryPanel odmah radi bez izmene UI-a.
 
 export const config = { runtime: "nodejs" };
 
-const KV_URL = process.env.KV_REST_API_URL;
-const KV_TOKEN_RO = process.env.KV_REST_API_READ_ONLY_TOKEN;
-const KV_TOKEN = process.env.KV_REST_API_TOKEN || KV_TOKEN_RO;
+function kvEnv() {
+  const url =
+    process.env.KV_REST_API_URL ||
+    process.env.UPSTASH_REDIS_REST_URL ||
+    process.env.KV_URL ||
+    "";
+  const token =
+    process.env.KV_REST_API_TOKEN ||
+    process.env.UPSTASH_REDIS_REST_TOKEN ||
+    process.env.KV_REST_API_READ_ONLY_TOKEN ||
+    "";
+  return { url, token };
+}
 
-async function kvGet(key) {
-  if (!KV_URL || (!KV_TOKEN && !KV_TOKEN_RO)) return null;
-  const token = KV_TOKEN_RO || KV_TOKEN;
+async function kvGetRaw(key) {
+  const { url, token } = kvEnv();
+  if (!url || !token) return null;
   try {
-    const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
-      headers: { Authorization: `Bearer ${token}` }, cache: "no-store",
+    // Prefer pipeline/get za doslednost, ali /get/<key> je brži za 1 ključ
+    const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
     });
     if (!r.ok) return null;
     const j = await r.json().catch(() => null);
     if (!j || typeof j.result === "undefined") return null;
-    try { return JSON.parse(j.result); } catch { return j.result; }
-  } catch { return null; }
+    return j.result;
+  } catch {
+    return null;
+  }
 }
 
-function parseYMD(s){ const m = String(s||"").match(/^(\d{4})-(\d{2})-(\d{2})/); return m? new Date(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`) : null; }
-function daysAgoUTC(d){ const now = new Date(); return (now - d) / 86400000; }
+async function kvGetJSON(key) {
+  const raw = await kvGetRaw(key);
+  if (raw == null) return null;
+  if (typeof raw === "string") {
+    const s = raw.trim();
+    if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+      try { return JSON.parse(s); } catch { return raw; }
+    }
+    return raw;
+  }
+  return raw;
+}
+
+function ymd(d = new Date()) {
+  return d.toISOString().slice(0, 10);
+}
+
+function daysArray(n) {
+  const out = [];
+  const today = new Date();
+  for (let i = 0; i < n; i++) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    out.push(ymd(d));
+  }
+  return out;
+}
+
+function coercePick(it) {
+  // normalizuj polja da UI dobije home/away/market/pick/odds/result
+  const home = it.home || it?.teams?.home || "";
+  const away = it.away || it?.teams?.away || "";
+  const market = it.market || it.market_label || "";
+  const rawPick = it.pick ?? it.selection ?? it.selection_label ?? it.pick_code;
+  const pick =
+    typeof rawPick === "string"
+      ? rawPick
+      : it?.pick_code === "1"
+      ? "Home"
+      : it?.pick_code === "2"
+      ? "Away"
+      : it?.pick_code === "X"
+      ? "Draw"
+      : String(rawPick || "");
+  const price = Number(it?.odds?.price);
+  // prefer `outcome` (što sada pišemo iz apply-learning) pa `result`
+  const result =
+    (it.outcome && String(it.outcome).toUpperCase()) ||
+    (it.result && String(it.result).toUpperCase()) ||
+    "";
+
+  return {
+    ...it,
+    home,
+    away,
+    market,
+    pick,
+    selection: pick,
+    odds: Number.isFinite(price) ? { price } : it.odds || {},
+    result, // "WIN" | "LOSE" | "VOID" | "PENDING" | ""
+  };
+}
+
+function flattenHistoryObject(obj) {
+  // hist:<YMD> format iz apply-learning: { ymd, items:[...], counts:{}, roi:{} }
+  if (!obj) return [];
+  if (Array.isArray(obj)) return obj.map(coercePick);
+  if (Array.isArray(obj.items)) return obj.items.map(coercePick);
+  return [];
+}
 
 export default async function handler(req, res) {
   try {
     const days = Math.max(1, Math.min(60, Number(req.query.days || 14)));
-    const index = await kvGet("hist:index");
-    const tags = Array.isArray(index) ? index : [];
 
-    const selected = [];
-    for (const tag of tags) {
-      const dt = parseYMD(tag);
-      if (!dt) continue;
-      if (daysAgoUTC(dt) <= days) selected.push(tag);
+    const ymds = daysArray(days);
+    const flat = [];
+
+    for (const d of ymds) {
+      // 1) primarno čitaj hist:<YMD>
+      let histObj = await kvGetJSON(`hist:${d}`);
+      let items = flattenHistoryObject(histObj);
+
+      // 2) fallback hist:day:<YMD>
+      if (!items.length) {
+        histObj = await kvGetJSON(`hist:day:${d}`);
+        items = flattenHistoryObject(histObj);
+      }
+
+      // 3) fallback vb:day:<YMD>:last (lista predloga bez ishoda)
+      if (!items.length) {
+        const vb = await kvGetJSON(`vb:day:${d}:last`);
+        if (Array.isArray(vb) && vb.length) {
+          items = vb.map(coercePick);
+        }
+      }
+
+      if (items.length) {
+        // možes dodati d info svakoj stavci radi rendera
+        for (const it of items) {
+          flat.push({ ...it, _day: d });
+        }
+      }
     }
 
-    const buckets = await Promise.all(selected.slice(0, 120).map(t => kvGet(`hist:${t}`)));
-    const flat = buckets
-      .filter(Array.isArray)
-      .flat()
-      .map(it => {
-        const raw = it?.pick;
-        const str = typeof raw === "string" ? raw :
-          (it?.selection_label || (it?.pick_code==="1"?"Home":it?.pick_code==="2"?"Away":"Draw"));
-        const home = it.home || it?.teams?.home || "";
-        const away = it.away || it?.teams?.away || "";
-        return { ...it, pick: str, selection: str, home, away };
-      });
-
-    return res.status(200).json({ ok: true, items: flat, history: flat, count: flat.length, index: selected });
+    // HistoryPanel gleda body.items ili body.history kao niz
+    return res.status(200).json({
+      ok: true,
+      count: flat.length,
+      items: flat,
+    });
   } catch (e) {
-    return res.status(200).json({ ok: false, error: String(e?.message || e) });
+    return res
+      .status(200)
+      .json({ ok: false, error: String(e?.message || e) });
   }
 }
