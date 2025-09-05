@@ -1,6 +1,8 @@
 // pages/api/history.js
-// NEW adapter: čita hist:<YMD> (primarno), pa hist:day:<YMD>, pa vb:day:<YMD>:last (fallback)
-// i vraća `items` (flat) tako da HistoryPanel odmah radi bez izmene UI-a.
+// Kompatibilni adapter za HistoryPanel:
+// - vraća i `items` i `history` (isti niz)
+// - nikad ne baca grešku ka klijentu; u fallbacku vraća prazne nizove
+// - čita redom: hist:<YMD> → hist:day:<YMD> → vb:day:<YMD>:last
 
 export const config = { runtime: "nodejs" };
 
@@ -22,7 +24,6 @@ async function kvGetRaw(key) {
   const { url, token } = kvEnv();
   if (!url || !token) return null;
   try {
-    // Prefer pipeline/get za doslednost, ali /get/<key> je brži za 1 ključ
     const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
       headers: { Authorization: `Bearer ${token}` },
       cache: "no-store",
@@ -52,7 +53,6 @@ async function kvGetJSON(key) {
 function ymd(d = new Date()) {
   return d.toISOString().slice(0, 10);
 }
-
 function daysArray(n) {
   const out = [];
   const today = new Date();
@@ -65,7 +65,6 @@ function daysArray(n) {
 }
 
 function coercePick(it) {
-  // normalizuj polja da UI dobije home/away/market/pick/odds/result
   const home = it.home || it?.teams?.home || "";
   const away = it.away || it?.teams?.away || "";
   const market = it.market || it.market_label || "";
@@ -81,12 +80,10 @@ function coercePick(it) {
       ? "Draw"
       : String(rawPick || "");
   const price = Number(it?.odds?.price);
-  // prefer `outcome` (što sada pišemo iz apply-learning) pa `result`
   const result =
     (it.outcome && String(it.outcome).toUpperCase()) ||
     (it.result && String(it.result).toUpperCase()) ||
     "";
-
   return {
     ...it,
     home,
@@ -100,7 +97,6 @@ function coercePick(it) {
 }
 
 function flattenHistoryObject(obj) {
-  // hist:<YMD> format iz apply-learning: { ymd, items:[...], counts:{}, roi:{} }
   if (!obj) return [];
   if (Array.isArray(obj)) return obj.map(coercePick);
   if (Array.isArray(obj.items)) return obj.items.map(coercePick);
@@ -109,13 +105,13 @@ function flattenHistoryObject(obj) {
 
 export default async function handler(req, res) {
   try {
+    res.setHeader("Cache-Control", "no-store");
     const days = Math.max(1, Math.min(60, Number(req.query.days || 14)));
-
     const ymds = daysArray(days);
-    const flat = [];
 
+    const flat = [];
     for (const d of ymds) {
-      // 1) primarno čitaj hist:<YMD>
+      // 1) primarno hist:<YMD>
       let histObj = await kvGetJSON(`hist:${d}`);
       let items = flattenHistoryObject(histObj);
 
@@ -125,31 +121,33 @@ export default async function handler(req, res) {
         items = flattenHistoryObject(histObj);
       }
 
-      // 3) fallback vb:day:<YMD>:last (lista predloga bez ishoda)
+      // 3) fallback vb:day:<YMD>:last (ima bar predloge)
       if (!items.length) {
         const vb = await kvGetJSON(`vb:day:${d}:last`);
-        if (Array.isArray(vb) && vb.length) {
-          items = vb.map(coercePick);
-        }
+        if (Array.isArray(vb) && vb.length) items = vb.map(coercePick);
       }
 
       if (items.length) {
-        // možes dodati d info svakoj stavci radi rendera
-        for (const it of items) {
-          flat.push({ ...it, _day: d });
-        }
+        for (const it of items) flat.push({ ...it, _day: d });
       }
     }
 
-    // HistoryPanel gleda body.items ili body.history kao niz
+    // Vraćamo DVA polja radi kompatibilnosti sa starim i novim panelom
     return res.status(200).json({
       ok: true,
+      days,
       count: flat.length,
       items: flat,
+      history: flat, // <= ključno za UI koji čita `history.map(...)`
     });
   } catch (e) {
-    return res
-      .status(200)
-      .json({ ok: false, error: String(e?.message || e) });
+    // Nikad ne ruši klijenta: vrati prazne nizove
+    return res.status(200).json({
+      ok: false,
+      error: String(e?.message || e),
+      items: [],
+      history: [],
+      count: 0,
+    });
   }
 }
