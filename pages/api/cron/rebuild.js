@@ -423,7 +423,7 @@ function extractHTFT(oddsPayload) {
     const bkm = uniqueName(row);
     const allowAny  = !ODDS_TRUSTED_ONLY || inListLowerIncludes(bkm, TRUSTED_BOOKIES);
     const allowFair = inListLowerIncludes(bkm, SHARP_BOOKIES);
-    const bets = Array.isArray(row?.bets) ? row.bets : [];
+    the bets = Array.isArray(row?.bets) ? row.bets : [];
     for (const bet of bets) {
       const nm = (bet?.name || "").toLowerCase();
       if (!/half\s*time.*full\s*time|ht\s*\/\s*ft|ht-?ft/i.test(nm)) continue;
@@ -965,8 +965,7 @@ export default async function handler(req, res) {
         }
       }
 
-      // --- pripremi “loose” fallback za ovaj fixture (bez stat-mixa), koristi implied iz fair/any i median cenu ---
-      // 1X2
+      // --- pripremi “loose” fallback za ovaj fixture (bez stat-mixa) ---
       (function makeLoose1X2(){
         const needBooks = MIN_BOOKS_RELAX_1X2;
         const sprLimit = 0.70;
@@ -991,7 +990,6 @@ export default async function handler(req, res) {
         }
       })();
 
-      // BTTS
       (function makeLooseBTTS(){
         const needBooks = MIN_BOOKS_RELAX;
         const sprLimit = 0.70;
@@ -1016,7 +1014,6 @@ export default async function handler(req, res) {
         }
       })();
 
-      // OU
       (function makeLooseOU(){
         const needBooks = MIN_BOOKS_RELAX;
         const sprLimit = 0.70;
@@ -1041,7 +1038,6 @@ export default async function handler(req, res) {
         }
       })();
 
-      // HT-FT (loose)
       (function makeLooseHTFT(){
         const needBooks = MIN_BOOKS_RELAX;
         const sprLimit = 0.70;
@@ -1084,6 +1080,10 @@ export default async function handler(req, res) {
     // dnevni union (za learning settle) — koristi slim listu (TARGET)
     const unionKey = `vb:day:${ymd}:union`;
     await kvSetJSON(unionKey, payloadSlim.items);
+
+    // ⬇️ DODATO: napiši i "last" koji tvoji workflow-i očekuju (pointer u debug-u)
+    const lastKey = `vb:day:${ymd}:last`;
+    await kvSetJSON(lastKey, payloadSlim.items);
 
     return res.status(200).json({
       ok:true, slot:slotQ, ymd,
