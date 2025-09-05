@@ -1,7 +1,13 @@
 // pages/api/cron/rebuild.js
-// Automatski gradi dnevni union iz vbl:<YMD>:{am,pm,late}, postavlja vb:day:<YMD>:last kao LISTU (radi UI),
-// snima Top 3 u vb:day:<YMD>:combined. Ako union ispadne prazan, SAM pozove /api/score-sync pa ponovi.
-// Podrazumevani YMD je po Europe/Belgrade.
+// Automatski napravi dnevni union i Combined tako da UI (Football/Combined tab) NIKAD ne ostane prazan.
+// Redosled:
+// 1) probaj iz vbl:<YMD>:{am,pm,late}
+// 2) ako prazno → pozovi /api/score-sync?ymd=<YMD> i ponovi (jer score-sync može da popuni podatke)
+// 3) ako i dalje prazno → fallback na vb:day:<YMD>:last (lista ili pointer na vbl:*)
+// Na kraju UVEK postavi:
+//   vb:day:<YMD>:union  = union (lista)
+//   vb:day:<YMD>:last   = union (LISTA, radi UI kompatibilnosti)
+//   vb:day:<YMD>:combined = Top 3 iz union-a
 
 function kvEnv() {
   const url =
@@ -97,12 +103,14 @@ function top3Combined(items) {
   return out;
 }
 
-async function readArrayKey(key) {
-  const val = await kvGetJSON(key);
+async function readArrayMaybeJSON(val) {
   if (Array.isArray(val)) return val;
-  if (typeof val === "string" && val.trim().startsWith("[")) { try { return JSON.parse(val); } catch {} }
+  if (typeof val === "string" && val.trim().startsWith("[")) {
+    try { return JSON.parse(val); } catch {}
+  }
   return [];
 }
+async function readArrayKey(key) { return readArrayMaybeJSON(await kvGetJSON(key)); }
 
 async function buildUnionFromSlots(ymd) {
   const slots = ["am", "pm", "late"];
@@ -112,10 +120,8 @@ async function buildUnionFromSlots(ymd) {
   for (let i = 0; i < slots.length; i++) {
     const raw = out?.[i]?.result ?? null;
     if (!raw) continue;
-    let arr = [];
-    if (Array.isArray(raw)) arr = raw;
-    else if (typeof raw === "string" && raw.trim().startsWith("[")) { try { arr = JSON.parse(raw); } catch {} }
-    if (Array.isArray(arr) && arr.length) chunks.push(...arr); // ← ispravno: spread
+    const arr = await readArrayMaybeJSON(raw);
+    if (arr.length) chunks.push(...arr); // ← obavezno spread; nema ".arr"
   }
   return dedupeBySignature(chunks);
 }
@@ -123,8 +129,19 @@ async function buildUnionFromSlots(ymd) {
 async function tryScoreSync(base, ymd) {
   try {
     const r = await fetch(`${base}/api/score-sync?ymd=${encodeURIComponent(ymd)}`, { cache: "no-store" });
-    await r.text(); // ignoriši telo; bitno je da poziv prođe
+    await r.text(); // nije bitan sadržaj
   } catch {}
+}
+
+async function getUnionFromLast(ymd) {
+  // last može biti LISTA ili STRING (pointer ka vbl:<YMD>:slot)
+  const lastVal = await kvGetJSON(`vb:day:${ymd}:last`);
+  if (Array.isArray(lastVal)) return dedupeBySignature(lastVal);
+  if (typeof lastVal === "string") {
+    const arr = await readArrayKey(String(lastVal));
+    if (arr.length) return dedupeBySignature(arr);
+  }
+  return [];
 }
 
 export default async function handler(req, res) {
@@ -132,33 +149,35 @@ export default async function handler(req, res) {
     res.setHeader("Cache-Control", "no-store");
 
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const tzYmd = ymdInTZ("Europe/Belgrade");
-    const ymd = url.searchParams.get("ymd") || tzYmd;
+    const ymd = url.searchParams.get("ymd") || ymdInTZ("Europe/Belgrade");
     const proto = (req.headers["x-forwarded-proto"] || "https");
     const base = `${proto}://${req.headers.host}`;
 
-    // 1) union iz slotova
+    // 1) probaj union iz slotova
     let union = await buildUnionFromSlots(ymd);
 
-    // 2) ako prazan, automatski pokreni score-sync pa ponovo pročitaj slotove
+    // 2) ako je prazan → pozovi score-sync pa probaj opet slotove
     if (!union.length) {
       await tryScoreSync(base, ymd);
       union = await buildUnionFromSlots(ymd);
     }
 
-    // 3) upiši union + last (LISTA radi UI)
-    await kvSetJSON(`vb:day:${ymd}:union`, union);
-    await kvSetJSON(`vb:day:${ymd}:last`, union);
+    // 3) ako i dalje prazan → uzmi iz :last (lista ili pointer)
+    if (!union.length) {
+      union = await getUnionFromLast(ymd);
+    }
 
-    // 4) combined (Top 3)
+    // 4) upiši union, last(=lista), combined
+    await kvSetJSON(`vb:day:${ymd}:union`, union);
+    await kvSetJSON(`vb:day:${ymd}:last`, union);       // LISTA — kompatibilno sa UI
     const combined = top3Combined(union);
     await kvSetJSON(`vb:day:${ymd}:combined`, combined);
 
     res.status(200).json({
       ok: true,
       ymd,
-      tz_default_used: !url.searchParams.get("ymd"),
       counts: { union: union.length, last: union.length, combined: combined.length },
+      note: "Ako union ostane 0, proveri da li score-sync za taj YMD generiše kandidatae ili koristi drugi dan (UTC vs CEST).",
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err?.message || err) });
