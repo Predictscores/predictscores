@@ -1,10 +1,12 @@
 // pages/api/history.js
 // Kompatibilni adapter za HistoryPanel:
 // - vraća i `items` i `history` (isti niz)
-// - nikad ne baca grešku ka klijentu; u fallbacku vraća prazne nizove
+// - nikad ne ruši klijenta; u fallbacku vraća prazne nizove
 // - čita redom: hist:<YMD> → hist:day:<YMD> → vb:day:<YMD>:last
 
 export const config = { runtime: "nodejs" };
+
+/* ---------------- ENV & KV helpers ---------------- */
 
 function kvEnv() {
   const url =
@@ -42,13 +44,22 @@ async function kvGetJSON(key) {
   if (raw == null) return null;
   if (typeof raw === "string") {
     const s = raw.trim();
-    if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
-      try { return JSON.parse(s); } catch { return raw; }
+    if (
+      (s.startsWith("{") && s.endsWith("}")) ||
+      (s.startsWith("[") && s.endsWith("]"))
+    ) {
+      try {
+        return JSON.parse(s);
+      } catch {
+        return raw;
+      }
     }
     return raw;
   }
   return raw;
 }
+
+/* ---------------- date helpers ---------------- */
 
 function ymd(d = new Date()) {
   return d.toISOString().slice(0, 10);
@@ -63,6 +74,8 @@ function daysArray(n) {
   }
   return out;
 }
+
+/* ---------------- shaping helpers ---------------- */
 
 function coercePick(it) {
   const home = it.home || it?.teams?.home || "";
@@ -84,6 +97,7 @@ function coercePick(it) {
     (it.outcome && String(it.outcome).toUpperCase()) ||
     (it.result && String(it.result).toUpperCase()) ||
     "";
+
   return {
     ...it,
     home,
@@ -103,13 +117,20 @@ function flattenHistoryObject(obj) {
   return [];
 }
 
+/* ---------------- handler ---------------- */
+
 export default async function handler(req, res) {
   try {
-    res.setHeader("Cache-Control", "no-store");
+    // Stabilni headeri: CORS + JSON + no-store
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "no-store, max-age=0, must-revalidate");
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+
     const days = Math.max(1, Math.min(60, Number(req.query.days || 14)));
     const ymds = daysArray(days);
 
     const flat = [];
+
     for (const d of ymds) {
       // 1) primarno hist:<YMD>
       let histObj = await kvGetJSON(`hist:${d}`);
@@ -121,27 +142,31 @@ export default async function handler(req, res) {
         items = flattenHistoryObject(histObj);
       }
 
-      // 3) fallback vb:day:<YMD>:last (ima bar predloge)
+      // 3) fallback vb:day:<YMD>:last (bar predlozi bez ishoda)
       if (!items.length) {
         const vb = await kvGetJSON(`vb:day:${d}:last`);
-        if (Array.isArray(vb) && vb.length) items = vb.map(coercePick);
+        if (Array.isArray(vb) && vb.length) {
+          items = vb.map(coercePick);
+        }
       }
 
       if (items.length) {
-        for (const it of items) flat.push({ ...it, _day: d });
+        for (const it of items) {
+          flat.push({ ...it, _day: d });
+        }
       }
     }
 
-    // Vraćamo DVA polja radi kompatibilnosti sa starim i novim panelom
+    // Vratimo i `items` i `history` radi kompatibilnosti UI-a
     return res.status(200).json({
       ok: true,
       days,
       count: flat.length,
       items: flat,
-      history: flat, // <= ključno za UI koji čita `history.map(...)`
+      history: flat,
     });
   } catch (e) {
-    // Nikad ne ruši klijenta: vrati prazne nizove
+    // Nikad ne ruši klijenta
     return res.status(200).json({
       ok: false,
       error: String(e?.message || e),
