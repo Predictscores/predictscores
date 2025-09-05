@@ -1,5 +1,5 @@
 // pages/api/history.js
-// History sada pokazuje SAMO Combined (Top 3 po danu):
+// History prikazuje SAMO Combined (Top 3 po danu):
 // 1) čita hist:<YMD> (građeno iz combined u apply-learning)
 // 2) fallback: vb:day:<YMD>:combined (ako hist još ne postoji)
 // Vraća i `items` i `history` (isti niz), + `count`.
@@ -98,16 +98,13 @@ export default async function handler(req, res) {
       let hist = await kvGetJSON(`hist:${d}`);
       let items = flattenHistObj(hist, d);
 
-      // 2) fallback: vb:day:<YMD>:combined (ako još nije pisano u hist)
+      // 2) fallback: vb:day:<YMD>:combined (ako hist još nije upisan)
       if (!items.length) {
         const combined = await kvGetJSON(`vb:day:${d}:combined`);
         if (Array.isArray(combined) && combined.length) {
           items = combined.map((x) => coercePick(x, d));
         }
       }
-
-      // 3) (opciono) poslednji fallback može biti union — ali ga PRESKAČEMO
-      // jer History želimo samo iz Combined.
 
       for (const it of items) flat.push(it);
     }
