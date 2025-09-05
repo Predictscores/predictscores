@@ -1,6 +1,7 @@
 // pages/api/cron/apply-learning.js
 // Settling i history SAMO nad vb:day:<YMD>:combined (Top 3).
-// U KV se NE diraju vb:day:<YMD>:{last,union}. History ide u hist:<YMD> i hist:day:<YMD>.
+// NE dira vb:day:<YMD>:{last,union}. Ako combined nedostaje, izgradi ga iz union-a (a union iz vbl:* ili :last).
+// Presuđuje 1X2, OU, BTTS, HT-FT. API-FOOTBALL: ID i date ±1 fallback.
 
 function kvEnv() {
   const url =
@@ -15,6 +16,7 @@ function kvEnv() {
     "";
   return { url, token };
 }
+
 async function kvPipeline(cmds) {
   const { url, token } = kvEnv();
   if (!url || !token) throw new Error("KV env not set (URL/TOKEN).");
@@ -47,7 +49,7 @@ function apiFootballKey() {
   return process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || "";
 }
 
-/* ------------ helpers: combined / union fallback ------------ */
+/* ------------- helpers: combined/union/last ------------- */
 
 function dedupeBySignature(items = []) {
   const out = []; const seen = new Set();
@@ -60,6 +62,7 @@ function dedupeBySignature(items = []) {
   }
   return out;
 }
+
 function rankOf(it) {
   const c = Number(it?.confidence_pct);
   const p = Number(it?.model_prob);
@@ -88,19 +91,63 @@ function top3Combined(items) {
   }
   return out;
 }
+
+function isPointerToSlot(x, ymd) {
+  return typeof x === "string" && new RegExp(`^vbl:${ymd}:(am|pm|late)$`).test(x);
+}
+
+async function readArrayKey(key) {
+  const val = await kvGetJSON(key);
+  if (Array.isArray(val)) return val;
+  if (typeof val === "string" && val.trim().startsWith("[")) { try { return JSON.parse(val); } catch {} }
+  return [];
+}
+
+async function buildUnionFromSlots(ymd) {
+  const slots = ["am", "pm", "late"];
+  const cmds = slots.map(s => ["GET", `vbl:${ymd}:${s}`]);
+  const out = await kvPipeline(cmds);
+  const chunks = [];
+  for (let i = 0; i < slots.length; i++) {
+    const raw = out?.[i]?.result ?? null;
+    if (!raw) continue;
+    let arr = [];
+    if (Array.isArray(raw)) arr = raw;
+    else if (typeof raw === "string" && raw.trim().startsWith("[")) { try { arr = JSON.parse(raw); } catch {} }
+    if (Array.isArray(arr) && arr.length) chunks.push(...arr);
+  }
+  return dedupeBySignature(chunks);
+}
+
+async function buildUnionWithFallback(ymd) {
+  let union = await buildUnionFromSlots(ymd);
+  if (union.length > 0) return union;
+
+  const last = await kvGet(`vb:day:${ymd}:last`);
+  if (isPointerToSlot(last, ymd)) {
+    const list = await readArrayKey(String(last));
+    union = dedupeBySignature(list);
+  } else {
+    const maybeList = await kvGetJSON(`vb:day:${ymd}:last`);
+    if (Array.isArray(maybeList)) union = dedupeBySignature(maybeList);
+  }
+  return union;
+}
+
 async function ensureCombinedForDay(ymd) {
-  // 1) probaj direktno combined
   const combined = await kvGetJSON(`vb:day:${ymd}:combined`);
   if (Array.isArray(combined) && combined.length) return dedupeBySignature(combined);
-  // 2) fallback: napravi iz union-a (i upiši kako bismo imali snapshot)
+
   const union = await kvGetJSON(`vb:day:${ymd}:union`);
-  const unionArr = Array.isArray(union) ? union : [];
+  let unionArr = Array.isArray(union) ? union : [];
+  if (!unionArr.length) unionArr = await buildUnionWithFallback(ymd);
+
   const built = top3Combined(dedupeBySignature(unionArr));
   await kvSetJSON(`vb:day:${ymd}:combined`, built);
   return built;
 }
 
-/* ------------ settle rules (1X2, OU, BTTS, HT-FT) ------------ */
+/* ------------- settle rules ------------- */
 
 function parseOUThreshold(it) {
   const s = (it.selection_label || it.pick || it.selection || it.pick_code || "").toString().toUpperCase();
@@ -171,12 +218,10 @@ function decideOutcomeFromFinals(it, finals) {
   return "PENDING";
 }
 
-/* ------------ API-FOOTBALL fetch (id + date ±1) ------------ */
+/* ------------- API-FOOTBALL fetch (ids + date ±1) ------------- */
 
 function apiKey() { return apiFootballKey(); }
-function normalizeName(s) {
-  return String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
-}
+function normalizeName(s) { return String(s||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().replace(/\s+/g," ").trim(); }
 function makePairKey(home, away) { return `${normalizeName(home)}|${normalizeName(away)}`; }
 
 async function fetchFixturesByIds(ids) {
@@ -231,19 +276,17 @@ function ymdShift(ymd, deltaDays) {
 async function ensureFinalsFor(ymd, items) {
   const fids = Array.from(new Set(items.map(it => it.fixture_id ?? it.id ?? it.fixtureId).filter(x => x != null)));
   const byId = await fetchFixturesByIds(fids);
-  // ako po ID nema dovoljno, probaj po datumu ymd, ymd-1, ymd+1
   const byPair = {};
-  const daysToTry = [0, -1, 1];
   if (Object.keys(byId).length < Math.ceil(fids.length * 0.6)) {
-    for (const dd of daysToTry) {
-      const byDate = await fetchFixturesByDate(dd === 0 ? ymd : ymdShift(ymd, dd));
-      Object.assign(byPair, byDate);
+    for (const dd of [0, -1, 1]) {
+      const add = await fetchFixturesByDate(dd === 0 ? ymd : ymdShift(ymd, dd));
+      Object.assign(byPair, add);
     }
   }
   return { byId, byPair };
 }
 
-/* ------------ handler ------------ */
+/* ------------- handler ------------- */
 
 export default async function handler(req, res) {
   try {
@@ -261,10 +304,10 @@ export default async function handler(req, res) {
     const reports = [];
 
     for (const ymd of ymds) {
-      // 1) uzmi Combined (Top 3) — izvor za History
+      // 1) Combined (Top 3)
       const items = await ensureCombinedForDay(ymd);
 
-      // 2) obezbedi finalne rezultate (ID + date fallback)
+      // 2) finalni rezultati
       const { byId, byPair } = await ensureFinalsFor(ymd, items);
 
       let settled = 0, won = 0, lost = 0, voided = 0, pending = 0;
@@ -321,7 +364,6 @@ export default async function handler(req, res) {
         },
       };
 
-      // 3) upiši isključivo history (NE diramo vb:day:<YMD>:{last,union})
       await kvSetJSON(`hist:${ymd}`, historyPayload);
       await kvSetJSON(`hist:day:${ymd}`, historyPayload);
 
