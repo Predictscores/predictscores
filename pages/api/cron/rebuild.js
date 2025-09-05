@@ -423,7 +423,7 @@ function extractHTFT(oddsPayload) {
     const bkm = uniqueName(row);
     const allowAny  = !ODDS_TRUSTED_ONLY || inListLowerIncludes(bkm, TRUSTED_BOOKIES);
     const allowFair = inListLowerIncludes(bkm, SHARP_BOOKIES);
-    the bets = Array.isArray(row?.bets) ? row.bets : [];
+    const bets = Array.isArray(row?.bets) ? row.bets : []; // ✅ ispravka
     for (const bet of bets) {
       const nm = (bet?.name || "").toLowerCase();
       if (!/half\s*time.*full\s*time|ht\s*\/\s*ft|ht-?ft/i.test(nm)) continue;
@@ -1081,7 +1081,7 @@ export default async function handler(req, res) {
     const unionKey = `vb:day:${ymd}:union`;
     await kvSetJSON(unionKey, payloadSlim.items);
 
-    // ⬇️ DODATO: napiši i "last" koji tvoji workflow-i očekuju (pointer u debug-u)
+    // ⬇️ DODATO: napiši i "last" koji workflow očekuje
     const lastKey = `vb:day:${ymd}:last`;
     await kvSetJSON(lastKey, payloadSlim.items);
 
