@@ -1,11 +1,13 @@
 // pages/api/cron/rebuild.js
-// Robusno punjenje dnevnih ključeva za UI (Football/Combined) uz "no-overwrite-when-empty":
-// - Gradi union iz vbl:<YMD>:{am,pm,late}
-// - Ako prazno → /api/score-sync?ymd=<YMD>, pa ponovo
-// - Ako prazno → /api/score-sync?days=3, pa ponovo
-// - Ako prazno → fallback na vb:day:<YMD>:last (lista ili pointer)
-// - Ako prazno → pogleda susedne dane (YMD-1, YMD+1) i zadrži mečeve čiji kickoff_utc po Europe/Belgrade upada u <YMD>
-// - Na kraju: piše vb:day:<YMD>:union/last/combined SAMO ako ima >0 stavki. Ako nema → NE dira postojeće ključeve.
+// Punjenje ključeva za UI sa 15 najboljih (Football) i Top 3 (Combined), uz no-overwrite-when-empty.
+// - union iz vbl:<YMD>:{am,pm,late}
+// - ako prazno → /api/score-sync?ymd=<YMD>, pa ponovo
+// - ako prazno → /api/score-sync?days=3, pa ponovo
+// - ako prazno → fallback na vb:day:<YMD>:last (lista ili pointer)
+// - ako prazno → pogledaj susedne dane (YMD-1, YMD+1) i filtriraj kickoff u lokalni <YMD>
+// - piši samo ako ima >0 stavki; nikad ne prepisuj prazninom
+// - vb:day:<YMD>:last  = Top 15 (LISTA)
+// - vb:day:<YMD>:combined = Top 3 (LISTA)
 
 function kvEnv() {
   const url =
@@ -64,7 +66,7 @@ function shiftYmd(ymd, delta) {
   return d.toISOString().slice(0,10);
 }
 
-/* ---------- helpers ---------- */
+/* ---------- ranking helpers ---------- */
 
 function dedupeBySignature(items = []) {
   const out = []; const seen = new Set();
@@ -89,22 +91,21 @@ function rankOf(it) {
     - (Number.isFinite(ev) ? ev : -1),
   ];
 }
-function top3Combined(items) {
-  const byRank = [...items].sort((a, b) => {
+function sortByRank(items) {
+  return [...items].sort((a, b) => {
     const ra = rankOf(a), rb = rankOf(b);
     for (let i = 0; i < ra.length; i++) if (ra[i] !== rb[i]) return ra[i] - rb[i];
     return 0;
   });
-  const out = []; const seenFixtures = new Set();
-  for (const it of byRank) {
-    const fid = it.fixture_id ?? it.id ?? it.fixtureId ?? it?.fixture?.id ?? null;
-    if (fid != null && seenFixtures.has(fid)) continue;
-    out.push(it);
-    if (fid != null) seenFixtures.add(fid);
-    if (out.length >= 3) break;
-  }
-  return out;
 }
+function topN(items, n) {
+  const sorted = sortByRank(items);
+  return sorted.slice(0, Math.max(0, Math.min(n, sorted.length)));
+}
+function top3(items) { return topN(items, 3); }
+function top15(items) { return topN(items, 15); }
+
+/* ---------- IO helpers ---------- */
 
 async function readArrayMaybeJSON(val) {
   if (Array.isArray(val)) return val;
@@ -126,7 +127,6 @@ async function buildUnionFromSlots(ymd) {
   }
   return dedupeBySignature(chunks);
 }
-
 async function tryHit(url) { try { await fetch(url, { cache: "no-store" }).then(r => r.text()); } catch {} }
 
 function localYmdFromUTC(iso, tz = "Europe/Belgrade") {
@@ -155,7 +155,6 @@ async function getUnionFromLast(ymd) {
   }
   return [];
 }
-
 async function getUnionFromAdjacentDaysFiltered(ymd) {
   const days = [shiftYmd(ymd, -1), shiftYmd(ymd, +1)];
   let combined = [];
@@ -177,11 +176,11 @@ export default async function handler(req, res) {
     const proto = (req.headers["x-forwarded-proto"] || "https");
     const base = `${proto}://${req.headers.host}`;
 
-    // Sačuvaj stare vrednosti (da ih NE pregaziš prazninom)
+    // Sačuvaj stare vrednosti da ih ne pregaziš prazninom
     const oldLast = await kvGetJSON(`vb:day:${ymd}:last`);
     const oldCombined = await kvGetJSON(`vb:day:${ymd}:combined`);
 
-    // 1) slotovi za YMD
+    // 1) union iz slotova
     let union = await buildUnionFromSlots(ymd);
 
     // 2) auto score-sync za taj YMD
@@ -206,29 +205,43 @@ export default async function handler(req, res) {
       union = await getUnionFromAdjacentDaysFiltered(ymd);
     }
 
-    // 6) PISANJE: samo ako ima > 0 stavki (no-overwrite-when-empty)
-    let mutated = false;
-    if (union.length > 0) {
-      await kvSetJSON(`vb:day:${ymd}:union`, union);
-      await kvSetJSON(`vb:day:${ymd}:last`, union);       // LISTA (UI očekuje listu)
-      const combined = top3Combined(union);
-      await kvSetJSON(`vb:day:${ymd}:combined`, combined);
-      mutated = true;
+    // Ako nema ničega — ne diraj postojeće vrednosti
+    if (!union.length) {
+      const finalLast = Array.isArray(oldLast) ? oldLast : [];
+      const finalCombined = Array.isArray(oldCombined) ? oldCombined : [];
+      return res.status(200).json({
+        ok: true,
+        ymd,
+        mutated: false,
+        counts: {
+          union: 0,
+          last: Array.isArray(finalLast) ? finalLast.length : 0,
+          combined: Array.isArray(finalCombined) ? finalCombined.length : 0,
+        },
+        note: "no candidates → keys NOT mutated",
+      });
     }
 
-    // Brojke za odgovor (uvek)
-    const finalLast = mutated ? union : (Array.isArray(oldLast) ? oldLast : []);
-    const finalCombined = mutated ? top3Combined(union) : (Array.isArray(oldCombined) ? oldCombined : []);
+    // Imamo unose → pripremi Top 15 i Top 3
+    const unionDedupe = dedupeBySignature(union);
+    const lastTop15 = top15(unionDedupe);     // Football tab traži 15 najboljih
+    const combinedTop3 = top3(unionDedupe);   // Combined tab 3 najbolja
+
+    // Upis (LISTE, ne pointeri)
+    await kvSetJSON(`vb:day:${ymd}:union`, unionDedupe);
+    await kvSetJSON(`vb:day:${ymd}:last`, lastTop15);
+    await kvSetJSON(`vb:day:${ymd}:combined`, combinedTop3);
+
     return res.status(200).json({
       ok: true,
       ymd,
-      mutated,
+      mutated: true,
       counts: {
-        union: union.length,
-        last: Array.isArray(finalLast) ? finalLast.length : 0,
-        combined: Array.isArray(finalCombined) ? finalCombined.length : 0,
+        union: unionDedupe.length,
+        last: lastTop15.length,
+        combined: combinedTop3.length,
       },
-      note: mutated ? "keys updated" : "no candidates → keys NOT mutated",
+      note: "keys updated (last=Top15, combined=Top3)",
     });
   } catch (err) {
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
