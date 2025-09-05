@@ -1,135 +1,79 @@
 // components/HistoryPanel.js
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
-const TZ = "Europe/Belgrade";
-const CLIENT_TIMEOUT_MS = 8000;
-
-async function safeJson(url, ms = CLIENT_TIMEOUT_MS) {
-  const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), ms);
-  try {
-    const r = await fetch(url, { cache: "no-store", signal: ctrl.signal });
-    const ct = r.headers.get("content-type") || "";
-    if (ct.includes("application/json")) return await r.json();
-    const t = await r.text();
-    try { return JSON.parse(t); } catch { return { ok:false, error:"non-JSON", raw:t }; }
-  } catch (e) {
-    return { ok:false, error:String(e?.message||e) };
-  } finally {
-    clearTimeout(id);
-  }
-}
-
-function statusIcon(status) {
-  const s = String(status||"").toLowerCase();
-  if (s === "win") return "✅";
-  if (s === "loss") return "❌";
-  if (s === "push" || s === "void") return "⏸";
-  return "⏳"; // pending / unknown
-}
-function fmtOdd(x) { const n = Number(x); return Number.isFinite(n) ? n.toFixed(2) : "—"; }
-
-function Row({ it }) {
-  return (
-    <div className="flex items-center justify-between p-3 rounded-xl bg-[#1f2339]">
-      <div className="min-w-0">
-        <div className="text-xs text-slate-400">
-          {it.ymd} {it.time_hhmm || ""} · {it.league_name || it.league_country || ""}
-        </div>
-        <div className="font-semibold truncate">
-          {it.home} <span className="text-slate-400">vs</span> {it.away}
-        </div>
-        <div className="text-sm text-slate-300">
-          {it.market || "—"}{it.selection_label ? " → " : ""}{it.selection_label || it.pick || "—"}{" "}
-          <span className="text-slate-400">({fmtOdd(it.odds)})</span>
-        </div>
-      </div>
-      <div className="text-xl pl-3 shrink-0">{statusIcon(it.status)}</div>
-    </div>
-  );
-}
-
-export default function HistoryPanel({ days = 14, top = 3 }) {
-  const [data, setData] = useState(null);
+export default function HistoryPanel({ days = 14 }) {
+  const [items, setItems] = useState([]);
   const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  async function load() {
-    setLoading(true);
-    setErr(null);
-    try {
-      // dodaj lagani cache-bust da izbegnemo edge cache/servisne radnike
-      const j = await safeJson(`/api/history-roi?days=${days}&top=${top}&_=${Date.now()%1e7}`);
-      if (j?.ok) setData(j);
-      else {
-        setErr(j?.error || "Greška u /api/history-roi");
-        setData(null);
-      }
-    } catch (e) {
-      setErr(String(e?.message || e));
-      setData(null);
-    } finally {
-      setLoading(false);
-    }
-  }
+  useEffect(() => {
+    const ac = new AbortController();
 
-  useEffect(() => { load(); }, [days, top]);
+    (async () => {
+      try {
+        setLoading(true);
+        setErr(null);
 
-  const flatItems = useMemo(() => {
-    const arr = [];
-    const daysArr = Array.isArray(data?.days) ? data.days : [];
-    for (const d of daysArr) {
-      const items = Array.isArray(d?.items) ? d.items : [];
-      for (const it of items) {
-        arr.push({
-          key: `${d.ymd}:${it.fixture_id || it.home+'-'+it.away}:${it.market || ""}:${it.pick_code || ""}`,
-          ymd: d.ymd,
-          ...it,
+        const r = await fetch(`/api/history?days=${days}`, {
+          cache: "no-store",
+          signal: ac.signal,
         });
-      }
-    }
-    return arr;
-  }, [data]);
 
-  const summary = data?.summary || null;
+        const ct = r.headers.get("content-type") || "";
+        const body = ct.includes("application/json")
+          ? await r.json()
+          : await r.text().then((t) => {
+              try { return JSON.parse(t); } catch { return { ok:false, error:"non-JSON", raw:t }; }
+            });
+
+        const arr =
+          Array.isArray(body?.items) ? body.items :
+          Array.isArray(body?.history) ? body.history :
+          Array.isArray(body) ? body : [];
+
+        setItems(arr);
+      } catch (e) {
+        // Next/React često abortuju fetch pri re-renderu — to ignorišemo
+        if (e && (e.name === "AbortError" || e.code === 20)) return;
+        setErr(String(e?.message || e));
+      } finally {
+        setLoading(false);
+      }
+    })();
+
+    return () => ac.abort();
+  }, [days]);
+
+  if (loading) return <div className="text-slate-400 text-sm">History: učitavam…</div>;
+  if (err)      return <div className="text-red-400 text-sm">History greška: {err}</div>;
+  if (!items.length) return <div className="text-slate-400 text-sm">Nema istorije u poslednjih {days} dana.</div>;
 
   return (
-    <div className="space-y-4">
-      {loading ? (
-        <div className="text-slate-400 text-sm">Učitavam…</div>
-      ) : err ? (
-        <div className="text-red-400 text-sm">Greška: {err}</div>
-      ) : !summary ? (
-        <div className="text-slate-400 text-sm">Nema podataka za poslednjih {days} dana.</div>
-      ) : (
-        <>
-          <div className="rounded-2xl bg-[#15182a] p-4">
-            <div className="flex flex-wrap items-center gap-4 text-sm text-slate-200">
-              <div className="font-semibold">History — {summary.days}d</div>
-              <div>Picks: <b>{summary.picks}</b></div>
-              <div>Settled: <b>{summary.settled}</b></div>
-              <div>W/L: <b>{summary.wins}</b> / <b>{Math.max(0, (summary.settled||0) - (summary.wins||0) - (summary.pushes||0))}</b></div>
-              <div>Push: <b>{summary.pushes}</b></div>
-              <div>Profit: <b>{Number(summary.profit||0).toFixed(3)}</b>u</div>
-              <div>ROI: <b>{Number(summary.roi_pct||0).toFixed(2)}%</b></div>
-              <div>Win%: <b>{Number(summary.win_rate_pct||0).toFixed(2)}%</b></div>
+    <div className="space-y-2">
+      {items.map((x, i) => {
+        const league = x?.league_name || x?.league || "";
+        const home = x?.home?.name || x?.home || "—";
+        const away = x?.away?.name || x?.away || "—";
+        const market = x?.market || x?.market_label || "";
+        const pick = x?.selection_label || x?.pick || x?.selection || "";
+        const price = Number(x?.odds?.price || x?.price);
+        const result = x?.result || x?.settle || "";
+        return (
+          <div key={x?.id || x?.fixture_id || i} className="p-3 rounded-xl bg-[#1f2339] text-sm">
+            <div className="text-slate-400">{league}</div>
+            <div className="font-semibold">
+              {home} <span className="text-slate-400">vs</span> {away}
+            </div>
+            <div className="text-slate-300">
+              {market}{market ? " → " : ""}{pick}
+              {Number.isFinite(price) ? ` (${price.toFixed(2)})` : ""}
+              {result ? ` · ${result}` : ""}
             </div>
           </div>
-
-          <div className="rounded-2xl bg-[#15182a] p-4">
-            <div className="text-base font-semibold text-white mb-3">Rezultati</div>
-            {!flatItems.length ? (
-              <div className="text-slate-400 text-sm">Još nema završenih mečeva u periodu.</div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-                {flatItems.map((it) => <Row key={it.key} it={it} />)}
-              </div>
-            )}
-          </div>
-        </>
-      )}
+        );
+      })}
     </div>
   );
 }
