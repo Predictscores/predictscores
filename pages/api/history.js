@@ -1,12 +1,10 @@
 // pages/api/history.js
-// Kompatibilni adapter za HistoryPanel:
-// - vraća i `items` i `history` (isti niz)
-// - nikad ne ruši klijenta; u fallbacku vraća prazne nizove
-// - čita redom: hist:<YMD> → hist:day:<YMD> → vb:day:<YMD>:last
+// History sada pokazuje SAMO Combined (Top 3 po danu):
+// 1) čita hist:<YMD> (građeno iz combined u apply-learning)
+// 2) fallback: vb:day:<YMD>:combined (ako hist još ne postoji)
+// Vraća i `items` i `history` (isti niz), + `count`.
 
 export const config = { runtime: "nodejs" };
-
-/* ---------------- ENV & KV helpers ---------------- */
 
 function kvEnv() {
   const url =
@@ -21,7 +19,6 @@ function kvEnv() {
     "";
   return { url, token };
 }
-
 async function kvGetRaw(key) {
   const { url, token } = kvEnv();
   if (!url || !token) return null;
@@ -34,94 +31,59 @@ async function kvGetRaw(key) {
     const j = await r.json().catch(() => null);
     if (!j || typeof j.result === "undefined") return null;
     return j.result;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
-
 async function kvGetJSON(key) {
   const raw = await kvGetRaw(key);
   if (raw == null) return null;
   if (typeof raw === "string") {
     const s = raw.trim();
-    if (
-      (s.startsWith("{") && s.endsWith("}")) ||
-      (s.startsWith("[") && s.endsWith("]"))
-    ) {
-      try {
-        return JSON.parse(s);
-      } catch {
-        return raw;
-      }
+    if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+      try { return JSON.parse(s); } catch { return raw; }
     }
     return raw;
   }
   return raw;
 }
 
-/* ---------------- date helpers ---------------- */
-
-function ymd(d = new Date()) {
-  return d.toISOString().slice(0, 10);
-}
+function ymd(d = new Date()) { return d.toISOString().slice(0, 10); }
 function daysArray(n) {
-  const out = [];
-  const today = new Date();
-  for (let i = 0; i < n; i++) {
-    const d = new Date(today);
-    d.setDate(d.getDate() - i);
-    out.push(ymd(d));
-  }
+  const out = []; const today = new Date();
+  for (let i = 0; i < n; i++) { const d = new Date(today); d.setDate(d.getDate() - i); out.push(ymd(d)); }
   return out;
 }
 
-/* ---------------- shaping helpers ---------------- */
-
-function coercePick(it) {
+function coercePick(it, d) {
   const home = it.home || it?.teams?.home || "";
   const away = it.away || it?.teams?.away || "";
   const market = it.market || it.market_label || "";
   const rawPick = it.pick ?? it.selection ?? it.selection_label ?? it.pick_code;
   const pick =
-    typeof rawPick === "string"
-      ? rawPick
-      : it?.pick_code === "1"
-      ? "Home"
-      : it?.pick_code === "2"
-      ? "Away"
-      : it?.pick_code === "X"
-      ? "Draw"
-      : String(rawPick || "");
+    typeof rawPick === "string" ? rawPick :
+    it?.pick_code === "1" ? "Home" :
+    it?.pick_code === "2" ? "Away" :
+    it?.pick_code === "X" ? "Draw" : String(rawPick || "");
   const price = Number(it?.odds?.price);
-  const result =
-    (it.outcome && String(it.outcome).toUpperCase()) ||
-    (it.result && String(it.result).toUpperCase()) ||
-    "";
-
+  const result = (it.outcome || it.result || "").toString().toUpperCase();
   return {
     ...it,
-    home,
-    away,
-    market,
-    pick,
-    selection: pick,
+    home, away, market,
+    pick, selection: pick,
     odds: Number.isFinite(price) ? { price } : it.odds || {},
-    result, // "WIN" | "LOSE" | "VOID" | "PENDING" | ""
+    result,
+    _day: it._day || d,
+    _source: it._source || "combined",
   };
 }
-
-function flattenHistoryObject(obj) {
+function flattenHistObj(obj, d) {
   if (!obj) return [];
-  if (Array.isArray(obj)) return obj.map(coercePick);
-  if (Array.isArray(obj.items)) return obj.items.map(coercePick);
+  if (Array.isArray(obj)) return obj.map((x) => coercePick(x, d));
+  if (Array.isArray(obj.items)) return obj.items.map((x) => coercePick(x, d));
   return [];
 }
 
-/* ---------------- handler ---------------- */
-
 export default async function handler(req, res) {
   try {
-    // Stabilni headeri: CORS + JSON + no-store
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Cache-Control", "no-store, max-age=0, must-revalidate");
     res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -132,41 +94,32 @@ export default async function handler(req, res) {
     const flat = [];
 
     for (const d of ymds) {
-      // 1) primarno hist:<YMD>
-      let histObj = await kvGetJSON(`hist:${d}`);
-      let items = flattenHistoryObject(histObj);
+      // 1) primarno hist:<YMD> (već settled iz combined)
+      let hist = await kvGetJSON(`hist:${d}`);
+      let items = flattenHistObj(hist, d);
 
-      // 2) fallback hist:day:<YMD>
+      // 2) fallback: vb:day:<YMD>:combined (ako još nije pisano u hist)
       if (!items.length) {
-        histObj = await kvGetJSON(`hist:day:${d}`);
-        items = flattenHistoryObject(histObj);
-      }
-
-      // 3) fallback vb:day:<YMD>:last (bar predlozi bez ishoda)
-      if (!items.length) {
-        const vb = await kvGetJSON(`vb:day:${d}:last`);
-        if (Array.isArray(vb) && vb.length) {
-          items = vb.map(coercePick);
+        const combined = await kvGetJSON(`vb:day:${d}:combined`);
+        if (Array.isArray(combined) && combined.length) {
+          items = combined.map((x) => coercePick(x, d));
         }
       }
 
-      if (items.length) {
-        for (const it of items) {
-          flat.push({ ...it, _day: d });
-        }
-      }
+      // 3) (opciono) poslednji fallback može biti union — ali ga PRESKAČEMO
+      // jer History želimo samo iz Combined.
+
+      for (const it of items) flat.push(it);
     }
 
-    // Vratimo i `items` i `history` radi kompatibilnosti UI-a
     return res.status(200).json({
       ok: true,
       days,
       count: flat.length,
       items: flat,
-      history: flat,
+      history: flat, // kompatibilnost sa UI koji čita .history
     });
   } catch (e) {
-    // Nikad ne ruši klijenta
     return res.status(200).json({
       ok: false,
       error: String(e?.message || e),
