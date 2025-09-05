@@ -1,9 +1,6 @@
 // pages/api/cron/apply-learning.js
-// Settle + history sa dva izvora finala:
-// 1) fixtures?ids=... (primarno)
-// 2) fixtures?date=YYYY-MM-DD&timezone=UTC (fallback name-match)
-// Podržava tržišta: 1X2, OU (Over/Under), BTTS, HT-FT.
-// Dodaje _day na svaku history stavku.
+// Settling i history SAMO nad vb:day:<YMD>:combined (Top 3).
+// U KV se NE diraju vb:day:<YMD>:{last,union}. History ide u hist:<YMD> i hist:day:<YMD>.
 
 function kvEnv() {
   const url =
@@ -18,7 +15,6 @@ function kvEnv() {
     "";
   return { url, token };
 }
-
 async function kvPipeline(cmds) {
   const { url, token } = kvEnv();
   if (!url || !token) throw new Error("KV env not set (URL/TOKEN).");
@@ -28,20 +24,11 @@ async function kvPipeline(cmds) {
     body: JSON.stringify(cmds),
     cache: "no-store",
   });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`KV pipeline HTTP ${r.status}: ${t}`);
-  }
+  if (!r.ok) { const t = await r.text().catch(() => ""); throw new Error(`KV pipeline HTTP ${r.status}: ${t}`); }
   return r.json();
 }
-async function kvGet(key) {
-  const out = await kvPipeline([["GET", key]]);
-  return out?.[0]?.result ?? null;
-}
-async function kvSet(key, val) {
-  const out = await kvPipeline([["SET", key, val]]);
-  return out?.[0]?.result ?? "OK";
-}
+async function kvGet(key) { const out = await kvPipeline([["GET", key]]); return out?.[0]?.result ?? null; }
+async function kvSet(key, val) { const out = await kvPipeline([["SET", key, val]]); return out?.[0]?.result ?? "OK"; }
 async function kvGetJSON(key) {
   const raw = await kvGet(key);
   if (raw == null) return null;
@@ -54,19 +41,14 @@ async function kvGetJSON(key) {
   }
   return raw;
 }
-async function kvSetJSON(key, obj) {
-  return kvSet(key, JSON.stringify(obj));
-}
+async function kvSetJSON(key, obj) { return kvSet(key, JSON.stringify(obj)); }
 
 function apiFootballKey() {
   return process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || "";
 }
 
-/* ---------- helpers: day lists ---------- */
+/* ------------ helpers: combined / union fallback ------------ */
 
-function isPointerString(x) {
-  return typeof x === "string" && /^vb:day:\d{4}-\d{2}-\d{2}:(am|pm|late|union)$/.test(x);
-}
 function dedupeBySignature(items = []) {
   const out = []; const seen = new Set();
   for (const it of Array.isArray(items) ? items : []) {
@@ -78,41 +60,47 @@ function dedupeBySignature(items = []) {
   }
   return out;
 }
-async function readDayListLastOrNull(ymd) {
-  const last = await kvGetJSON(`vb:day:${ymd}:last`);
-  if (Array.isArray(last)) return last;
-  if (isPointerString(last)) {
-    const deref = await kvGetJSON(String(last));
-    if (Array.isArray(deref)) return deref;
-  }
-  if (typeof last === "string") {
-    const s = last.trim();
-    if ((s.startsWith("[") && s.endsWith("]")) || (s.startsWith("{") && s.endsWith("}"))) {
-      try { const p = JSON.parse(s); if (Array.isArray(p)) return p; } catch {}
-    }
-  }
-  return null;
+function rankOf(it) {
+  const c = Number(it?.confidence_pct);
+  const p = Number(it?.model_prob);
+  const evlb = Number(it?._ev_lb);
+  const ev = Number(it?._ev);
+  return [
+    - (Number.isFinite(c) ? c : -1),
+    - (Number.isFinite(p) ? p : -1),
+    - (Number.isFinite(evlb) ? evlb : -1),
+    - (Number.isFinite(ev) ? ev : -1),
+  ];
 }
-async function buildDayUnion(ymd) {
-  const slots = ["am", "pm", "late"]; const chunks = [];
-  for (const slot of slots) {
-    const arr = await kvGetJSON(`vbl:${ymd}:${slot}`);
-    if (Array.isArray(arr) && arr.length) chunks.push(...arr);
+function top3Combined(items) {
+  const byRank = [...items].sort((a, b) => {
+    const ra = rankOf(a), rb = rankOf(b);
+    for (let i = 0; i < ra.length; i++) if (ra[i] !== rb[i]) return ra[i] - rb[i];
+    return 0;
+  });
+  const out = []; const seenFixtures = new Set();
+  for (const it of byRank) {
+    const fid = it.fixture_id ?? it.id ?? it.fixtureId ?? it?.fixture?.id ?? null;
+    if (fid != null && seenFixtures.has(fid)) continue;
+    out.push(it);
+    if (fid != null) seenFixtures.add(fid);
+    if (out.length >= 3) break;
   }
-  return dedupeBySignature(chunks);
+  return out;
 }
-async function ensureDayLastIsList(ymd) {
-  const ex = await readDayListLastOrNull(ymd);
-  if (ex && ex.length) { await kvSetJSON(`vb:day:${ymd}:union`, dedupeBySignature(ex)); return ex; }
+async function ensureCombinedForDay(ymd) {
+  // 1) probaj direktno combined
+  const combined = await kvGetJSON(`vb:day:${ymd}:combined`);
+  if (Array.isArray(combined) && combined.length) return dedupeBySignature(combined);
+  // 2) fallback: napravi iz union-a (i upiši kako bismo imali snapshot)
   const union = await kvGetJSON(`vb:day:${ymd}:union`);
-  if (Array.isArray(union) && union.length) { await kvSetJSON(`vb:day:${ymd}:last`, union); return union; }
-  const built = await buildDayUnion(ymd);
-  await kvSetJSON(`vb:day:${ymd}:last`, built);
-  await kvSetJSON(`vb:day:${ymd}:union`, built);
+  const unionArr = Array.isArray(union) ? union : [];
+  const built = top3Combined(dedupeBySignature(unionArr));
+  await kvSetJSON(`vb:day:${ymd}:combined`, built);
   return built;
 }
 
-/* ---------- settle helpers ---------- */
+/* ------------ settle rules (1X2, OU, BTTS, HT-FT) ------------ */
 
 function parseOUThreshold(it) {
   const s = (it.selection_label || it.pick || it.selection || it.pick_code || "").toString().toUpperCase();
@@ -146,6 +134,7 @@ function decideOutcomeFromFinals(it, finals) {
   const htA = Number(finals.ht_away ?? NaN);
   const ftWinner = winnerFromScore(ftH, ftA);
   const htWinner = Number.isFinite(htH) && Number.isFinite(htA) ? winnerFromScore(htH, htA) : null;
+
   if (!Number.isFinite(ftH) || !Number.isFinite(ftA)) return "PENDING";
 
   if (market.includes("1X2") || market === "1X2") {
@@ -168,25 +157,30 @@ function decideOutcomeFromFinals(it, finals) {
     const parts = side.split("/").map((s) => s.trim());
     if (parts.length === 2) {
       const [htPick, ftPick] = parts;
-      const okHT = htPick === htWinner;
-      const okFT = ftPick === ftWinner;
+      const okHT =
+        htPick === "HOME" ? htWinner === "HOME" :
+        htPick === "AWAY" ? htWinner === "AWAY" :
+        htPick === "DRAW" ? htWinner === "DRAW" : false;
+      const okFT =
+        ftPick === "HOME" ? ftWinner === "HOME" :
+        ftPick === "AWAY" ? ftWinner === "AWAY" :
+        ftPick === "DRAW" ? ftWinner === "DRAW" : false;
       return okHT && okFT ? "WIN" : "LOSE";
     }
   }
   return "PENDING";
 }
 
-/* ---------- API-FOOTBALL fetch & matching ---------- */
+/* ------------ API-FOOTBALL fetch (id + date ±1) ------------ */
 
+function apiKey() { return apiFootballKey(); }
 function normalizeName(s) {
-  return String(s || "")
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // strip diacritics
-    .toLowerCase().replace(/\s+/g, " ").trim();
+  return String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 function makePairKey(home, away) { return `${normalizeName(home)}|${normalizeName(away)}`; }
 
 async function fetchFixturesByIds(ids) {
-  const key = apiFootballKey(); if (!key || !ids.length) return {};
+  const key = apiKey(); if (!key || !ids.length) return {};
   const url = `https://v3.football.api-sports.io/fixtures?ids=${ids.join(",")}`;
   const r = await fetch(url, { headers: { "x-apisports-key": key, "Accept": "application/json" }, cache: "no-store" });
   if (!r.ok) return {};
@@ -208,12 +202,11 @@ async function fetchFixturesByIds(ids) {
   }
   return map;
 }
-
 async function fetchFixturesByDate(ymd) {
-  const key = apiFootballKey(); if (!key) return { byPair: {}, rawCount: 0 };
+  const key = apiKey(); if (!key) return {};
   const url = `https://v3.football.api-sports.io/fixtures?date=${ymd}&timezone=UTC`;
   const r = await fetch(url, { headers: { "x-apisports-key": key, "Accept": "application/json" }, cache: "no-store" });
-  if (!r.ok) return { byPair: {}, rawCount: 0 };
+  if (!r.ok) return {};
   const j = await r.json().catch(() => ({}));
   const byPair = {};
   for (const row of j?.response || []) {
@@ -229,25 +222,28 @@ async function fetchFixturesByDate(ymd) {
       provider: "api-football(date)",
     };
   }
-  return { byPair, rawCount: (j?.response || []).length };
+  return byPair;
 }
-
+function ymdShift(ymd, deltaDays) {
+  const d = new Date(`${ymd}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + deltaDays);
+  return d.toISOString().slice(0,10);
+}
 async function ensureFinalsFor(ymd, items) {
   const fids = Array.from(new Set(items.map(it => it.fixture_id ?? it.id ?? it.fixtureId).filter(x => x != null)));
-  const finalsById = await fetchFixturesByIds(fids);
-
-  // ako je dobijeno malo rezultata, povuci i po datumu
-  const needDateFallback = Object.keys(finalsById).length < Math.ceil(fids.length * 0.6);
-  let byPair = {};
-  if (needDateFallback || !fids.length) {
-    const fx = await fetchFixturesByDate(ymd);
-    byPair = fx.byPair;
+  const byId = await fetchFixturesByIds(fids);
+  // ako po ID nema dovoljno, probaj po datumu ymd, ymd-1, ymd+1
+  const byPair = {};
+  const daysToTry = [0, -1, 1];
+  if (Object.keys(byId).length < Math.ceil(fids.length * 0.6)) {
+    for (const dd of daysToTry) {
+      const byDate = await fetchFixturesByDate(dd === 0 ? ymd : ymdShift(ymd, dd));
+      Object.assign(byPair, byDate);
+    }
   }
-
-  return { finalsById, finalsByPair: byPair };
+  return { byId, byPair };
 }
 
-/* ---------- handler ---------- */
+/* ------------ handler ------------ */
 
 export default async function handler(req, res) {
   try {
@@ -259,22 +255,17 @@ export default async function handler(req, res) {
 
     const today = new Date();
     const ymds = [];
-    if (ymdParam) {
-      ymds.push(ymdParam);
-    } else {
-      for (let i = 0; i < days; i++) {
-        const d = new Date(today); d.setDate(d.getDate() - i);
-        ymds.push(d.toISOString().slice(0, 10));
-      }
-    }
+    if (ymdParam) { ymds.push(ymdParam); }
+    else { for (let i = 0; i < days; i++) { const d = new Date(today); d.setDate(d.getDate() - i); ymds.push(d.toISOString().slice(0,10)); } }
 
     const reports = [];
 
     for (const ymd of ymds) {
-      const list = await ensureDayLastIsList(ymd);
-      const items = dedupeBySignature(list);
+      // 1) uzmi Combined (Top 3) — izvor za History
+      const items = await ensureCombinedForDay(ymd);
 
-      const { finalsById, finalsByPair } = await ensureFinalsFor(ymd, items);
+      // 2) obezbedi finalne rezultate (ID + date fallback)
+      const { byId, byPair } = await ensureFinalsFor(ymd, items);
 
       let settled = 0, won = 0, lost = 0, voided = 0, pending = 0;
       let staked = 0, returned = 0;
@@ -285,30 +276,25 @@ export default async function handler(req, res) {
       for (const it of items) {
         const fid = it.fixture_id ?? it.id ?? it.fixtureId ?? null;
         const odds = Number(it?.odds?.price ?? 1) || 1;
+        const home = it.home?.name || it.home || it?.teams?.home || "";
+        const away = it.away?.name || it.away || it?.teams?.away || "";
+        const keyPair = makePairKey(home, away);
 
         let finals = null;
         let outcome = "PENDING";
         let reason = "none";
 
-        if (fid != null && finalsById[fid]) {
-          finals = finalsById[fid];
+        if (fid != null && byId[fid]) {
+          finals = byId[fid];
           outcome = decideOutcomeFromFinals(it, finals);
           reason = "id";
-          if (finals) matchedById++;
+          matchedById++;
         }
-
-        if (outcome === "PENDING") {
-          // pokušaj name-match po datumu
-          const home = it.home?.name || it.home || it?.teams?.home || "";
-          const away = it.away?.name || it.away || it?.teams?.away || "";
-          const key1 = makePairKey(home, away);
-          const key2 = makePairKey(away, home); // za svaki slučaj
-          if (finalsByPair[key1] || finalsByPair[key2]) {
-            finals = finalsByPair[key1] || finalsByPair[key2];
-            outcome = decideOutcomeFromFinals(it, finals);
-            reason = "nameMatch";
-            matchedByName++;
-          }
+        if (outcome === "PENDING" && (byPair[keyPair] || byPair[makePairKey(away, home)])) {
+          finals = byPair[keyPair] || byPair[makePairKey(away, home)];
+          outcome = decideOutcomeFromFinals(it, finals);
+          reason = "nameMatch";
+          matchedByName++;
         }
 
         if (outcome === "WIN") { staked += 1; returned += odds; settled += 1; won += 1; }
@@ -316,7 +302,7 @@ export default async function handler(req, res) {
         else if (outcome === "VOID" || outcome === "PUSH") { settled += 1; voided += 1; }
         else { pending += 1; }
 
-        settledItems.push({ ...it, outcome, finals: finals || null, _day: ymd, _settle_reason: reason });
+        settledItems.push({ ...it, outcome, finals: finals || null, _day: ymd, _source: "combined", _settle_reason: reason });
       }
 
       const roi = staked > 0 ? (returned - staked) / staked : 0;
@@ -328,16 +314,16 @@ export default async function handler(req, res) {
         items: settledItems,
         meta: {
           builtAt: new Date().toISOString(),
-          finals_by_id: Object.keys(finalsById).length,
+          finals_by_id: Object.keys(byId).length,
           finals_by_name: matchedByName,
           matchedById, matchedByName,
+          source: "combined",
         },
       };
 
+      // 3) upiši isključivo history (NE diramo vb:day:<YMD>:{last,union})
       await kvSetJSON(`hist:${ymd}`, historyPayload);
       await kvSetJSON(`hist:day:${ymd}`, historyPayload);
-      await kvSetJSON(`vb:day:${ymd}:last`, items);
-      await kvSetJSON(`vb:day:${ymd}:union`, items);
 
       reports.push({
         ymd,
