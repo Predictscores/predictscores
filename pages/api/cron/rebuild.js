@@ -1,8 +1,7 @@
 // pages/api/cron/rebuild.js 
 // Slot rebuild sa 3 slota (late/am/pm), realnijim EV-om (median price),
-// sum-safe clamp-om za 1X2, fallback-om za OU/BTTS, fill-to-limit,
+// sum-safe clamp-om za 1X2, fallback-om za OU/BTTS, fill-to-limit (TARGET 15/20/6),
 // i blagom "learning" kalibracijom (čitanje iz vb:cal:v1).
-// ⬇️ TARGET po dogovoru: am/pm radnim danima = 15, am/pm vikendom = 20, late = 6
 
 export const config = { api: { bodyParser: false } };
 
@@ -67,10 +66,8 @@ function inListLowerIncludes(nameLower, list) {
 }
 
 /* ---------------- global knobs ---------------- */
-// ⬇️ dogovoreni limiti (mogu se override-ovati env varovima)
-const LIMIT_AMPM_WEEKDAY = envNum("SLOT_WEEKDAY_LIMIT", 15);
-const LIMIT_AMPM_WEEKEND = envNum("SLOT_WEEKEND_LIMIT", 20);
-const LIMIT_LATE_ANY     = envNum("SLOT_LATE_LIMIT", 6);
+const DEFAULT_LIMIT_WEEKDAY = envNum("SLOT_WEEKDAY_LIMIT", 15);
+const DEFAULT_LIMIT_WEEKEND = envNum("SLOT_WEEKEND_LIMIT", 20); // ⬅️ vikend 20 (po tvojoj želji)
 
 const MIN_ODDS = envNum("MIN_ODDS", 1.01);
 const MODEL_ALPHA = envNum("MODEL_ALPHA", 0.4);
@@ -157,7 +154,7 @@ function bestPrice(m, k) { // ostavljeno za reference
 
 function isWomensLeague(leagueName="", teams={home:"",away:""}) {
   const s = `${leagueName} ${teams.home} ${teams.away}`.toLowerCase();
-  return /\b(women|femin|femen|femenino|feminina|w\s*league|ladies|girls|女子|жен)\b/.test(s);
+  return /\b(women|femin|femen|w\s*league|ladies|girls|女子|жен)\b/.test(s);
 }
 function lowTierMention(s=""){
   return /\b(U1[7-9]|U2[0-3]|U-1[7-9]|U-2[0-3]|Youth|Reserves|Reserve|II\b| B\b|B Team|Academy|U21|U23)\b/i.test(s);
@@ -423,7 +420,7 @@ function extractHTFT(oddsPayload) {
     const bkm = uniqueName(row);
     const allowAny  = !ODDS_TRUSTED_ONLY || inListLowerIncludes(bkm, TRUSTED_BOOKIES);
     const allowFair = inListLowerIncludes(bkm, SHARP_BOOKIES);
-    const bets = Array.isArray(row?.bets) ? row.bets : []; // ✅ ispravka
+    const bets = Array.isArray(row?.bets) ? row.bets : [];
     for (const bet of bets) {
       const nm = (bet?.name || "").toLowerCase();
       if (!/half\s*time.*full\s*time|ht\s*\/\s*ft|ht-?ft/i.test(nm)) continue;
@@ -589,25 +586,20 @@ function sumSafeClamp1x2(implied, proposed, isX) {
 /* ---------------- handler ---------------- */
 export default async function handler(req, res) {
   try {
-    const ymd = ymdInTZ();
+    const now = new Date();
+    const ymdCET = ymdInTZ(now, TZ);
+    const ymdUTC = ymdInTZ(now, "UTC");
+    const ymd = ymdCET;
+
     const slotQ = String(req.query?.slot || "").toLowerCase() || "am";
     const window =
       slotQ === "late" ? { hmin: 0,  hmax: 9 }  :
       slotQ === "am"   ? { hmin: 10, hmax: 14 } :
                          { hmin: 15, hmax: 23 };
 
-    // ⬇️ vikend u lokalnoj (TZ) zoni
-    const isWeekendLocal = (() => {
-      try {
-        const wd = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, weekday: "short" }).format(new Date());
-        return wd === "Sat" || wd === "Sun";
-      } catch { const d=new Date(); const gd=d.getUTCDay(); return gd===0 || gd===6; }
-    })();
-
-    // ⬇️ TARGET po slotu/danu: late=6, am/pm=15 (radni), am/pm=20 (vikend)
-    const TARGET =
-      slotQ === "late" ? LIMIT_LATE_ANY :
-      (isWeekendLocal ? LIMIT_AMPM_WEEKEND : LIMIT_AMPM_WEEKDAY);
+    const isWeekend = [0,6].includes(new Date().getDay());
+    const slotLimit = isWeekend ? DEFAULT_LIMIT_WEEKEND : DEFAULT_LIMIT_WEEKDAY;
+    const TARGET = (slotQ === "late") ? 6 : slotLimit; // ⬅️ 6 za late, 15/20 za am/pm
 
     // fixtures
     const raw = await fetchFixturesByDate(ymd);
@@ -966,6 +958,7 @@ export default async function handler(req, res) {
       }
 
       // --- pripremi “loose” fallback za ovaj fixture (bez stat-mixa) ---
+      // 1X2
       (function makeLoose1X2(){
         const needBooks = MIN_BOOKS_RELAX_1X2;
         const sprLimit = 0.70;
@@ -990,6 +983,7 @@ export default async function handler(req, res) {
         }
       })();
 
+      // BTTS
       (function makeLooseBTTS(){
         const needBooks = MIN_BOOKS_RELAX;
         const sprLimit = 0.70;
@@ -1014,6 +1008,7 @@ export default async function handler(req, res) {
         }
       })();
 
+      // OU
       (function makeLooseOU(){
         const needBooks = MIN_BOOKS_RELAX;
         const sprLimit = 0.70;
@@ -1038,6 +1033,7 @@ export default async function handler(req, res) {
         }
       })();
 
+      // HT-FT (loose)
       (function makeLooseHTFT(){
         const needBooks = MIN_BOOKS_RELAX;
         const sprLimit = 0.70;
@@ -1060,7 +1056,7 @@ export default async function handler(req, res) {
     const sorted = bestPerFixture.sort((a,b)=> ((b._ev_lb ?? b._ev) - (a._ev_lb ?? a._ev)) || (b.confidence_pct - a.confidence_pct));
     const pickedIds = new Set(sorted.map(x => x.fixture_id));
 
-    // fill-to-limit: popuni do TARGET (dinamički: 6/15/20)
+    // fill-to-limit
     const fillers = Array.from(fillerByFixture.values())
       .filter(c => c && !pickedIds.has(c.fixture_id))
       .sort((a,b)=> (b._ev - a._ev) || (b.confidence_pct - a.confidence_pct));
@@ -1069,7 +1065,7 @@ export default async function handler(req, res) {
       sorted.push(fillers.shift());
     }
 
-    // upis u KV (slim = TARGET, full = do 100, ali >= TARGET)
+    // upis u KV (slim TARGET, full širi, i union za settle)
     const keySlim = `vbl:${ymd}:${slotQ}`;
     const keyFull = `vbl_full:${ymd}:${slotQ}`;
     const payloadSlim = { items: sorted.slice(0, TARGET), at: new Date().toISOString(), ymd, slot: slotQ };
@@ -1077,13 +1073,19 @@ export default async function handler(req, res) {
     await kvSetJSON(keySlim, payloadSlim);
     await kvSetJSON(keyFull, payloadFull);
 
-    // dnevni union (za learning settle) — koristi slim listu (TARGET)
-    const unionKey = `vb:day:${ymd}:union`;
-    await kvSetJSON(unionKey, payloadSlim.items);
+    // dnevni union (za learning settle) — koristimo slim listu (TARGET)
+    const unionKeyCET = `vb:day:${ymdCET}:union`;
+    await kvSetJSON(unionKeyCET, payloadSlim.items);
 
-    // ⬇️ DODATO: napiši i "last" koji workflow očekuje
-    const lastKey = `vb:day:${ymd}:last`;
-    await kvSetJSON(lastKey, payloadSlim.items);
+    // (opciono) upiši i UTC dan za mirniji /api/debug/kv prikaz
+    const unionKeyUTC = `vb:day:${ymdUTC}:union`;
+    if (unionKeyUTC !== unionKeyCET) {
+      await kvSetJSON(unionKeyUTC, payloadSlim.items);
+    }
+
+    // POINTERI ZA DANAŠNJI DAN (CET i UTC)
+    await kvSetJSON(`vb:day:${ymdCET}:last`, { key: unionKeyCET });
+    await kvSetJSON(`vb:day:${ymdUTC}:last`, { key: unionKeyUTC });
 
     return res.status(200).json({
       ok:true, slot:slotQ, ymd,
