@@ -1,107 +1,182 @@
-// FILE: pages/api/score-sync.js
-export const config = { api: { bodyParser: false } };
+// pages/api/score-sync.js
+// Svrha: priprema kandidata za history/settle tako da :last bude LISTA.
+// Više ne puca na pointer; sam napravi union i normalizuje :last.
+// Radi za 1–14 dana unazad ili za konkretan ?ymd=YYYY-MM-DD.
 
-const BASE = "https://v3.football.api-sports.io";
-const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-const MAX_IDS_PER_CALL = 20;
+function kvEnv() {
+  const url =
+    process.env.KV_REST_API_URL ||
+    process.env.UPSTASH_REDIS_REST_URL ||
+    process.env.KV_URL ||
+    "";
+  const token =
+    process.env.KV_REST_API_TOKEN ||
+    process.env.UPSTASH_REDIS_REST_TOKEN ||
+    process.env.KV_REST_API_READ_ONLY_TOKEN ||
+    "";
+  return { url, token };
+}
+
+async function kvPipeline(cmds) {
+  const { url, token } = kvEnv();
+  if (!url || !token) throw new Error("KV env not set (URL/TOKEN).");
+  const r = await fetch(`${url}/pipeline`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(cmds),
+    cache: "no-store",
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`KV pipeline HTTP ${r.status}: ${t}`);
+  }
+  return r.json();
+}
 
 async function kvGet(key) {
-  const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
-  if (!url || !token) return null;
-  const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!r.ok) return null;
-  const { result } = await r.json();
-  try { return result ? JSON.parse(result) : null; } catch { return null; }
+  const out = await kvPipeline([["GET", key]]);
+  return out?.[0]?.result ?? null;
 }
-async function kvSet(key, value) {
-  const url = process.env.KV_REST_API_URL, token = process.env.KV_REST_API_TOKEN;
-  if (!url || !token) return;
-  await fetch(`${url}/set/${encodeURIComponent(key)}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ value: JSON.stringify(value) }),
-  });
+async function kvSet(key, val) {
+  const out = await kvPipeline([["SET", key, val]]);
+  return out?.[0]?.result ?? "OK";
 }
-async function afGet(path) {
-  const key = process.env.API_FOOTBALL_KEY;
-  if (!key) throw new Error("API_FOOTBALL_KEY missing");
-  const r = await fetch(`${BASE}${path}`, {
-    headers: { "x-apisports-key": key, "x-rapidapi-key": key },
-  });
-  if (!r.ok) throw new Error(`AF ${path} ${r.status}`);
-  const j = await r.json();
-  return Array.isArray(j?.response) ? j.response : [];
+async function kvGetJSON(key) {
+  const raw = await kvGet(key);
+  if (raw == null) return null;
+  if (typeof raw === "string") {
+    const s = raw.trim();
+    if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+      try { return JSON.parse(s); } catch { return raw; }
+    }
+    return raw;
+  }
+  return raw;
 }
-function ymd(d = new Date()) {
-  return new Intl.DateTimeFormat("sv-SE",{ timeZone: TZ, year:"numeric", month:"2-digit", day:"2-digit"}).format(d);
+async function kvSetJSON(key, obj) {
+  return kvSet(key, JSON.stringify(obj));
 }
-function ymdList(days) {
+
+function isPointerString(x) {
+  return (
+    typeof x === "string" &&
+    /^vb:day:\d{4}-\d{2}-\d{2}:(am|pm|late|union)$/.test(x)
+  );
+}
+function dedupeBySignature(items = []) {
   const out = [];
-  const now = new Date();
-  for (let i = 0; i < days; i++) {
-    const d = new Date(now); d.setDate(d.getDate() - i);
-    out.push(ymd(d));
+  const seen = new Set();
+  for (const it of Array.isArray(items) ? items : []) {
+    const fid = it.fixture_id ?? it.id ?? it.fixtureId ?? "";
+    const mkt = it.market ?? it.market_label ?? "";
+    const sel = it.pick ?? it.selection ?? it.selection_label ?? "";
+    const sig = `${fid}::${mkt}::${sel}`;
+    if (!seen.has(sig)) {
+      seen.add(sig);
+      out.push(it);
+    }
   }
   return out;
 }
-function chunk(arr, n) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
-  return out;
+
+async function readDayListLastOrNull(ymd) {
+  const lastKey = `vb:day:${ymd}:last`;
+  const last = await kvGetJSON(lastKey);
+  if (Array.isArray(last)) return last;
+
+  if (isPointerString(last)) {
+    const deref = await kvGetJSON(String(last));
+    if (Array.isArray(deref)) return deref;
+  }
+
+  if (typeof last === "string") {
+    const s = last.trim();
+    if ((s.startsWith("[") && s.endsWith("]")) || (s.startsWith("{") && s.endsWith("}"))) {
+      try {
+        const parsed = JSON.parse(s);
+        if (Array.isArray(parsed)) return parsed;
+      } catch {}
+    }
+  }
+  return null;
 }
-function extractScore(fx) {
-  const sc = fx?.score || {};
-  const ht = sc?.halftime || {};
-  const ft = sc?.fulltime || {};
-  const ftH = Number.isFinite(Number(ft?.home)) ? Number(ft.home) : Number(sc?.home);
-  const ftA = Number.isFinite(Number(ft?.away)) ? Number(ft.away) : Number(sc?.away);
-  const htH = Number.isFinite(Number(ht?.home)) ? Number(ht.home) : null;
-  const htA = Number.isFinite(Number(ht?.away)) ? Number(ht.away) : null;
-  const short = fx?.fixture?.status?.short || "";
-  return { ftH, ftA, htH, htA, short };
+
+async function buildDayUnion(ymd) {
+  const slots = ["am", "pm", "late"];
+  const chunks = [];
+  for (const slot of slots) {
+    const arr = await kvGetJSON(`vbl:${ymd}:${slot}`);
+    if (Array.isArray(arr) && arr.length) chunks.push(...arr);
+  }
+  return dedupeBySignature(chunks);
+}
+
+async function writeDayLastAsList(ymd, list) {
+  const arr = dedupeBySignature(Array.isArray(list) ? list : []);
+  await kvSetJSON(`vb:day:${ymd}:last`, arr);
+  await kvSetJSON(`vb:day:${ymd}:union`, arr);
+  return arr.length;
+}
+
+async function ensureDayLastIsList(ymd) {
+  const existing = await readDayListLastOrNull(ymd);
+  if (existing && existing.length) {
+    await kvSetJSON(`vb:day:${ymd}:union`, dedupeBySignature(existing));
+    return existing.length;
+  }
+  const union = await kvGetJSON(`vb:day:${ymd}:union`);
+  if (Array.isArray(union) && union.length) {
+    return writeDayLastAsList(ymd, union);
+  }
+  const built = await buildDayUnion(ymd);
+  return writeDayLastAsList(ymd, built);
+}
+
+function kvEnvInfo() {
+  const { url, token } = kvEnv();
+  return { url: url ? `${url.slice(0, 32)}…` : null, hasToken: Boolean(token) };
 }
 
 export default async function handler(req, res) {
   try {
-    const days = Math.max(1, Math.min(3, Number(req.query.days || 2)));
-    const ymds = ymdList(days);
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const ymdParam = url.searchParams.get("ymd");
+    const days = Math.max(1, Math.min(14, parseInt(url.searchParams.get("days") || "1", 10)));
 
-    const wanted = new Set();
-    for (const d of ymds) {
-      const snap = await kvGet(`vb:day:${d}:last`);
-      if (!Array.isArray(snap)) continue;
-      for (const p of snap) {
-        if (p?.fixture_id) wanted.add(Number(p.fixture_id));
-      }
-    }
-    const ids = Array.from(wanted);
-
-    // preskoči već upisane
-    const need = [];
-    for (const id of ids) {
-      const sc = await kvGet(`vb:score:${id}`);
-      if (!sc || sc.ftH == null || sc.ftA == null) need.push(id);
-    }
-
-    let written = 0, fetched = 0;
-    for (const group of chunk(need, MAX_IDS_PER_CALL)) {
-      const rows = await afGet(`/fixtures?ids=${group.join("-")}`);
-      fetched += rows.length;
-      for (const fx of rows) {
-        const id = fx?.fixture?.id;
-        if (!id) continue;
-        const { ftH, ftA, htH, htA, short } = extractScore(fx);
-        if (!Number.isFinite(ftH) || !Number.isFinite(ftA)) continue;
-        await kvSet(`vb:score:${id}`, { ftH, ftA, htH, htA, status: short, built_at: new Date().toISOString() });
-        written += 1;
+    const today = new Date();
+    const ymds = [];
+    if (ymdParam) {
+      ymds.push(ymdParam);
+    } else {
+      for (let i = 0; i < days; i++) {
+        const d = new Date(today);
+        d.setDate(d.getDate() - i);
+        ymds.push(d.toISOString().slice(0, 10));
       }
     }
 
-    res.setHeader("Cache-Control", "no-store");
-    return res.status(200).json({ ok:true, days, candidates: ids.length, need: need.length, fetched, written });
-  } catch (e) {
-    return res.status(500).json({ ok:false, error: String(e?.message || e) });
+    const byDay = [];
+    let totalCandidates = 0;
+
+    for (const ymd of ymds) {
+      const ensured = await ensureDayLastIsList(ymd);
+      const last = await readDayListLastOrNull(ymd);
+      const count = Array.isArray(last) ? last.length : 0;
+      totalCandidates += count;
+      byDay.push({ ymd, ensured, candidates: count });
+    }
+
+    res.status(200).json({
+      ok: true,
+      totalCandidates,
+      days: ymds.length,
+      byDay,
+      kv: kvEnvInfo(),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 }
