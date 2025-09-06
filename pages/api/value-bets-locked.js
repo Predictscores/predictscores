@@ -1,8 +1,7 @@
 // pages/api/value-bets-locked.js
 // Combined & Football feed (Kick-Off / Confidence)
-// Fix: vrednosti u KV mogu biti upakovane kao {"value":"[...]"} (string JSON).
-// Ovaj reader to detektuje i raspakuje bez menjanja ostatka sistema.
-// NOVO: podrška za ?slim=1 (vrati "slim" oblik bez novih fajlova).
+// Robustan reader za Vercel KV: vrednosti mogu biti i {"value":"[...]"} ili {"value":[...]}.
+// Dodatno: striktno poštuj ?slot= (am/pm/late) i NIKAD ne vrati drugi slot.
 
 export const config = { api: { bodyParser: false } };
 
@@ -43,45 +42,31 @@ async function kvGET_first(key, diag) {
 /* ---------------- parsing helpers (robust) ---------------- */
 function safeJSON(s){ try{ return JSON.parse(s); }catch{ return null; } }
 
-// Raspakuje sledeće formate:
-// - "[{...}]" (čist JSON niz, kao string)
-// - {"value":"[...]"}
-// - {"value":[...]}  (ako je već niz)
-// - duplo-JSON (string koji sadrži string JSON-a)
+// Raspakivanje: "[...]" | {"value":"[...]"} | {"value":[...]} | duplo-JSON string
 function unpack(raw) {
   if (!raw || typeof raw !== "string") return null;
-
-  // 1) prvi pokušaj parse-a
   let v1 = safeJSON(raw);
-
-  // Ako je već niz ili objekat sa poljima – nastavi dalje
   if (Array.isArray(v1)) return v1;
 
-  // Ako je objekat koji sadrži .value
   if (v1 && typeof v1 === "object" && "value" in v1) {
     const inner = v1.value;
     if (Array.isArray(inner)) return inner;
     if (typeof inner === "string") {
       const v2 = safeJSON(inner);
       if (Array.isArray(v2)) return v2;
-      if (v2 && typeof v2 === "object") return v2; // možda objekat sa .items itd.
+      if (v2 && typeof v2 === "object") return v2;
     }
-    return v1; // vrati objekat; arrFromAny će probati da izvuče listu
+    return v1; // arrFromAny će pokušati da izvuče listu
   }
-
-  // Ako je posle prvog parse-a dobiven string koji izgleda kao JSON → parse opet
   if (typeof v1 === "string" && /^[\[{]/.test(v1.trim())) {
     const v2 = safeJSON(v1);
     if (Array.isArray(v2) || (v2 && typeof v2 === "object")) return v2;
   }
-
-  // Ako originalni raw izgleda kao JSON (bez prvog parse-a)
   if (/^[\[{]/.test(raw.trim())) {
     const v3 = safeJSON(raw.trim());
     if (Array.isArray(v3) || (v3 && typeof v3 === "object")) return v3;
   }
-
-  return v1; // možda je null; arrFromAny će to odbiti
+  return v1;
 }
 
 function arrFromAny(x) {
@@ -92,7 +77,6 @@ function arrFromAny(x) {
   if (Array.isArray(x.football)) return x.football;
   if (Array.isArray(x.list)) return x.list;
   if (Array.isArray(x.data)) return x.data;
-  // čest slučaj: { value: "[...]" } ili { value: [...] }
   if (Array.isArray(x.value)) return x.value;
   if (typeof x.value === "string") {
     const v = safeJSON(x.value);
@@ -106,22 +90,6 @@ function arrFromAny(x) {
     }
   }
   return null;
-}
-
-/* --------- SLIM transform (bez menjanja default ponašanja) --------- */
-function toSlimItem(x){
-  return {
-    fixture_id: x?.fixture_id ?? x?.fixture?.id ?? null,
-    league_name: x?.league_name ?? x?.league?.name ?? null,
-    league_country: x?.league_country ?? x?.league?.country ?? null,
-    home: x?.home ?? x?.teams?.home?.name ?? x?.teams?.home ?? null,
-    away: x?.away ?? x?.teams?.away?.name ?? x?.teams?.away ?? null,
-    kickoff_utc: x?.kickoff_utc ?? x?.datetime_local?.starting_at?.date_time ?? null,
-    pick: x?.pick ?? x?.selection_label ?? null,
-    pick_code: x?.pick_code ?? null,
-    confidence_pct: x?.confidence_pct ?? (x?.model_prob ? Math.round(100 * x.model_prob) : null),
-    price: x?.odds?.price ?? null,
-  };
 }
 
 /* ---------------- time + warm helpers ---------------- */
@@ -144,8 +112,9 @@ function computeBaseUrl(req) {
 }
 const sleep = (ms) => new Promise(r=>setTimeout(r,ms));
 
-/* ---------------- core load ---------------- */
-async function loadAll(ymd, slot, preferFull, diag) {
+/* ---------------- loader (STRICT slot) ---------------- */
+async function loadAllStrict(ymd, slot, preferFull, diag) {
+  // Traži SAMO zadati slot; nikakav drugi!
   const locked = preferFull
     ? [`vbl_full:${ymd}:${slot}`, `vbl:${ymd}:${slot}`]
     : [`vbl:${ymd}:${slot}`, `vbl_full:${ymd}:${slot}`];
@@ -173,85 +142,78 @@ async function loadAll(ymd, slot, preferFull, diag) {
 /* ---------------- handler ---------------- */
 export default async function handler(req, res) {
   try {
+    // hard no-cache na svim CDN slojevima
     res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Vercel-CDN-Cache-Control", "no-store");
+    res.setHeader("CDN-Cache-Control", "no-store");
+
     const q = req.query || {};
     const now = new Date();
-    const ymd = (q.ymd && String(q.ymd).match(/^\d{4}-\d{2}-\d{2}$/)) ? String(q.ymd) : ymdInTZ(now, TZ);
-    const slot = (q.slot && /^(am|pm|late)$/.test(q.slot)) ? q.slot : deriveSlot(hourInTZ(now, TZ));
-    const cap = Math.max(1, Math.min(Number(q.n ?? q.limit ?? 50), 200));
-    const wantDebug = String(q.debug ?? "") === "1";
-    const preferFull = String(q.full ?? "") === "1";
-    const allowWarm  = String(q.autowarm ?? "1") !== "0";
-    // *** IZMENJENO: robustan slim mod (podržava shape=slim, slim=true, format=slim, UA "snapshot", itd.)
-    const smRaw = String(q.slim ?? q.shape ?? q.format ?? q.mode ?? "").toLowerCase().trim();
-    const ua    = String(req.headers["user-agent"] || "").toLowerCase();
-    const slimMode = ["1","true","yes","y","on","slim","s"].includes(smRaw) || /snapshot/.test(ua);
+    const ymd = (q.ymd && String(Array.isArray(q.ymd) ? q.ymd[0] : q.ymd).match(/^\d{4}-\d{2}-\d{2}$/))
+      ? String(Array.isArray(q.ymd) ? q.ymd[0] : q.ymd)
+      : ymdInTZ(now, TZ);
 
-    // Peek za brzu proveru ključa
+    // NORMALIZUJ slot iz query-ja (string!), inače deriviraj iz sata
+    const qSlotRaw = Array.isArray(q.slot) ? q.slot[0] : q.slot;
+    const qSlot     = typeof qSlotRaw === "string" ? qSlotRaw.toLowerCase().trim() : "";
+    const slot = /^(am|pm|late)$/.test(qSlot) ? qSlot : deriveSlot(hourInTZ(now, TZ));
+
+    const cap = Math.max(1, Math.min(Number(Array.isArray(q.n) ? q.n[0] : (q.n ?? q.limit ?? 50)), 200));
+    const wantDebug = String(Array.isArray(q.debug) ? q.debug[0] : q.debug ?? "") === "1";
+    const preferFull = String(Array.isArray(q.full) ? q.full[0] : q.full ?? "") === "1";
+    const allowWarm  = String(Array.isArray(q.autowarm) ? q.autowarm[0] : q.autowarm ?? "1") !== "0";
+
+    // Peek util
     if (q.peek) {
       const diag = {};
-      const { raw, flavor, url } = await kvGET_first(String(q.peek), diag);
+      const key = String(Array.isArray(q.peek) ? q.peek[0] : q.peek);
+      const { raw, flavor, url } = await kvGET_first(key, diag);
       return res.status(200).json({
-        ok:true, peek:String(q.peek), flavor, url,
+        ok:true, peek:key, flavor, url,
         raw_present: !!raw, raw_len: raw ? raw.length : 0,
         sample: raw ? raw.slice(0, 240) : null,
         debug: diag
       });
     }
 
-    const diag = wantDebug ? {} : null;
+    const diag = wantDebug ? { meta:{ requested_slot:slot, ymd } } : null;
 
-    let { arr, picked, flavor } = await loadAll(ymd, slot, preferFull, diag);
+    let { arr, picked, flavor } = await loadAllStrict(ymd, slot, preferFull, diag);
 
-    // autowarm: rebuild → refresh-odds(force) → retry
+    // autowarm: rebuild → refresh-odds(force) → retry (SAMO za taj slot)
     if ((!arr || !arr.length) && allowWarm) {
       try {
         const baseUrl = computeBaseUrl(req);
         await fetch(`${baseUrl}/api/cron/rebuild?slot=${slot}`, { cache:"no-store" }).catch(()=>{});
         await sleep(800);
-        ({ arr, picked, flavor } = await loadAll(ymd, slot, preferFull, diag));
+        ({ arr, picked, flavor } = await loadAllStrict(ymd, slot, preferFull, diag));
         if (!arr || !arr.length) {
           await fetch(`${baseUrl}/api/cron/refresh-odds?slot=${slot}&force=1`, { cache:"no-store" }).catch(()=>{});
           await sleep(1200);
-          ({ arr, picked, flavor } = await loadAll(ymd, slot, preferFull, diag));
+          ({ arr, picked, flavor } = await loadAllStrict(ymd, slot, preferFull, diag));
         }
       } catch {}
     }
 
+    // Ako i dalje nema ništa – jasno signalizuj koji slot je tražen
     if (!arr || !arr.length) {
       const out = {
         ok: true, slot, ymd,
         items: [], football: [], top3: [],
-        source: `vb-locked:kv:${slimMode?'miss-slim':'miss'}·${picked ? picked : 'none'}${wantDebug ? ':no-data' : ''}`,
+        source: `vb-locked:kv:miss·${picked ? picked : 'none'}`,
         policy_cap: cap
       };
       if (wantDebug) out.debug = diag;
       return res.status(200).json(out);
     }
 
-    // default (full) ostaje potpuno isto
-    let items = arr.slice(0, cap);
-    let sourceTag = `vb-locked:kv:hit·${picked}·${flavor}`;
-
-    // slim mod: mapiraj u lagani oblik + vrati value_bets/football/items identično
-    if (slimMode) {
-      items = items.map(toSlimItem);
-      sourceTag = `vb-locked:kv:hit-slim·${picked}·${flavor}`;
-      return res.status(200).json({
-        ok: true, slot, ymd,
-        value_bets: items, football: items, items,
-        source: sourceTag,
-        policy_cap: cap,
-        ...(wantDebug ? { debug: diag } : {})
-      });
-    }
-
-    // full mod (bez promene ponašanja)
+    // Normalan izlaz (nema nikakvog menjanja forme)
+    const items = arr.slice(0, cap);
     const top3  = arr.slice(0, Math.min(3, cap));
     const out = {
       ok: true, slot, ymd,
       items, football: items, top3,
-      source: sourceTag,
+      source: `vb-locked:kv:hit·${picked}·${flavor}`,
       policy_cap: cap
     };
     if (wantDebug) out.debug = diag;
