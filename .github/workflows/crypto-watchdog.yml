@@ -2,17 +2,32 @@ name: Crypto Watchdog
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # na 5 minuta; promeni na */10, */15 po želji
-  workflow_dispatch: {}      # opcioni ručni trigger
+    - cron: "*/10 * * * *"   # menjaj na ritam koji želiš (5/10/15 min)
+  workflow_dispatch: {}      # ručni trigger iz Actions taba
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Call crypto-watchdog
+      - name: Validate secrets
         env:
-          BASE_URL: ${{ secrets.BASE_URL }}       # npr. https://predictscores.vercel.app
-          CRON_KEY: ${{ secrets.CRON_KEY }}       # isti kao Vercel env CRON_KEY
+          BASE_URL: ${{ secrets.BASE_URL }}
+          CRON_KEY: ${{ secrets.CRON_KEY }}
         run: |
           set -e
-          curl -fsSL "$BASE_URL/api/cron/crypto-watchdog?key=$CRON_KEY" -o /dev/stdout
+          if [ -z "$BASE_URL" ]; then
+            echo "ERROR: BASE_URL secret is missing."; exit 1; fi
+          if [ -z "$CRON_KEY" ]; then
+            echo "ERROR: CRON_KEY secret is missing."; exit 1; fi
+          if ! echo "$BASE_URL" | grep -Eq '^https?://'; then
+            echo "ERROR: BASE_URL must include scheme (https://). Current: '$BASE_URL'"; exit 1; fi
+
+      - name: Call crypto-watchdog
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          CRON_KEY: ${{ secrets.CRON_KEY }}
+        run: |
+          set -e
+          curl --fail --show-error --silent \
+            "$BASE_URL/api/cron/crypto-watchdog?key=$CRON_KEY" \
+            | tee /dev/stderr
