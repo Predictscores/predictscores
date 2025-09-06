@@ -2,6 +2,7 @@
 // Combined & Football feed (Kick-Off / Confidence)
 // Fix: vrednosti u KV mogu biti upakovane kao {"value":"[...]"} (string JSON).
 // Ovaj reader to detektuje i raspakuje bez menjanja ostatka sistema.
+// NOVO: podrška za ?slim=1 (vrati "slim" oblik bez novih fajlova).
 
 export const config = { api: { bodyParser: false } };
 
@@ -107,6 +108,22 @@ function arrFromAny(x) {
   return null;
 }
 
+/* --------- SLIM transform (bez menjanja default ponašanja) --------- */
+function toSlimItem(x){
+  return {
+    fixture_id: x?.fixture_id ?? x?.fixture?.id ?? null,
+    league_name: x?.league_name ?? x?.league?.name ?? null,
+    league_country: x?.league_country ?? x?.league?.country ?? null,
+    home: x?.home ?? x?.teams?.home?.name ?? x?.teams?.home ?? null,
+    away: x?.away ?? x?.teams?.away?.name ?? x?.teams?.away ?? null,
+    kickoff_utc: x?.kickoff_utc ?? x?.datetime_local?.starting_at?.date_time ?? null,
+    pick: x?.pick ?? x?.selection_label ?? null,
+    pick_code: x?.pick_code ?? null,
+    confidence_pct: x?.confidence_pct ?? (x?.model_prob ? Math.round(100 * x.model_prob) : null),
+    price: x?.odds?.price ?? null,
+  };
+}
+
 /* ---------------- time + warm helpers ---------------- */
 function ymdInTZ(d=new Date(), tz=TZ){
   const fmt = new Intl.DateTimeFormat("en-CA",{ timeZone:tz, year:"numeric", month:"2-digit", day:"2-digit" });
@@ -165,6 +182,7 @@ export default async function handler(req, res) {
     const wantDebug = String(q.debug ?? "") === "1";
     const preferFull = String(q.full ?? "") === "1";
     const allowWarm  = String(q.autowarm ?? "1") !== "0";
+    const slimMode  = String(q.slim ?? q.shape ?? q.mode ?? "") === "1"; // <— NOVO
 
     // Peek za brzu proveru ključa
     if (q.peek) {
@@ -201,20 +219,36 @@ export default async function handler(req, res) {
       const out = {
         ok: true, slot, ymd,
         items: [], football: [], top3: [],
-        source: `vb-locked:kv:miss·${picked ? picked : 'none'}${wantDebug ? ':no-data' : ''}`,
+        source: `vb-locked:kv:${slimMode?'miss-slim':'miss'}·${picked ? picked : 'none'}${wantDebug ? ':no-data' : ''}`,
         policy_cap: cap
       };
       if (wantDebug) out.debug = diag;
       return res.status(200).json(out);
     }
 
-    const items = arr.slice(0, cap);
-    const top3  = arr.slice(0, Math.min(3, cap));
+    // default (full) ostaje potpuno isto
+    let items = arr.slice(0, cap);
+    let sourceTag = `vb-locked:kv:hit·${picked}·${flavor}`;
 
+    // slim mod: mapiraj u lagani oblik + vrati value_bets/football/items identično
+    if (slimMode) {
+      items = items.map(toSlimItem);
+      sourceTag = `vb-locked:kv:hit-slim·${picked}·${flavor}`;
+      return res.status(200).json({
+        ok: true, slot, ymd,
+        value_bets: items, football: items, items,
+        source: sourceTag,
+        policy_cap: cap,
+        ...(wantDebug ? { debug: diag } : {})
+      });
+    }
+
+    // full mod (bez promene ponašanja)
+    const top3  = arr.slice(0, Math.min(3, cap));
     const out = {
       ok: true, slot, ymd,
       items, football: items, top3,
-      source: `vb-locked:kv:hit·${picked}·${flavor}`,
+      source: sourceTag,
       policy_cap: cap
     };
     if (wantDebug) out.debug = diag;
