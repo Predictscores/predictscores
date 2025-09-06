@@ -1,13 +1,13 @@
 // pages/api/value-bets-locked.js
 // Combined & Football feed (Kick-Off / Confidence)
-// Robusniji parser za vrednosti iz KV (podržava duplo-JSON, b64 JSON, razne oblike)
-// Ne menja response shape, ne dira History.
+// Fix: vrednosti u KV mogu biti upakovane kao {"value":"[...]"} (string JSON).
+// Ovaj reader to detektuje i raspakuje bez menjanja ostatka sistema.
 
 export const config = { api: { bodyParser: false } };
 
 const TZ = "Europe/Belgrade";
 
-/* ----------------------------- KV (Vercel REST) ----------------------------- */
+/* ---------------- KV (Vercel REST, RW/RO token) ---------------- */
 function getKvCfgs() {
   const url = (process.env.KV_REST_API_URL || "").replace(/\/+$/, "");
   const rw  = process.env.KV_REST_API_TOKEN || "";
@@ -39,52 +39,75 @@ async function kvGET_first(key, diag) {
   return { raw: null, flavor: null, url: null };
 }
 
-/* ----------------------------- parsing helpers ----------------------------- */
-function safeJSON(s) { try { return JSON.parse(s); } catch { return null; } }
+/* ---------------- parsing helpers (robust) ---------------- */
+function safeJSON(s){ try{ return JSON.parse(s); }catch{ return null; } }
 
-function maybeDoubleJSON(raw) {
-  // 1st parse
-  let v = safeJSON(raw);
-  if (v && typeof v !== "string") return v;
-  // ako je string koji izgleda kao JSON, pokušaj još jednom
-  if (typeof v === "string" && /^[\[{]/.test(v.trim())) {
-    const v2 = safeJSON(v);
-    if (v2) return v2;
-  }
-  // možda originalni raw već počinje sa [ ili { → direktno
-  if (typeof raw === "string" && /^[\[{]/.test(raw.trim())) {
-    const v3 = safeJSON(raw.trim());
-    if (v3) return v3;
-  }
-  // poslednji pokušaj: base64 (nekad KV vrati b64 serijalizovano)
-  try {
-    if (/^[A-Za-z0-9+/=]+$/.test(raw.trim())) {
-      const buf = Buffer.from(raw.trim(), "base64").toString("utf8");
-      const v4 = safeJSON(buf);
-      if (v4) return v4;
-      // ako je dupli i u b64
-      if (typeof v4 === "string" && /^[\[{]/.test(v4.trim())) {
-        const v5 = safeJSON(v4);
-        if (v5) return v5;
-      }
+// Raspakuje sledeće formate:
+// - "[{...}]" (čist JSON niz, kao string)
+// - {"value":"[...]"}
+// - {"value":[...]}  (ako je već niz)
+// - duplo-JSON (string koji sadrži string JSON-a)
+function unpack(raw) {
+  if (!raw || typeof raw !== "string") return null;
+
+  // 1) prvi pokušaj parse-a
+  let v1 = safeJSON(raw);
+
+  // Ako je već niz ili objekat sa poljima – nastavi dalje
+  if (Array.isArray(v1)) return v1;
+
+  // Ako je objekat koji sadrži .value
+  if (v1 && typeof v1 === "object" && "value" in v1) {
+    const inner = v1.value;
+    if (Array.isArray(inner)) return inner;
+    if (typeof inner === "string") {
+      const v2 = safeJSON(inner);
+      if (Array.isArray(v2)) return v2;
+      if (v2 && typeof v2 === "object") return v2; // možda objekat sa .items itd.
     }
-  } catch {}
-  return null;
+    return v1; // vrati objekat; arrFromAny će probati da izvuče listu
+  }
+
+  // Ako je posle prvog parse-a dobiven string koji izgleda kao JSON → parse opet
+  if (typeof v1 === "string" && /^[\[{]/.test(v1.trim())) {
+    const v2 = safeJSON(v1);
+    if (Array.isArray(v2) || (v2 && typeof v2 === "object")) return v2;
+  }
+
+  // Ako originalni raw izgleda kao JSON (bez prvog parse-a)
+  if (/^[\[{]/.test(raw.trim())) {
+    const v3 = safeJSON(raw.trim());
+    if (Array.isArray(v3) || (v3 && typeof v3 === "object")) return v3;
+  }
+
+  return v1; // možda je null; arrFromAny će to odbiti
 }
 
 function arrFromAny(x) {
   if (!x) return null;
   if (Array.isArray(x)) return x;
-  if (Array.isArray(x?.items)) return x.items;
-  if (Array.isArray(x?.value_bets)) return x.value_bets;
-  if (Array.isArray(x?.football)) return x.football;
-  // ponekad listu drže pod .list ili .data
-  if (Array.isArray(x?.list)) return x.list;
-  if (Array.isArray(x?.data)) return x.data;
+  if (Array.isArray(x.items)) return x.items;
+  if (Array.isArray(x.value_bets)) return x.value_bets;
+  if (Array.isArray(x.football)) return x.football;
+  if (Array.isArray(x.list)) return x.list;
+  if (Array.isArray(x.data)) return x.data;
+  // čest slučaj: { value: "[...]" } ili { value: [...] }
+  if (Array.isArray(x.value)) return x.value;
+  if (typeof x.value === "string") {
+    const v = safeJSON(x.value);
+    if (Array.isArray(v)) return v;
+    if (v && typeof v === "object") {
+      if (Array.isArray(v.items)) return v.items;
+      if (Array.isArray(v.value_bets)) return v.value_bets;
+      if (Array.isArray(v.football)) return v.football;
+      if (Array.isArray(v.list)) return v.list;
+      if (Array.isArray(v.data)) return v.data;
+    }
+  }
   return null;
 }
 
-/* ----------------------------- time helpers ---------------------------- */
+/* ---------------- time + warm helpers ---------------- */
 function ymdInTZ(d=new Date(), tz=TZ){
   const fmt = new Intl.DateTimeFormat("en-CA",{ timeZone:tz, year:"numeric", month:"2-digit", day:"2-digit" });
   const p = fmt.formatToParts(d).reduce((a,x)=>(a[x.type]=x.value,a),{});
@@ -95,8 +118,6 @@ function hourInTZ(d=new Date(), tz=TZ){
   return parseInt(fmt.format(d),10);
 }
 function deriveSlot(h){ if (h<12) return "am"; if (h<18) return "pm"; return "late"; }
-
-/* ------------------------------ warm helpers --------------------------- */
 function computeBaseUrl(req) {
   const envBase = process.env.NEXT_PUBLIC_BASE_URL;
   if (envBase) return envBase.replace(/\/+$/,"");
@@ -106,7 +127,7 @@ function computeBaseUrl(req) {
 }
 const sleep = (ms) => new Promise(r=>setTimeout(r,ms));
 
-/* --------------------------- core load routine ------------------------- */
+/* ---------------- core load ---------------- */
 async function loadAll(ymd, slot, preferFull, diag) {
   const locked = preferFull
     ? [`vbl_full:${ymd}:${slot}`, `vbl:${ymd}:${slot}`]
@@ -114,32 +135,25 @@ async function loadAll(ymd, slot, preferFull, diag) {
 
   for (const k of locked) {
     const { raw, flavor } = await kvGET_first(k, diag);
-    const obj = maybeDoubleJSON(raw);
+    const obj = unpack(raw);
     const arr = arrFromAny(obj);
     if (arr && arr.length) return { arr, picked: k, flavor };
-    // dijagnostika: ako imamo raw ali ne i arr, zabeleži uzorak
-    if (raw && diag) {
-      diag._sample = diag._sample || {};
-      diag._sample[k] = raw.slice(0, 240);
-    }
+    if (raw && diag) { diag._sample = diag._sample || {}; diag._sample[k] = raw.slice(0, 240); }
   }
 
   const alt = [`vb:day:${ymd}:${slot}`, `vb:day:${ymd}:last`, `vb:day:${ymd}:union`];
   for (const k of alt) {
     const { raw, flavor } = await kvGET_first(k, diag);
-    const obj = maybeDoubleJSON(raw);
+    const obj = unpack(raw);
     const arr = arrFromAny(obj);
     if (arr && arr.length) return { arr, picked: `${k}→fallback`, flavor };
-    if (raw && diag) {
-      diag._sample = diag._sample || {};
-      diag._sample[k] = raw.slice(0, 240);
-    }
+    if (raw && diag) { diag._sample = diag._sample || {}; diag._sample[k] = raw.slice(0, 240); }
   }
 
   return { arr: null, picked: null, flavor: null };
 }
 
-/* -------------------------------- handler ------------------------------ */
+/* ---------------- handler ---------------- */
 export default async function handler(req, res) {
   try {
     res.setHeader("Cache-Control", "no-store");
@@ -152,7 +166,7 @@ export default async function handler(req, res) {
     const preferFull = String(q.full ?? "") === "1";
     const allowWarm  = String(q.autowarm ?? "1") !== "0";
 
-    // Peek režim za brzu proveru sadržaja ključa
+    // Peek za brzu proveru ključa
     if (q.peek) {
       const diag = {};
       const { raw, flavor, url } = await kvGET_first(String(q.peek), diag);
@@ -168,14 +182,13 @@ export default async function handler(req, res) {
 
     let { arr, picked, flavor } = await loadAll(ymd, slot, preferFull, diag);
 
-    // autowarm: rebuild → pa refresh-odds force=1 → pa ponovo čitanje
+    // autowarm: rebuild → refresh-odds(force) → retry
     if ((!arr || !arr.length) && allowWarm) {
       try {
         const baseUrl = computeBaseUrl(req);
         await fetch(`${baseUrl}/api/cron/rebuild?slot=${slot}`, { cache:"no-store" }).catch(()=>{});
         await sleep(800);
         ({ arr, picked, flavor } = await loadAll(ymd, slot, preferFull, diag));
-
         if (!arr || !arr.length) {
           await fetch(`${baseUrl}/api/cron/refresh-odds?slot=${slot}&force=1`, { cache:"no-store" }).catch(()=>{});
           await sleep(1200);
