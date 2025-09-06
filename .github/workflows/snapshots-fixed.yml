@@ -1,102 +1,34 @@
-name: Snapshots (AM/PM/LATE)
-
-on:
-  schedule:
-    # SRB 10:00 -> 08:00 UTC
-    - cron: '0 8 * * *'
-    # SRB 15:00 -> 13:00 UTC
-    - cron: '0 13 * * *'
-    # SRB 00:00 -> 22:00 UTC (prethodni dan)
-    - cron: '0 22 * * *'
-  workflow_dispatch:
-    inputs:
-      slot:
-        description: 'am | pm | late | auto'
-        required: false
-        default: 'auto'
-
-env:
-  BASE: ${{ secrets.BASE_URL }}
-  FALLBACK_BASE: https://predictscores.vercel.app
-
-concurrency:
-  group: snapshots
-  cancel-in-progress: false
-
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
       - name: Resolve BASE, SLOT and YMD (Europe/Belgrade)
         id: ctx
+        env:
+          FALLBACK_BASE: https://predictscores.vercel.app
+          INP: ${{ inputs.slot }}
+          SCH: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
-          BASE="${BASE:-}"
-          if [ -z "$BASE" ]; then BASE="$FALLBACK_BASE"; fi
+
+          BASE="${BASE:-$FALLBACK_BASE}"
           echo "base=$BASE" >> $GITHUB_OUTPUT
 
-          INP="${{ github.event.inputs.slot || '' }}"
-          SCH="${{ github.event.schedule || '' }}"
-          if [ -n "$INP" ] && [ "$INP" != "auto" ]; then
+          # 1) Ručni ulaz ima prioritet
+          if [ -n "${INP:-}" ] && [ "${INP}" != "auto" ]; then
             SLOT="$INP"
-          else
+          # 2) Ako smo stvarno na schedule eventu, mapiraj po cron izrazu
+          elif [ -n "${SCH:-}" ]; then
             case "$SCH" in
-              "0 8 * * *")  SLOT="am"  ;;
-              "0 13 * * *") SLOT="pm"  ;;
-              "0 22 * * *") SLOT="late";;
+              "0 8 * * *")  SLOT="am"  ;;  # 10:00 SRB
+              "0 13 * * *") SLOT="pm"  ;;  # 15:00 SRB
+              "0 22 * * *") SLOT="late";;  # 00:00 SRB (prethodni UTC dan)
               *)            SLOT="am"  ;;
             esac
-          fi
-          echo "slot=$SLOT" >> $GITHUB_OUTPUT
-
-          YMD=$(TZ=Europe/Belgrade date +%F)
-          echo "ymd=$YMD" >> $GITHUB_OUTPUT
-          echo "Resolved: BASE=$BASE, SLOT=$SLOT, YMD=$YMD"
-
-      - name: Refresh odds for slot (FIRST)
-        run: |
-          set -euo pipefail
-          curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/refresh-odds?slot=${{ steps.ctx.outputs.slot }}&ymd=${{ steps.ctx.outputs.ymd }}"
-
-      # ⬇️ POMERENO GORE: rebuild ide PRE sanity-check-a
-      - name: Rebuild locked feed for slot
-        run: |
-          set -euo pipefail
-          curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/rebuild?slot=${{ steps.ctx.outputs.slot }}&ymd=${{ steps.ctx.outputs.ymd }}"
-
-      # Sanity check sada proverava /api/value-bets-locked i polje "items"
-      - name: Sanity check value-bets after rebuild (retry)
-        run: |
-          set -euo pipefail
-          B="${{ steps.ctx.outputs.base }}"
-          S="${{ steps.ctx.outputs.slot }}"
-          D="${{ steps.ctx.outputs.ymd }}"
-          tries=5
-          delay=6
-          for i in $(seq 1 $tries); do
-            RESP=$(curl -fsS "$B/api/value-bets-locked?slot=$S&ymd=$D&slim=1&n=1")
-            echo "$RESP"
-            # Ako JE prazno -> '"items":[]' ; ako NIJE prazno, nema tog patterna
-            if ! echo "$RESP" | grep -q '"items":\[\]'; then
-              echo "Non-empty feed, proceed."
-              exit 0
+          # 3) Fallback: izračunaj slot po SRB lokalnom satu
+          else
+            H=$(TZ=Europe/Belgrade date +%H)
+            if   [ "$H" -lt 10 ]; then SLOT="late"
+            elif [ "$H" -lt 15 ]; then SLOT="am"
+            else SLOT="pm"
             fi
-            echo "Empty feed, retry in ${delay}s..."
-            sleep $delay
-          done
-          echo "Still empty feed; proceeding anyway."
+          fi
 
-      - name: Insights build
-        run: |
-          set -euo pipefail
-          curl -fsS "${{ steps.ctx.outputs.base }}/api/insights-build"
-
-      - name: Apply learning (writes :last)
-        run: |
-          set -euo pipefail
-          curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/apply-learning"
-
-      - name: History settle (last 3 days)
-        run: |
-          set -euo pipefail
-          curl -fsS "${{ steps.ctx.outputs.base }}/api/history-check?days=3"
+          echo "slot=$SLOT" >> $GITHUB_OUTPUT
+          echo "ymd=$(TZ=Europe/Belgrade date +%F)" >> $GITHUB_OUTPUT
