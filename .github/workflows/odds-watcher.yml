@@ -4,7 +4,12 @@ on:
   schedule:
     - cron: "*/15 * * * *"   # watcher svakih 15 min (UTC)
     - cron: "5 * * * *"      # scheduler svakog sata u :05 (UTC)
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "am / pm / late (opciono ručno preglasavanje)"
+        required: false
+        default: ""
 
 concurrency:
   group: odds-watcher
@@ -15,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 5
+    timeout-minutes: 7
     steps:
       - name: Compute slot and minute (Europe/Belgrade)
         id: ctx
@@ -24,9 +29,13 @@ jobs:
           TZZ="Europe/Belgrade"
           H=$(TZ=$TZZ date +%H)
           M=$(TZ=$TZZ date +%M)
-          if   [ "$H" -lt 10 ]; then SLOT=late
-          elif [ "$H" -lt 15 ]; then SLOT=am
-          else SLOT=pm; fi
+          if [ -n "${{ github.event.inputs.slot }}" ]; then
+            SLOT="${{ github.event.inputs.slot }}"
+          else
+            if   [ "$H" -lt 10 ]; then SLOT=late
+            elif [ "$H" -lt 15 ]; then SLOT=am
+            else SLOT=pm; fi
+          fi
           echo "slot=$SLOT"  >> "$GITHUB_OUTPUT"
           echo "minute=$M"   >> "$GITHUB_OUTPUT"
           echo "Local time $H:$M -> SLOT=$SLOT"
@@ -42,54 +51,59 @@ jobs:
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "Resolved BASE=$BASE"
 
-      # SATNI SCHEDULER: u :05 (UTC) napuni KV za detektovani slot
-      - name: Rebuild KV (hourly at :05)
-        if: steps.ctx.outputs.minute == '05'
+      # UVEK pokreni rebuild (bezbedno; server ignoriše kad nema šta da radi)
+      - name: Rebuild KV (always)
         run: |
           set -euo pipefail
           BASE="${{ steps.base.outputs.base }}"
           SLOT="${{ steps.ctx.outputs.slot }}"
           echo "Rebuilding KV for SLOT=$SLOT …"
           curl -fsS \
-            -A "gha-odds-watcher/1.0" \
+            -A "gha-odds-watcher/1.1" \
             --connect-timeout 10 \
             --max-time 180 \
-            --retry 3 --retry-all-errors --retry-delay 5 --retry-max-time 200 \
-            "$BASE/api/cron/rebuild?slot=$SLOT"
+            --retry 2 --retry-all-errors --retry-delay 3 --retry-max-time 200 \
+            "$BASE/api/cron/rebuild?slot=$SLOT" || true
 
-      # GUARD: u ostalim minutima proveri da li je KV spreman (KV-only endpoint)
-      - name: Guard – skip refresh if KV not ready
-        id: guard
-        if: steps.ctx.outputs.minute != '05'
+      # Ako je KV prazan, toplo ga probaj zagrejati pa nastavi svakako
+      - name: Ensure KV has items (self-warm if empty)
+        id: warm
         run: |
           set -euo pipefail
           BASE="${{ steps.base.outputs.base }}"
           SLOT="${{ steps.ctx.outputs.slot }}"
-          echo "Probing KV for slot=$SLOT …"
-          OUT=$(curl -fsS \
-            -A "gha-odds-watcher/1.0" \
-            --connect-timeout 10 \
-            --max-time 30 \
-            "$BASE/api/value-bets-locked?slot=$SLOT&n=1")
-          if echo "$OUT" | grep -q '"source":"vb-locked:kv:hit'; then
-            echo "KV ready -> will refresh odds"
-            echo "skip=0" >> "$GITHUB_OUTPUT"
-          else
-            echo "KV NOT ready -> skip refresh-odds (no-op)"
-            echo "skip=1" >> "$GITHUB_OUTPUT"
+          probe() {
+            curl -fsS \
+              -A "gha-odds-watcher/1.1" \
+              --connect-timeout 10 \
+              --max-time 30 \
+              "$BASE/api/value-bets-locked?slot=$SLOT&n=1" || echo '{}'
+          }
+          OUT=$(probe)
+          if echo "$OUT" | grep -q '"items":[]'; then
+            echo "KV empty -> warm via rebuild + short sleep"
+            curl -fsS \
+              -A "gha-odds-watcher/1.1" \
+              --connect-timeout 10 \
+              --max-time 120 \
+              "$BASE/api/cron/rebuild?slot=$SLOT" || true
+            sleep 3
           fi
+          echo "vb_locked_response=$OUT" >> "$GITHUB_OUTPUT"
 
-      # REFRESH: ako je KV spreman, osveži kvote za trenutni slot (per-fixture prozor)
-      - name: Refresh odds for current slot
-        if: steps.ctx.outputs.minute != '05' && steps.guard.outputs.skip != '1'
+      # REFRESH: uvek pozovi refresh-odds (više nema skip logike)
+      - name: Refresh odds for current slot (always)
         run: |
           set -euo pipefail
           BASE="${{ steps.base.outputs.base }}"
           SLOT="${{ steps.ctx.outputs.slot }}"
           echo "Refreshing odds for SLOT=$SLOT …"
           curl -fsS \
-            -A "gha-odds-watcher/1.0" \
+            -A "gha-odds-watcher/1.1" \
             --connect-timeout 10 \
-            --max-time 120 \
-            --retry 3 --retry-all-errors --retry-delay 5 --retry-max-time 150 \
-            "$BASE/api/cron/refresh-odds?slot=$SLOT"
+            --max-time 180 \
+            --retry 2 --retry-all-errors --retry-delay 3 --retry-max-time 200 \
+            "$BASE/api/cron/refresh-odds?slot=$SLOT" || true
+
+      - name: Done
+        run: echo "Done."
