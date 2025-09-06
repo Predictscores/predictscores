@@ -1,54 +1,56 @@
 // pages/api/value-bets-locked.js
 // Combined & Football feed (Kick-Off / Confidence)
-// Čita iz SVIH dostupnih KV backend-a i uzima prvi nađen ključ.
-// Debug sada pokazuje i po-backend status.
+// Čita iz Vercel KV (REST). Dodata je dijagnostika:
+//  - debug: per-key status (hit/miss + dužina), koji URL i token su korišćeni
+//  - ?peek=<key> vrati raw sadržaj tog ključa (za brzu proveru tokom debuga)
+//
+// Ne menja shape regularnog odgovora osim dodatnog "debug" polja kad ?debug=1.
+
 export const config = { api: { bodyParser: false } };
 
 const TZ = "Europe/Belgrade";
 
-/* ---------------- KV multi-read ---------------- */
-function getKvBackends() {
+/* ----------------------------- KV (Vercel REST) ----------------------------- */
+function getKvCfgs() {
+  // Pročitaj i RW i RO token — oba gledamo; koristi se prvi koji radi.
+  const url = (process.env.KV_REST_API_URL || "").replace(/\/+$/, "");
+  const rw = process.env.KV_REST_API_TOKEN || "";
+  const ro = process.env.KV_REST_API_READ_ONLY_TOKEN || "";
   const out = [];
-  const kvUrl = process.env.KV_REST_API_URL, kvTok = process.env.KV_REST_API_TOKEN;
-  const upUrl = process.env.UPSTASH_REDIS_REST_URL, upTok = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (kvUrl && kvTok) out.push({ flavor: "vercel-kv", url: kvUrl.replace(/\/+$/,""), token: kvTok });
-  if (upUrl && upTok) out.push({ flavor: "upstash-redis", url: upUrl.replace(/\/+$/,""), token: upTok });
+  if (url && rw) out.push({ flavor: "vercel-kv:rw", url, token: rw });
+  if (url && ro) out.push({ flavor: "vercel-kv:ro", url, token: ro });
   return out;
 }
-async function kvGETrawFirst(key, dbg) {
-  const out = getKvBackends();
-  for (const b of out) {
+
+async function kvGET_first(key, diag) {
+  const cfgs = getKvCfgs();
+  for (const c of cfgs) {
     try {
-      const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`, {
-        method: "GET",
-        headers: { Authorization: `Bearer ${b.token}` },
-        cache: "no-store",
-      });
-      dbg && (dbg[b.flavor] = dbg[b.flavor] || {});
-      if (!r.ok) { dbg && (dbg[b.flavor][key] = "miss(http)"); continue; }
-      const j = await r.json().catch(() => null);
-      if (typeof j?.result === "string" && j.result) {
-        dbg && (dbg[b.flavor][key] = `hit(len=${j.result.length})`);
-        return { raw: j.result, backend: b.flavor };
-      }
-      dbg && (dbg[b.flavor][key] = "miss(null)");
-    } catch {
-      dbg && (dbg[b.flavor][key] = "miss(err)");
+      const u = `${c.url}/get/${encodeURIComponent(key)}`;
+      const r = await fetch(u, { headers: { Authorization: `Bearer ${c.token}` }, cache: "no-store" });
+      const ok = r.ok;
+      const j = ok ? await r.json().catch(() => null) : null;
+      const val = j && typeof j.result === "string" ? j.result : null;
+      diag && (diag[c.flavor] = diag[c.flavor] || {}, diag[c.flavor][key] = ok ? (val ? `hit(len=${val.length})` : "miss(null)") : `miss(http ${r.status})`, diag[c.flavor]._url = c.url);
+      if (val) return { raw: val, flavor: c.flavor, url: c.url };
+    } catch (e) {
+      diag && (diag[c.flavor] = diag[c.flavor] || {}, diag[c.flavor][key] = `miss(err:${String(e?.message||e).slice(0,60)})`, diag[c.flavor]._url = c.url);
     }
   }
-  return { raw: null, backend: null };
+  return { raw: null, flavor: null, url: null };
 }
-function toObj(raw) { if (!raw) return null; try { return JSON.parse(raw); } catch { return null; } }
-function arrFromAny(x) {
-  if (!x) return null;
-  if (Array.isArray(x)) return x;
-  if (Array.isArray(x?.items)) return x.items;
-  if (Array.isArray(x?.value_bets)) return x.value_bets;
-  if (Array.isArray(x?.football)) return x.football;
+
+function toObj(s){ if(!s) return null; try{ return JSON.parse(s); }catch{ return null; } }
+function arrFromAny(x){
+  if(!x) return null;
+  if(Array.isArray(x)) return x;
+  if(Array.isArray(x?.items)) return x.items;
+  if(Array.isArray(x?.value_bets)) return x.value_bets;
+  if(Array.isArray(x?.football)) return x.football;
   return null;
 }
 
-/* ---------------- time helpers --------------- */
+/* ----------------------------- time helpers ---------------------------- */
 function ymdInTZ(d=new Date(), tz=TZ){
   const fmt = new Intl.DateTimeFormat("en-CA",{ timeZone:tz, year:"numeric", month:"2-digit", day:"2-digit" });
   const p = fmt.formatToParts(d).reduce((a,x)=>(a[x.type]=x.value,a),{});
@@ -60,7 +62,7 @@ function hourInTZ(d=new Date(), tz=TZ){
 }
 function deriveSlot(h){ if (h<12) return "am"; if (h<18) return "pm"; return "late"; }
 
-/* ---------------- auto-warm support ---------- */
+/* ------------------------------ warm helpers --------------------------- */
 function computeBaseUrl(req) {
   const envBase = process.env.NEXT_PUBLIC_BASE_URL;
   if (envBase) return envBase.replace(/\/+$/,"");
@@ -70,27 +72,27 @@ function computeBaseUrl(req) {
 }
 const sleep = (ms) => new Promise(r=>setTimeout(r,ms));
 
-/* --------------- core loader ---------------- */
-async function tryLoadAll(ymd, slot, preferFull, dbg) {
+/* --------------------------- core load routine ------------------------- */
+async function loadAll(ymd, slot, preferFull, diag) {
+  // redosled ključeva
   const locked = preferFull
     ? [`vbl_full:${ymd}:${slot}`, `vbl:${ymd}:${slot}`]
     : [`vbl:${ymd}:${slot}`, `vbl_full:${ymd}:${slot}`];
-
   for (const k of locked) {
-    const { raw, backend } = await kvGETrawFirst(k, dbg);
+    const { raw, flavor } = await kvGET_first(k, diag);
     const arr = arrFromAny(toObj(raw));
-    if (arr && arr.length) return { arr, picked: `${k}`, backend };
+    if (arr && arr.length) return { arr, picked: k, flavor };
   }
   const alt = [`vb:day:${ymd}:${slot}`, `vb:day:${ymd}:last`, `vb:day:${ymd}:union`];
   for (const k of alt) {
-    const { raw, backend } = await kvGETrawFirst(k, dbg);
+    const { raw, flavor } = await kvGET_first(k, diag);
     const arr = arrFromAny(toObj(raw));
-    if (arr && arr.length) return { arr, picked: `${k}→fallback`, backend };
+    if (arr && arr.length) return { arr, picked: `${k}→fallback`, flavor };
   }
-  return { arr: null, picked: null, backend: null };
+  return { arr: null, picked: null, flavor: null };
 }
 
-/* ------------------- handler ---------------- */
+/* -------------------------------- handler ------------------------------ */
 export default async function handler(req, res) {
   try {
     res.setHeader("Cache-Control", "no-store");
@@ -101,30 +103,44 @@ export default async function handler(req, res) {
     const cap = Math.max(1, Math.min(Number(q.n ?? q.limit ?? 50), 200));
     const wantDebug = String(q.debug ?? "") === "1";
     const preferFull = String(q.full ?? "") === "1";
-    const allowWarm = String(q.autowarm ?? "1") !== "0";
+    const allowWarm  = String(q.autowarm ?? "1") !== "0";
 
-    const dbg = wantDebug ? {} : null;
-
-    let { arr, picked, backend } = await tryLoadAll(ymd, slot, preferFull, dbg);
-
-    // autowarm: okini refresh-odds force=1 ako je baš prazno, pa probaj ponovo
-    if ((!Array.isArray(arr) || arr.length===0) && allowWarm) {
-      try {
-        const baseUrl = computeBaseUrl(req);
-        await fetch(`${baseUrl}/api/cron/refresh-odds?slot=${slot}&force=1`, { cache:"no-store" }).catch(()=>{});
-        await sleep(1200);
-        ({ arr, picked, backend } = await tryLoadAll(ymd, slot, preferFull, dbg));
-      } catch { /* ignore */ }
+    // quick peek mode: /api/value-bets-locked?peek=vbl:2025-09-06:am&debug=1
+    if (q.peek) {
+      const diag = {};
+      const { raw, flavor, url } = await kvGET_first(String(q.peek), diag);
+      return res.status(200).json({ ok:true, peek:String(q.peek), flavor, url, raw_present: !!raw, raw_len: raw ? raw.length : 0, debug: diag });
     }
 
-    if (!Array.isArray(arr) || arr.length===0) {
+    const diag = wantDebug ? {} : null;
+
+    let { arr, picked, flavor } = await loadAll(ymd, slot, preferFull, diag);
+
+    if ((!arr || !arr.length) && allowWarm) {
+      try {
+        const baseUrl = computeBaseUrl(req);
+        // prvo rebuild
+        await fetch(`${baseUrl}/api/cron/rebuild?slot=${slot}`, { cache:"no-store" }).catch(()=>{});
+        await sleep(1000);
+        ({ arr, picked, flavor } = await loadAll(ymd, slot, preferFull, diag));
+
+        // ako i dalje prazno, probaj da nateraš refresh-odds da kreira vbl* (force=1)
+        if (!arr || !arr.length) {
+          await fetch(`${baseUrl}/api/cron/refresh-odds?slot=${slot}&force=1`, { cache:"no-store" }).catch(()=>{});
+          await sleep(1200);
+          ({ arr, picked, flavor } = await loadAll(ymd, slot, preferFull, diag));
+        }
+      } catch {}
+    }
+
+    if (!arr || !arr.length) {
       const out = {
         ok: true, slot, ymd,
         items: [], football: [], top3: [],
         source: `vb-locked:kv:miss·${picked ? picked : 'none'}${wantDebug ? ':no-data' : ''}`,
-        policy_cap: cap,
+        policy_cap: cap
       };
-      if (wantDebug) out.debug = { kv_probed: dbg || {} };
+      if (wantDebug) out.debug = diag;
       return res.status(200).json(out);
     }
 
@@ -134,11 +150,12 @@ export default async function handler(req, res) {
     const out = {
       ok: true, slot, ymd,
       items, football: items, top3,
-      source: `vb-locked:kv:hit·${picked}·${backend}`,
-      policy_cap: cap,
+      source: `vb-locked:kv:hit·${picked}·${flavor}`,
+      policy_cap: cap
     };
-    if (wantDebug) out.debug = { kv_probed: dbg || {} };
+    if (wantDebug) out.debug = diag;
     return res.status(200).json(out);
+
   } catch (e) {
     return res.status(200).json({
       ok: false, error: String(e?.message || e),
