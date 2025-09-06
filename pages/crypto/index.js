@@ -21,7 +21,7 @@ export default function CryptoSignalsPage() {
 
   useEffect(() => {
     load();
-    const id = setInterval(load, 60_000); // 60s poll
+    const id = setInterval(load, 60_000);
     return () => clearInterval(id);
   }, []);
 
@@ -68,7 +68,7 @@ function EmptyState() {
   return (
     <div className="rounded-lg border border-dashed border-gray-300 p-10 text-center bg-white">
       <p className="text-lg font-semibold">Trenutno nema jakih signala.</p>
-      <p className="text-sm text-gray-600 mt-1">Vrati se kasnije – osvežava se automatski.</p>
+      <p className="text-sm text-gray-600 mt-1">Osvežava se automatski.</p>
     </div>
   );
 }
@@ -95,7 +95,6 @@ function SkeletonGrid() {
 function SignalCard({ it }) {
   const dirColor = it.signal === "LONG" ? "bg-green-600" : "bg-red-600";
   const dirText  = it.signal === "LONG" ? "LONG" : "SHORT";
-
   const pct = (v) => (v == null ? "—" : `${Number(v).toFixed(2)}%`);
   const bnLink = it?.pair ? `https://www.binance.com/en/trade/${encodeURIComponent(it.pair.replace("USDT","_USDT"))}?type=spot` : null;
 
