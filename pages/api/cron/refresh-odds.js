@@ -1,52 +1,60 @@
 // pages/api/cron/refresh-odds.js
-// Osvežava kvote i po potrebi puni vbl* kada ne postoje.
-// FIX: kvSETjson sada ispravno radi za oba okruženja:
-//  - Vercel KV  -> POST /set/<key> { "value": "<json>" }
-//  - Upstash Redis REST -> POST /pipeline [{ "command":"SET","args":[key,value] }]
-
+// Osvežava kvote; ako vbl* ne postoji, generiše vbl_full:/vbl: za slot.
+// NOVO: upisuje u SVE dostupne KV backend-e (Vercel KV i/ili Upstash).
 export const config = { api: { bodyParser: false } };
 
 const TZ = "Europe/Belgrade";
 const AF_BASE = "https://v3.football.api-sports.io";
 
 /* ---------------- KV helpers ---------------- */
-function pickKvEnv() {
+function kvBackends() {
+  const out = [];
   const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
   const bU = process.env.UPSTASH_REDIS_REST_URL, bT = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (aU && aT) return { url: aU.replace(/\/+$/,""), tok: aT, flavor: "vercel-kv" };
-  if (bU && bT) return { url: bU.replace(/\/+$/,""), tok: bT, flavor: "upstash-redis" };
-  return null;
+  if (aU && aT) out.push({ flavor: "vercel-kv", url: aU.replace(/\/+$/,""), tok: aT });
+  if (bU && bT) out.push({ flavor: "upstash-redis", url: bU.replace(/\/+$/,""), tok: bT });
+  return out;
 }
-async function kvGETraw(k) {
-  const env = pickKvEnv(); if (!env) return null;
-  const r = await fetch(`${env.url}/get/${encodeURIComponent(k)}`, {
-    headers: { Authorization: `Bearer ${env.tok}` }, cache: "no-store",
-  }).catch(()=>null);
-  if (!r || !r.ok) return null;
-  const j = await r.json().catch(()=>null);
-  return typeof j?.result === "string" ? j.result : null;
+async function kvGETraw(key) {
+  for (const b of kvBackends()) {
+    try {
+      const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`, {
+        headers: { Authorization: `Bearer ${b.tok}` }, cache: "no-store",
+      });
+      if (!r.ok) continue;
+      const j = await r.json().catch(()=>null);
+      if (typeof j?.result === "string" && j.result) {
+        return { raw: j.result, flavor: b.flavor };
+      }
+    } catch { /* next backend */ }
+  }
+  return { raw: null, flavor: null };
 }
-async function kvSETjson(k, v) {
-  const env = pickKvEnv(); if (!env) return false;
-  const val = JSON.stringify(v);
-  try {
-    if (env.flavor === "vercel-kv") {
-      const r = await fetch(`${env.url}/set/${encodeURIComponent(k)}`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${env.tok}`, "content-type":"application/json" },
-        body: JSON.stringify({ value: val }),
-      });
-      return r.ok;
-    } else {
-      // Upstash Redis REST: pipeline SET
-      const r = await fetch(`${env.url}/pipeline`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${env.tok}`, "content-type":"application/json" },
-        body: JSON.stringify([{ command: "SET", args: [k, val] }]),
-      });
-      return r.ok;
-    }
-  } catch { return false; }
+async function kvSETjsonAll(key, valObj) {
+  const val = JSON.stringify(valObj);
+  const backends = kvBackends();
+  const saved = [];
+  for (const b of backends) {
+    try {
+      if (b.flavor === "vercel-kv") {
+        const r = await fetch(`${b.url}/set/${encodeURIComponent(key)}`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${b.tok}`, "content-type":"application/json" },
+          body: JSON.stringify({ value: val }),
+        });
+        if (r.ok) saved.push(b.flavor);
+      } else {
+        // Upstash Redis REST pipeline
+        const r = await fetch(`${b.url}/pipeline`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${b.tok}`, "content-type":"application/json" },
+          body: JSON.stringify([{ command: "SET", args: [key, val] }]),
+        });
+        if (r.ok) saved.push(b.flavor);
+      }
+    } catch { /* ignore one backend */ }
+  }
+  return { any: saved.length>0, backends: saved };
 }
 function toObj(s){ if(!s) return null; try{ return JSON.parse(s); }catch{ return null; } }
 function arrFromAny(x){
@@ -100,7 +108,6 @@ function best1x2FromBookmakers(bookmakers){
       if(!(vHome && vDraw && vAway)) continue;
       const oH = parseFloat(vHome.odd), oD = parseFloat(vDraw.odd), oA = parseFloat(vAway.odd);
       if(!isFinite(oH)||!isFinite(oD)||!isFinite(oA)) continue;
-      books++;
       const pH = 1/oH, pD = 1/oD, pA = 1/oA, S = pH+pD+pA;
       const arr = [
         {code:"1", label:"Home", prob:pH/S, price:oH},
@@ -118,13 +125,13 @@ function best1x2FromBookmakers(bookmakers){
 }
 
 async function collectFixtureIdsAndMeta(ymd, slot){
-  // 1) pokušaj iz KV
+  // 1) KV (vbl/vb:day…)
   const keys = [
     `vbl_full:${ymd}:${slot}`, `vbl:${ymd}:${slot}`,
     `vb:day:${ymd}:${slot}`, `vb:day:${ymd}:last`, `vb:day:${ymd}:union`
   ];
   for(const k of keys){
-    const arr = arrFromAny(toObj(await kvGETraw(k)));
+    const arr = arrFromAny(toObj((await kvGETraw(k)).raw));
     if(arr && arr.length){
       const ids = uniqNums(arr.map(x=>x?.fixture_id ?? x?.fixture?.id));
       if(ids.length) return { ids, source:`kv:${k}`, metaById: Object.fromEntries(arr.map(x=>{
@@ -132,7 +139,7 @@ async function collectFixtureIdsAndMeta(ymd, slot){
       })) };
     }
   }
-  // 2) seed fixtures za dan
+  // 2) Seed: fixtures od dana
   const jf = await afFetch("/fixtures", { date: ymd, timezone: TZ });
   const resp = jf?.response || [];
   const ids = uniqNums(resp.map(x=>x?.fixture?.id));
@@ -150,12 +157,6 @@ async function collectFixtureIdsAndMeta(ymd, slot){
   return { ids: ids.slice(0,60), source:"seed:fixtures:date", metaById };
 }
 
-function slotOfISO(iso){
-  if(!iso) return "pm";
-  const h = Number(new Intl.DateTimeFormat("sv-SE",{ timeZone: TZ, hour:"2-digit", hour12:false }).format(new Date(iso)));
-  if(h<10) return "late"; if(h<15) return "am"; return "pm";
-}
-
 /* ------------------- handler ------------------- */
 export default async function handler(req,res){
   try{
@@ -167,8 +168,9 @@ export default async function handler(req,res){
     const slot = (q.slot && /^(am|pm|late)$/.test(q.slot)) ? q.slot : deriveSlot(hourInTZ(now, TZ));
     const force = String(q.force ?? "0")==="1";
 
-    const key = getAFKey();
-    if(!key) return res.status(200).json({ ok:false, ymd, slot, error:"API-Football key missing", source:"refresh-odds" });
+    if(!getAFKey()) {
+      return res.status(200).json({ ok:false, ymd, slot, error:"API-Football key missing", source:"refresh-odds" });
+    }
 
     // 1) fixture ID-evi
     let { ids, source, metaById } = await collectFixtureIdsAndMeta(ymd, slot);
@@ -176,11 +178,12 @@ export default async function handler(req,res){
       return res.status(200).json({ ok:true, ymd, slot, inspected:0, filtered:0, targeted:0, touched:0, source:"refresh-odds:empty-no-force", debug:{ tried:[] } });
     }
 
-    // 2) pozovi odds i, ako vbl* ne postoji, kreiraj locked listu
-    const haveVbl = !!arrFromAny(toObj(await kvGETraw(`vbl:${ymd}:${slot}`)));
+    // 2) povuci odds; ako vbl* ne postoji, napravi locked listu
+    const haveVbl = !!arrFromAny(toObj((await kvGETraw(`vbl:${ymd}:${slot}`)).raw));
     const createdLocked = [];
     let called = 0, cached = 0;
 
+    // blaga paralelizacija
     const lanes = 5;
     const buckets = Array.from({length: lanes}, ()=>[]);
     ids.forEach((x,i)=>buckets[i%lanes].push(x));
@@ -190,18 +193,16 @@ export default async function handler(req,res){
         try{
           const jo = await afFetch("/odds", { fixture: id });
           called++;
-
-          // cache odds
           const payload = { fetched_at: Date.now(), fixture_id: id, data: jo?.response ?? jo };
-          if(await kvSETjson(`odds:fixture:${id}`, payload)) cached++;
+          // cache odds u sve KV-e (nije presudno, ali uniformno)
+          await kvSETjsonAll(`odds:fixture:${id}`, payload);
 
-          // make locked item if missing
           if(!haveVbl){
             const bookmakers = (jo?.response?.[0]?.bookmakers) || [];
             const best = best1x2FromBookmakers(bookmakers);
             const meta = metaById?.[id] || {};
             if(best){
-              const item = {
+              createdLocked.push({
                 fixture_id: id,
                 league: meta.league || null,
                 league_name: meta?.league?.name || null,
@@ -218,19 +219,18 @@ export default async function handler(req,res){
                 model_prob: best.model_prob,
                 confidence_pct: Math.round(100*best.model_prob),
                 odds: { price: best.price, books_count: best.books_count || 1 },
-              };
-              createdLocked.push(item);
+              });
             }
           }
+          cached++; // broj uspešnih fetch+obrada
         }catch{ /* skip one id */ }
         await new Promise(r=>setTimeout(r, 120));
       }
     };
-
     await Promise.all(buckets.map(lane));
 
-    // ako smo kreirali locked listu, upiši vbl* (sada SET radi za oba KV sistema)
-    let saved = false;
+    // 3) ako smo kreirali locked listu → upiši u SVE backend-e
+    let savedBackends = [];
     if(createdLocked.length){
       createdLocked.sort((a,b)=>
         (b.confidence_pct - a.confidence_pct) ||
@@ -238,9 +238,9 @@ export default async function handler(req,res){
       );
       const full = createdLocked.slice(0, 25);
       const cut  = createdLocked.slice(0, 15);
-      const ok1 = await kvSETjson(`vbl_full:${ymd}:${slot}`, full);
-      const ok2 = await kvSETjson(`vbl:${ymd}:${slot}`, cut);
-      saved = ok1 && ok2;
+      const r1 = await kvSETjsonAll(`vbl_full:${ymd}:${slot}`, full);
+      const r2 = await kvSETjsonAll(`vbl:${ymd}:${slot}`, cut);
+      savedBackends = Array.from(new Set([...(r1.backends||[]), ...(r2.backends||[])]));
     }
 
     return res.status(200).json({
@@ -249,7 +249,12 @@ export default async function handler(req,res){
       inspected: ids.length, filtered: ids.length,
       targeted: ids.length, touched: cached,
       source: `refresh-odds:per-fixture`,
-      debug: { tried: [`${source}`], pickedKey: createdLocked.length?`vbl:${ymd}:${slot}`:null, listLen: createdLocked.length, saved }
+      debug: {
+        tried: [`${source}`],
+        pickedKey: createdLocked.length?`vbl:${ymd}:${slot}`:null,
+        listLen: createdLocked.length,
+        saved_backends: savedBackends
+      }
     });
 
   }catch(e){
