@@ -74,47 +74,27 @@ function unpack(raw) {
   if (!raw || typeof raw !== "string") return null;
   let v1 = J(raw);
   if (Array.isArray(v1)) return v1;
-
   if (v1 && typeof v1 === "object" && "value" in v1) {
-    const inner = v1.value;
-    if (Array.isArray(inner)) return inner;
-    if (typeof inner === "string") {
-      const v2 = J(inner);
+    if (Array.isArray(v1.value)) return v1.value;
+    if (typeof v1.value === "string") {
+      const v2 = J(v1.value);
       if (Array.isArray(v2)) return v2;
-      if (v2 && typeof v2 === "object") return v2;
+      if (v2 && typeof v2 === "object") {
+        if (Array.isArray(v2.items)) return v2.items;
+        if (Array.isArray(v2.value_bets)) return v2.value_bets;
+        if (Array.isArray(v2.football)) return v2.football;
+        if (Array.isArray(v2.list)) return v2.list;
+        if (Array.isArray(v2.data)) return v2.data;
+      }
     }
-    return v1;
+    return null;
   }
-
-  if (typeof v1 === "string" && /^[\[{]/.test(v1.trim())) {
-    const v2 = J(v1);
-    if (Array.isArray(v2) || (v2 && typeof v2 === "object")) return v2;
-  }
-  if (/^[\[{]/.test(raw.trim())) {
-    const v3 = J(raw.trim());
-    if (Array.isArray(v3) || (v3 && typeof v3 === "object")) return v3;
-  }
-  return v1;
-}
-function arrFromAny(x) {
-  if (!x) return null;
-  if (Array.isArray(x)) return x;
-  if (Array.isArray(x.items)) return x.items;
-  if (Array.isArray(x.value_bets)) return x.value_bets;
-  if (Array.isArray(x.football)) return x.football;
-  if (Array.isArray(x.list)) return x.list;
-  if (Array.isArray(x.data)) return x.data;
-  if (Array.isArray(x.value)) return x.value;
-  if (typeof x.value === "string") {
-    const v = J(x.value);
-    if (Array.isArray(v)) return v;
-    if (v && typeof v === "object") {
-      if (Array.isArray(v.items)) return v.items;
-      if (Array.isArray(v.value_bets)) return v.value_bets;
-      if (Array.isArray(v.football)) return v.football;
-      if (Array.isArray(v.list)) return v.list;
-      if (Array.isArray(v.data)) return v.data;
-    }
+  if (v1 && typeof v1 === "object") {
+    if (Array.isArray(v1.items)) return v1.items;
+    if (Array.isArray(v1.value_bets)) return v1.value_bets;
+    if (Array.isArray(v1.football)) return v1.football;
+    if (Array.isArray(v1.list)) return v1.list;
+    if (Array.isArray(v1.data)) return v1.data;
   }
   return null;
 }
@@ -129,7 +109,30 @@ function hourInTZ(d=new Date(), tz=TZ){
   const fmt = new Intl.DateTimeFormat("en-GB",{ timeZone:tz, hour:"2-digit", hour12:false });
   return parseInt(fmt.format(d),10);
 }
-function deriveSlot(h){ if (h<12) return "am"; if (h<18) return "pm"; return "late"; }
+// Usklađeno sa reader-om: late 00–09, am 10–14, pm 15–23
+function deriveSlot(h){ if (h<10) return "late"; if (h<15) return "am"; return "pm"; }
+
+/* ---------------- kickoff helpers + slot filter (align with locked reader) ---------------- */
+function kickoffDate(x){
+  const s =
+    x?.kickoff_utc ||
+    x?.datetime_local?.starting_at?.date_time ||
+    x?.datetime_utc ||
+    x?.start_time?.utc ||
+    x?.start_time;
+  if (!s || typeof s !== "string") return null;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function inSlotLocal(item, slot) {
+  const d = kickoffDate(item);
+  if (!d) return true; // ako ne znamo vreme, ne odbacuj
+  const h = hourInTZ(d, TZ);
+  if (slot === "late") return h < 10;            // 00–09
+  if (slot === "am")   return h >= 10 && h < 15; // 10–14
+  return h >= 15;                                 // 15–23
+}
 
 /* ---------------- handler ---------------- */
 export default async function handler(req, res) {
@@ -180,6 +183,14 @@ export default async function handler(req, res) {
       });
     }
 
+    // slot-filter: zadrži samo utakmice koje pripadaju traženom slotu
+    const beforeCount = candidates.length;
+    candidates = candidates.filter(x => inSlotLocal(x, slot));
+    const afterCount = candidates.length;
+    if (diag) {
+      diag._slot_filter = { slot, before: beforeCount, after: afterCount };
+    }
+
     // 3) upiši kandidata u vb:day:* (kompatibilan format: {"value":"[...]"})
     const payloadString = JSON.stringify(candidates);            // "[{...}]"
     const stored = JSON.stringify({ value: payloadString });     // {"value":"[...]"}
@@ -207,4 +218,16 @@ export default async function handler(req, res) {
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
+}
+
+// helpers used above
+function arrFromAny(x){
+  if (!x) return null;
+  if (Array.isArray(x)) return x;
+  if (Array.isArray(x.items)) return x.items;
+  if (Array.isArray(x.value_bets)) return x.value_bets;
+  if (Array.isArray(x.football)) return x.football;
+  if (Array.isArray(x.list)) return x.list;
+  if (Array.isArray(x.data)) return x.data;
+  return null;
 }
