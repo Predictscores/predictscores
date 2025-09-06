@@ -1,0 +1,18 @@
+name: Crypto Watchdog
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # na 5 minuta; promeni na */10, */15 po želji
+  workflow_dispatch: {}      # opcioni ručni trigger
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call crypto-watchdog
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}       # npr. https://predictscores.vercel.app
+          CRON_KEY: ${{ secrets.CRON_KEY }}       # isti kao Vercel env CRON_KEY
+        run: |
+          set -e
+          curl -fsSL "$BASE_URL/api/cron/crypto-watchdog?key=$CRON_KEY" -o /dev/stdout
