@@ -182,7 +182,10 @@ export default async function handler(req, res) {
     const wantDebug = String(q.debug ?? "") === "1";
     const preferFull = String(q.full ?? "") === "1";
     const allowWarm  = String(q.autowarm ?? "1") !== "0";
-    const slimMode  = String(q.slim ?? q.shape ?? q.mode ?? "") === "1"; // <— NOVO
+    // *** IZMENJENO: robustan slim mod (podržava shape=slim, slim=true, format=slim, UA "snapshot", itd.)
+    const smRaw = String(q.slim ?? q.shape ?? q.format ?? q.mode ?? "").toLowerCase().trim();
+    const ua    = String(req.headers["user-agent"] || "").toLowerCase();
+    const slimMode = ["1","true","yes","y","on","slim","s"].includes(smRaw) || /snapshot/.test(ua);
 
     // Peek za brzu proveru ključa
     if (q.peek) {
