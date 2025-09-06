@@ -43,15 +43,14 @@ jobs:
       - name: Resolve BASE URL
         id: base
         env:
-          BASE_FROM_VARS: ${{ vars.BASE_URL }}        # (opciono) GitHub Repo/Org Variable
-          BASE_FROM_SECRETS: ${{ secrets.BASE_URL }}  # (opciono) GitHub Secret
+          BASE_FROM_VARS: ${{ vars.BASE_URL }}
+          BASE_FROM_SECRETS: ${{ secrets.BASE_URL }}
         run: |
           set -euo pipefail
           BASE="${BASE_FROM_VARS:-${BASE_FROM_SECRETS:-https://predictscores.vercel.app}}"
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "Resolved BASE=$BASE"
 
-      # UVEK pokreni rebuild (bezbedno; server ignoriše kad nema šta da radi)
       - name: Rebuild KV (always)
         run: |
           set -euo pipefail
@@ -65,33 +64,23 @@ jobs:
             --retry 2 --retry-all-errors --retry-delay 3 --retry-max-time 200 \
             "$BASE/api/cron/rebuild?slot=$SLOT" || true
 
-      # Ako je KV prazan, toplo ga probaj zagrejati pa nastavi svakako
       - name: Ensure KV has items (self-warm if empty)
         id: warm
         run: |
           set -euo pipefail
           BASE="${{ steps.base.outputs.base }}"
           SLOT="${{ steps.ctx.outputs.slot }}"
-          probe() {
-            curl -fsS \
-              -A "gha-odds-watcher/1.1" \
-              --connect-timeout 10 \
-              --max-time 30 \
-              "$BASE/api/value-bets-locked?slot=$SLOT&n=1" || echo '{}'
-          }
-          OUT=$(probe)
-          if echo "$OUT" | grep -q '"items":[]'; then
+          OUT=$(curl -fsS -A "gha-odds-watcher/1.1" --connect-timeout 10 --max-time 30 \
+                "$BASE/api/value-bets-locked?slot=$SLOT&n=1" || echo '{}')
+          N=$(printf "%s" "$OUT" | jq -r '(.items|length) // 0' 2>/dev/null || echo 0)
+          if [ "$N" -eq 0 ]; then
             echo "KV empty -> warm via rebuild + short sleep"
-            curl -fsS \
-              -A "gha-odds-watcher/1.1" \
-              --connect-timeout 10 \
-              --max-time 120 \
-              "$BASE/api/cron/rebuild?slot=$SLOT" || true
+            curl -fsS -A "gha-odds-watcher/1.1" --connect-timeout 10 --max-time 120 \
+                 "$BASE/api/cron/rebuild?slot=$SLOT" || true
             sleep 3
           fi
-          echo "vb_locked_response=$OUT" >> "$GITHUB_OUTPUT"
+          echo "vb_locked_response_len=$N" >> "$GITHUB_OUTPUT"
 
-      # REFRESH: uvek pozovi refresh-odds (više nema skip logike)
       - name: Refresh odds for current slot (always)
         run: |
           set -euo pipefail
@@ -103,7 +92,7 @@ jobs:
             --connect-timeout 10 \
             --max-time 180 \
             --retry 2 --retry-all-errors --retry-delay 3 --retry-max-time 200 \
-            "$BASE/api/cron/refresh-odds?slot=$SLOT" || true
+            "$BASE/api/cron/refresh-odds?slot=$SLOT&force=1" || true
 
       - name: Done
         run: echo "Done."
