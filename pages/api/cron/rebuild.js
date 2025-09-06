@@ -1,249 +1,210 @@
 // pages/api/cron/rebuild.js
-// Punjenje ključeva za UI sa 15 najboljih (Football) i Top 3 (Combined), uz no-overwrite-when-empty.
-// - union iz vbl:<YMD>:{am,pm,late}
-// - ako prazno → /api/score-sync?ymd=<YMD>, pa ponovo
-// - ako prazno → /api/score-sync?days=3, pa ponovo
-// - ako prazno → fallback na vb:day:<YMD>:last (lista ili pointer)
-// - ako prazno → pogledaj susedne dane (YMD-1, YMD+1) i filtriraj kickoff u lokalni <YMD>
-// - piši samo ako ima >0 stavki; nikad ne prepisuj prazninom
-// - vb:day:<YMD>:last  = Top 15 (LISTA)
-// - vb:day:<YMD>:combined = Top 3 (LISTA)
+// Rebuild "locked" dnevne ključeve za zadati slot.
+// Ako nema kandidata u vb:day:*, fallback na vbl/vbl_full kako bi Snapshot dobio ne-prazan feed.
+// Ne menja istoriju: pišemo samo u vb:day:* ključeve, format kompatibilan sa postojećim reader-ima.
 
-function kvEnv() {
-  const url =
-    process.env.KV_REST_API_URL ||
-    process.env.UPSTASH_REDIS_REST_URL ||
-    process.env.KV_URL ||
-    "";
-  const token =
-    process.env.KV_REST_API_TOKEN ||
-    process.env.UPSTASH_REDIS_REST_TOKEN ||
-    process.env.KV_REST_API_READ_ONLY_TOKEN ||
-    "";
-  return { url, token };
-}
+export const config = { api: { bodyParser: false } };
 
-async function kvPipeline(cmds) {
-  const { url, token } = kvEnv();
-  if (!url || !token) throw new Error("KV env not set (URL/TOKEN).");
-  const r = await fetch(`${url}/pipeline`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify(cmds),
-    cache: "no-store",
-  });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`KV pipeline HTTP ${r.status}: ${t}`);
-  }
-  return r.json();
-}
-async function kvGet(key) { const out = await kvPipeline([["GET", key]]); return out?.[0]?.result ?? null; }
-async function kvSet(key, val) { const out = await kvPipeline([["SET", key, val]]); return out?.[0]?.result ?? "OK"; }
-async function kvGetJSON(key) {
-  const raw = await kvGet(key);
-  if (raw == null) return null;
-  if (typeof raw === "string") {
-    const s = raw.trim();
-    if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
-      try { return JSON.parse(s); } catch { return raw; }
-    }
-    return raw;
-  }
-  return raw;
-}
-async function kvSetJSON(key, obj) { return kvSet(key, JSON.stringify(obj)); }
+const TZ = "Europe/Belgrade";
 
-function ymdInTZ(tz = "Europe/Belgrade", d = new Date()) {
-  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(d);
-  const y = parts.find(p => p.type === "year")?.value;
-  const m = parts.find(p => p.type === "month")?.value;
-  const dd = parts.find(p => p.type === "day")?.value;
-  return `${y}-${m}-${dd}`;
-}
-function shiftYmd(ymd, delta) {
-  const d = new Date(`${ymd}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + delta);
-  return d.toISOString().slice(0,10);
-}
-
-/* ---------- ranking helpers ---------- */
-
-function dedupeBySignature(items = []) {
-  const out = []; const seen = new Set();
-  for (const it of Array.isArray(items) ? items : []) {
-    const fid = it.fixture_id ?? it.id ?? it.fixtureId ?? "";
-    const mkt = it.market ?? it.market_label ?? "";
-    const sel = it.pick ?? it.selection ?? it.selection_label ?? "";
-    const sig = `${fid}::${mkt}::${sel}`;
-    if (!seen.has(sig)) { seen.add(sig); out.push(it); }
-  }
+/* ---------------- KV (Vercel REST, RW/RO token) ---------------- */
+function getKvCfgs() {
+  const url = (process.env.KV_REST_API_URL || "").replace(/\/+$/, "");
+  const rw  = process.env.KV_REST_API_TOKEN || "";
+  const ro  = process.env.KV_REST_API_READ_ONLY_TOKEN || "";
+  const out = [];
+  if (url && rw) out.push({ flavor: "vercel-kv:rw", url, token: rw });
+  if (url && ro) out.push({ flavor: "vercel-kv:ro", url, token: ro });
   return out;
 }
-function rankOf(it) {
-  const c = Number(it?.confidence_pct);
-  const p = Number(it?.model_prob);
-  const evlb = Number(it?._ev_lb);
-  const ev = Number(it?._ev);
-  return [
-    - (Number.isFinite(c) ? c : -1),
-    - (Number.isFinite(p) ? p : -1),
-    - (Number.isFinite(evlb) ? evlb : -1),
-    - (Number.isFinite(ev) ? ev : -1),
-  ];
-}
-function sortByRank(items) {
-  return [...items].sort((a, b) => {
-    const ra = rankOf(a), rb = rankOf(b);
-    for (let i = 0; i < ra.length; i++) if (ra[i] !== rb[i]) return ra[i] - rb[i];
-    return 0;
-  });
-}
-function topN(items, n) {
-  const sorted = sortByRank(items);
-  return sorted.slice(0, Math.max(0, Math.min(n, sorted.length)));
-}
-function top3(items) { return topN(items, 3); }
-function top15(items) { return topN(items, 15); }
 
-/* ---------- IO helpers ---------- */
-
-async function readArrayMaybeJSON(val) {
-  if (Array.isArray(val)) return val;
-  if (typeof val === "string" && val.trim().startsWith("[")) { try { return JSON.parse(val); } catch {} }
-  return [];
-}
-async function readArrayKey(key) { return readArrayMaybeJSON(await kvGetJSON(key)); }
-
-async function buildUnionFromSlots(ymd) {
-  const slots = ["am", "pm", "late"];
-  const cmds = slots.map(s => ["GET", `vbl:${ymd}:${s}`]);
-  const out = await kvPipeline(cmds);
-  const chunks = [];
-  for (let i = 0; i < slots.length; i++) {
-    const raw = out?.[i]?.result ?? null;
-    if (!raw) continue;
-    const arr = await readArrayMaybeJSON(raw);
-    if (arr.length) chunks.push(...arr); // OBAVEZNO spread
+async function kvGET_first(key, diag) {
+  const cfgs = getKvCfgs();
+  for (const c of cfgs) {
+    try {
+      const r = await fetch(`${c.url}/get/${encodeURIComponent(key)}`, {
+        headers: { Authorization: `Bearer ${c.token}` },
+        cache: "no-store",
+      });
+      const ok = r.ok;
+      const j  = ok ? await r.json().catch(() => null) : null;
+      const val = j && typeof j.result === "string" ? j.result : null;
+      diag && (diag[c.flavor] = diag[c.flavor] || {},
+               diag[c.flavor][key] = ok ? (val ? `hit(len=${val.length})` : "miss(null)") : `miss(http ${r.status})`,
+               diag[c.flavor]._url = c.url);
+      if (val) return { raw: val, flavor: c.flavor, url: c.url };
+    } catch (e) {
+      diag && (diag[c.flavor] = diag[c.flavor] || {},
+               diag[c.flavor][key] = `miss(err:${String(e?.message||e).slice(0,60)})`);
+    }
   }
-  return dedupeBySignature(chunks);
-}
-async function tryHit(url) { try { await fetch(url, { cache: "no-store" }).then(r => r.text()); } catch {} }
-
-function localYmdFromUTC(iso, tz = "Europe/Belgrade") {
-  try {
-    const d = new Date(iso);
-    const parts = new Intl.DateTimeFormat("en-GB", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(d);
-    const y = parts.find(p => p.type === "year")?.value;
-    const m = parts.find(p => p.type === "month")?.value;
-    const dd = parts.find(p => p.type === "day")?.value;
-    return `${y}-${m}-${dd}`;
-  } catch { return null; }
-}
-function inLocalDay(it, ymd, tz = "Europe/Belgrade") {
-  const utc = it?.kickoff_utc || it?.kickoffUTC || it?.kickoffUtc || null;
-  if (utc) return localYmdFromUTC(utc, tz) === ymd;
-  const k = (it?.kickoff || "").toString();
-  return k.length >= 10 ? k.slice(0,10) === ymd : false;
+  return { raw: null, flavor: null, url: null };
 }
 
-async function getUnionFromLast(ymd) {
-  const lastVal = await kvGetJSON(`vb:day:${ymd}:last`);
-  if (Array.isArray(lastVal) && lastVal.length) return dedupeBySignature(lastVal);
-  if (typeof lastVal === "string") {
-    const deref = await readArrayKey(String(lastVal));
-    if (deref.length) return dedupeBySignature(deref);
+async function kvSET_all(key, valueString, diag) {
+  // valueString treba da bude STRING; pišemo {"value": valueString} da ostanemo kompatibilni
+  const cfgs = getKvCfgs().filter(c => c.flavor.includes(":rw"));
+  let okAny = false;
+  for (const c of cfgs) {
+    try {
+      const r = await fetch(`${c.url}/set/${encodeURIComponent(key)}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${c.token}`,
+          "Content-Type": "application/json",
+        },
+        cache: "no-store",
+        body: JSON.stringify({ value: valueString }),
+      });
+      const ok = r.ok;
+      diag && (diag[c.flavor] = diag[c.flavor] || {},
+               diag[c.flavor][`SET ${key}`] = ok ? "ok" : `http ${r.status}`);
+      okAny = okAny || ok;
+    } catch (e) {
+      diag && (diag[c.flavor] = diag[c.flavor] || {},
+               diag[c.flavor][`SET ${key}`] = `err:${String(e?.message||e).slice(0,60)}`);
+    }
   }
-  return [];
+  return okAny;
 }
-async function getUnionFromAdjacentDaysFiltered(ymd) {
-  const days = [shiftYmd(ymd, -1), shiftYmd(ymd, +1)];
-  let combined = [];
-  for (const d of days) {
-    const arr = await buildUnionFromSlots(d);
-    if (arr.length) combined.push(...arr.filter(it => inLocalDay(it, ymd, "Europe/Belgrade")));
+
+/* ---------------- parsing helpers (robust) ---------------- */
+function J(s){ try{ return JSON.parse(s); }catch{ return null; } }
+function unpack(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  let v1 = J(raw);
+  if (Array.isArray(v1)) return v1;
+
+  if (v1 && typeof v1 === "object" && "value" in v1) {
+    const inner = v1.value;
+    if (Array.isArray(inner)) return inner;
+    if (typeof inner === "string") {
+      const v2 = J(inner);
+      if (Array.isArray(v2)) return v2;
+      if (v2 && typeof v2 === "object") return v2;
+    }
+    return v1;
   }
-  return dedupeBySignature(combined);
+
+  if (typeof v1 === "string" && /^[\[{]/.test(v1.trim())) {
+    const v2 = J(v1);
+    if (Array.isArray(v2) || (v2 && typeof v2 === "object")) return v2;
+  }
+  if (/^[\[{]/.test(raw.trim())) {
+    const v3 = J(raw.trim());
+    if (Array.isArray(v3) || (v3 && typeof v3 === "object")) return v3;
+  }
+  return v1;
+}
+function arrFromAny(x) {
+  if (!x) return null;
+  if (Array.isArray(x)) return x;
+  if (Array.isArray(x.items)) return x.items;
+  if (Array.isArray(x.value_bets)) return x.value_bets;
+  if (Array.isArray(x.football)) return x.football;
+  if (Array.isArray(x.list)) return x.list;
+  if (Array.isArray(x.data)) return x.data;
+  if (Array.isArray(x.value)) return x.value;
+  if (typeof x.value === "string") {
+    const v = J(x.value);
+    if (Array.isArray(v)) return v;
+    if (v && typeof v === "object") {
+      if (Array.isArray(v.items)) return v.items;
+      if (Array.isArray(v.value_bets)) return v.value_bets;
+      if (Array.isArray(v.football)) return v.football;
+      if (Array.isArray(v.list)) return v.list;
+      if (Array.isArray(v.data)) return v.data;
+    }
+  }
+  return null;
 }
 
-/* ---------- handler ---------- */
+/* ---------------- time helpers ---------------- */
+function ymdInTZ(d=new Date(), tz=TZ){
+  const fmt = new Intl.DateTimeFormat("en-CA",{ timeZone:tz, year:"numeric", month:"2-digit", day:"2-digit" });
+  const p = fmt.formatToParts(d).reduce((a,x)=>(a[x.type]=x.value,a),{});
+  return `${p.year}-${p.month}-${p.day}`;
+}
+function hourInTZ(d=new Date(), tz=TZ){
+  const fmt = new Intl.DateTimeFormat("en-GB",{ timeZone:tz, hour:"2-digit", hour12:false });
+  return parseInt(fmt.format(d),10);
+}
+function deriveSlot(h){ if (h<12) return "am"; if (h<18) return "pm"; return "late"; }
 
+/* ---------------- handler ---------------- */
 export default async function handler(req, res) {
   try {
-    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Cache-Control","no-store");
+    const q = req.query || {};
+    const now = new Date();
+    const ymd = (q.ymd && /^\d{4}-\d{2}-\d{2}$/.test(String(q.ymd))) ? String(q.ymd) : ymdInTZ(now, TZ);
+    const slot = (q.slot && /^(am|pm|late)$/.test(String(q.slot))) ? String(q.slot) : deriveSlot(hourInTZ(now, TZ));
+    const wantDebug = String(q.debug ?? "") === "1";
+    const diag = wantDebug ? {} : null;
 
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const ymd = url.searchParams.get("ymd") || ymdInTZ("Europe/Belgrade");
-    const proto = (req.headers["x-forwarded-proto"] || "https");
-    const base = `${proto}://${req.headers.host}`;
-
-    // Sačuvaj stare vrednosti da ih ne pregaziš prazninom
-    const oldLast = await kvGetJSON(`vb:day:${ymd}:last`);
-    const oldCombined = await kvGetJSON(`vb:day:${ymd}:combined`);
-
-    // 1) union iz slotova
-    let union = await buildUnionFromSlots(ymd);
-
-    // 2) auto score-sync za taj YMD
-    if (!union.length) {
-      await tryHit(`${base}/api/score-sync?ymd=${encodeURIComponent(ymd)}`);
-      union = await buildUnionFromSlots(ymd);
+    // 1) pokušaj primarnih kandidata u vb:day:*
+    const primKeys = [
+      `vb:day:${ymd}:${slot}`,
+      `vb:day:${ymd}:union`,
+      `vb:day:${ymd}:last`,
+    ];
+    let candidates = null, src = null;
+    for (const k of primKeys) {
+      const { raw } = await kvGET_first(k, diag);
+      const arr = arrFromAny(unpack(raw));
+      if (arr && arr.length) { candidates = arr; src = k; break; }
     }
 
-    // 3) score-sync sa days (neki tokovi pune samo sa ?days)
-    if (!union.length) {
-      await tryHit(`${base}/api/score-sync?days=3`);
-      union = await buildUnionFromSlots(ymd);
+    // 2) fallback: vbl/vbl_full ako primarni ne postoje
+    if (!candidates || !candidates.length) {
+      const fbKeys = [
+        `vbl:${ymd}:${slot}`,
+        `vbl_full:${ymd}:${slot}`,
+      ];
+      for (const k of fbKeys) {
+        const { raw } = await kvGET_first(k, diag);
+        const arr = arrFromAny(unpack(raw));
+        if (arr && arr.length) { candidates = arr; src = `${k}→fallback`; break; }
+      }
     }
 
-    // 4) fallback na :last (lista ili pointer)
-    if (!union.length) {
-      union = await getUnionFromLast(ymd);
-    }
-
-    // 5) fallback na susedne dane (filtrirano po lokalnom YMD)
-    if (!union.length) {
-      union = await getUnionFromAdjacentDaysFiltered(ymd);
-    }
-
-    // Ako nema ničega — ne diraj postojeće vrednosti
-    if (!union.length) {
-      const finalLast = Array.isArray(oldLast) ? oldLast : [];
-      const finalCombined = Array.isArray(oldCombined) ? oldCombined : [];
+    if (!candidates || !candidates.length) {
+      // ništa ne diramo
       return res.status(200).json({
         ok: true,
         ymd,
         mutated: false,
-        counts: {
-          union: 0,
-          last: Array.isArray(finalLast) ? finalLast.length : 0,
-          combined: Array.isArray(finalCombined) ? finalCombined.length : 0,
-        },
+        counts: { union: 0, last: 0, combined: 0 },
         note: "no candidates → keys NOT mutated",
+        ...(wantDebug ? { debug: diag } : {})
       });
     }
 
-    // Imamo unose → pripremi Top 15 i Top 3
-    const unionDedupe = dedupeBySignature(union);
-    const lastTop15 = top15(unionDedupe);     // Football tab traži 15 najboljih
-    const combinedTop3 = top3(unionDedupe);   // Combined tab 3 najbolja
+    // 3) upiši kandidata u vb:day:* (kompatibilan format: {"value":"[...]"})
+    const payloadString = JSON.stringify(candidates);            // "[{...}]"
+    const stored = JSON.stringify({ value: payloadString });     // {"value":"[...]"}
+    const kSlot   = `vb:day:${ymd}:${slot}`;
+    const kUnion  = `vb:day:${ymd}:union`;
+    const kLast   = `vb:day:${ymd}:last`;
 
-    // Upis (LISTE, ne pointeri)
-    await kvSetJSON(`vb:day:${ymd}:union`, unionDedupe);
-    await kvSetJSON(`vb:day:${ymd}:last`, lastTop15);
-    await kvSetJSON(`vb:day:${ymd}:combined`, combinedTop3);
+    await kvSET_all(kSlot,  stored, diag);
+    await kvSET_all(kUnion, stored, diag);
+    await kvSET_all(kLast,  stored, diag);
 
     return res.status(200).json({
       ok: true,
       ymd,
       mutated: true,
       counts: {
-        union: unionDedupe.length,
-        last: lastTop15.length,
-        combined: combinedTop3.length,
+        union: candidates.length,
+        last:  candidates.length,
+        combined: candidates.length,
       },
-      note: "keys updated (last=Top15, combined=Top3)",
+      source: src,
+      ...(wantDebug ? { debug: diag } : {})
     });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+
+  } catch (e) {
+    return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
 }
