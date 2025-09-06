@@ -1,4 +1,6 @@
 // pages/api/crypto.js
+// API sa "compat" projekcijom za postojeći UI: dodaje alias polja i top-level duplikate.
+// Core i KV keš ostaju isti (buildSignals u lib/crypto-core.js).
 import { buildSignals } from "../../lib/crypto-core";
 
 const {
@@ -32,7 +34,9 @@ export default async function handler(req, res) {
   try {
     const force = parseBool(req.query.force || "0");
     const n = clampInt(req.query.n, CFG.TOP_N, 1, 10);
+    const shape = String(req.query.shape || "").toLowerCase(); // "legacy" | "slim" (opciono)
 
+    // force auth + throttle
     if (force) {
       if (!checkCronKey(req, CRON_KEY)) return res.status(401).json({ ok: false, error: "unauthorized" });
       if (await isForceThrottled()) return res.status(429).json({ ok: false, error: "too_many_requests" });
@@ -41,15 +45,20 @@ export default async function handler(req, res) {
     const cacheKey = "crypto:signals:latest";
     const cached = await kvGetJSON(cacheKey);
     if (!force && cached && Array.isArray(cached.items) && cached.items.length) {
-      const items = projectForUI(cached.items).slice(0, n);
-      return res.status(200).json({
-        ok: true, source: "cache",
+      const arr = projectForUI(cached.items).sort((a,b)=>b.confidence_pct - a.confidence_pct).slice(0, n);
+      return sendCompat(res, {
+        ok: true,
+        version: "crypto-v1-compat",
+        sport: "crypto",
+        source: "cache",
         ts: cached.ts || Date.now(),
         ttl_min: cached.ttl_min || CFG.REFRESH_MIN,
-        count: items.length, items,
-      });
+        count: arr.length,
+        items: arr,
+      }, shape);
     }
 
+    // live refresh
     const itemsRaw = await buildSignals({
       cgApiKey: COINGECKO_API_KEY,
       minVol: CFG.MIN_VOL,
@@ -61,35 +70,103 @@ export default async function handler(req, res) {
 
     const itemsStable = await applyStickiness(itemsRaw, CFG.COOLDOWN_MIN);
 
+    // upiši keš (bez n-limit)
     const payload = { ts: Date.now(), ttl_min: CFG.REFRESH_MIN, items: itemsStable };
     await kvSetJSON(cacheKey, payload, CFG.REFRESH_MIN * 60);
     if (force) await setForceLock();
 
-    const top = projectForUI(itemsStable).sort((a,b)=>b.confidence_pct - a.confidence_pct).slice(0, n);
+    // top-N i projekcija
+    const arr = projectForUI(itemsStable).sort((a,b)=>b.confidence_pct - a.confidence_pct).slice(0, n);
 
-    return res.status(200).json({
-      ok: true, source: "live",
-      ts: payload.ts, ttl_min: payload.ttl_min,
-      count: top.length, items: top,
-    });
+    return sendCompat(res, {
+      ok: true,
+      version: "crypto-v1-compat",
+      sport: "crypto",
+      source: "live",
+      ts: payload.ts,
+      ttl_min: payload.ttl_min,
+      count: arr.length,
+      items: arr,
+    }, shape);
+
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
 }
 
-/* ---------- projection for UI (aliases added) ---------- */
+/* ---------- UI projection / aliases ---------- */
 function projectForUI(list) {
-  return (Array.isArray(list) ? list : []).map((it) => ({
-    ...it,
-    type: "crypto",
-    ticker: it.symbol,
-    direction: String(it.signal || "").toLowerCase(),   // long/short
-    confidence: it.confidence_pct,                      // alias
-    change30m: nz(it.m30_pct), change1h: nz(it.h1_pct),
-    change4h: nz(it.h4_pct), change24h: nz(it.d24_pct), change7d: nz(it.d7_pct),
-  }));
+  return (Array.isArray(list) ? list : []).map((it) => {
+    const dir = String(it.signal || "").toLowerCase(); // long/short
+    const isLong = dir === "long";
+    const isShort = dir === "short";
+
+    const m30 = numOr0(it.m30_pct);
+    const h1  = numOr0(it.h1_pct);
+    const h4  = numOr0(it.h4_pct);
+    const d24 = numOr0(it.d24_pct);
+    const d7  = numOr0(it.d7_pct);
+
+    return {
+      // original
+      ...it,
+
+      // canonical fields
+      type: "crypto",
+      sport: "crypto",
+      category: "crypto",
+      market: "crypto",
+      ticker: it.symbol,
+      symbolUpper: String(it.symbol || "").toUpperCase(),
+
+      // direction aliases
+      signal: it.signal,                 // LONG/SHORT
+      direction: dir,                    // long/short
+      side: dir,                         // alias
+      action: isLong ? "BUY" : "SELL",   // BUY/SELL
+      isLong, isShort,
+
+      // confidence aliases
+      confidence_pct: it.confidence_pct,
+      confidence: it.confidence_pct,
+      confidenceScore: it.confidence_pct,
+      score: it.confidence_pct,
+
+      // timeframe aliases (numbers only)
+      m30_pct: m30, h1_pct: h1, h4_pct: h4, d24_pct: d24, d7_pct: d7,
+      change30m: m30, change1h: h1, change4h: h4, change24h: d24, change7d: d7,
+      tf: { m30, h1, h4, d24, d7 },   // ponekad UI čita ugnježden objekat
+
+      // optional SL/TP ako ih ima (ostavi kako jeste)
+      // entry, sl, tp mogu postojati iz core-a sa ATR – ne diramo
+    };
+  });
 }
-function nz(x){ return (x == null ? 0 : x); }
+
+/* ---------- response shaper (top-level aliases) ---------- */
+function sendCompat(res, base, shape) {
+  const items = base.items || [];
+  const out = {
+    ...base,
+    // top-level duplicati za različite UI-ove
+    data: items,
+    predictions: items,
+    rows: items,
+    list: items,
+    results: items,
+    total: base.count,
+  };
+
+  if (shape === "legacy") {
+    // Najčešći legacy format: { ok, total, items } (plus zadržimo kompat polja)
+    return res.status(200).json({ ok: out.ok, total: out.count, items: out.items, ...out });
+  }
+  if (shape === "slim") {
+    // Samo niz stavki, bez omota (ako UI to traži)
+    return res.status(200).json(items);
+  }
+  return res.status(200).json(out);
+}
 
 /* ---------- security/throttle ---------- */
 function checkCronKey(req, expected) {
@@ -164,7 +241,8 @@ function authHeader() {
   return h;
 }
 
-/* ---------- tiny utils ---------- */
+/* ---------- utils ---------- */
 function toNum(x, d = 0) { const n = Number(x); return Number.isFinite(n) ? n : d; }
 function clampInt(v, def, min, max) { const n = parseInt(v,10); if (!Number.isFinite(n)) return def; return Math.min(max, Math.max(min, n)); }
 function parseBool(x){ return String(x).toLowerCase()==="1"||String(x).toLowerCase()==="true"; }
+function numOr0(v){ const n = Number(v); return Number.isFinite(n) ? n : 0; }
