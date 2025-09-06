@@ -1,8 +1,12 @@
 // pages/api/cron/crypto-watchdog.js
-// Ping koji forsira osvežavanje kripto signala i PROSLEĐUJE tajni ključ ka /api/crypto.
-// Pokriva oba slučaja zaštite: preko header-a i preko query parametra.
+// Forsira osvežavanje kripto signala i PROSLEĐUJE tajni ključ + Vercel Protection Bypass token
+// kako bi zaobišao "Authentication Required" stranicu.
+//
+// ENV koje koristi:
+// - CRON_KEY               (tvoja tajna lozinka za watchdog endpoint)
+// - VERCEL_BYPASS_TOKEN    (Vercel Protection → Bypass Tokens → Create Token)
 
-const { CRON_KEY = "" } = process.env;
+const { CRON_KEY = "", VERCEL_BYPASS_TOKEN = "" } = process.env;
 
 export default async function handler(req, res) {
   try {
@@ -12,18 +16,22 @@ export default async function handler(req, res) {
     }
 
     const base = getBaseUrl(req); // npr. https://predictscores.vercel.app
-    // Prosledi ključ i u query (key=...) za slučaj da middleware to očekuje.
-    const target = `${base}/api/crypto?force=1&key=${encodeURIComponent(CRON_KEY)}`;
+    const target = `${base}/api/crypto?force=1`;
 
-    // Prosledi ključ i u header-ima (x-cron-key + Authorization: Bearer ...)
-    const r = await fetch(target, {
-      cache: "no-store",
-      headers: {
-        "x-cron-key": CRON_KEY,
-        "authorization": `Bearer ${CRON_KEY}`,
-      },
-    });
+    const headers = {
+      "user-agent": "crypto-watchdog/1.0",
+      // prosledi i naš ključ (ako tvoj /api/crypto ili neki middleware to očekuje)
+      "x-cron-key": CRON_KEY,
+      "authorization": `Bearer ${CRON_KEY}`,
+    };
 
+    // Ako je uključena Vercel Protection, prosledi bypass token u headeru i kao cookie
+    if (VERCEL_BYPASS_TOKEN) {
+      headers["x-vercel-protection-bypass"] = VERCEL_BYPASS_TOKEN;
+      headers["cookie"] = `vercel_bypass=${VERCEL_BYPASS_TOKEN}`;
+    }
+
+    const r = await fetch(target, { cache: "no-store", headers });
     const text = await r.text();
     let json;
     try { json = JSON.parse(text); } catch {}
@@ -34,7 +42,6 @@ export default async function handler(req, res) {
       upstream: { status: r.status, ok: r.ok },
       live_count: json?.count ?? null,
       ts: Date.now(),
-      // mali debug snapshot (bezbedno): ili JSON ili prvih 200 znakova teksta
       sample: json ?? text.slice(0, 200),
     });
   } catch (e) {
