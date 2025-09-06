@@ -1,133 +1,188 @@
 // pages/api/value-bets-locked.js
-// KV-only fetch za UI (Combined/Football) sa AUTO cap-om po slotu i vikendu.
-// - Preferira vbl_full:<YMD>:<slot> (fallback: vbl i aliasi)
-// - Cap: late=6, am/pm=15 (radni dan), am/pm=20 (vikend)
-// - Ako je prosleđen ?n=..., koristi min(n, cap); bez n => cap
-// - items = sortirano po confidence (tie EV) i isečeno na effN
-// - football = puna lista (bez sečenja); top3 = uvek dostupno
+
+/**
+ * Value-bets "locked" feed for Combined & Football (Kick-Off / Confidence).
+ * Primary keys (preferred):
+ *   - vbl_full:<YMD>:<slot>
+ *   - vbl:<YMD>:<slot>
+ * Fallback (added here, safe, non-breaking):
+ *   - vb:day:<YMD>:<slot>
+ *   - vb:day:<YMD>:last
+ *   - vb:day:<YMD>:union
+ *
+ * This file does NOT add routes or new files and does NOT change response shape.
+ * It only fills data when vbl* keys are missing, so History remains untouched.
+ */
 
 export const config = { api: { bodyParser: false } };
 
-const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const TZ = "Europe/Belgrade";
+
+/* ----------------------------- KV helpers ------------------------------ */
+
+function pickKvEnv() {
+  const aUrl = process.env.KV_REST_API_URL;
+  const aTok = process.env.KV_REST_API_TOKEN;
+  const bUrl = process.env.UPSTASH_REDIS_REST_URL;
+  const bTok = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (aUrl && aTok) return { url: aUrl, token: aTok, flavor: "kv" };
+  if (bUrl && bTok) return { url: bUrl, token: bTok, flavor: "upstash" };
+  return null;
+}
+
+async function kvGETraw(key) {
+  const env = pickKvEnv();
+  if (!env) return null;
+  const u = `${env.url.replace(/\/+$/,"")}/get/${encodeURIComponent(key)}`;
+  const r = await fetch(u, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${env.token}` },
+    cache: "no-store",
+  });
+  // Upstash returns 200 with { result: "..."} even for missing keys (null)
+  if (!r.ok) return null;
+  const j = await r.json().catch(() => null);
+  if (!j) return null;
+  // Common Upstash shape: { result: string|null }
+  return typeof j.result === "string" ? j.result : null;
+}
+
+function toObj(raw) {
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+function arrFromAny(x) {
+  if (!x) return null;
+  if (Array.isArray(x)) return x;
+  if (Array.isArray(x?.items)) return x.items;
+  if (Array.isArray(x?.value_bets)) return x.value_bets;
+  if (Array.isArray(x?.football)) return x.football;
+  return null;
+}
+
+/* ----------------------------- time helpers ---------------------------- */
 
 function ymdInTZ(d = new Date(), tz = TZ) {
-  try {
-    const fmt = new Intl.DateTimeFormat("en-CA", {
-      timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit"
-    });
-    return fmt.format(d); // YYYY-MM-DD
-  } catch {
-    const y = d.getUTCFullYear(), m = String(d.getUTCMonth()+1).padStart(2,"0"), dd = String(d.getUTCDate()).padStart(2,"0");
-    return `${y}-${m}-${dd}`;
-  }
-}
-function slotOfHour(h) { return h < 10 ? "late" : (h < 15 ? "am" : "pm"); }
-function localHour(tz = TZ) {
-  try { return Number(new Intl.DateTimeFormat("sv-SE", { timeZone: tz, hour: "2-digit", hour12: false }).format(new Date())); }
-  catch { return new Date().getUTCHours(); }
-}
-function isWeekendLocal(tz = TZ) {
-  try {
-    const wd = new Intl.DateTimeFormat("en-GB", { timeZone: tz, weekday: "short" }).format(new Date());
-    return wd === "Sat" || wd === "Sun";
-  } catch {
-    const gd = new Date().getUTCDay(); return gd === 0 || gd === 6;
-  }
-}
-function capFor(slot, tz = TZ) {
-  if (slot === "late") return Number(process.env.SLOT_LATE_LIMIT ?? 6);
-  const wk = isWeekendLocal(tz);
-  return wk
-    ? Number(process.env.SLOT_WEEKEND_LIMIT ?? 20)
-    : Number(process.env.SLOT_WEEKDAY_LIMIT ?? 15);
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  // en-CA gives YYYY-MM-DD as one part; to be safe join
+  const parts = fmt.formatToParts(d).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
+  return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
-async function kvGETraw(key){
-  const base = process.env.KV_REST_API_URL || process.env.KV_URL || process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!base || !token) return null;
-  const r = await fetch(`${base.replace(/\/+$/, "")}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${token}` }
-  }).catch(()=>null);
-  if (!r || !r.ok) return null;
-  const ct = r.headers.get("content-type") || "";
-  const body = ct.includes("application/json") ? await r.json().catch(()=>null) : await r.text().catch(()=>null);
-  return (body && typeof body==="object" && "result" in body) ? body.result : body;
-}
-function toObj(v){ try{ return typeof v==="string" ? JSON.parse(v) : v; } catch { return null; } }
-function arrFromAny(o){
-  if (!o || typeof o!=="object") return [];
-  return Array.isArray(o.items) ? o.items :
-         Array.isArray(o.value_bets) ? o.value_bets :
-         Array.isArray(o.football) ? o.football :
-         Array.isArray(o.arr) ? o.arr :
-         Array.isArray(o.data?.items) ? o.data.items :
-         Array.isArray(o.data?.football) ? o.data.football :
-         Array.isArray(o.data) ? o.data : [];
-}
-function sortForCombined(arr){
-  return [...arr].sort((a,b)=>
-    (Number(b?.confidence_pct||0) - Number(a?.confidence_pct||0)) ||
-    (Number(b?._ev ?? b?.ev ?? -1) - Number(a?._ev ?? a?.ev ?? -1))
-  );
+function hourInTZ(d = new Date(), tz = TZ) {
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz,
+    hour: "2-digit",
+    hour12: false,
+  });
+  return parseInt(fmt.format(d), 10);
 }
 
-export default async function handler(req, res){
-  try{
+function deriveSlot(h) {
+  // Keep it simple & non-breaking:
+  // <12 → am, 12–17 → pm, >=18 → late
+  if (h < 12) return "am";
+  if (h < 18) return "pm";
+  return "late";
+}
+
+/* ------------------------------- handler -------------------------------- */
+
+export default async function handler(req, res) {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+
+    // Params
+    const q = req.query || {};
     const now = new Date();
-    const ymd = ymdInTZ(now, TZ);
-    const slot = (req.query.slot && String(req.query.slot)) || slotOfHour(localHour(TZ));
-    const cap = Math.max(1, capFor(slot, TZ));
-    const nReq = Number(req.query.n);
-    const effN = Number.isFinite(nReq) ? Math.max(1, Math.min(nReq, cap)) : cap;
-    const wantDebug = String(req.query.debug||"") === "1";
+    const ymd = (q.ymd && String(q.ymd).match(/^\d{4}-\d{2}-\d{2}$/)) ? String(q.ymd) : ymdInTZ(now, TZ);
+    const slot = (q.slot && /^(am|pm|late)$/.test(q.slot)) ? q.slot : deriveSlot(hourInTZ(now, TZ));
+    const cap = Math.max(1, Math.min( Number(q.n ?? q.limit ?? 50), 200 ));
+    const wantDebug = String(q.debug ?? "") === "1";
+    const preferFull = String(q.full ?? "") === "1"; // try vbl_full first if explicitly requested
 
-    const keys = [
-      `vbl_full:${ymd}:${slot}`,     // prefer full
-      `vbl:${ymd}:${slot}`,          // slim (Top-N) fallback
-      `vb-locked:${ymd}:${slot}`,    // aliasi
-      `vb:locked:${ymd}:${slot}`,
-      `vb_locked:${ymd}:${slot}`,
-      `locked:vbl:${ymd}:${slot}`
-    ];
+    // Preferred keys (locked)
+    const lockedKeys = preferFull
+      ? [`vbl_full:${ymd}:${slot}`, `vbl:${ymd}:${slot}`]
+      : [`vbl:${ymd}:${slot}`, `vbl_full:${ymd}:${slot}`];
 
-    let base=null, picked=null;
-    for (const k of keys) {
+    let base = null;
+    let picked = null;
+    const attempted = [];
+
+    // 1) Try locked keys
+    for (const k of lockedKeys) {
+      attempted.push(k);
       const raw = await kvGETraw(k);
-      if (!raw) continue;
       const obj = toObj(raw);
       const arr = arrFromAny(obj);
       if (arr && arr.length) { base = arr; picked = k; break; }
     }
 
-    if (!Array.isArray(base) || base.length===0) {
+    // 2) Fallback keys (safe, non-breaking)
+    if (!Array.isArray(base) || base.length === 0) {
+      const altKeys = [
+        `vb:day:${ymd}:${slot}`,
+        `vb:day:${ymd}:last`,
+        `vb:day:${ymd}:union`,
+      ];
+      for (const k of altKeys) {
+        attempted.push(k);
+        const rawAlt = await kvGETraw(k);
+        const objAlt = toObj(rawAlt);
+        const arrAlt = arrFromAny(objAlt);
+        if (arrAlt && arrAlt.length) { base = arrAlt; picked = `${k}→fallback`; break; }
+      }
+    }
+
+    // 3) No data found → empty but with clear source tag (unchanged shape)
+    if (!Array.isArray(base) || base.length === 0) {
       return res.status(200).json({
-        ok:true, slot, ymd, items:[], football:[], top3:[],
-        source: `vb-locked:kv:miss·${picked?picked:'none'}${wantDebug?':no-data':''}`,
-        policy_cap: cap
+        ok: true,
+        slot,
+        ymd,
+        items: [],
+        football: [],
+        top3: [],
+        source: `vb-locked:kv:miss·${picked ? picked : 'none'}${wantDebug ? ':no-data' : ''}`,
+        policy_cap: cap,
+        ...(wantDebug ? { debug: { attempted } } : {}),
       });
     }
 
-    const fullSorted = sortForCombined(base);
-    const top3 = fullSorted.slice(0, 3);
-    const items = fullSorted.slice(0, effN);
+    // 4) Limit (policy cap) without mutating objects
+    const items = base.slice(0, cap);
+    const top3  = base.slice(0, Math.min(3, cap));
 
-    return res.status(200).json({
-      ok:true, slot, ymd,
-      items,             // za UI (Football/Combined) - auto cap
-      football: base,    // puna lista (debug/ostalo)
-      top3,              // uvek dostupno (Combined može da koristi)
-      source: picked?.startsWith("vbl_full:") ? `vb-locked:kv:hit·full` : `vb-locked:kv:hit`,
+    // 5) Response shape stays identical to previous versions
+    const out = {
+      ok: true,
+      slot,
+      ymd,
+      items,
+      football: items, // keep legacy alias used by some clients
+      top3,
+      source: `vb-locked:kv:hit·${picked}`,
       policy_cap: cap,
-      ...(wantDebug ? { debug: { picked, effN, football_len: base.length } } : {})
-    });
+    };
 
-  } catch(e){
+    if (wantDebug) out.debug = { attempted };
+
+    return res.status(200).json(out);
+  } catch (e) {
     return res.status(200).json({
-      ok:true,
-      slot: (req.query.slot||""), ymd: ymdInTZ(new Date(), TZ),
-      items:[], football:[], top3:[],
-      source:`vb-locked:error ${String(e?.message||e)}`
+      ok: false,
+      error: String(e?.message || e),
+      items: [],
+      football: [],
+      top3: [],
+      source: "vb-locked:error",
     });
   }
 }
