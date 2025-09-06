@@ -58,7 +58,14 @@ jobs:
           set -euo pipefail
           curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/refresh-odds?slot=${{ steps.ctx.outputs.slot }}&ymd=${{ steps.ctx.outputs.ymd }}"
 
-      - name: Sanity check value-bets before rebuild (retry)
+      # ⬇️ POMERENO GORE: rebuild ide PRE sanity-check-a
+      - name: Rebuild locked feed for slot
+        run: |
+          set -euo pipefail
+          curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/rebuild?slot=${{ steps.ctx.outputs.slot }}&ymd=${{ steps.ctx.outputs.ymd }}"
+
+      # Sanity check sada proverava /api/value-bets-locked i polje "items"
+      - name: Sanity check value-bets after rebuild (retry)
         run: |
           set -euo pipefail
           B="${{ steps.ctx.outputs.base }}"
@@ -67,9 +74,10 @@ jobs:
           tries=5
           delay=6
           for i in $(seq 1 $tries); do
-            RESP=$(curl -fsS "$B/api/value-bets?slot=$S&ymd=$D&limit=1")
+            RESP=$(curl -fsS "$B/api/value-bets-locked?slot=$S&ymd=$D&slim=1&n=1")
             echo "$RESP"
-            if ! echo "$RESP" | grep -q '"value_bets":\[\]'; then
+            # Ako JE prazno -> '"items":[]' ; ako NIJE prazno, nema tog patterna
+            if ! echo "$RESP" | grep -q '"items":\[\]'; then
               echo "Non-empty feed, proceed."
               exit 0
             fi
@@ -77,11 +85,6 @@ jobs:
             sleep $delay
           done
           echo "Still empty feed; proceeding anyway."
-
-      - name: Rebuild locked feed for slot
-        run: |
-          set -euo pipefail
-          curl -fsS "${{ steps.ctx.outputs.base }}/api/cron/rebuild?slot=${{ steps.ctx.outputs.slot }}&ymd=${{ steps.ctx.outputs.ymd }}"
 
       - name: Insights build
         run: |
