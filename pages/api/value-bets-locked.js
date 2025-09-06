@@ -1,8 +1,13 @@
 // pages/api/value-bets-locked.js
 // Feed za Combined & Football (Kick-Off / Confidence)
-// 1) Primarno: vbl_full:<YMD>:<slot> / vbl:<YMD>:<slot>
-// 2) Fallback:  vb:day:<YMD>:(slot|last|union)
-// 3) Auto-warm: ako je sve prazno, pozovi /api/cron/rebuild?slot=… pa ponovi čitanje
+//
+// Prioritet:
+// 1) vbl_full:<YMD>:<slot> / vbl:<YMD>:<slot>
+// 2) fallback: vb:day:<YMD>:(slot|last|union)
+// 3) auto-warm: ako je sve prazno, pozovi /api/cron/rebuild?slot=…,
+//    pa ako KV i dalje prazan, koristi .football iz odgovora i vrati to.
+//    (Bez novih fajlova, bez menjanja History ruta/ključeva.)
+
 export const config = { api: { bodyParser: false } };
 
 const TZ = "Europe/Belgrade";
@@ -54,6 +59,28 @@ function hourInTZ(d = new Date(), tz = TZ) {
 }
 function deriveSlot(h) { if (h < 12) return "am"; if (h < 18) return "pm"; return "late"; }
 
+/* ------------------------------ rebuild IO ----------------------------- */
+function computeBaseUrl(req) {
+  const envBase = process.env.NEXT_PUBLIC_BASE_URL;
+  if (envBase) return envBase.replace(/\/+$/, "");
+  const host = req.headers["x-forwarded-host"] || req.headers.host || "localhost:3000";
+  const proto = req.headers["x-forwarded-proto"] || "https";
+  return `${proto}://${host}`;
+}
+
+async function fetchJsonSafe(url) {
+  try {
+    const r = await fetch(url, { cache: "no-store" });
+    const ct = r.headers.get("content-type") || "";
+    if (!r.ok) return null;
+    if (ct.includes("application/json")) return await r.json().catch(() => null);
+    const t = await r.text();
+    try { return JSON.parse(t); } catch { return null; }
+  } catch { return null; }
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 /* --------------------------- core load routine ------------------------- */
 async function tryLoadAllKeys(ymd, slot, preferFull, attempted) {
   let base = null, picked = null;
@@ -80,17 +107,7 @@ async function tryLoadAllKeys(ymd, slot, preferFull, attempted) {
   return { base: null, picked: null };
 }
 
-function computeBaseUrl(req) {
-  const envBase = process.env.NEXT_PUBLIC_BASE_URL;
-  if (envBase) return envBase.replace(/\/+$/, "");
-  const host = req.headers["x-forwarded-host"] || req.headers.host || "localhost:3000";
-  const proto = req.headers["x-forwarded-proto"] || "https";
-  return `${proto}://${host}`;
-}
-
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-/* ------------------------------- handler -------------------------------- */
+/* -------------------------------- handler ------------------------------ */
 export default async function handler(req, res) {
   try {
     res.setHeader("Cache-Control", "no-store");
@@ -102,24 +119,48 @@ export default async function handler(req, res) {
     const cap = Math.max(1, Math.min(Number(q.n ?? q.limit ?? 50), 200));
     const wantDebug = String(q.debug ?? "") === "1";
     const preferFull = String(q.full ?? "") === "1";
-    const allowWarm = String(q.autowarm ?? "1") !== "0"; // autowarm on by default
+    const allowWarm = String(q.autowarm ?? "1") !== "0"; // default: ON
 
     const attempted = [];
     let { base, picked } = await tryLoadAllKeys(ymd, slot, preferFull, attempted);
 
-    // Auto-warm: ako je sve prazno, okini rebuild pa probaj opet
+    // Auto-warm pass 1: pokreni rebuild i probaj ponovo pročitati KV
     if ((!Array.isArray(base) || base.length === 0) && allowWarm) {
       try {
         const baseUrl = computeBaseUrl(req);
-        // probaj rebuild za konkretni slot (ne dodajemo nove fajlove/rute)
         await fetch(`${baseUrl}/api/cron/rebuild?slot=${slot}`, { method: "GET", cache: "no-store" }).catch(() => {});
         await sleep(1500);
         ({ base, picked } = await tryLoadAllKeys(ymd, slot, preferFull, attempted));
-      } catch {
-        // swallow
-      }
+      } catch { /* ignore */ }
     }
 
+    // Auto-warm pass 2: ako KV i dalje prazan, koristi direktno .football iz rebuild odgovora (dry prvo, pa bez dry)
+    if ((!Array.isArray(base) || base.length === 0) && allowWarm) {
+      try {
+        const baseUrl = computeBaseUrl(req);
+        const tryUrls = [
+          `${baseUrl}/api/cron/rebuild?slot=${slot}&dry=1`,
+          `${baseUrl}/api/cron/rebuild?slot=${slot}`
+        ];
+        for (const u of tryUrls) {
+          const j = await fetchJsonSafe(u);
+          const arr = arrFromAny(j);
+          if (arr && arr.length) {
+            base = arr;
+            picked = `warm:rebuild.football`;
+            break;
+          }
+          // fallback: neki odgovori stavljaju pod .football eksplicitno
+          if (Array.isArray(j?.football) && j.football.length) {
+            base = j.football;
+            picked = `warm:rebuild.football`;
+            break;
+          }
+        }
+      } catch { /* ignore */ }
+    }
+
+    // Nema podataka → prazan odgovor (shape ostaje identičan)
     if (!Array.isArray(base) || base.length === 0) {
       return res.status(200).json({
         ok: true,
@@ -134,8 +175,9 @@ export default async function handler(req, res) {
       });
     }
 
+    // Limit/alias
     const items = base.slice(0, cap);
-    const top3 = base.slice(0, Math.min(3, cap));
+    const top3  = base.slice(0, Math.min(3, cap));
 
     const out = {
       ok: true,
