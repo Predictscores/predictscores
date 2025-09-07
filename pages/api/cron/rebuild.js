@@ -1,7 +1,8 @@
 // pages/api/cron/rebuild.js
 // Rekonstrukcija "locked" feed-a za dati slot.
 // Ako kandidati u KV nemaju kickoff (npr. vbl:* lista ID-jeva), povuci detalje iz API-Football,
-// izračunaj slot (late 00–09, am 10–14, pm 15–23), filtriraj i upiši u vb:day:<YMD>:<slot> (+union, +last).
+// filtriraj po slotu (late 00–09, am 10–14, pm 15–23) i upiši u vb:day:<YMD>:<slot> (+union, +last)
+// I — NOVO — napravi mirror i u vbl_full:<YMD>:<slot> i vbl:<YMD>:<slot> da ih čitač sigurno vidi.
 
 export const config = { api: { bodyParser: false } };
 
@@ -99,8 +100,6 @@ function hourInTZ(d=new Date(), tz=TZ){
   return parseInt(fmt.format(d),10);
 }
 function deriveSlot(h){ if (h<10) return "late"; if (h<15) return "am"; return "pm"; }
-
-// ROBUSNO: timestamp > kickoff_utc > datetime_local > fixture.date...
 function kickoffDate(x){
   const ts = x?.fixture?.timestamp ?? x?.timestamp;
   if (typeof ts === "number" && isFinite(ts)) {
@@ -120,7 +119,7 @@ function kickoffDate(x){
 }
 function inSlotLocal(item, slot) {
   const d = kickoffDate(item);
-  if (!d) return false;  // STROGO: bez vremena -> ne prolazi slot
+  if (!d) return false;  // strogo: bez vremena ne prolazi
   const h = hourInTZ(d, TZ);
   if (slot === "late") return h < 10;            // 00–09
   if (slot === "am")   return h >= 10 && h < 15; // 10–14
@@ -160,7 +159,6 @@ function mapFixtureToItem(fx){
     datetime_local: kick ? { starting_at: { date_time: String(kick).replace("T"," ").replace("Z","") } } : null,
     kickoff_utc: kick,
     timestamp: ts,
-    // minimalni stubovi za UI
     market: "1X2",
     selection_label: null,
     pick: null,
@@ -168,7 +166,7 @@ function mapFixtureToItem(fx){
     model_prob: null,
     confidence_pct: null,
     odds: null,
-    fixture: { id, timestamp: ts, date: kick }, // čuvamo i raw za buduće
+    fixture: { id, timestamp: ts, date: kick },
   };
 }
 
@@ -183,13 +181,13 @@ export default async function handler(req, res) {
   const diag = wantDebug ? {} : null;
 
   try {
-    // 1) Učitaj kandidate iz KV (pokušaj redom)
+    // 1) Učitaj kandidate iz KV
     const prefer = [
-      `vb:day:${ymd}:${slot}`,   // već gotovi
+      `vb:day:${ymd}:${slot}`,
       `vb:day:${ymd}:union`,
       `vb:day:${ymd}:last`,
-      `vbl_full:${ymd}:${slot}`, // meta sa vremenima
-      `vbl:${ymd}:${slot}`,      // često samo ID-jevi
+      `vbl_full:${ymd}:${slot}`,
+      `vbl:${ymd}:${slot}`,
     ];
     let rawArr = null, src = null;
     for (const k of prefer) {
@@ -198,20 +196,18 @@ export default async function handler(req, res) {
       if (arr && arr.length) { rawArr = arr; src = k; break; }
     }
 
-    // 2) Ako je `vbl:*` (verovatno lista ID-jeva) – povuci detalje iz AF da bismo imali kickoff
+    // 2) Ako je vbl lista ID-jeva → povuci detalje iz AF da dobijemo kickoff
     let items = null;
     if (rawArr && rawArr.length) {
       const looksLikeIdsOnly = rawArr.every(v =>
         typeof v === "number" || (typeof v === "string" && /^\d+$/.test(v)) ||
         (v && typeof v === "object" && v.fixture_id == null && v.fixture?.id == null && v.kickoff_utc == null)
       );
-
       if (looksLikeIdsOnly) {
         const ids = Array.from(new Set(rawArr.map(v => Number(v)).filter(n => Number.isFinite(n)))).slice(0, 60);
         const lanes = 6;
         const buckets = Array.from({ length: lanes }, () => []);
         ids.forEach((x,i)=> buckets[i%lanes].push(x));
-
         const got = [];
         const lane = async (subset) => {
           for (const id of subset) {
@@ -227,12 +223,11 @@ export default async function handler(req, res) {
         items = got;
         src = `${src}→af:fixtures[id]`;
       } else {
-        // već su objekti sa metama
         items = rawArr;
       }
     }
 
-    // 3) Ako i dalje nemamo ništa → fallback: povuci sve mečeve za datum pa filtriraj
+    // 3) Ako i dalje nemamo ništa → fallback: sve mečeve za datum pa filtriraj
     if (!items || !items.length) {
       const jf = await afFetch("/fixtures", { date: ymd, timezone: TZ });
       const resp = Array.isArray(jf?.response) ? jf.response : [];
@@ -240,7 +235,7 @@ export default async function handler(req, res) {
       src = "fallback:af-fixtures";
     }
 
-    // 4) Slot-filter (STROG: bez kickoffa → out)
+    // 4) Slot-filter (STROGO)
     const before = items.length;
     const filtered = items
       .filter(x => inSlotLocal(x, slot))
@@ -248,7 +243,7 @@ export default async function handler(req, res) {
       .slice(0, 60);
     const after = filtered.length;
 
-    // 5) Upis u vb:day:* (kompatibilni box format)
+    // 5) Upis u vb:day:* (box format {"value":"[...]"})
     const boxed = JSON.stringify({ value: JSON.stringify(filtered) });
     const kSlot   = `vb:day:${ymd}:${slot}`;
     const kUnion  = `vb:day:${ymd}:union`;
@@ -257,13 +252,19 @@ export default async function handler(req, res) {
     const s2 = await kvSET(kUnion, boxed, diag);
     const s3 = await kvSET(kLast,  boxed, diag);
 
+    // 6) MIRROR u vbl_full/vbl — da ih value-bets-locked SIGURNO pronađe
+    const vblFullPayload = JSON.stringify({ value: JSON.stringify(filtered.slice(0, 60)) });
+    const vblCutPayload  = JSON.stringify({ value: JSON.stringify(filtered.slice(0, 25)) }); // kraća lista za vbl
+    const s4 = await kvSET(`vbl_full:${ymd}:${slot}`, vblFullPayload, diag);
+    const s5 = await kvSET(`vbl:${ymd}:${slot}`,      vblCutPayload,  diag);
+
     return res.status(200).json({
       ok: true,
       ymd,
       mutated: true,
       counts: { union: after, last: after, combined: after },
       source: src,
-      saved_backends: Array.from(new Set([...(s1||[]), ...(s2||[]), ...(s3||[])])),
+      saved_backends: Array.from(new Set([...(s1||[]), ...(s2||[]), ...(s3||[]), ...(s4||[]), ...(s5||[])])),
       ...(wantDebug ? { debug: { before, after, slot } } : {})
     });
 
