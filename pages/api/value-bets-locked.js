@@ -85,7 +85,7 @@ function kickoffDate(x){
 }
 function inSlotLocal(item, slot) {
   const d = kickoffDate(item);
-  if (!d) return true; // KEY: ako ne znamo vreme, ne odbacuj
+  if (!d) return false; // KEY: ako ne znamo vreme, ne odbacuj
   const h = hourInTZ(d, TZ);
   if (slot === "late") return h < 10;            // 00–09
   if (slot === "am")   return h >= 10 && h < 15; // 10–14
