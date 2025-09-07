@@ -1,7 +1,6 @@
 // pages/api/cron/refresh-odds.js
-// Osvežava kvote; ako vbl* ne postoji, generiše vbl_full:/vbl: za slot.
-// NOVO: usaglašeni slotovi (late 00–09, am 10–14, pm 15–23) + slot-filter pre kreiranja vbl/vbl_full.
-// NOVO: upisuje u SVE dostupne KV backend-e (Vercel KV i/ili Upstash).
+// Seed-uje listu fixtures za zadati slot i cache-uje osnovne meta/odds podatke.
+// FIX: dodata PAGINACIJA preko svih strana /fixtures za ymd + slot-filter (late 00–09, am 10–14, pm 15–23).
 export const config = { api: { bodyParser: false } };
 
 const TZ = "Europe/Belgrade";
@@ -27,7 +26,7 @@ async function kvGETraw(key) {
       if (typeof j?.result === "string" && j.result) {
         return { raw: j.result, flavor: b.flavor };
       }
-    } catch { /* next backend */ }
+    } catch {}
   }
   return { raw: null, flavor: null };
 }
@@ -45,7 +44,6 @@ async function kvSETjsonAll(key, valObj) {
         });
         if (r.ok) saved.push(b.flavor);
       } else {
-        // Upstash Redis REST pipeline
         const r = await fetch(`${b.url}/pipeline`, {
           method: "POST",
           headers: { Authorization: `Bearer ${b.tok}`, "content-type":"application/json" },
@@ -53,7 +51,7 @@ async function kvSETjsonAll(key, valObj) {
         });
         if (r.ok) saved.push(b.flavor);
       }
-    } catch { /* ignore one backend */ }
+    } catch {}
   }
   return { any: saved.length>0, backends: saved };
 }
@@ -64,6 +62,8 @@ function arrFromAny(x){
   if(Array.isArray(x?.items)) return x.items;
   if(Array.isArray(x?.value_bets)) return x.value_bets;
   if(Array.isArray(x?.football)) return x.football;
+  if(Array.isArray(x?.list)) return x.list;
+  if(Array.isArray(x?.data)) return x.data;
   return null;
 }
 
@@ -77,7 +77,7 @@ function hourInTZ(d=new Date(), tz=TZ){
   const fmt = new Intl.DateTimeFormat("en-GB",{timeZone:tz,hour:"2-digit",hour12:false});
   return parseInt(fmt.format(d),10);
 }
-// USKLAĐENO sa ostatkom sistema:
+// USKLAĐENO:
 function deriveSlot(h){ if(h<10) return "late"; if(h<15) return "am"; return "pm"; }
 
 /* --------------- slot helpers --------------- */
@@ -89,7 +89,7 @@ function kickoffFromMeta(meta){
 }
 function inSlotLocal(meta, slot){
   const d = kickoffFromMeta(meta);
-  if (!d) return true; // ako ne znamo vreme, ne odbacuj
+  if (!d) return false; // ovde smo striktni (u ovom fajlu), fallback je u reader-u ako baš treba
   const h = hourInTZ(d, TZ);
   if (slot === "late") return h < 10;            // 00–09
   if (slot === "am")   return h >= 10 && h < 15; // 10–14
@@ -101,20 +101,45 @@ function getAFKey(){ return process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.
 async function afFetch(path, params={}){
   const key = getAFKey();
   if(!key) throw new Error("Missing API-Football key");
-  const qs = new URLSearchParams(params).toString();
-  const url = `${AF_BASE}${path}${qs?`?${qs}`:""}`;
-  const r = await fetch(url,{ headers:{ "x-apisports-key": key }, cache:"no-store" });
-  const ct = r.headers.get("content-type")||"";
-  if(!r.ok) throw new Error(`AF ${path} ${r.status}`);
-  if(ct.includes("application/json")) return await r.json();
-  const t = await r.text(); try{ return JSON.parse(t); }catch{ throw new Error(`AF non-json ${path}`); }
+  const url = new URL(`https://v3.football.api-sports.io${path}`);
+  Object.entries(params).forEach(([k,v]) => { if (v != null) url.searchParams.set(k, String(v)); });
+  const r = await fetch(url, {
+    headers: { "x-apisports-key": key },
+    cache: "no-store",
+  });
+  const ct = r.headers.get("content-type") || "";
+  const text = await r.text();
+  if (!ct.includes("application/json")) throw new Error(`API-Football non-JSON (${r.status}) ${text.slice(0,120)}`);
+  let j; try { j = JSON.parse(text); } catch { j = null; }
+  if (!j) throw new Error("API-Football parse error");
+  return j;
 }
 
-/* --------------- seed & odds --------------- */
+/* -------- fetch ALL fixture pages for date -------- */
+async function fetchAllFixturesForDate(ymd){
+  let page = 1, all = [];
+  // tvrdi limit da ne uđemo u beskonačnu petlju
+  const HARD_CAP_PAGES = 12;
+  while (page <= HARD_CAP_PAGES) {
+    const jf = await afFetch("/fixtures", { date: ymd, timezone: TZ, page });
+    const arr = Array.isArray(jf?.response) ? jf.response : [];
+    all.push(...arr);
+    const cur = Number(jf?.paging?.current || page);
+    const tot = Number(jf?.paging?.total || page);
+    if (!tot || cur >= tot) break;
+    page++;
+    await new Promise(r=>setTimeout(r, 120));
+  }
+  // stabilno sortiranje
+  all.sort((a,b)=> new Date(a?.fixture?.date||0) - new Date(b?.fixture?.date||0));
+  return all;
+}
+
+/* --------------- odds helpers --------------- */
 function uniqNums(a){ const s=new Set(); for(const v of a||[]){ const n=Number(v); if(Number.isFinite(n)&&n>0)s.add(n);} return [...s]; }
 
 function best1x2FromBookmakers(bookmakers){
-  let best = null; let books = 0;
+  let best = null;
   for(const b of bookmakers||[]){
     for(const bet of b.bets||[]){
       const name = String(bet.name||"").toLowerCase();
@@ -138,43 +163,8 @@ function best1x2FromBookmakers(bookmakers){
       }
     }
   }
-  if(best) best.books_count = books;
+  if(best) best.books_count = 1;
   return best;
-}
-
-async function collectFixtureIdsAndMeta(ymd, slot){
-  // 1) KV (vbl/vb:day…)
-  const keys = [
-    `vbl_full:${ymd}:${slot}`, `vbl:${ymd}:${slot}`,
-    `vb:day:${ymd}:${slot}`, `vb:day:${ymd}:last`, `vb:day:${ymd}:union`
-  ];
-  for(const k of keys){
-    const arr = arrFromAny(toObj((await kvGETraw(k)).raw));
-    if(arr && arr.length){
-      const ids = uniqNums(arr.map(x=>x?.fixture_id ?? x?.fixture?.id));
-      if(ids.length) return { ids, source:`kv:${k}`, metaById: Object.fromEntries(arr.map(x=>{
-        const id = Number(x?.fixture_id ?? x?.fixture?.id); return [id, x];
-      })) };
-    }
-  }
-  // 2) Seed: fixtures od dana
-  const jf = await afFetch("/fixtures", { date: ymd, timezone: TZ });
-  const resp = Array.isArray(jf?.response) ? jf.response : [];
-  // stabilno sortiranje po vremenu
-  resp.sort((a,b)=> new Date(a?.fixture?.date||0) - new Date(b?.fixture?.date||0));
-  const ids = uniqNums(resp.map(x=>x?.fixture?.id));
-  const metaById = {};
-  for(const it of resp){
-    const id = Number(it?.fixture?.id);
-    if(!id) continue;
-    metaById[id] = {
-      league: it?.league,
-      teams: it?.teams,
-      datetime_local: { starting_at: { date_time: it?.fixture?.date?.replace("T"," ").replace("Z","") } },
-      kickoff_utc: it?.fixture?.date || null,
-    };
-  }
-  return { ids: ids.slice(0,60), source:"seed:fixtures:date", metaById };
 }
 
 /* ------------------- handler ------------------- */
@@ -185,33 +175,56 @@ export default async function handler(req,res){
     const q = req.query||{};
     const now = new Date();
     const ymd = (q.ymd && String(q.ymd).match(/^\d{4}-\d{2}-\d{2}$/)) ? String(q.ymd) : ymdInTZ(now, TZ);
-    const slot = (q.slot && /^(am|pm|late)$/.test(q.slot)) ? q.slot : deriveSlot(hourInTZ(now, TZ));
+    const slot = (q.slot && /^(am|pm|late)$/.test(String(q.slot))) ? q.slot : deriveSlot(hourInTZ(now, TZ));
     const force = String(q.force ?? "0")==="1";
 
     if(!getAFKey()) {
       return res.status(200).json({ ok:false, ymd, slot, error:"API-Football key missing", source:"refresh-odds" });
     }
 
-    // 1) fixture ID-evi + meta
-    let { ids, source, metaById } = await collectFixtureIdsAndMeta(ymd, slot);
-    if((!ids || !ids.length) && !force){
-      return res.status(200).json({ ok:true, ymd, slot, inspected:0, filtered:0, targeted:0, touched:0, source:"refresh-odds:empty-no-force", debug:{ tried:[] } });
+    // 1) all fixtures for date (ALL PAGES)
+    const all = await fetchAllFixturesForDate(ymd);
+    const inspected = all.length;
+
+    // 2) map to meta and strict slot-filter
+    const metaById = {};
+    for (const it of all) {
+      const id = Number(it?.fixture?.id);
+      if (!id) continue;
+      metaById[id] = {
+        league: it?.league,
+        teams:  it?.teams,
+        datetime_local: { starting_at: { date_time: (it?.fixture?.date || "").replace("T"," ").replace("Z","") } },
+        kickoff_utc: it?.fixture?.date || null,
+      };
+    }
+    const rows = all.map(it => {
+      const id = Number(it?.fixture?.id);
+      return id ? { id, meta: metaById[id] } : null;
+    }).filter(Boolean);
+
+    const slotRows = rows.filter(r => inSlotLocal(r.meta, slot));
+    const filtered = slotRows.length;
+    const pickedIds = slotRows.slice(0, 60).map(r => r.id); // samo slot
+
+    // Ako posle *celog dana* i dalje nema mečeva u slotu:
+    if (!pickedIds.length && !force) {
+      return res.status(200).json({
+        ok: true, ymd, slot,
+        inspected, filtered, targeted: 0, touched: 0,
+        source: "refresh-odds:no-slot-matches",
+        debug: { tried:["fixtures:all-pages"], pickedKey:null, listLen:0, saved_backends:[] }
+      });
     }
 
-    // 2) SLOT FILTER pre kreiranja vbl/vbl_full
-    const rows = (ids||[]).map(id => ({ id, meta: metaById?.[id] })).filter(r=>r && r.id);
-    const slotRows = rows.filter(r => inSlotLocal(r.meta, slot));
-    const picked = (slotRows.length ? slotRows : rows).slice(0, 60).map(r=>r.id);
-
-    // 3) povuci odds; ako vbl* ne postoji, napravi locked listu (samo za picked)
+    // 3) odds fetch + kreiranje vbl_full/vbl za SLOT
     const haveVbl = !!arrFromAny(toObj((await kvGETraw(`vbl:${ymd}:${slot}`)).raw));
     const createdLocked = [];
     let called = 0, cached = 0;
 
-    // blaga paralelizacija
     const lanes = 5;
     const buckets = Array.from({length: lanes}, ()=>[]);
-    picked.forEach((x,i)=>buckets[i%lanes].push(x));
+    pickedIds.forEach((x,i)=>buckets[i%lanes].push(x));
 
     const lane = async (subset)=>{
       for(const id of subset){
@@ -219,15 +232,13 @@ export default async function handler(req,res){
           const jo = await afFetch("/odds", { fixture: id });
           called++;
           const payload = { fetched_at: Date.now(), fixture_id: id, data: jo?.response ?? jo };
-          // cache odds u sve KV-e (nije presudno, ali uniformno)
           await kvSETjsonAll(`odds:fixture:${id}`, payload);
 
           if(!haveVbl){
             const bookmakers = (jo?.response?.[0]?.bookmakers) || [];
             const best = best1x2FromBookmakers(bookmakers);
             const meta = metaById?.[id] || {};
-            // dodatni gard: ako meta postoji, proveri slot
-            if(best && inSlotLocal(meta, slot)){
+            if(best){ // meta je već u slotu (strict)
               createdLocked.push({
                 fixture_id: id,
                 league: meta.league || null,
@@ -248,14 +259,13 @@ export default async function handler(req,res){
               });
             }
           }
-          cached++; // broj uspešnih fetch+obrada
-        }catch{ /* skip one id */ }
+          cached++;
+        }catch{}
         await new Promise(r=>setTimeout(r, 120));
       }
     };
     await Promise.all(buckets.map(lane));
 
-    // 4) ako smo kreirali locked listu → upiši u SVE backend-e
     let savedBackends = [];
     if(createdLocked.length){
       createdLocked.sort((a,b)=>
@@ -265,20 +275,20 @@ export default async function handler(req,res){
       const full = createdLocked.slice(0, 25);
       const cut  = createdLocked.slice(0, 15);
       const r1 = await kvSETjsonAll(`vbl_full:${ymd}:${slot}`, full);
-      const r2 = await kvSETjsonAll(`vbl:${ymd}:${slot}`, cut);
+      const r2 = await kvSETjsonAll(`vbl:${ymd}:${slot}`,     cut);
       savedBackends = Array.from(new Set([...(r1.backends||[]), ...(r2.backends||[])]));
     }
 
     return res.status(200).json({
       ok: true,
       ymd, slot,
-      inspected: ids.length,
-      filtered: slotRows.length,
-      targeted: picked.length,
+      inspected,
+      filtered,
+      targeted: pickedIds.length,
       touched: cached,
-      source: `refresh-odds:per-fixture`,
+      source: "refresh-odds:fixtures:all-pages(slot)",
       debug: {
-        tried: [`${source}`],
+        tried: ["fixtures:all-pages"],
         pickedKey: createdLocked.length?`vbl:${ymd}:${slot}`:null,
         listLen: createdLocked.length,
         saved_backends: savedBackends
