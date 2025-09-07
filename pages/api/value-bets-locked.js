@@ -1,7 +1,7 @@
 // pages/api/value-bets-locked.js
-// Čita "locked" dnevne vrednosti. Ako posle slot-filtra ostane prazno,
-// radi bezbedan fallback umesto da vrati prazan niz.
-// Slot granice: late 00–09, am 10–14, pm 15–23.
+// Čita "locked" dnevne vrednosti za dati slot.
+// PRIORITET: vb:day:<ymd>:<slot> → vb:day:<ymd>:(union|last) → vbl_full:<ymd>:<slot> → vbl:<ymd>:<slot>
+// Slot granice: late 00–09, am 10–14, pm 15–23. Strogo: stavke bez kickoff-a se ne puštaju.
 
 export const config = { api: { bodyParser: false } };
 
@@ -68,33 +68,39 @@ function unpack(raw) {
 }
 
 /* ---------------- slot helpers ---------------- */
+function ymdInTZ(d=new Date(), tz=TZ){
+  const fmt = new Intl.DateTimeFormat("en-CA",{ timeZone:tz, year:"numeric", month:"2-digit", day:"2-digit" });
+  const p = fmt.formatToParts(d).reduce((a,x)=>(a[x.type]=x.value,a),{});
+  return `${p.year}-${p.month}-${p.day}`;
+}
 function hourInTZ(d=new Date(), tz=TZ){
   const fmt = new Intl.DateTimeFormat("en-GB",{ timeZone:tz, hour:"2-digit", hour12:false });
   return parseInt(fmt.format(d),10);
 }
 function kickoffDate(x){
+  const ts = x?.fixture?.timestamp ?? x?.timestamp;
+  if (typeof ts === "number" && isFinite(ts)) {
+    const d = new Date(ts * 1000);
+    if (!isNaN(d.getTime())) return d;
+  }
   const s =
     x?.kickoff_utc ||
     x?.datetime_local?.starting_at?.date_time ||
+    x?.fixture?.date ||
     x?.datetime_utc ||
     x?.start_time?.utc ||
     x?.start_time;
   if (!s || typeof s !== "string") return null;
-  const d = new Date(s);
-  return isNaN(d.getTime()) ? null : d;
+  const d2 = new Date(s);
+  return isNaN(d2.getTime()) ? null : d2;
 }
 function inSlotLocal(item, slot) {
   const d = kickoffDate(item);
-  if (!d) return false; // KEY: ako ne znamo vreme, ne odbacuj
+  if (!d) return false; // STROGO: bez vremena ne prolazi
   const h = hourInTZ(d, TZ);
   if (slot === "late") return h < 10;            // 00–09
   if (slot === "am")   return h >= 10 && h < 15; // 10–14
   return h >= 15;                                 // 15–23
-}
-function ymdInTZ(d=new Date(), tz=TZ){
-  const fmt = new Intl.DateTimeFormat("en-CA",{ timeZone:tz, year:"numeric", month:"2-digit", day:"2-digit" });
-  const p = fmt.formatToParts(d).reduce((a,x)=>(a[x.type]=x.value,a),{});
-  return `${p.year}-${p.month}-${p.day}`;
 }
 
 /* ---------------- handler ---------------- */
@@ -107,7 +113,7 @@ export default async function handler(req, res) {
 
   const diag = {};
   try {
-    // 1) Primarni izvori
+    // 1) Primarni izvori: vb:day*
     const keysMain = [
       `vb:day:${ymd}:${slot}`,
       `vb:day:${ymd}:union`,
@@ -120,33 +126,24 @@ export default async function handler(req, res) {
       if (arr && arr.length) { items = arr; source = k; break; }
     }
 
-    // 2) Ako i dalje ništa → probaj meta izvore (vbl_full pa vbl)
-    let fallback_used = false;
+    // 2) Ako nema vb:day → meta izvori: vbl_full pa vbl
     if (!items || !items.length) {
       const keysMeta = [
         `vbl_full:${ymd}:${slot}`,
-        `vbl:${ymd}:${slot}`,       // može biti lista minimalnih stavki
+        `vbl:${ymd}:${slot}`,
       ];
       for (const k of keysMeta) {
         const { raw } = await kvGET(k, diag);
         const arr = arrFromAny(unpack(raw));
-        if (arr && arr.length) { items = arr; source = k; fallback_used = true; break; }
+        if (arr && arr.length) { items = arr; source = k; break; }
       }
     }
 
-    // 3) Slot-filter, ali tolerantan
     const before = items ? items.length : 0;
     const filtered = (items || []).filter(x => inSlotLocal(x, slot));
-    let out = filtered;
+    const out = filtered;
 
-    // 4) Ako posle filtra ostane prazno → vrati nestriktno (fallback)
-    if (!out.length && items && items.length) {
-      out = items.slice(0, 60);
-      fallback_used = true;
-      source = `fallback:${source}`;
-    }
-
-    // 5) Top3 (ako ima confidence_pct)
+    // 3) top3 (po confidence_pct ako postoji)
     const top3 = out
       .filter(x => typeof x?.confidence_pct === "number")
       .sort((a,b)=> (b.confidence_pct - a.confidence_pct))
@@ -156,11 +153,11 @@ export default async function handler(req, res) {
       ok: true,
       slot, ymd,
       items: out,
-      football: out,   // kompatibilno sa postojećim UI
+      football: out,
       top3,
       source,
       policy_cap: 50,
-      debug: { before, after: out.length, fallback_used }
+      debug: { before, after: out.length, fallback_used: false }
     });
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
