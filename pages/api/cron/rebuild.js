@@ -1,26 +1,24 @@
 // pages/api/cron/rebuild.js
-// Rebuild "locked" dnevne ključeve za zadati slot.
-// Ako nema kandidata u vb:day:*, fallback na vbl/vbl_full kako bi Snapshot dobio ne-prazan feed.
-// Ne menja istoriju: pišemo samo u vb:day:* ključeve, format kompatibilan sa postojećim reader-ima.
+// Rekonstrukcija "locked" feed-a. Ako KV nema kandidate, povuci fixtures za dan iz API-Football,
+// filtriraj po slotu i upisi minimalne stavke u vb:day:<YMD>:<slot> (+union, +last).
+// Slot granice usklađene svuda: late 00–09, am 10–14, pm 15–23.
 
 export const config = { api: { bodyParser: false } };
 
 const TZ = "Europe/Belgrade";
 
-/* ---------------- KV (Vercel REST, RW/RO token) ---------------- */
-function getKvCfgs() {
+/* ---------------- KV (Vercel REST) ---------------- */
+function kvCfgs() {
   const url = (process.env.KV_REST_API_URL || "").replace(/\/+$/, "");
   const rw  = process.env.KV_REST_API_TOKEN || "";
   const ro  = process.env.KV_REST_API_READ_ONLY_TOKEN || "";
-  const out = [];
-  if (url && rw) out.push({ flavor: "vercel-kv:rw", url, token: rw });
-  if (url && ro) out.push({ flavor: "vercel-kv:ro", url, token: ro });
-  return out;
+  const list = [];
+  if (url && rw) list.push({ flavor: "vercel-kv:rw", url, token: rw });
+  if (url && ro) list.push({ flavor: "vercel-kv:ro", url, token: ro });
+  return list;
 }
-
-async function kvGET_first(key, diag) {
-  const cfgs = getKvCfgs();
-  for (const c of cfgs) {
+async function kvGET(key, diag) {
+  for (const c of kvCfgs()) {
     try {
       const r = await fetch(`${c.url}/get/${encodeURIComponent(key)}`, {
         headers: { Authorization: `Bearer ${c.token}` },
@@ -28,24 +26,18 @@ async function kvGET_first(key, diag) {
       });
       const ok = r.ok;
       const j  = ok ? await r.json().catch(() => null) : null;
-      const val = j && typeof j.result === "string" ? j.result : null;
-      diag && (diag[c.flavor] = diag[c.flavor] || {},
-               diag[c.flavor][key] = ok ? (val ? `hit(len=${val.length})` : "miss(null)") : `miss(http ${r.status})`,
-               diag[c.flavor]._url = c.url);
-      if (val) return { raw: val, flavor: c.flavor, url: c.url };
+      const raw = j && typeof j.result === "string" ? j.result : null;
+      diag && (diag.reads = diag.reads || [], diag.reads.push({ flavor:c.flavor, key, status: ok ? (raw ? "hit" : "miss-null") : `http-${r.status}` }));
+      if (raw) return { raw, flavor: c.flavor };
     } catch (e) {
-      diag && (diag[c.flavor] = diag[c.flavor] || {},
-               diag[c.flavor][key] = `miss(err:${String(e?.message||e).slice(0,60)})`);
+      diag && (diag.reads = diag.reads || [], diag.reads.push({ flavor:c.flavor, key, status:`err:${String(e?.message||e)}` }));
     }
   }
-  return { raw: null, flavor: null, url: null };
+  return { raw: null, flavor: null };
 }
-
-async function kvSET_all(key, valueString, diag) {
-  // valueString treba da bude STRING; pišemo {"value": valueString} da ostanemo kompatibilni
-  const cfgs = getKvCfgs().filter(c => c.flavor.includes(":rw"));
-  let okAny = false;
-  for (const c of cfgs) {
+async function kvSET(key, valueString, diag) {
+  let saved = [];
+  for (const c of kvCfgs().filter(x => x.flavor.endsWith(":rw"))) {
     try {
       const r = await fetch(`${c.url}/set/${encodeURIComponent(key)}`, {
         method: "POST",
@@ -56,20 +48,29 @@ async function kvSET_all(key, valueString, diag) {
         cache: "no-store",
         body: JSON.stringify({ value: valueString }),
       });
-      const ok = r.ok;
-      diag && (diag[c.flavor] = diag[c.flavor] || {},
-               diag[c.flavor][`SET ${key}`] = ok ? "ok" : `http ${r.status}`);
-      okAny = okAny || ok;
+      if (r.ok) saved.push(c.flavor);
+      diag && (diag.writes = diag.writes || [], diag.writes.push({ flavor:c.flavor, key, status:r.ok ? "ok" : `http-${r.status}` }));
     } catch (e) {
-      diag && (diag[c.flavor] = diag[c.flavor] || {},
-               diag[c.flavor][`SET ${key}`] = `err:${String(e?.message||e).slice(0,60)}`);
+      diag && (diag.writes = diag.writes || [], diag.writes.push({ flavor:c.flavor, key, status:`err:${String(e?.message||e)}` }));
     }
   }
-  return okAny;
+  return saved;
 }
 
-/* ---------------- parsing helpers (robust) ---------------- */
+/* ---------------- parse helpers ---------------- */
 function J(s){ try{ return JSON.parse(s); }catch{ return null; } }
+function arrFromAny(x){
+  if (!x) return null;
+  if (Array.isArray(x)) return x;
+  if (x && typeof x === "object") {
+    if (Array.isArray(x.items)) return x.items;
+    if (Array.isArray(x.value_bets)) return x.value_bets;
+    if (Array.isArray(x.football)) return x.football;
+    if (Array.isArray(x.list)) return x.list;
+    if (Array.isArray(x.data)) return x.data;
+  }
+  return null;
+}
 function unpack(raw) {
   if (!raw || typeof raw !== "string") return null;
   let v1 = J(raw);
@@ -79,27 +80,15 @@ function unpack(raw) {
     if (typeof v1.value === "string") {
       const v2 = J(v1.value);
       if (Array.isArray(v2)) return v2;
-      if (v2 && typeof v2 === "object") {
-        if (Array.isArray(v2.items)) return v2.items;
-        if (Array.isArray(v2.value_bets)) return v2.value_bets;
-        if (Array.isArray(v2.football)) return v2.football;
-        if (Array.isArray(v2.list)) return v2.list;
-        if (Array.isArray(v2.data)) return v2.data;
-      }
+      if (v2 && typeof v2 === "object") return arrFromAny(v2);
     }
     return null;
   }
-  if (v1 && typeof v1 === "object") {
-    if (Array.isArray(v1.items)) return v1.items;
-    if (Array.isArray(v1.value_bets)) return v1.value_bets;
-    if (Array.isArray(v1.football)) return v1.football;
-    if (Array.isArray(v1.list)) return v1.list;
-    if (Array.isArray(v1.data)) return v1.data;
-  }
+  if (v1 && typeof v1 === "object") return arrFromAny(v1);
   return null;
 }
 
-/* ---------------- time helpers ---------------- */
+/* ---------------- time + slot helpers ---------------- */
 function ymdInTZ(d=new Date(), tz=TZ){
   const fmt = new Intl.DateTimeFormat("en-CA",{ timeZone:tz, year:"numeric", month:"2-digit", day:"2-digit" });
   const p = fmt.formatToParts(d).reduce((a,x)=>(a[x.type]=x.value,a),{});
@@ -109,10 +98,7 @@ function hourInTZ(d=new Date(), tz=TZ){
   const fmt = new Intl.DateTimeFormat("en-GB",{ timeZone:tz, hour:"2-digit", hour12:false });
   return parseInt(fmt.format(d),10);
 }
-// Usklađeno sa reader-om: late 00–09, am 10–14, pm 15–23
 function deriveSlot(h){ if (h<10) return "late"; if (h<15) return "am"; return "pm"; }
-
-/* ---------------- kickoff helpers + slot filter (align with locked reader) ---------------- */
 function kickoffDate(x){
   const s =
     x?.kickoff_utc ||
@@ -124,110 +110,123 @@ function kickoffDate(x){
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : d;
 }
-
 function inSlotLocal(item, slot) {
   const d = kickoffDate(item);
-  if (!d) return true; // ako ne znamo vreme, ne odbacuj
+  if (!d) return true; // ako ne znamo vreme, NE odbacuj (da ne ostanemo prazni)
   const h = hourInTZ(d, TZ);
   if (slot === "late") return h < 10;            // 00–09
   if (slot === "am")   return h >= 10 && h < 15; // 10–14
   return h >= 15;                                 // 15–23
 }
 
+/* ---------------- API-Football (fixtures) ---------------- */
+const AF_BASE = "https://v3.football.api-sports.io";
+function afKey(){ return process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || ""; }
+async function afFetch(path, params={}){
+  const key = afKey();
+  if (!key) throw new Error("Missing API-Football key");
+  const url = new URL(`${AF_BASE}${path}`);
+  Object.entries(params).forEach(([k,v])=> url.searchParams.set(k,String(v)));
+  const r = await fetch(url, { headers:{ "x-apisports-key": key }, cache:"no-store" });
+  const ct = r.headers.get("content-type")||"";
+  const t = await r.text();
+  if (!ct.includes("application/json")) throw new Error(`AF non-JSON ${r.status}: ${t.slice(0,120)}`);
+  let j; try{ j=JSON.parse(t);}catch{ j=null; }
+  if (!j) throw new Error("AF parse error");
+  return j;
+}
+
+/* ---------------- fallback build from fixtures ---------------- */
+function mapFixtureToItem(fx){
+  const id = Number(fx?.fixture?.id);
+  const kick = fx?.fixture?.date || null;
+  const teams = { home: fx?.teams?.home?.name || null, away: fx?.teams?.away?.name || null };
+  const league = fx?.league || null;
+  return {
+    fixture_id: id,
+    league,
+    league_name: league?.name || null,
+    league_country: league?.country || null,
+    teams,
+    home: teams.home,
+    away: teams.away,
+    datetime_local: kick ? { starting_at: { date_time: String(kick).replace("T"," ").replace("Z","") } } : null,
+    kickoff_utc: kick,
+    // minimalni stubovi (UI-friendly, ali bez obaveznih pickova)
+    market: "1X2",
+    selection_label: null,
+    pick: null,
+    pick_code: null,
+    model_prob: null,
+    confidence_pct: null,
+    odds: null,
+  };
+}
+
 /* ---------------- handler ---------------- */
 export default async function handler(req, res) {
-  try {
-    res.setHeader("Cache-Control","no-store");
-    const q = req.query || {};
-    const now = new Date();
-    const ymd = (q.ymd && /^\d{4}-\d{2}-\d{2}$/.test(String(q.ymd))) ? String(q.ymd) : ymdInTZ(now, TZ);
-    const slot = (q.slot && /^(am|pm|late)$/.test(String(q.slot))) ? String(q.slot) : deriveSlot(hourInTZ(now, TZ));
-    const wantDebug = String(q.debug ?? "") === "1";
-    const diag = wantDebug ? {} : null;
+  res.setHeader("Cache-Control","no-store");
+  const q = req.query || {};
+  const now = new Date();
+  const ymd = (q.ymd && /^\d{4}-\d{2}-\d{2}$/.test(String(q.ymd))) ? String(q.ymd) : ymdInTZ(now, TZ);
+  const slot = (q.slot && /^(am|pm|late)$/.test(String(q.slot))) ? String(q.slot) : deriveSlot(hourInTZ(now, TZ));
+  const wantDebug = String(q.debug ?? "") === "1";
+  const diag = wantDebug ? {} : null;
 
-    // 1) pokušaj primarnih kandidata u vb:day:*
-    const primKeys = [
+  try {
+    // 1) Pokušaj pronaći spremne kandidate u KV
+    const prefer = [
       `vb:day:${ymd}:${slot}`,
       `vb:day:${ymd}:union`,
       `vb:day:${ymd}:last`,
+      `vbl_full:${ymd}:${slot}`,
+      `vbl:${ymd}:${slot}`,
     ];
     let candidates = null, src = null;
-    for (const k of primKeys) {
-      const { raw } = await kvGET_first(k, diag);
+    for (const k of prefer) {
+      const { raw } = await kvGET(k, diag);
       const arr = arrFromAny(unpack(raw));
       if (arr && arr.length) { candidates = arr; src = k; break; }
     }
 
-    // 2) fallback: vbl/vbl_full ako primarni ne postoje
+    // 2) Ako i dalje nemamo ništa → fallback: fixtures za YMD
     if (!candidates || !candidates.length) {
-      const fbKeys = [
-        `vbl:${ymd}:${slot}`,
-        `vbl_full:${ymd}:${slot}`,
-      ];
-      for (const k of fbKeys) {
-        const { raw } = await kvGET_first(k, diag);
-        const arr = arrFromAny(unpack(raw));
-        if (arr && arr.length) { candidates = arr; src = `${k}→fallback`; break; }
-      }
+      const jf = await afFetch("/fixtures", { date: ymd, timezone: TZ });
+      const resp = Array.isArray(jf?.response) ? jf.response : [];
+      const items = resp.map(mapFixtureToItem)
+        .filter(Boolean)
+        .filter(x => inSlotLocal(x, slot))        // slot-filter
+        .sort((a,b)=> (Date.parse(a.kickoff_utc||0) - Date.parse(b.kickoff_utc||0)))
+        .slice(0, 60);
+      candidates = items;
+      src = "fallback:af-fixtures";
     }
 
-    if (!candidates || !candidates.length) {
-      // ništa ne diramo
-      return res.status(200).json({
-        ok: true,
-        ymd,
-        mutated: false,
-        counts: { union: 0, last: 0, combined: 0 },
-        note: "no candidates → keys NOT mutated",
-        ...(wantDebug ? { debug: diag } : {})
-      });
-    }
+    // 3) Slot-filter (sigurnosno; već rađeno i u fallback-u)
+    const before = candidates.length;
+    const filtered = candidates.filter(x => inSlotLocal(x, slot));
+    const after = filtered.length;
 
-    // slot-filter: zadrži samo utakmice koje pripadaju traženom slotu
-    const beforeCount = candidates.length;
-    candidates = candidates.filter(x => inSlotLocal(x, slot));
-    const afterCount = candidates.length;
-    if (diag) {
-      diag._slot_filter = { slot, before: beforeCount, after: afterCount };
-    }
-
-    // 3) upiši kandidata u vb:day:* (kompatibilan format: {"value":"[...]"})
-    const payloadString = JSON.stringify(candidates);            // "[{...}]"
-    const stored = JSON.stringify({ value: payloadString });     // {"value":"[...]"}
+    // 4) Upis u vb:day:* (kompatibilni boks format)
+    const boxed = JSON.stringify({ value: JSON.stringify(filtered) });
     const kSlot   = `vb:day:${ymd}:${slot}`;
     const kUnion  = `vb:day:${ymd}:union`;
     const kLast   = `vb:day:${ymd}:last`;
-
-    await kvSET_all(kSlot,  stored, diag);
-    await kvSET_all(kUnion, stored, diag);
-    await kvSET_all(kLast,  stored, diag);
+    const s1 = await kvSET(kSlot,  boxed, diag);
+    const s2 = await kvSET(kUnion, boxed, diag);
+    const s3 = await kvSET(kLast,  boxed, diag);
 
     return res.status(200).json({
       ok: true,
       ymd,
       mutated: true,
-      counts: {
-        union: candidates.length,
-        last:  candidates.length,
-        combined: candidates.length,
-      },
+      counts: { union: after, last: after, combined: after },
       source: src,
-      ...(wantDebug ? { debug: diag } : {})
+      saved_backends: Array.from(new Set([...(s1||[]), ...(s2||[]), ...(s3||[])])),
+      ...(wantDebug ? { debug: { before, after, slot } } : {})
     });
 
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
-}
-
-// helpers used above
-function arrFromAny(x){
-  if (!x) return null;
-  if (Array.isArray(x)) return x;
-  if (Array.isArray(x.items)) return x.items;
-  if (Array.isArray(x.value_bets)) return x.value_bets;
-  if (Array.isArray(x.football)) return x.football;
-  if (Array.isArray(x.list)) return x.list;
-  if (Array.isArray(x.data)) return x.data;
-  return null;
 }
