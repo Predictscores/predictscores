@@ -1,5 +1,6 @@
 // pages/api/cron/refresh-odds.js
 // Osvežava kvote; ako vbl* ne postoji, generiše vbl_full:/vbl: za slot.
+// NOVO: usaglašeni slotovi (late 00–09, am 10–14, pm 15–23) + slot-filter pre kreiranja vbl/vbl_full.
 // NOVO: upisuje u SVE dostupne KV backend-e (Vercel KV i/ili Upstash).
 export const config = { api: { bodyParser: false } };
 
@@ -76,7 +77,24 @@ function hourInTZ(d=new Date(), tz=TZ){
   const fmt = new Intl.DateTimeFormat("en-GB",{timeZone:tz,hour:"2-digit",hour12:false});
   return parseInt(fmt.format(d),10);
 }
-function deriveSlot(h){ if(h<12) return "am"; if(h<18) return "pm"; return "late"; }
+// USKLAĐENO sa ostatkom sistema:
+function deriveSlot(h){ if(h<10) return "late"; if(h<15) return "am"; return "pm"; }
+
+/* --------------- slot helpers --------------- */
+function kickoffFromMeta(meta){
+  const s = meta?.kickoff_utc || meta?.datetime_local?.starting_at?.date_time || null;
+  if (!s || typeof s !== "string") return null;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+function inSlotLocal(meta, slot){
+  const d = kickoffFromMeta(meta);
+  if (!d) return true; // ako ne znamo vreme, ne odbacuj
+  const h = hourInTZ(d, TZ);
+  if (slot === "late") return h < 10;            // 00–09
+  if (slot === "am")   return h >= 10 && h < 15; // 10–14
+  return h >= 15;                                 // 15–23
+}
 
 /* --------------- API-Football --------------- */
 function getAFKey(){ return process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.env.API_FOOTBALL_KEY || ""; }
@@ -141,7 +159,9 @@ async function collectFixtureIdsAndMeta(ymd, slot){
   }
   // 2) Seed: fixtures od dana
   const jf = await afFetch("/fixtures", { date: ymd, timezone: TZ });
-  const resp = jf?.response || [];
+  const resp = Array.isArray(jf?.response) ? jf.response : [];
+  // stabilno sortiranje po vremenu
+  resp.sort((a,b)=> new Date(a?.fixture?.date||0) - new Date(b?.fixture?.date||0));
   const ids = uniqNums(resp.map(x=>x?.fixture?.id));
   const metaById = {};
   for(const it of resp){
@@ -172,13 +192,18 @@ export default async function handler(req,res){
       return res.status(200).json({ ok:false, ymd, slot, error:"API-Football key missing", source:"refresh-odds" });
     }
 
-    // 1) fixture ID-evi
+    // 1) fixture ID-evi + meta
     let { ids, source, metaById } = await collectFixtureIdsAndMeta(ymd, slot);
     if((!ids || !ids.length) && !force){
       return res.status(200).json({ ok:true, ymd, slot, inspected:0, filtered:0, targeted:0, touched:0, source:"refresh-odds:empty-no-force", debug:{ tried:[] } });
     }
 
-    // 2) povuci odds; ako vbl* ne postoji, napravi locked listu
+    // 2) SLOT FILTER pre kreiranja vbl/vbl_full
+    const rows = (ids||[]).map(id => ({ id, meta: metaById?.[id] })).filter(r=>r && r.id);
+    const slotRows = rows.filter(r => inSlotLocal(r.meta, slot));
+    const picked = (slotRows.length ? slotRows : rows).slice(0, 60).map(r=>r.id);
+
+    // 3) povuci odds; ako vbl* ne postoji, napravi locked listu (samo za picked)
     const haveVbl = !!arrFromAny(toObj((await kvGETraw(`vbl:${ymd}:${slot}`)).raw));
     const createdLocked = [];
     let called = 0, cached = 0;
@@ -186,7 +211,7 @@ export default async function handler(req,res){
     // blaga paralelizacija
     const lanes = 5;
     const buckets = Array.from({length: lanes}, ()=>[]);
-    ids.forEach((x,i)=>buckets[i%lanes].push(x));
+    picked.forEach((x,i)=>buckets[i%lanes].push(x));
 
     const lane = async (subset)=>{
       for(const id of subset){
@@ -201,7 +226,8 @@ export default async function handler(req,res){
             const bookmakers = (jo?.response?.[0]?.bookmakers) || [];
             const best = best1x2FromBookmakers(bookmakers);
             const meta = metaById?.[id] || {};
-            if(best){
+            // dodatni gard: ako meta postoji, proveri slot
+            if(best && inSlotLocal(meta, slot)){
               createdLocked.push({
                 fixture_id: id,
                 league: meta.league || null,
@@ -229,7 +255,7 @@ export default async function handler(req,res){
     };
     await Promise.all(buckets.map(lane));
 
-    // 3) ako smo kreirali locked listu → upiši u SVE backend-e
+    // 4) ako smo kreirali locked listu → upiši u SVE backend-e
     let savedBackends = [];
     if(createdLocked.length){
       createdLocked.sort((a,b)=>
@@ -246,8 +272,10 @@ export default async function handler(req,res){
     return res.status(200).json({
       ok: true,
       ymd, slot,
-      inspected: ids.length, filtered: ids.length,
-      targeted: ids.length, touched: cached,
+      inspected: ids.length,
+      filtered: slotRows.length,
+      targeted: picked.length,
+      touched: cached,
       source: `refresh-odds:per-fixture`,
       debug: {
         tried: [`${source}`],
