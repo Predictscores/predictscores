@@ -1,7 +1,7 @@
 // pages/api/cron/rebuild.js
-// Rekonstrukcija "locked" feed-a. Ako KV nema kandidate, povuci fixtures za dan iz API-Football,
-// filtriraj po slotu i upisi minimalne stavke u vb:day:<YMD>:<slot> (+union, +last).
-// Slot granice usklađene svuda: late 00–09, am 10–14, pm 15–23.
+// Rekonstrukcija "locked" feed-a za dati slot.
+// Ako kandidati u KV nemaju kickoff (npr. vbl:* lista ID-jeva), povuci detalje iz API-Football,
+// izračunaj slot (late 00–09, am 10–14, pm 15–23), filtriraj i upiši u vb:day:<YMD>:<slot> (+union, +last).
 
 export const config = { api: { bodyParser: false } };
 
@@ -99,20 +99,28 @@ function hourInTZ(d=new Date(), tz=TZ){
   return parseInt(fmt.format(d),10);
 }
 function deriveSlot(h){ if (h<10) return "late"; if (h<15) return "am"; return "pm"; }
+
+// ROBUSNO: timestamp > kickoff_utc > datetime_local > fixture.date...
 function kickoffDate(x){
+  const ts = x?.fixture?.timestamp ?? x?.timestamp;
+  if (typeof ts === "number" && isFinite(ts)) {
+    const d = new Date(ts * 1000);
+    if (!isNaN(d.getTime())) return d;
+  }
   const s =
     x?.kickoff_utc ||
     x?.datetime_local?.starting_at?.date_time ||
+    x?.fixture?.date ||
     x?.datetime_utc ||
     x?.start_time?.utc ||
     x?.start_time;
   if (!s || typeof s !== "string") return null;
-  const d = new Date(s);
-  return isNaN(d.getTime()) ? null : d;
+  const d2 = new Date(s);
+  return isNaN(d2.getTime()) ? null : d2;
 }
 function inSlotLocal(item, slot) {
   const d = kickoffDate(item);
-  if (!d) return true; // ako ne znamo vreme, NE odbacuj (da ne ostanemo prazni)
+  if (!d) return false;  // STROGO: bez vremena -> ne prolazi slot
   const h = hourInTZ(d, TZ);
   if (slot === "late") return h < 10;            // 00–09
   if (slot === "am")   return h >= 10 && h < 15; // 10–14
@@ -126,7 +134,7 @@ async function afFetch(path, params={}){
   const key = afKey();
   if (!key) throw new Error("Missing API-Football key");
   const url = new URL(`${AF_BASE}${path}`);
-  Object.entries(params).forEach(([k,v])=> url.searchParams.set(k,String(v)));
+  Object.entries(params).forEach(([k,v])=> (v!=null) && url.searchParams.set(k,String(v)));
   const r = await fetch(url, { headers:{ "x-apisports-key": key }, cache:"no-store" });
   const ct = r.headers.get("content-type")||"";
   const t = await r.text();
@@ -135,11 +143,10 @@ async function afFetch(path, params={}){
   if (!j) throw new Error("AF parse error");
   return j;
 }
-
-/* ---------------- fallback build from fixtures ---------------- */
 function mapFixtureToItem(fx){
   const id = Number(fx?.fixture?.id);
   const kick = fx?.fixture?.date || null;
+  const ts   = fx?.fixture?.timestamp || null;
   const teams = { home: fx?.teams?.home?.name || null, away: fx?.teams?.away?.name || null };
   const league = fx?.league || null;
   return {
@@ -152,7 +159,8 @@ function mapFixtureToItem(fx){
     away: teams.away,
     datetime_local: kick ? { starting_at: { date_time: String(kick).replace("T"," ").replace("Z","") } } : null,
     kickoff_utc: kick,
-    // minimalni stubovi (UI-friendly, ali bez obaveznih pickova)
+    timestamp: ts,
+    // minimalni stubovi za UI
     market: "1X2",
     selection_label: null,
     pick: null,
@@ -160,10 +168,11 @@ function mapFixtureToItem(fx){
     model_prob: null,
     confidence_pct: null,
     odds: null,
+    fixture: { id, timestamp: ts, date: kick }, // čuvamo i raw za buduće
   };
 }
 
-/* ---------------- handler ---------------- */
+/* ---------------- main ---------------- */
 export default async function handler(req, res) {
   res.setHeader("Cache-Control","no-store");
   const q = req.query || {};
@@ -174,40 +183,72 @@ export default async function handler(req, res) {
   const diag = wantDebug ? {} : null;
 
   try {
-    // 1) Pokušaj pronaći spremne kandidate u KV
+    // 1) Učitaj kandidate iz KV (pokušaj redom)
     const prefer = [
-      `vb:day:${ymd}:${slot}`,
+      `vb:day:${ymd}:${slot}`,   // već gotovi
       `vb:day:${ymd}:union`,
       `vb:day:${ymd}:last`,
-      `vbl_full:${ymd}:${slot}`,
-      `vbl:${ymd}:${slot}`,
+      `vbl_full:${ymd}:${slot}`, // meta sa vremenima
+      `vbl:${ymd}:${slot}`,      // često samo ID-jevi
     ];
-    let candidates = null, src = null;
+    let rawArr = null, src = null;
     for (const k of prefer) {
       const { raw } = await kvGET(k, diag);
       const arr = arrFromAny(unpack(raw));
-      if (arr && arr.length) { candidates = arr; src = k; break; }
+      if (arr && arr.length) { rawArr = arr; src = k; break; }
     }
 
-    // 2) Ako i dalje nemamo ništa → fallback: fixtures za YMD
-    if (!candidates || !candidates.length) {
+    // 2) Ako je `vbl:*` (verovatno lista ID-jeva) – povuci detalje iz AF da bismo imali kickoff
+    let items = null;
+    if (rawArr && rawArr.length) {
+      const looksLikeIdsOnly = rawArr.every(v =>
+        typeof v === "number" || (typeof v === "string" && /^\d+$/.test(v)) ||
+        (v && typeof v === "object" && v.fixture_id == null && v.fixture?.id == null && v.kickoff_utc == null)
+      );
+
+      if (looksLikeIdsOnly) {
+        const ids = Array.from(new Set(rawArr.map(v => Number(v)).filter(n => Number.isFinite(n)))).slice(0, 60);
+        const lanes = 6;
+        const buckets = Array.from({ length: lanes }, () => []);
+        ids.forEach((x,i)=> buckets[i%lanes].push(x));
+
+        const got = [];
+        const lane = async (subset) => {
+          for (const id of subset) {
+            try {
+              const jf = await afFetch("/fixtures", { id });
+              const fx = Array.isArray(jf?.response) ? jf.response[0] : null;
+              if (fx) got.push(mapFixtureToItem(fx));
+            } catch {}
+            await new Promise(r=>setTimeout(r, 120));
+          }
+        };
+        await Promise.all(buckets.map(lane));
+        items = got;
+        src = `${src}→af:fixtures[id]`;
+      } else {
+        // već su objekti sa metama
+        items = rawArr;
+      }
+    }
+
+    // 3) Ako i dalje nemamo ništa → fallback: povuci sve mečeve za datum pa filtriraj
+    if (!items || !items.length) {
       const jf = await afFetch("/fixtures", { date: ymd, timezone: TZ });
       const resp = Array.isArray(jf?.response) ? jf.response : [];
-      const items = resp.map(mapFixtureToItem)
-        .filter(Boolean)
-        .filter(x => inSlotLocal(x, slot))        // slot-filter
-        .sort((a,b)=> (Date.parse(a.kickoff_utc||0) - Date.parse(b.kickoff_utc||0)))
-        .slice(0, 60);
-      candidates = items;
+      items = resp.map(mapFixtureToItem);
       src = "fallback:af-fixtures";
     }
 
-    // 3) Slot-filter (sigurnosno; već rađeno i u fallback-u)
-    const before = candidates.length;
-    const filtered = candidates.filter(x => inSlotLocal(x, slot));
+    // 4) Slot-filter (STROG: bez kickoffa → out)
+    const before = items.length;
+    const filtered = items
+      .filter(x => inSlotLocal(x, slot))
+      .sort((a,b)=> (Date.parse(a.kickoff_utc||0) - Date.parse(b.kickoff_utc||0)))
+      .slice(0, 60);
     const after = filtered.length;
 
-    // 4) Upis u vb:day:* (kompatibilni boks format)
+    // 5) Upis u vb:day:* (kompatibilni box format)
     const boxed = JSON.stringify({ value: JSON.stringify(filtered) });
     const kSlot   = `vb:day:${ymd}:${slot}`;
     const kUnion  = `vb:day:${ymd}:union`;
