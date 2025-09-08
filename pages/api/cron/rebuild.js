@@ -3,7 +3,8 @@
 // Slotovi (Europe/Belgrade): late 00–09, am 10–14, pm 15–23.
 // Pravila: bez U-liga/Primavera/Youth, MIN_ODDS ≥ 1.50, obavezno popunjen pick/odds/confidence preko /odds.
 // Upis: vb:day:<YMD>:<slot> (+union,+last) [boxed] + mirror vbl_full:<YMD>:<slot> i vbl:<YMD>:<slot> [plain array].
-// NOVO: održava i vb:day:<YMD>:combined (Top-3 za ceo dan) — BOXED format.
+// NOVO: održava i vb:day:<YMD>:combined (Top-3 za ceo dan) — BOXED format,
+//       i ako je prazan hist:<YMD>, seed-uje ga iz combined (takođe BOXED).
 
 export const config = { api: { bodyParser: false } };
 
@@ -317,7 +318,7 @@ function dedupByFixture(arr) {
 export default async function handler(req, res) {
   res.setHeader("Cache-Control","no-store");
   const q = req.query || {};
-  theLoop: try {
+  try {
     const now = new Date();
     const ymd = (q.ymd && /^\d{4}-\d{2}-\d{2}$/.test(String(q.ymd))) ? String(q.ymd) : ymdInTZ(now, TZ);
     const slot = (q.slot && /^(am|pm|late)$/.test(String(q.slot))) ? String(q.slot) : deriveSlot(hourInTZ(now, TZ));
@@ -396,6 +397,14 @@ export default async function handler(req, res) {
       .slice(0, 3);
     const boxedCombined = JSON.stringify({ value: JSON.stringify(merged) });
     const s6 = await kvSET(`vb:day:${ymd}:combined`, boxedCombined, diag);
+
+    // 9) DODATO — ako je hist:<YMD> prazan, seed-uj iz combined (BOXED)
+    const histKey = `hist:${ymd}`;
+    const histRaw = (await kvGET(histKey, diag)).raw;
+    const histArr = arrFromAny(unpack(histRaw)) || [];
+    if (histArr.length === 0 && merged.length > 0) {
+      await kvSET(histKey, boxedCombined, diag);
+    }
 
     return res.status(200).json({
       ok: true,
