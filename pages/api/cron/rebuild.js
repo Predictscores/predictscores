@@ -3,6 +3,7 @@
 // Slotovi (Europe/Belgrade): late 00–09, am 10–14, pm 15–23.
 // Pravila: bez U-liga/Primavera/Youth, MIN_ODDS ≥ 1.50, obavezno popunjen pick/odds/confidence preko /odds.
 // Upis: vb:day:<YMD>:<slot> (+union,+last) [boxed] + mirror vbl_full:<YMD>:<slot> i vbl:<YMD>:<slot> [plain array].
+// NOVO: održava i vb:day:<YMD>:combined (Top-3 za ceo dan).
 
 export const config = { api: { bodyParser: false } };
 
@@ -183,9 +184,39 @@ function mapFixtureToItem(fx){
   };
 }
 
+/* -------- robust fixtures for date (handles backfill) -------- */
+async function fetchAllFixturesForDate(ymd){
+  const tries = [
+    { tag: "date+tz",    params: { date: ymd, timezone: TZ } },
+    { tag: "date",       params: { date: ymd } },
+    { tag: "from-to+tz", params: { from: ymd, to: ymd, timezone: TZ } },
+    { tag: "from-to",    params: { from: ymd, to: ymd } },
+    { tag: "date+UTC",   params: { date: ymd, timezone: "UTC" } },
+  ];
+  const HARD_CAP_PAGES = 12;
+  const bag = new Map();
+  for (const t of tries) {
+    let page = 1;
+    while (page <= HARD_CAP_PAGES) {
+      const jf = await afFetch("/fixtures", { ...t.params, page });
+      const arr = Array.isArray(jf?.response) ? jf.response : [];
+      for (const fx of arr) {
+        const id = fx?.fixture?.id;
+        if (id && !bag.has(id)) bag.set(id, fx);
+      }
+      const cur = Number(jf?.paging?.current || page);
+      const tot = Number(jf?.paging?.total || page);
+      if (!tot || cur >= tot) break;
+      page++;
+      await new Promise(r=>setTimeout(r, 120));
+    }
+    if (bag.size) break;
+  }
+  return Array.from(bag.values()).sort((a,b)=> new Date(a?.fixture?.date||0) - new Date(b?.fixture?.date||0));
+}
+
 /* -------- odds helpers -------- */
 // Biramo NAJVEROVATNIJI ishod među onima sa kvotom >= minOdds.
-// Verovatnoće normalizujemo preko sve 3 kvote (H/D/A) iz istog bookmakera.
 function best1x2FromBookmakers(bookmakers, minOdds = MIN_ODDS) {
   let best = null, books = 0;
   for (const b of bookmakers || []) {
@@ -210,7 +241,7 @@ function best1x2FromBookmakers(bookmakers, minOdds = MIN_ODDS) {
       ].filter(c => c.odd >= minOdds);
 
       if (!cands.length) continue;
-      cands.sort((a,b)=> b.prob - a.prob); // najveća normalizovana verovatnoća
+      cands.sort((a,b)=> b.prob - a.prob);
       const pick = cands[0];
       const chosen = {
         pick_code: pick.code,
@@ -263,6 +294,25 @@ async function enrichWithOdds(items){
   return { called, filled };
 }
 
+/* -------- scoring for combined -------- */
+function scoreForSort(it) {
+  const c = Number(it?.confidence_pct ?? 0);
+  const p = Number(it?.model_prob ?? 0);
+  const ev = Number(it?.ev ?? it?.edge ?? 0);
+  return c * 10000 + p * 100 + ev;
+}
+function dedupByFixture(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const it of arr || []) {
+    const id = Number(it?.fixture_id ?? it?.fixture?.id);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(it);
+  }
+  return out;
+}
+
 /* ---------------- main ---------------- */
 export default async function handler(req, res) {
   res.setHeader("Cache-Control","no-store");
@@ -289,13 +339,13 @@ export default async function handler(req, res) {
       if (arr && arr.length) { rawArr = arr; src = k; break; }
     }
 
-    // 2) Ako nema ništa → fixtures za YMD
+    // 2) Ako nema ništa → fixtures za YMD (ROBUST)
     let items;
     if (rawArr && rawArr.length) {
       items = rawArr;
     } else {
-      const jf = await afFetch("/fixtures", { date: ymd, timezone: TZ });
-      const resp = Array.isArray(jf?.response) ? jf.response : [];
+      const fixtures = await fetchAllFixturesForDate(ymd);
+      const resp = Array.isArray(fixtures) ? fixtures : [];
       items = resp.map(mapFixtureToItem);
       src = "fallback:af-fixtures";
     }
@@ -310,7 +360,7 @@ export default async function handler(req, res) {
     // 4) Popuni /odds samo za slotirane (malo poziva)
     const { called, filled } = await enrichWithOdds(slotFiltered);
 
-    // 5) Odbaci sve bez pick-a ili sa kvotom < MIN_ODDS (teorijski su vec eliminisani u best1x2)
+    // 5) Odbaci sve bez pick-a ili sa kvotom < MIN_ODDS
     const withPicks = slotFiltered
       .filter(x => x.pick && x.odds && Number(x.odds.price) >= MIN_ODDS);
 
@@ -337,13 +387,22 @@ export default async function handler(req, res) {
     const s4 = await kvSET(`vbl_full:${ymd}:${slot}`, JSON.stringify(withPicks), diag);
     const s5 = await kvSET(`vbl:${ymd}:${slot}`,      JSON.stringify(shortList), diag);
 
+    // 8) NOVO — održavaj vb:day:<YMD>:combined (Top-3 za ceo dan; merge+trim)
+    const top3ThisSlot = withPicks.slice(0, 3);
+    const prevRaw = (await kvGET(`vb:day:${ymd}:combined`, diag)).raw;
+    const prevArr = arrFromAny(unpack(prevRaw)) || [];
+    const merged = dedupByFixture([...prevArr, ...top3ThisSlot])
+      .sort((a,b) => scoreForSort(b) - scoreForSort(a))
+      .slice(0, 3);
+    const s6 = await kvSET(`vb:day:${ymd}:combined`, JSON.stringify(merged), diag);
+
     return res.status(200).json({
       ok: true,
       ymd,
       mutated: true,
       counts: { union: withPicks.length, last: withPicks.length, combined: withPicks.length },
       source: src,
-      saved_backends: Array.from(new Set([...(s1||[]), ...(s2||[]), ...(s3||[]), ...(s4||[]), ...(s5||[])])),
+      saved_backends: Array.from(new Set([...(s1||[]), ...(s2||[]), ...(s3||[]), ...(s4||[]), ...(s5||[]), ...(s6||[])])),
       ...(wantDebug ? { debug: { slot, odds_called: called, odds_filled: filled, kept: withPicks.length, returned: shortList.length } } : {})
     });
 
