@@ -1,5 +1,5 @@
 // pages/api/crypto.js
-// API sa "compat" projekcijom za postojeći UI: dodaje alias polja i top-level duplikate.
+// API sa "compat" projekcijom za postojeći UI: dodaje ALIAS signals + slim format.
 // Core i KV keš ostaju isti (buildSignals u lib/crypto-core.js).
 import { buildSignals } from "../../lib/crypto-core";
 
@@ -149,6 +149,7 @@ function sendCompat(res, base, shape) {
   const out = {
     ...base,
     // top-level duplicati za različite UI-ove
+    signals: items,      // <<<<<<<<<<  KLJUČNO za tvoj front
     data: items,
     predictions: items,
     rows: items,
