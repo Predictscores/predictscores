@@ -1,7 +1,6 @@
 // pages/api/crypto.js
-// API sa "compat" projekcijom: dodaje ALIAS signals + shape=slim (plain array).
-// Propusta Entry/SL/TP/expectedMove/rr/valid_until bez izmene.
-// Fudbal se ne dira.
+// API sa "compat" projekcijom: dodaje ALIAS signals + shape=slim + aliasi za Entry/TP/SL.
+// Propusta Entry/SL/TP/expectedMove/rr/valid_until iz core-a. Fudbal se ne dotiče.
 
 import { buildSignals } from "../../lib/crypto-core";
 
@@ -10,7 +9,7 @@ const {
   UPSTASH_REDIS_REST_URL = "",
   UPSTASH_REDIS_REST_TOKEN = "",
   CRON_KEY = "",
-  CRYPTO_TOP_N = "5",
+  CRYPTO_TOP_N = "3",
   CRYPTO_MIN_VOL_USD = "50000000",
   CRYPTO_MIN_MCAP_USD = "200000000",
   CRYPTO_COOLDOWN_MIN = "30",
@@ -21,7 +20,7 @@ const {
 } = process.env;
 
 const CFG = {
-  TOP_N: clampInt(CRYPTO_TOP_N, 5, 1, 10),
+  TOP_N: clampInt(CRYPTO_TOP_N, 3, 1, 10),
   MIN_VOL: toNum(CRYPTO_MIN_VOL_USD, 50_000_000),
   MIN_MCAP: toNum(CRYPTO_MIN_MCAP_USD, 200_000_000),
   COOLDOWN_MIN: clampInt(CRYPTO_COOLDOWN_MIN, 30, 0, 1440),
@@ -91,8 +90,15 @@ function projectForUI(list) {
     const d24 = numOr0(it.d24_pct);
     const d7  = numOr0(it.d7_pct);
 
+    // ---- aliasi za nivoe (bitno za SignalCard) ----
+    const entry = (it.entry ?? it.entryPrice ?? null);
+    const tp    = (it.tp ?? it.takeProfit ?? it.tpPrice ?? null);
+    const sl    = (it.sl ?? it.stopLoss ?? it.slPrice ?? null);
+
     return {
       ...it,
+
+      // canonical
       type: "crypto", sport: "crypto", category: "crypto", market: "crypto",
       ticker: it.symbol, symbolUpper: String(it.symbol || "").toUpperCase(),
 
@@ -106,7 +112,13 @@ function projectForUI(list) {
       m30_pct: m30, h1_pct: h1, h4_pct: h4, d24_pct: d24, d7_pct: d7,
       change30m: m30, change1h: h1, change4h: h4, change24h: d24, change7d: d7,
 
-      // entry/sl/tp/rr/expectedMove/valid_until već su tu ako ih core izda
+      // ----- LEVELS (sa svim popularnim imenima) -----
+      entry, entryPrice: entry,
+      tp, takeProfit: tp, tpPrice: tp, targetPrice: tp,
+      sl, stopLoss: sl, slPrice: sl,
+      rr: it.rr ?? it.riskReward ?? null,
+      valid_until: it.valid_until ?? it.validUntil ?? null,
+      validUntil: it.valid_until ?? it.validUntil ?? null,
     };
   });
 }
@@ -115,7 +127,7 @@ function sendCompat(res, base, shape) {
   const items = base.items || [];
   const out = {
     ...base,
-    signals: items,      // ALIAS koji tvoj front već čita
+    signals: items,      // front čita ovo
     data: items, predictions: items, rows: items, list: items, results: items,
     total: base.count,
   };
@@ -194,6 +206,8 @@ function checkCronKey(req, expected) {
   if (auth.toLowerCase().startsWith("bearer ") && auth.slice(7) === expected) return true;
   return false;
 }
+
+/* ---------- utils ---------- */
 function toNum(x, d = 0) { const n = Number(x); return Number.isFinite(n) ? n : d; }
 function clampInt(v, def, min, max) { const n = parseInt(v,10); if (!Number.isFinite(n)) return def; return Math.min(max, Math.max(min, n)); }
 function parseBool(x){ return String(x).toLowerCase()==="1"||String(x).toLowerCase()==="true"; }
