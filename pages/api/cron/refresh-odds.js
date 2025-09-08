@@ -1,6 +1,8 @@
 // pages/api/cron/refresh-odds.js
-// Seed-uje listu fixtures za zadati slot i cache-uje osnovne meta/odds podatke.
-// FIX: dodata PAGINACIJA preko svih strana /fixtures za ymd + slot-filter (late 00–09, am 10–14, pm 15–23).
+// Seed-uje/refresh-uje odds za dati slot i dan, sa pametnim fallback-om na KV.
+// Redosled izvora: vbl_full:<YMD>:<slot> → vb:day:<YMD>:<slot> → vb:day:<YMD>:(union|last) → API-Football fixtures (all pages).
+// Slot-filter (Europe/Belgrade): late 00–09, am 10–14, pm 15–23.
+
 export const config = { api: { bodyParser: false } };
 
 const TZ = "Europe/Belgrade";
@@ -15,18 +17,20 @@ function kvBackends() {
   if (bU && bT) out.push({ flavor: "upstash-redis", url: bU.replace(/\/+$/,""), tok: bT });
   return out;
 }
-async function kvGETraw(key) {
+async function kvGETraw(key, diag) {
   for (const b of kvBackends()) {
     try {
       const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`, {
         headers: { Authorization: `Bearer ${b.tok}` }, cache: "no-store",
       });
-      if (!r.ok) continue;
+      if (!r.ok) { diag && diag.push({ key, flavor:b.flavor, status:`http-${r.status}` }); continue; }
       const j = await r.json().catch(()=>null);
-      if (typeof j?.result === "string" && j.result) {
-        return { raw: j.result, flavor: b.flavor };
-      }
-    } catch {}
+      const val = (typeof j?.result === "string" && j.result) ? j.result : null;
+      diag && diag.push({ key, flavor:b.flavor, status: val ? "hit" : "miss-null" });
+      if (val) return { raw: val, flavor: b.flavor };
+    } catch(e) {
+      diag && diag.push({ key, flavor:b.flavor, status:`err:${String(e?.message||e)}` });
+    }
   }
   return { raw: null, flavor: null };
 }
@@ -64,6 +68,9 @@ function arrFromAny(x){
   if(Array.isArray(x?.football)) return x.football;
   if(Array.isArray(x?.list)) return x.list;
   if(Array.isArray(x?.data)) return x.data;
+  if(x && typeof x==="object" && typeof x.value==="string"){
+    try{ const v = JSON.parse(x.value); if(Array.isArray(v)) return v; }catch{}
+  }
   return null;
 }
 
@@ -82,14 +89,18 @@ function deriveSlot(h){ if(h<10) return "late"; if(h<15) return "am"; return "pm
 
 /* --------------- slot helpers --------------- */
 function kickoffFromMeta(meta){
-  const s = meta?.kickoff_utc || meta?.datetime_local?.starting_at?.date_time || null;
+  const s =
+    meta?.kickoff_utc ||
+    meta?.datetime_local?.starting_at?.date_time ||
+    meta?.fixture?.date ||
+    null;
   if (!s || typeof s !== "string") return null;
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : d;
 }
 function inSlotLocal(meta, slot){
   const d = kickoffFromMeta(meta);
-  if (!d) return false; // ovde smo striktni (u ovom fajlu), fallback je u reader-u ako baš treba
+  if (!d) return false; // ovde smo striktni (seed ne popušta bez vremena)
   const h = hourInTZ(d, TZ);
   if (slot === "late") return h < 10;            // 00–09
   if (slot === "am")   return h >= 10 && h < 15; // 10–14
@@ -101,12 +112,9 @@ function getAFKey(){ return process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.
 async function afFetch(path, params={}){
   const key = getAFKey();
   if(!key) throw new Error("Missing API-Football key");
-  const url = new URL(`https://v3.football.api-sports.io${path}`);
+  const url = new URL(`${AF_BASE}${path}`);
   Object.entries(params).forEach(([k,v]) => { if (v != null) url.searchParams.set(k, String(v)); });
-  const r = await fetch(url, {
-    headers: { "x-apisports-key": key },
-    cache: "no-store",
-  });
+  const r = await fetch(url, { headers: { "x-apisports-key": key }, cache: "no-store" });
   const ct = r.headers.get("content-type") || "";
   const text = await r.text();
   if (!ct.includes("application/json")) throw new Error(`API-Football non-JSON (${r.status}) ${text.slice(0,120)}`);
@@ -118,8 +126,7 @@ async function afFetch(path, params={}){
 /* -------- fetch ALL fixture pages for date -------- */
 async function fetchAllFixturesForDate(ymd){
   let page = 1, all = [];
-  // tvrdi limit da ne uđemo u beskonačnu petlju
-  const HARD_CAP_PAGES = 12;
+  const HARD_CAP_PAGES = 12; // safety
   while (page <= HARD_CAP_PAGES) {
     const jf = await afFetch("/fixtures", { date: ymd, timezone: TZ, page });
     const arr = Array.isArray(jf?.response) ? jf.response : [];
@@ -130,7 +137,6 @@ async function fetchAllFixturesForDate(ymd){
     page++;
     await new Promise(r=>setTimeout(r, 120));
   }
-  // stabilno sortiranje
   all.sort((a,b)=> new Date(a?.fixture?.date||0) - new Date(b?.fixture?.date||0));
   return all;
 }
@@ -139,8 +145,9 @@ async function fetchAllFixturesForDate(ymd){
 function uniqNums(a){ const s=new Set(); for(const v of a||[]){ const n=Number(v); if(Number.isFinite(n)&&n>0)s.add(n);} return [...s]; }
 
 function best1x2FromBookmakers(bookmakers){
-  let best = null;
+  let best = null, books = 0;
   for(const b of bookmakers||[]){
+    books++;
     for(const bet of b.bets||[]){
       const name = String(bet.name||"").toLowerCase();
       if(!(name.includes("match winner") || name==="1x2" || name.includes("winner"))) continue;
@@ -163,7 +170,7 @@ function best1x2FromBookmakers(bookmakers){
       }
     }
   }
-  if(best) best.books_count = 1;
+  if(best) best.books_count = books || 1;
   return best;
 }
 
@@ -175,56 +182,120 @@ export default async function handler(req,res){
     const q = req.query||{};
     const now = new Date();
     const ymd = (q.ymd && String(q.ymd).match(/^\d{4}-\d{2}-\d{2}$/)) ? String(q.ymd) : ymdInTZ(now, TZ);
-    const slot = (q.slot && /^(am|pm|late)$/.test(String(q.slot))) ? q.slot : deriveSlot(hourInTZ(now, TZ));
+    const slot = (q.slot && /^(am|pm|late)$/.test(String(q.slot))) ? String(q.slot) : deriveSlot(hourInTZ(now, TZ));
     const force = String(q.force ?? "0")==="1";
 
     if(!getAFKey()) {
       return res.status(200).json({ ok:false, ymd, slot, error:"API-Football key missing", source:"refresh-odds" });
     }
 
-    // 1) all fixtures for date (ALL PAGES)
-    const all = await fetchAllFixturesForDate(ymd);
-    const inspected = all.length;
+    // --------- 0) spremi listu kandidata iz KV ili API, sa evidencijom šta je pokušaо
+    const tried = [];
+    let pickedKey = null;
+    let list = null;              // lista objekata sa {fixture_id,...} ili full fixtures
+    let metaById = {};            // minimalna meta per id
 
-    // 2) map to meta and strict slot-filter
-    const metaById = {};
-    for (const it of all) {
-      const id = Number(it?.fixture?.id);
-      if (!id) continue;
-      metaById[id] = {
-        league: it?.league,
-        teams:  it?.teams,
-        datetime_local: { starting_at: { date_time: (it?.fixture?.date || "").replace("T"," ").replace("Z","") } },
-        kickoff_utc: it?.fixture?.date || null,
-      };
+    // A) vbl_full:<ymd>:<slot>
+    tried.push(`vbl_full:${ymd}:${slot}`);
+    const rawVblFull = (await kvGETraw(`vbl_full:${ymd}:${slot}`)).raw;
+    const arrVblFull = arrFromAny(toObj(rawVblFull));
+    if (arrVblFull && arrVblFull.length) {
+      pickedKey = `vbl_full:${ymd}:${slot}`;
+      list = arrVblFull;
     }
-    const rows = all.map(it => {
-      const id = Number(it?.fixture?.id);
-      return id ? { id, meta: metaById[id] } : null;
-    }).filter(Boolean);
 
-    const slotRows = rows.filter(r => inSlotLocal(r.meta, slot));
-    const filtered = slotRows.length;
-    const pickedIds = slotRows.slice(0, 60).map(r => r.id); // samo slot
+    // B) vb:day:<ymd>:<slot> (boxed)
+    if (!list) {
+      tried.push(`vb:day:${ymd}:${slot}`);
+      const rawBox = (await kvGETraw(`vb:day:${ymd}:${slot}`)).raw;
+      const arrBox = arrFromAny(toObj(rawBox));
+      if (arrBox && arrBox.length) {
+        pickedKey = `vb:day:${ymd}:${slot}`;
+        list = arrBox;
+      }
+    }
 
-    // Ako posle *celog dana* i dalje nema mečeva u slotu:
-    if (!pickedIds.length && !force) {
+    // C) vb:day:<ymd>:(union|last)
+    if (!list) {
+      for (const k of [`vb:day:${ymd}:union`, `vb:day:${ymd}:last`]) {
+        tried.push(k);
+        const raw = (await kvGETraw(k)).raw;
+        const arr = arrFromAny(toObj(raw));
+        if (arr && arr.length) { pickedKey = k; list = arr; break; }
+      }
+    }
+
+    // D) API fixtures (all pages) — kao poslednji fallback
+    let inspected = 0, filtered = 0;
+    if (!list) {
+      tried.push("fixtures:all-pages");
+      const all = await fetchAllFixturesForDate(ymd);
+      inspected = all.length;
+      // mapiraj meta
+      for (const it of all) {
+        const id = Number(it?.fixture?.id);
+        if (!id) continue;
+        metaById[id] = {
+          league: it?.league,
+          teams:  it?.teams,
+          datetime_local: { starting_at: { date_time: (it?.fixture?.date || "").replace("T"," ").replace("Z","") } },
+          kickoff_utc: it?.fixture?.date || null,
+        };
+      }
+      const rows = all.map(it => {
+        const id = Number(it?.fixture?.id);
+        return id ? { id, meta: metaById[id] } : null;
+      }).filter(Boolean);
+
+      const slotRows = rows.filter(r => inSlotLocal(r.meta, slot));
+      filtered = slotRows.length;
+      const ids = slotRows.slice(0, 60).map(r => r.id);
+      list = ids.map(id => ({ fixture_id: id, ...(metaById[id] ? { ...metaById[id] } : {}) }));
+      pickedKey = "fixtures:all-pages";
+    } else {
+      // meta iz KV zapisa (vbl_full / vb:day*) — ponovo provuci slot za svaki slučaj
+      const norm = [];
+      for (const it of list) {
+        const id = Number(it?.fixture_id ?? it?.fixture?.id ?? it?.id ?? it);
+        if (!id) continue;
+        const meta = {
+          league: it?.league || it?.league_obj || null,
+          teams:  it?.teams || { home: it?.home ? { name: it.home } : null, away: it?.away ? { name: it.away } : null },
+          datetime_local: it?.datetime_local || (it?.kickoff_utc
+            ? { starting_at: { date_time: String(it.kickoff_utc).replace("T"," ").replace("Z","") } }
+            : null),
+          kickoff_utc: it?.kickoff_utc || it?.fixture?.date || null,
+          fixture: it?.fixture || null,
+        };
+        if (inSlotLocal(meta, slot)) {
+          norm.push({ fixture_id: id, ...meta });
+          metaById[id] = meta;
+        }
+      }
+      inspected = list.length;
+      filtered  = norm.length;
+      list = norm.slice(0, 60);
+    }
+
+    // Ako i dalje nema kandidata i nije force → nema šta da se radi
+    if (!list || !list.length) {
       return res.status(200).json({
         ok: true, ymd, slot,
         inspected, filtered, targeted: 0, touched: 0,
-        source: "refresh-odds:no-slot-matches",
-        debug: { tried:["fixtures:all-pages"], pickedKey:null, listLen:0, saved_backends:[] }
+        source: "refresh-odds",
+        debug: { tried, pickedKey, listLen: 0, saved_backends: [] }
       });
     }
 
-    // 3) odds fetch + kreiranje vbl_full/vbl za SLOT
+    // 1) izvuci ID-jeve i paralelno osveži /odds
+    const ids = uniqNums(list.map(x => x?.fixture_id ?? x?.fixture?.id ?? x?.id ?? x));
+    const lanes = 5;
+    const buckets = Array.from({length: lanes}, ()=>[]);
+    ids.forEach((x,i)=>buckets[i%lanes].push(x));
+
     const haveVbl = !!arrFromAny(toObj((await kvGETraw(`vbl:${ymd}:${slot}`)).raw));
     const createdLocked = [];
     let called = 0, cached = 0;
-
-    const lanes = 5;
-    const buckets = Array.from({length: lanes}, ()=>[]);
-    pickedIds.forEach((x,i)=>buckets[i%lanes].push(x));
 
     const lane = async (subset)=>{
       for(const id of subset){
@@ -238,7 +309,7 @@ export default async function handler(req,res){
             const bookmakers = (jo?.response?.[0]?.bookmakers) || [];
             const best = best1x2FromBookmakers(bookmakers);
             const meta = metaById?.[id] || {};
-            if(best){ // meta je već u slotu (strict)
+            if(best && inSlotLocal(meta, slot)){
               createdLocked.push({
                 fixture_id: id,
                 league: meta.league || null,
@@ -272,7 +343,7 @@ export default async function handler(req,res){
         (b.confidence_pct - a.confidence_pct) ||
         ((Date.parse(a.kickoff_utc||0)) - (Date.parse(b.kickoff_utc||0)))
       );
-      const full = createdLocked.slice(0, 25);
+      const full = createdLocked.slice(0, 60);
       const cut  = createdLocked.slice(0, 15);
       const r1 = await kvSETjsonAll(`vbl_full:${ymd}:${slot}`, full);
       const r2 = await kvSETjsonAll(`vbl:${ymd}:${slot}`,     cut);
@@ -284,15 +355,10 @@ export default async function handler(req,res){
       ymd, slot,
       inspected,
       filtered,
-      targeted: pickedIds.length,
+      targeted: ids.length,
       touched: cached,
-      source: "refresh-odds:fixtures:all-pages(slot)",
-      debug: {
-        tried: ["fixtures:all-pages"],
-        pickedKey: createdLocked.length?`vbl:${ymd}:${slot}`:null,
-        listLen: createdLocked.length,
-        saved_backends: savedBackends
-      }
+      source: "refresh-odds",
+      debug: { tried, pickedKey, listLen: (createdLocked||[]).length, saved_backends: savedBackends }
     });
 
   }catch(e){
