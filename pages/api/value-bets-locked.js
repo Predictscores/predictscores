@@ -1,6 +1,7 @@
 // pages/api/value-bets-locked.js
 // Response za UI ("football" tab) sa tvrdim cap-om po slotu i danu u nedelji.
 // Weekday: late=6, am=15, pm=15;  Weekend (Sat/Sun): late=6, am=20, pm=20.
+// DOPUNA: ubacuje tickets (BTTS/OU2.5/HT-FT) direktno u payload iz KV ključeva tickets:<YMD>(:slot)
 
 export const config = { api: { bodyParser: false } };
 
@@ -120,6 +121,36 @@ function capFor(ymd, slot){
   return 15;
 }
 
+/* --------------- tickets read helper --------------- */
+async function readTickets(ymd, slot, trace){
+  const tried = [];
+  const { raw:rawDay } = await kvGETraw(`tickets:${ymd}`, trace && tried);
+  let obj = toObj(rawDay);
+  let source = rawDay ? `tickets:${ymd}` : null;
+  if (!obj || typeof obj !== "object") {
+    const { raw:rawSlot } = await kvGETraw(`tickets:${ymd}:${slot}`, trace && tried);
+    obj = toObj(rawSlot);
+    source = rawSlot ? `tickets:${ymd}:${slot}` : source;
+  }
+  const empty = { btts:[], ou25:[], htft:[] };
+  if (!obj || typeof obj !== "object") return { tickets: empty, source: source || null, tried };
+  // sigurnosni filteri (ban + min odds + sort)
+  const clean = (arr=[]) => (arr||[])
+    .filter(it => !isYouthOrBanned(it))
+    .filter(it => !it.market_odds || Number(it.market_odds) >= MIN_ODDS)
+    .sort((a,b)=> (Number(b?.confidence_pct||0) - Number(a?.confidence_pct||0)) ||
+                  (Date.parse(a?.kickoff_utc||0) - Date.parse(b?.kickoff_utc||0)));
+  return {
+    tickets: {
+      btts: clean(obj.btts),
+      ou25: clean(obj.ou25),
+      htft: clean(obj.htft),
+    },
+    source: source || null,
+    tried
+  };
+}
+
 /* ---------------- handler ---------------- */
 export default async function handler(req,res){
   try{
@@ -141,24 +172,28 @@ export default async function handler(req,res){
       `vb:day:${ymd}:last`,
     ];
     let pool = [];
-    let source = [];
+    let sources = [];
     for (const k of triedKeys) {
       const { raw } = await kvGETraw(k, trace);
       const arr = arrFromAny(toObj(raw));
       if (Array.isArray(arr) && arr.length) {
         pool.push(...arr);
-        source.push(k);
+        sources.push(k);
       }
     }
     pool = dedupByFixture(pool);
 
     // Ako nema ničega, vrati prazan odgovor (ne diramo dalje logike)
     if (!pool.length) {
+      const { tickets, source:tsrc, tried:ttried } = await readTickets(ymd, slot, trace);
       return res.status(200).json({
-        ok:true, slot, ymd, items:[], football:[], top3:[],
-        source: source.length ? source.join(" + ") : null,
+        ok:true, slot, ymd,
+        items:[], football:[], top3:[],
+        tickets,
+        source: sources.length ? sources.join(" + ") : null,
+        tickets_source: tsrc,
         policy_cap: capFor(ymd, slot),
-        ...(wantDebug ? { debug:{ tried: triedKeys, trace } } : {})
+        ...(wantDebug ? { debug:{ tried: triedKeys, trace, tickets_tried: ttried, before: 0, after: 0 } } : {})
       });
     }
 
@@ -178,7 +213,10 @@ export default async function handler(req,res){
     const cap = capFor(ymd, slot);
     const items = pool.slice(0, cap);
 
-    // 5) izlaz u formatu koji UI očekuje
+    // 5) tiketi iz KV
+    const { tickets, source:tsrc, tried:ttried } = await readTickets(ymd, slot, trace);
+
+    // 6) izlaz u formatu koji UI očekuje
     const top3 = items.slice(0,3);
     const payload = {
       ok: true,
@@ -187,10 +225,12 @@ export default async function handler(req,res){
       items,
       football: items,   // isti set za "football" tab
       top3,
-      source: source.join(" + "),
+      tickets,           // NOVO: BTTS / OU2.5 / HT-FT
+      source: sources.join(" + "),
+      tickets_source: tsrc,
       policy_cap: cap,
     };
-    if (wantDebug) payload.debug = { tried: triedKeys, trace, before: pool.length, after: items.length };
+    if (wantDebug) payload.debug = { tried: triedKeys, trace, tickets_tried: ttried, before: pool.length, after: items.length };
     return res.status(200).json(payload);
 
   }catch(e){
