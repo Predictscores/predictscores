@@ -1,58 +1,84 @@
-// FILE: components/CryptoTopSignals.jsx
-import React from 'react';
-import useCryptoSignals from '../hooks/useCryptoSignals';
-import SignalCard from './SignalCard';
+// components/CryptoTopSignals.jsx
+// Render top-N kripto signala preko SignalCard, sa Entry / TP / SL nivoima.
+// Ne zavisi od DataContext-a: sam čita /api/crypto i radi lokalni sort/limit.
 
-function normalizeConfidence(conf) {
-  const raw = typeof conf === 'number' ? conf : 0;
-  const pct = raw > 1 ? raw : raw * 100;
-  return Math.min(95, Math.max(5, Math.round(pct)));
+import { useEffect, useState, useMemo } from "react";
+import SignalCard from "./SignalCard";
+
+function pickList(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== "object") return [];
+  return payload.items || payload.signals || payload.data || payload.results || [];
 }
 
-const STABLES = new Set(['USDT','USDC','USDE','DAI','TUSD','FDUSD','USDP','EURS','EURT','USTC']);
+export default function CryptoTopSignals({ limit = 3 }) {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
 
-export default function CryptoTopSignals({ limit = 10 }) {
-  const { crypto = [], loading, error } = useCryptoSignals(limit);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const r = await fetch("/api/crypto", { cache: "no-store" });
+        const j = await r.json();
+        if (!alive) return;
+        const list = pickList(j)
+          .filter(Boolean)
+          .sort((a, b) => (b?.confidence_pct ?? 0) - (a?.confidence_pct ?? 0));
+        setItems(list);
+      } catch {
+        setItems([]);
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
 
-  if (loading) return <div>Loading crypto signals...</div>;
-  if (error) return <div>Error loading crypto signals</div>;
+  const top = useMemo(() => items.slice(0, limit), [items, limit]);
 
-  const withConf = crypto.map(s => ({ ...s, confidence: normalizeConfidence(s.confidence) }));
-
-  let filtered = withConf.filter(s => {
-    const sym = String(s.symbol || '').toUpperCase();
-    if (STABLES.has(sym)) return false;
-    const move = typeof s.expectedMove === 'number' ? s.expectedMove : 0;
-    return move >= 0.8;
-  });
-
-  if (filtered.length < Math.min(3, limit)) {
-    filtered = withConf.filter(s => {
-      const sym = String(s.symbol || '').toUpperCase();
-      if (STABLES.has(sym)) return false;
-      const move = typeof s.expectedMove === 'number' ? s.expectedMove : 0;
-      return move >= 0.3;
-    });
+  if (loading) {
+    return (
+      <div className="text-slate-300 text-sm py-4">
+        Učitavam kripto signale…
+      </div>
+    );
   }
 
-  filtered.sort((a, b) => {
-    const c = (b.confidence || 0) - (a.confidence || 0);
-    if (c !== 0) return c;
-    const em = (b.expectedMove || 0) - (a.expectedMove || 0);
-    if (em !== 0) return em;
-    return String(a.symbol).localeCompare(String(b.symbol));
-  });
-
-  const top = filtered.slice(0, limit);
+  if (!top.length) {
+    return (
+      <div className="text-slate-300 text-sm py-4">
+        Trenutno nema kripto signala.
+      </div>
+    );
+  }
 
   return (
-    <div className="space-y-4">
-      {top.map(signal => (
-        <SignalCard key={signal.symbol} data={signal} type="crypto" />
+    <div className="grid gap-4 md:grid-cols-3 sm:grid-cols-2 grid-cols-1">
+      {top.map((it) => (
+        <SignalCard
+          key={`${it.symbol || it.ticker || it.id}-${it.exchange || ""}`}
+          // osnovno
+          sport="crypto"
+          ticker={(it.symbolUpper || it.symbol || it.ticker || "").toUpperCase()}
+          title={(it.symbolUpper || it.symbol || it.ticker || "").toUpperCase()}
+          subtitle={it.name || it.pair || it.exchange || "Crypto"}
+          direction={it.direction || (String(it.signal || "").toLowerCase())}
+          confidence={it.confidence_pct ?? it.confidence ?? 0}
+          image={it.image}
+
+          // NIVOI — pokrivamo više naziva (aliasi su i na API strani)
+          entryPrice={it.entry ?? it.entryPrice ?? null}
+          takeProfit={it.tp ?? it.takeProfit ?? it.tpPrice ?? null}
+          stopLoss={it.sl ?? it.stopLoss ?? it.slPrice ?? null}
+          rr={it.rr ?? it.riskReward ?? null}
+
+          // dodatno (ako ih kartica koristi)
+          exchange={it.exchange}
+          pair={it.pair}
+          validUntil={it.valid_until ?? it.validUntil ?? null}
+        />
       ))}
-      {top.length === 0 && (
-        <div className="text-gray-500 text-sm">No crypto suggestions at the moment.</div>
-      )}
     </div>
   );
 }
