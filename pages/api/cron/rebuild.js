@@ -3,7 +3,7 @@
 // Slotovi (Europe/Belgrade): late 00–09, am 10–14, pm 15–23.
 // Pravila: bez U-liga/Primavera/Youth, MIN_ODDS ≥ 1.50, obavezno popunjen pick/odds/confidence preko /odds.
 // Upis: vb:day:<YMD>:<slot> (+union,+last) [boxed] + mirror vbl_full:<YMD>:<slot> i vbl:<YMD>:<slot> [plain array].
-// NOVO: održava i vb:day:<YMD>:combined (Top-3 za ceo dan).
+// NOVO: održava i vb:day:<YMD>:combined (Top-3 za ceo dan) — BOXED format.
 
 export const config = { api: { bodyParser: false } };
 
@@ -317,13 +317,13 @@ function dedupByFixture(arr) {
 export default async function handler(req, res) {
   res.setHeader("Cache-Control","no-store");
   const q = req.query || {};
-  const now = new Date();
-  const ymd = (q.ymd && /^\d{4}-\d{2}-\d{2}$/.test(String(q.ymd))) ? String(q.ymd) : ymdInTZ(now, TZ);
-  const slot = (q.slot && /^(am|pm|late)$/.test(String(q.slot))) ? String(q.slot) : deriveSlot(hourInTZ(now, TZ));
-  const wantDebug = String(q.debug ?? "") === "1";
-  const diag = wantDebug ? {} : null;
+  theLoop: try {
+    const now = new Date();
+    const ymd = (q.ymd && /^\d{4}-\d{2}-\d{2}$/.test(String(q.ymd))) ? String(q.ymd) : ymdInTZ(now, TZ);
+    const slot = (q.slot && /^(am|pm|late)$/.test(String(q.slot))) ? String(q.slot) : deriveSlot(hourInTZ(now, TZ));
+    const wantDebug = String(q.debug ?? "") === "1";
+    const diag = wantDebug ? {} : null;
 
-  try {
     // 1) Kandidati iz KV (vb:day -> vbl_full -> vbl)
     const prefer = [
       `vb:day:${ymd}:${slot}`,
@@ -387,14 +387,15 @@ export default async function handler(req, res) {
     const s4 = await kvSET(`vbl_full:${ymd}:${slot}`, JSON.stringify(withPicks), diag);
     const s5 = await kvSET(`vbl:${ymd}:${slot}`,      JSON.stringify(shortList), diag);
 
-    // 8) NOVO — održavaj vb:day:<YMD>:combined (Top-3 za ceo dan; merge+trim)
+    // 8) NOVO — održavaj vb:day:<YMD>:combined (Top-3 za ceo dan; merge+trim) — BOXED format
     const top3ThisSlot = withPicks.slice(0, 3);
     const prevRaw = (await kvGET(`vb:day:${ymd}:combined`, diag)).raw;
     const prevArr = arrFromAny(unpack(prevRaw)) || [];
     const merged = dedupByFixture([...prevArr, ...top3ThisSlot])
       .sort((a,b) => scoreForSort(b) - scoreForSort(a))
       .slice(0, 3);
-    const s6 = await kvSET(`vb:day:${ymd}:combined`, JSON.stringify(merged), diag);
+    const boxedCombined = JSON.stringify({ value: JSON.stringify(merged) });
+    const s6 = await kvSET(`vb:day:${ymd}:combined`, boxedCombined, diag);
 
     return res.status(200).json({
       ok: true,
