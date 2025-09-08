@@ -1,8 +1,9 @@
 // pages/api/cron/rebuild.js
-// Rekonstrukcija "locked" feed-a za slot.
-// Puni vb:day:<YMD>:<slot> (+union, +last) i — KLJUČNO — pravi MIRROR u vbl_full:<YMD>:<slot> i vbl:<YMD>:<slot>
-// pri čemu je vbl format "plain array" (JSON niz), jer ga tvoj reader očekuje.
-// Slot granice: late 00–09, am 10–14, pm 15–23. Strogo: bez kickoff-a ne prolazi.
+// Rekonstrukcija "locked" feed-a za slot (late 00–09, am 10–14, pm 15–23).
+// 1) Učita kandidate iz KV (vb:day → vbl_full → vbl) ili fallback-uje na fixtures za dan.
+// 2) Strogo filtrira po slotu.
+// 3) **NOVO:** Za već filtrirane fixture-ove povuče /odds i popuni pick/odds/confidence.
+// 4) Upisuje u vb:day:<YMD>:<slot> (+union,+last) i MIRROR u vbl_full:<YMD>:<slot> i vbl:<YMD>:<slot>.
 
 export const config = { api: { bodyParser: false } };
 
@@ -119,7 +120,7 @@ function kickoffDate(x){
 }
 function inSlotLocal(item, slot) {
   const d = kickoffDate(item);
-  if (!d) return false;  // strogo
+  if (!d) return false;  // strogo: bez vremena ne prolazi
   const h = hourInTZ(d, TZ);
   if (slot === "late") return h < 10;            // 00–09
   if (slot === "am")   return h >= 10 && h < 15; // 10–14
@@ -159,6 +160,7 @@ function mapFixtureToItem(fx){
     datetime_local: kick ? { starting_at: { date_time: String(kick).replace("T"," ").replace("Z","") } } : null,
     kickoff_utc: kick,
     timestamp: ts,
+    // stub polja; popunićemo posle sa /odds
     market: "1X2",
     selection_label: null,
     pick: null,
@@ -168,6 +170,72 @@ function mapFixtureToItem(fx){
     odds: null,
     fixture: { id, timestamp: ts, date: kick },
   };
+}
+
+/* -------- pick/odds helpers (novo) -------- */
+function best1x2FromBookmakers(bookmakers){
+  let best = null, books = 0;
+  for(const b of bookmakers || []){
+    books++;
+    for(const bet of b.bets || []){
+      const name = String(bet.name||"").toLowerCase();
+      if(!(name.includes("match winner") || name==="1x2" || name.includes("winner"))) continue;
+      const vals = bet.values || [];
+      const vHome = vals.find(v=>/^home$/i.test(v.value||""));
+      const vDraw = vals.find(v=>/^draw$/i.test(v.value||""));
+      const vAway = vals.find(v=>/^away$/i.test(v.value||""));
+      if(!(vHome && vDraw && vAway)) continue;
+      const oH = parseFloat(vHome.odd), oD = parseFloat(vDraw.odd), oA = parseFloat(vAway.odd);
+      if(!isFinite(oH)||!isFinite(oD)||!isFinite(oA)) continue;
+      const pH = 1/oH, pD = 1/oD, pA = 1/oA, S = pH+pD+pA;
+      const cand = [
+        {code:"1", label:"Home", prob:pH/S, price:oH},
+        {code:"X", label:"Draw", prob:pD/S, price:oD},
+        {code:"2", label:"Away", prob:pA/S, price:oA},
+      ].sort((a,b)=>b.prob-a.prob)[0];
+      if(!best || cand.prob>best.model_prob || (Math.abs(cand.prob-best.model_prob)<1e-9 && cand.price<best.odds.price)){
+        best = { pick_code:cand.code, pick:cand.label, model_prob:cand.prob, odds:{ price:cand.price } };
+      }
+    }
+  }
+  if(best) best.odds.books_count = books;
+  return best;
+}
+
+async function enrichWithOdds(items){
+  const ids = items.map(x=>Number(x.fixture_id)).filter(n=>Number.isFinite(n));
+  const lanes = 4;
+  const buckets = Array.from({length: lanes}, ()=>[]);
+  ids.forEach((id,i)=> buckets[i%lanes].push(id));
+
+  const byId = new Map(items.map(it=>[Number(it.fixture_id), it]));
+  let called = 0, filled = 0;
+
+  const lane = async subset=>{
+    for(const id of subset){
+      try{
+        const jo = await afFetch("/odds", { fixture: id });
+        called++;
+        const bookmakers = jo?.response?.[0]?.bookmakers || [];
+        const best = best1x2FromBookmakers(bookmakers);
+        if(best){
+          const it = byId.get(id);
+          if(it){
+            it.selection_label = best.pick;
+            it.pick = best.pick;
+            it.pick_code = best.pick_code || best.pick_code || (best.pick === "Home" ? "1" : best.pick === "Draw" ? "X" : "2");
+            it.model_prob = best.model_prob;
+            it.confidence_pct = Math.round(100*best.model_prob);
+            it.odds = { price: best.odds.price, books_count: best.odds.books_count || best.books_count || 1 };
+            filled++;
+          }
+        }
+      }catch{/* skip one */}
+      await new Promise(r=>setTimeout(r, 120));
+    }
+  };
+  await Promise.all(buckets.map(lane));
+  return { called, filled };
 }
 
 /* ---------------- main ---------------- */
@@ -181,7 +249,7 @@ export default async function handler(req, res) {
   const diag = wantDebug ? {} : null;
 
   try {
-    // 1) Učitaj postojeće kandidate (vb:day → vbl_full → vbl)
+    // 1) Učitaj iz KV
     const prefer = [
       `vb:day:${ymd}:${slot}`,
       `vb:day:${ymd}:union`,
@@ -196,10 +264,30 @@ export default async function handler(req, res) {
       if (arr && arr.length) { rawArr = arr; src = k; break; }
     }
 
-    // 2) Ako nema ništa → fallback: fixtures za dan
+    // 2) Ako nema ništa → fixtures za dan
     let items = null;
     if (rawArr && rawArr.length) {
-      items = rawArr;
+      const looksLikeIdsOnly = rawArr.every(v =>
+        typeof v === "number" || (typeof v === "string" && /^\d+$/.test(v)) ||
+        (v && typeof v === "object" && v.fixture_id == null && v.fixture?.id == null && v.kickoff_utc == null)
+      );
+      if (looksLikeIdsOnly) {
+        // ako je vbl lista ID-jeva, dovuci pune fixture objekte
+        const ids = Array.from(new Set(rawArr.map(v => Number(v)).filter(Number.isFinite))).slice(0, 60);
+        const got = [];
+        for (const id of ids) {
+          try {
+            const jf = await afFetch("/fixtures", { id });
+            const fx = Array.isArray(jf?.response) ? jf.response[0] : null;
+            if (fx) got.push(mapFixtureToItem(fx));
+          } catch {}
+          await new Promise(r=>setTimeout(r,120));
+        }
+        items = got;
+        src = `${src}→af:fixtures[id]`;
+      } else {
+        items = rawArr;
+      }
     } else {
       const jf = await afFetch("/fixtures", { date: ymd, timezone: TZ });
       const resp = Array.isArray(jf?.response) ? jf.response : [];
@@ -207,14 +295,16 @@ export default async function handler(req, res) {
       src = "fallback:af-fixtures";
     }
 
-    // 3) Slot-filter (strogo) i sečenje
+    // 3) Slot-filter (strogo) i sort
     const filtered = items
       .filter(x => inSlotLocal(x, slot))
       .sort((a,b)=> (Date.parse(a.kickoff_utc||0) - Date.parse(b.kickoff_utc||0)))
       .slice(0, 60);
-    const after = filtered.length;
 
-    // 4) Upis u vb:day:* (box format)
+    // 4) **ENRICH ODDS for filtered only** (malo poziva)
+    const { called, filled } = await enrichWithOdds(filtered);
+
+    // 5) Upis u vb:day:* (box format) + MIRROR u vbl* (plain array)
     const boxed = JSON.stringify({ value: JSON.stringify(filtered) });
     const kSlot   = `vb:day:${ymd}:${slot}`;
     const kUnion  = `vb:day:${ymd}:union`;
@@ -223,12 +313,12 @@ export default async function handler(req, res) {
     const s2 = await kvSET(kUnion, boxed, diag);
     const s3 = await kvSET(kLast,  boxed, diag);
 
-    // 5) MIRROR u vbl_full / vbl (PLAIN ARRAY, bez boksa)
     const vblFull = JSON.stringify(filtered.slice(0, 60));
     const vblCut  = JSON.stringify(filtered.slice(0, 25));
     const s4 = await kvSET(`vbl_full:${ymd}:${slot}`, vblFull, diag);
     const s5 = await kvSET(`vbl:${ymd}:${slot}`,      vblCut,  diag);
 
+    const after = filtered.length;
     return res.status(200).json({
       ok: true,
       ymd,
@@ -236,7 +326,7 @@ export default async function handler(req, res) {
       counts: { union: after, last: after, combined: after },
       source: src,
       saved_backends: Array.from(new Set([...(s1||[]), ...(s2||[]), ...(s3||[]), ...(s4||[]), ...(s5||[])])),
-      ...(wantDebug ? { debug: { after, slot, wrote_vbl: true } } : {})
+      ...(wantDebug ? { debug: { after, slot, odds_called: called, odds_filled: filled } } : {})
     });
 
   } catch (e) {
