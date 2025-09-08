@@ -1,6 +1,8 @@
 // pages/api/crypto.js
-// API sa "compat" projekcijom za postojeći UI: dodaje ALIAS signals + slim format.
-// Core i KV keš ostaju isti (buildSignals u lib/crypto-core.js).
+// API sa "compat" projekcijom: dodaje ALIAS signals + shape=slim (plain array).
+// Propusta Entry/SL/TP/expectedMove/rr/valid_until bez izmene.
+// Fudbal se ne dira.
+
 import { buildSignals } from "../../lib/crypto-core";
 
 const {
@@ -14,7 +16,7 @@ const {
   CRYPTO_COOLDOWN_MIN = "30",
   CRYPTO_REFRESH_MINUTES = "45",
   CRYPTO_QUORUM_VOTES = "3",
-  CRYPTO_BINANCE_TOP = "120",
+  CRYPTO_BINANCE_TOP = "150",
   CRYPTO_FORCE_THROTTLE_SEC = "240",
 } = process.env;
 
@@ -25,18 +27,16 @@ const CFG = {
   COOLDOWN_MIN: clampInt(CRYPTO_COOLDOWN_MIN, 30, 0, 1440),
   REFRESH_MIN: clampInt(CRYPTO_REFRESH_MINUTES, 45, 5, 720),
   QUORUM: clampInt(CRYPTO_QUORUM_VOTES, 3, 3, 5),
-  BINANCE_TOP: clampInt(CRYPTO_BINANCE_TOP, 120, 20, 250),
+  BINANCE_TOP: clampInt(CRYPTO_BINANCE_TOP, 150, 20, 400),
   FORCE_TTL: clampInt(CRYPTO_FORCE_THROTTLE_SEC, 240, 30, 3600),
-  THRESH: { m30: 0.2, h1: 0.3, h4: 0.5, d24: 0.0, d7: 0.0 },
 };
 
 export default async function handler(req, res) {
   try {
     const force = parseBool(req.query.force || "0");
     const n = clampInt(req.query.n, CFG.TOP_N, 1, 10);
-    const shape = String(req.query.shape || "").toLowerCase(); // "legacy" | "slim" (opciono)
+    const shape = String(req.query.shape || "").toLowerCase(); // "legacy" | "slim"
 
-    // force auth + throttle
     if (force) {
       if (!checkCronKey(req, CRON_KEY)) return res.status(401).json({ ok: false, error: "unauthorized" });
       if (await isForceThrottled()) return res.status(429).json({ ok: false, error: "too_many_requests" });
@@ -47,46 +47,30 @@ export default async function handler(req, res) {
     if (!force && cached && Array.isArray(cached.items) && cached.items.length) {
       const arr = projectForUI(cached.items).sort((a,b)=>b.confidence_pct - a.confidence_pct).slice(0, n);
       return sendCompat(res, {
-        ok: true,
-        version: "crypto-v1-compat",
-        sport: "crypto",
-        source: "cache",
-        ts: cached.ts || Date.now(),
-        ttl_min: cached.ttl_min || CFG.REFRESH_MIN,
-        count: arr.length,
-        items: arr,
+        ok: true, version: "crypto-v1-compat", sport: "crypto",
+        source: "cache", ts: cached.ts || Date.now(), ttl_min: cached.ttl_min || CFG.REFRESH_MIN,
+        count: arr.length, items: arr,
       }, shape);
     }
 
-    // live refresh
     const itemsRaw = await buildSignals({
       cgApiKey: COINGECKO_API_KEY,
       minVol: CFG.MIN_VOL,
       minMcap: CFG.MIN_MCAP,
       quorum: CFG.QUORUM,
       binanceTop: CFG.BINANCE_TOP,
-      thresh: CFG.THRESH,
     });
 
     const itemsStable = await applyStickiness(itemsRaw, CFG.COOLDOWN_MIN);
-
-    // upiši keš (bez n-limit)
     const payload = { ts: Date.now(), ttl_min: CFG.REFRESH_MIN, items: itemsStable };
     await kvSetJSON(cacheKey, payload, CFG.REFRESH_MIN * 60);
     if (force) await setForceLock();
 
-    // top-N i projekcija
     const arr = projectForUI(itemsStable).sort((a,b)=>b.confidence_pct - a.confidence_pct).slice(0, n);
-
     return sendCompat(res, {
-      ok: true,
-      version: "crypto-v1-compat",
-      sport: "crypto",
-      source: "live",
-      ts: payload.ts,
-      ttl_min: payload.ttl_min,
-      count: arr.length,
-      items: arr,
+      ok: true, version: "crypto-v1-compat", sport: "crypto",
+      source: "live", ts: payload.ts, ttl_min: payload.ttl_min,
+      count: arr.length, items: arr,
     }, shape);
 
   } catch (e) {
@@ -94,7 +78,7 @@ export default async function handler(req, res) {
   }
 }
 
-/* ---------- UI projection / aliases ---------- */
+/* ---------- projection / aliases ---------- */
 function projectForUI(list) {
   return (Array.isArray(list) ? list : []).map((it) => {
     const dir = String(it.signal || "").toLowerCase(); // long/short
@@ -108,86 +92,36 @@ function projectForUI(list) {
     const d7  = numOr0(it.d7_pct);
 
     return {
-      // original
       ...it,
-
-      // canonical fields
-      type: "crypto",
-      sport: "crypto",
-      category: "crypto",
-      market: "crypto",
-      ticker: it.symbol,
-      symbolUpper: String(it.symbol || "").toUpperCase(),
+      type: "crypto", sport: "crypto", category: "crypto", market: "crypto",
+      ticker: it.symbol, symbolUpper: String(it.symbol || "").toUpperCase(),
 
       // direction aliases
-      signal: it.signal,                 // LONG/SHORT
-      direction: dir,                    // long/short
-      side: dir,                         // alias
-      action: isLong ? "BUY" : "SELL",   // BUY/SELL
-      isLong, isShort,
+      direction: dir, side: dir, action: isLong ? "BUY" : "SELL", isLong, isShort,
 
       // confidence aliases
-      confidence_pct: it.confidence_pct,
-      confidence: it.confidence_pct,
-      confidenceScore: it.confidence_pct,
-      score: it.confidence_pct,
+      confidence: it.confidence_pct, confidenceScore: it.confidence_pct, score: it.confidence_pct,
 
       // timeframe aliases (numbers only)
       m30_pct: m30, h1_pct: h1, h4_pct: h4, d24_pct: d24, d7_pct: d7,
       change30m: m30, change1h: h1, change4h: h4, change24h: d24, change7d: d7,
-      tf: { m30, h1, h4, d24, d7 },   // ponekad UI čita ugnježden objekat
 
-      // optional SL/TP ako ih ima (ostavi kako jeste)
-      // entry, sl, tp mogu postojati iz core-a sa ATR – ne diramo
+      // entry/sl/tp/rr/expectedMove/valid_until već su tu ako ih core izda
     };
   });
 }
 
-/* ---------- response shaper (top-level aliases) ---------- */
 function sendCompat(res, base, shape) {
   const items = base.items || [];
   const out = {
     ...base,
-    // top-level duplicati za različite UI-ove
-    signals: items,      // <<<<<<<<<<  KLJUČNO za tvoj front
-    data: items,
-    predictions: items,
-    rows: items,
-    list: items,
-    results: items,
+    signals: items,      // ALIAS koji tvoj front već čita
+    data: items, predictions: items, rows: items, list: items, results: items,
     total: base.count,
   };
-
-  if (shape === "legacy") {
-    // Najčešći legacy format: { ok, total, items } (plus zadržimo kompat polja)
-    return res.status(200).json({ ok: out.ok, total: out.count, items: out.items, ...out });
-  }
-  if (shape === "slim") {
-    // Samo niz stavki, bez omota (ako UI to traži)
-    return res.status(200).json(items);
-  }
+  if (shape === "legacy") return res.status(200).json({ ok: out.ok, total: out.count, items: out.items, ...out });
+  if (shape === "slim")   return res.status(200).json(items);
   return res.status(200).json(out);
-}
-
-/* ---------- security/throttle ---------- */
-function checkCronKey(req, expected) {
-  if (!expected) return false;
-  const q = String(req.query.key || "");
-  const h = String(req.headers["x-cron-key"] || "");
-  const auth = String(req.headers["authorization"] || "");
-  if (q && q === expected) return true;
-  if (h && h === expected) return true;
-  if (auth.toLowerCase().startsWith("bearer ") && auth.slice(7) === expected) return true;
-  return false;
-}
-async function isForceThrottled() {
-  if (!UPSTASH_REDIS_REST_URL) return false;
-  const v = await kvGetJSON("crypto:force:lock");
-  return !!v;
-}
-async function setForceLock() {
-  if (!UPSTASH_REDIS_REST_URL) return;
-  await kvSetJSON("crypto:force:lock", { ts: Date.now() }, CFG.FORCE_TTL);
 }
 
 /* ---------- anti-flip ---------- */
@@ -218,7 +152,7 @@ async function applyStickiness(items, cooldownMin) {
   function snap(x) { return { signal: x.signal, score: (x.confidence_pct - 55) / 40, confidence_pct: x.confidence_pct, ts: now }; }
 }
 
-/* ---------- KV helpers ---------- */
+/* ---------- KV/throttle/security ---------- */
 async function kvGetJSON(key) {
   if (!UPSTASH_REDIS_REST_URL) return null;
   const u = `${UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(key)}`;
@@ -241,8 +175,25 @@ function authHeader() {
   if (UPSTASH_REDIS_REST_TOKEN) h["Authorization"] = `Bearer ${UPSTASH_REDIS_REST_TOKEN}`;
   return h;
 }
-
-/* ---------- utils ---------- */
+async function isForceThrottled() {
+  if (!UPSTASH_REDIS_REST_URL) return false;
+  const v = await kvGetJSON("crypto:force:lock");
+  return !!v;
+}
+async function setForceLock() {
+  if (!UPSTASH_REDIS_REST_URL) return;
+  await kvSetJSON("crypto:force:lock", { ts: Date.now() }, CFG.FORCE_TTL);
+}
+function checkCronKey(req, expected) {
+  if (!expected) return false;
+  const q = String(req.query.key || "");
+  const h = String(req.headers["x-cron-key"] || "");
+  const auth = String(req.headers["authorization"] || "");
+  if (q && q === expected) return true;
+  if (h && h === expected) return true;
+  if (auth.toLowerCase().startsWith("bearer ") && auth.slice(7) === expected) return true;
+  return false;
+}
 function toNum(x, d = 0) { const n = Number(x); return Number.isFinite(n) ? n : d; }
 function clampInt(v, def, min, max) { const n = parseInt(v,10); if (!Number.isFinite(n)) return def; return Math.min(max, Math.max(min, n)); }
 function parseBool(x){ return String(x).toLowerCase()==="1"||String(x).toLowerCase()==="true"; }
