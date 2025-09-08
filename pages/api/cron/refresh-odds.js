@@ -123,22 +123,35 @@ async function afFetch(path, params={}){
   return j;
 }
 
-/* -------- fetch ALL fixture pages for date -------- */
+/* -------- fetch ALL fixture pages for date (ROBUST) -------- */
 async function fetchAllFixturesForDate(ymd){
-  let page = 1, all = [];
+  const tries = [
+    { tag: "date+tz",    params: { date: ymd, timezone: TZ } },
+    { tag: "date",       params: { date: ymd } },
+    { tag: "from-to+tz", params: { from: ymd, to: ymd, timezone: TZ } },
+    { tag: "from-to",    params: { from: ymd, to: ymd } },
+    { tag: "date+UTC",   params: { date: ymd, timezone: "UTC" } },
+  ];
   const HARD_CAP_PAGES = 12; // safety
-  while (page <= HARD_CAP_PAGES) {
-    const jf = await afFetch("/fixtures", { date: ymd, timezone: TZ, page });
-    const arr = Array.isArray(jf?.response) ? jf.response : [];
-    all.push(...arr);
-    const cur = Number(jf?.paging?.current || page);
-    const tot = Number(jf?.paging?.total || page);
-    if (!tot || cur >= tot) break;
-    page++;
-    await new Promise(r=>setTimeout(r, 120));
+  const bag = new Map();
+  for (const t of tries) {
+    let page = 1;
+    while (page <= HARD_CAP_PAGES) {
+      const jf = await afFetch("/fixtures", { ...t.params, page });
+      const arr = Array.isArray(jf?.response) ? jf.response : [];
+      for (const fx of arr) {
+        const id = fx?.fixture?.id;
+        if (id && !bag.has(id)) bag.set(id, fx);
+      }
+      const cur = Number(jf?.paging?.current || page);
+      const tot = Number(jf?.paging?.total || page);
+      if (!tot || cur >= tot) break;
+      page++;
+      await new Promise(r=>setTimeout(r, 120));
+    }
+    if (bag.size) break;
   }
-  all.sort((a,b)=> new Date(a?.fixture?.date||0) - new Date(b?.fixture?.date||0));
-  return all;
+  return Array.from(bag.values()).sort((a,b)=> new Date(a?.fixture?.date||0) - new Date(b?.fixture?.date||0));
 }
 
 /* --------------- odds helpers --------------- */
@@ -225,13 +238,12 @@ export default async function handler(req,res){
       }
     }
 
-    // D) API fixtures (all pages) — kao poslednji fallback
+    // D) API fixtures (ROBUST all pages) — kao poslednji fallback
     let inspected = 0, filtered = 0;
     if (!list) {
       tried.push("fixtures:all-pages");
       const all = await fetchAllFixturesForDate(ymd);
       inspected = all.length;
-      // mapiraj meta
       for (const it of all) {
         const id = Number(it?.fixture?.id);
         if (!id) continue;
@@ -277,7 +289,6 @@ export default async function handler(req,res){
       list = norm.slice(0, 60);
     }
 
-    // Ako i dalje nema kandidata i nije force → nema šta da se radi
     if (!list || !list.length) {
       return res.status(200).json({
         ok: true, ymd, slot,
