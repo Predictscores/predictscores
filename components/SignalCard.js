@@ -44,7 +44,7 @@ export default function SignalCard({ data = {}, type }) {
         <div className="mt-2 text-sm">
           <div>Current: ${fmt(price)}</div>
           <div>
-            Entry:{' '}
+            Entry{' '}
             <span className={signal === 'LONG' ? 'text-green-400' : 'text-red-400'}>
               ${fmt(entryPrice)} {signal === 'LONG' ? '↑' : '↓'}
             </span>
@@ -89,7 +89,7 @@ export default function SignalCard({ data = {}, type }) {
         <div className="text-xs text-gray-500">—</div>
       </div>
 
-      {/* DESNO: sad prosleđujemo i symbol zbog fallback fetch-a */}
+      {/* DESNO: prosleđujemo i symbol zbog fallback fetch-a */}
       <div className="w-[50%] pl-4 flex items-center justify-center">
         {Array.isArray(bars) && bars.length > 0 ? (
           <TradingViewChart bars={bars} entry={entryPrice} sl={sl} tp={tp} symbol={symbol} />
