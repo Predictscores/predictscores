@@ -3,6 +3,7 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import HistoryPanel from "./HistoryPanel";
+import SignalCard from "./SignalCard";
 
 const TZ = "Europe/Belgrade";
 
@@ -229,7 +230,9 @@ function useFootballFeed() {
     }
   }
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+  }, []);
 
   return { list, err, loading, reload: load };
 }
@@ -244,7 +247,25 @@ function useCryptoTop3() {
       setLoading(true);
       setErr(null);
       const j = await safeJson(`/api/crypto`);
-      const arr = Array.isArray(j?.signals) ? j.signals : Array.isArray(j) ? j : [];
+      // Normalizuj različite oblike: items / predictions / data / list / results / signals / direktan niz
+      const arr = Array.isArray(j?.items)
+        ? j.items
+        : Array.isArray(j?.predictions)
+        ? j.predictions
+        : Array.isArray(j?.data)
+        ? j.data
+        : Array.isArray(j?.list)
+        ? j.list
+        : Array.isArray(j?.results)
+        ? j.results
+        : Array.isArray(j?.signals)
+        ? j.signals
+        : Array.isArray(j?.crypto)
+        ? j.crypto
+        : Array.isArray(j)
+        ? j
+        : [];
+      // uzimamo top 3
       setItems(arr.slice(0, 3));
     } catch (e) {
       setErr(String(e?.message || e));
@@ -254,7 +275,10 @@ function useCryptoTop3() {
     }
   }
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+  }, []);
+
   return { items, err, loading };
 }
 
@@ -269,26 +293,22 @@ function CombinedBody({ footballTop3, cryptoTop3 }) {
           <div className="text-slate-400 text-sm">Trenutno nema predloga.</div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            {footballTop3.map((b) => (<FootballCard key={b.id} bet={b} />))}
+            {footballTop3.map((b) => (
+              <FootballCard key={b.id} bet={b} />
+            ))}
           </div>
         )}
       </div>
 
-      {/* Crypto Top 3 */}
+      {/* Crypto Top 3 (detaljni prikaz sa Entry/SL/TP/chart) */}
       <div className="rounded-2xl bg-[#15182a] p-4">
         <div className="text-base font-semibold text-white mb-3">Crypto — Top 3</div>
         {!cryptoTop3.length ? (
           <div className="text-slate-400 text-sm">Trenutno nema kripto signala.</div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div className="space-y-3">
             {cryptoTop3.map((c, i) => (
-              <div key={c?.symbol || i} className="p-4 rounded-xl bg-[#1f2339]">
-                <div className="text-sm font-semibold">{c.symbol}</div>
-                <div className="text-xs text-slate-400">{c.name}</div>
-                <div className="mt-1 text-sm">
-                  Signal: <b>{c.signal}</b> · Conf {Math.round(Number(c.confidence_pct || 0))}%
-                </div>
-              </div>
+              <SignalCard key={c?.symbol || i} data={c} type="crypto" />
             ))}
           </div>
         )}
@@ -311,17 +331,32 @@ function FootballBody({ list }) {
       {/* Unutrašnji tabovi */}
       <div className="flex items-center gap-2">
         <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${tab==="ko"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
-          onClick={()=>setTab("ko")} type="button"
-        >Kick-Off</button>
+          className={`px-3 py-1.5 rounded-lg text-sm ${
+            tab === "ko" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
+          }`}
+          onClick={() => setTab("ko")}
+          type="button"
+        >
+          Kick-Off
+        </button>
         <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${tab==="conf"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
-          onClick={()=>setTab("conf")} type="button"
-        >Confidence</button>
+          className={`px-3 py-1.5 rounded-lg text-sm ${
+            tab === "conf" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
+          }`}
+          onClick={() => setTab("conf")}
+          type="button"
+        >
+          Confidence
+        </button>
         <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${tab==="hist"?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
-          onClick={()=>setTab("hist")} type="button"
-        >History</button>
+          className={`px-3 py-1.5 rounded-lg text-sm ${
+            tab === "hist" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
+          }`}
+          onClick={() => setTab("hist")}
+          type="button"
+        >
+          History
+        </button>
       </div>
 
       {tab === "hist" ? (
@@ -331,11 +366,13 @@ function FootballBody({ list }) {
           <div className="text-base font-semibold text-white mb-3">
             {tab === "ko" ? "Kick-Off" : "Confidence"}
           </div>
-          {!(tab==="ko"?koRows:confRows).length ? (
+          {!(tab === "ko" ? koRows : confRows).length ? (
             <div className="text-slate-400 text-sm">Trenutno nema predloga.</div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-              {(tab==="ko"?koRows:confRows).map((b) => <FootballCard key={b.id} bet={b} />)}
+              {(tab === "ko" ? koRows : confRows).map((b) => (
+                <FootballCard key={b.id} bet={b} />
+              ))}
             </div>
           )}
         </div>
@@ -345,21 +382,16 @@ function FootballBody({ list }) {
 }
 
 function CryptoBody({ list }) {
+  // Samo Crypto tab – koristi isti puni prikaz kao i u "Combined"
   return (
     <div className="rounded-2xl bg-[#15182a] p-4">
       <div className="text-base font-semibold text-white mb-3">Crypto — Top 3</div>
       {!list.length ? (
         <div className="text-slate-400 text-sm">Trenutno nema kripto signala.</div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div className="space-y-3">
           {list.map((c, i) => (
-            <div key={c?.symbol || i} className="p-4 rounded-xl bg-[#1f2339]">
-              <div className="text-sm font-semibold">{c.symbol}</div>
-              <div className="text-xs text-slate-400">{c.name}</div>
-              <div className="mt-1 text-sm">
-                Signal: <b>{c.signal}</b> · Conf {Math.round(Number(c.confidence_pct || 0))}%
-              </div>
-            </div>
+            <SignalCard key={c?.symbol || i} data={c} type="crypto" />
           ))}
         </div>
       )}
@@ -375,7 +407,7 @@ export default function CombinedBets() {
 
   // Combined: Top 3 po confidence
   const top3Football = useMemo(
-    () => [...fb.list].sort((a,b)=> b.conf - a.conf).slice(0,3),
+    () => [...fb.list].sort((a, b) => b.conf - a.conf).slice(0, 3),
     [fb.list]
   );
 
@@ -383,11 +415,13 @@ export default function CombinedBets() {
     <div className="mt-4 space-y-4">
       {/* Gornji tabovi */}
       <div className="flex items-center gap-2">
-        {["Combined","Football","Crypto"].map((name) => (
+        {["Combined", "Football", "Crypto"].map((name) => (
           <button
             key={name}
             onClick={() => setTab(name)}
-            className={`px-3 py-1.5 rounded-lg text-sm ${tab===name?"bg-[#202542] text-white":"bg-[#171a2b] text-slate-300"}`}
+            className={`px-3 py-1.5 rounded-lg text-sm ${
+              tab === name ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
+            }`}
             type="button"
           >
             {name}
