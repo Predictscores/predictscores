@@ -1,15 +1,15 @@
 // pages/api/cron/rebuild.js
 // Rekonstrukcija "locked" feed-a za slot.
-// Slot granice: late 00–09, am 10–14, pm 15–23 (Europe/Belgrade).
-// Uvodi: youth/primavera ban, MIN_ODDS=1.5, obavezno popunjavanje pick/odds/confidence preko /odds
-// i upis u vb:day:* + mirror u vbl_full:* i vbl:* (reader-friendly).
+// Slotovi (Europe/Belgrade): late 00–09, am 10–14, pm 15–23.
+// Pravila: bez U-liga/Primavera/Youth, MIN_ODDS ≥ 1.50, obavezno popunjen pick/odds/confidence preko /odds.
+// Upis: vb:day:<YMD>:<slot> (+union,+last) [boxed] + mirror vbl_full:<YMD>:<slot> i vbl:<YMD>:<slot> [plain array].
 
 export const config = { api: { bodyParser: false } };
 
 const TZ = "Europe/Belgrade";
-const TARGET_N = 15;      // koliko želimo u vbl (kratka lista)
-const MIN_ODDS = 1.5;     // minimalna kvota
-const LANES = 4;          // paralelizacija za /odds
+const TARGET_N = 15;     // koliko vracamo u kratkoj listi (vbl)
+const MIN_ODDS = 1.5;    // minimalna dozvoljena kvota za izabrani ishod
+const LANES = 4;         // paralelizacija za /odds
 
 /* ---------------- KV (Vercel REST) ---------------- */
 function kvCfgs() {
@@ -171,6 +171,7 @@ function mapFixtureToItem(fx){
     datetime_local: kick ? { starting_at: { date_time: String(kick).replace("T"," ").replace("Z","") } } : null,
     kickoff_utc: kick,
     timestamp: ts,
+    // stub polja (popunićemo posle sa /odds)
     market: "1X2",
     selection_label: null,
     pick: null,
@@ -183,32 +184,47 @@ function mapFixtureToItem(fx){
 }
 
 /* -------- odds helpers -------- */
-function best1x2FromBookmakers(bookmakers){
+// Biramo NAJVEROVATNIJI ishod među onima sa kvotom >= minOdds.
+// Verovatnoće normalizujemo preko sve 3 kvote (H/D/A) iz istog bookmakera.
+function best1x2FromBookmakers(bookmakers, minOdds = MIN_ODDS) {
   let best = null, books = 0;
   for (const b of bookmakers || []) {
     books++;
     for (const bet of b.bets || []) {
-      const name = String(bet.name||"").toLowerCase();
-      if (!(name.includes("match winner") || name==="1x2" || name.includes("winner"))) continue;
+      const name = String(bet.name || "").toLowerCase();
+      if (!(name.includes("match winner") || name === "1x2" || name.includes("winner"))) continue;
       const vals = bet.values || [];
-      const vH = vals.find(v=>/^home$/i.test(v.value||""));
-      const vD = vals.find(v=>/^draw$/i.test(v.value||""));
-      const vA = vals.find(v=>/^away$/i.test(v.value||""));
-      if (!(vH && vD && vA)) continue;
+      const vH = vals.find(v => /^home$/i.test(v.value || ""));
+      const vD = vals.find(v => /^draw$/i.test(v.value || ""));
+      const vA = vals.find(v => /^away$/i.test(v.value || ""));
+      if (!vH || !vD || !vA) continue;
+
       const oH = parseFloat(vH.odd), oD = parseFloat(vD.odd), oA = parseFloat(vA.odd);
-      if (!isFinite(oH)||!isFinite(oD)||!isFinite(oA)) continue;
-      const pH = 1/oH, pD = 1/oD, pA = 1/oA, S = pH+pD+pA;
-      const cand = [
-        {code:"1", label:"Home", prob:pH/S, price:oH},
-        {code:"X", label:"Draw", prob:pD/S, price:oD},
-        {code:"2", label:"Away", prob:pA/S, price:oA},
-      ].sort((a,b)=> b.prob - a.prob)[0];
-      if (!best || cand.prob > best.model_prob || (Math.abs(cand.prob - best.model_prob) < 1e-9 && cand.price < best.odds.price)) {
-        best = { pick_code: cand.code, pick: cand.label, model_prob: cand.prob, odds: { price: cand.price }, books_count: 1 };
+      if (!isFinite(oH) || !isFinite(oD) || !isFinite(oA)) continue;
+
+      const pH = 1/oH, pD = 1/oD, pA = 1/oA, S = pH + pD + pA;
+      const cands = [
+        { code:"1", label:"Home", odd:oH, prob:pH / S },
+        { code:"X", label:"Draw", odd:oD, prob:pD / S },
+        { code:"2", label:"Away", odd:oA, prob:pA / S },
+      ].filter(c => c.odd >= minOdds);
+
+      if (!cands.length) continue;
+      cands.sort((a,b)=> b.prob - a.prob); // najveća normalizovana verovatnoća
+      const pick = cands[0];
+      const chosen = {
+        pick_code: pick.code,
+        pick: pick.label,
+        model_prob: pick.prob,
+        odds: { price: pick.odd, books_count: 1 },
+      };
+      if (!best || chosen.model_prob > best.model_prob ||
+         (Math.abs(chosen.model_prob - best.model_prob) < 1e-9 && chosen.odds.price < best.odds.price)) {
+        best = chosen;
       }
     }
   }
-  if (best) best.odds.books_count = best.books_count;
+  if (best) best.odds.books_count = Math.max(1, books);
   return best;
 }
 
@@ -225,7 +241,7 @@ async function enrichWithOdds(items){
         const jo = await afFetch("/odds", { fixture: id });
         called++;
         const bookmakers = jo?.response?.[0]?.bookmakers || [];
-        const best = best1x2FromBookmakers(bookmakers);
+        const best = best1x2FromBookmakers(bookmakers, MIN_ODDS);
         if (best) {
           const it = byId.get(id);
           if (it) {
@@ -238,7 +254,7 @@ async function enrichWithOdds(items){
             filled++;
           }
         }
-      } catch { /* ignore */ }
+      } catch { /* skip */ }
       await new Promise(r=>setTimeout(r,120));
     }
   };
@@ -284,42 +300,42 @@ export default async function handler(req, res) {
       src = "fallback:af-fixtures";
     }
 
-    // 3) Strogi slot + youth/primavera ban + sort po vremenu
+    // 3) Strogi slot + youth/primavera ban + sort po vremenu (max 60)
     const slotFiltered = items
       .filter(x => inSlotLocal(x, slot))
       .filter(x => !isYouthOrBanned(x))
       .sort((a,b)=> (Date.parse(a.kickoff_utc||0) - Date.parse(b.kickoff_utc||0)))
       .slice(0, 60);
 
-    // 4) Popuni /odds SAMO za slotirane (malo poziva)
+    // 4) Popuni /odds samo za slotirane (malo poziva)
     const { called, filled } = await enrichWithOdds(slotFiltered);
 
-    // 5) Odbaci sve bez pick-a/odds-a i one sa kvotom < MIN_ODDS
+    // 5) Odbaci sve bez pick-a ili sa kvotom < MIN_ODDS (teorijski su vec eliminisani u best1x2)
     const withPicks = slotFiltered
       .filter(x => x.pick && x.odds && Number(x.odds.price) >= MIN_ODDS);
 
-    // 6) Sort po confidence, pa po kickoff-u; preseci na TARGET_N
+    // 6) Sort: najpre confidence, zatim kickoff; preseci na TARGET_N (za kratku listu)
     withPicks.sort((a,b)=>
       (b.confidence_pct - a.confidence_pct) ||
       (Date.parse(a.kickoff_utc||0) - Date.parse(b.kickoff_utc||0))
     );
     const shortList = withPicks.slice(0, TARGET_N);
 
-    // 7) Upis u vb:day:* (box format) + mirror u vbl_full (do 60) i vbl (TARGET_N)
+    // 7) Upis u vb:day:* (BOXED) + mirror u vbl_full (plain, full) i vbl (plain, short)
     const boxedFull = JSON.stringify({ value: JSON.stringify(withPicks) });
     const boxedShort = JSON.stringify({ value: JSON.stringify(shortList) });
+
     const kSlot   = `vb:day:${ymd}:${slot}`;
     const kUnion  = `vb:day:${ymd}:union`;
     const kLast   = `vb:day:${ymd}:last`;
+
     const s1 = await kvSET(kSlot,  boxedFull, diag);
     const s2 = await kvSET(kUnion, boxedFull, diag);
     const s3 = await kvSET(kLast,  boxedFull, diag);
 
-    // mirror (reader-friendly)
-    const vblFull = JSON.stringify(withPicks);
-    const vblCut  = JSON.stringify(shortList);
-    const s4 = await kvSET(`vbl_full:${ymd}:${slot}`, vblFull, diag);
-    const s5 = await kvSET(`vbl:${ymd}:${slot}`,      vblCut,  diag);
+    // mirror (reader-friendly: plain arrays)
+    const s4 = await kvSET(`vbl_full:${ymd}:${slot}`, JSON.stringify(withPicks), diag);
+    const s5 = await kvSET(`vbl:${ymd}:${slot}`,      JSON.stringify(shortList), diag);
 
     return res.status(200).json({
       ok: true,
