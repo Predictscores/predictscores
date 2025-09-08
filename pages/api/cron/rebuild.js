@@ -1,13 +1,15 @@
 // pages/api/cron/rebuild.js
-// Rekonstrukcija "locked" feed-a za slot (late 00–09, am 10–14, pm 15–23).
-// 1) Učita kandidate iz KV (vb:day → vbl_full → vbl) ili fallback-uje na fixtures za dan.
-// 2) Strogo filtrira po slotu.
-// 3) **NOVO:** Za već filtrirane fixture-ove povuče /odds i popuni pick/odds/confidence.
-// 4) Upisuje u vb:day:<YMD>:<slot> (+union,+last) i MIRROR u vbl_full:<YMD>:<slot> i vbl:<YMD>:<slot>.
+// Rekonstrukcija "locked" feed-a za slot.
+// Slot granice: late 00–09, am 10–14, pm 15–23 (Europe/Belgrade).
+// Uvodi: youth/primavera ban, MIN_ODDS=1.5, obavezno popunjavanje pick/odds/confidence preko /odds
+// i upis u vb:day:* + mirror u vbl_full:* i vbl:* (reader-friendly).
 
 export const config = { api: { bodyParser: false } };
 
 const TZ = "Europe/Belgrade";
+const TARGET_N = 15;      // koliko želimo u vbl (kratka lista)
+const MIN_ODDS = 1.5;     // minimalna kvota
+const LANES = 4;          // paralelizacija za /odds
 
 /* ---------------- KV (Vercel REST) ---------------- */
 function kvCfgs() {
@@ -23,37 +25,33 @@ async function kvGET(key, diag) {
   for (const c of kvCfgs()) {
     try {
       const r = await fetch(`${c.url}/get/${encodeURIComponent(key)}`, {
-        headers: { Authorization: `Bearer ${c.token}` },
-        cache: "no-store",
+        headers: { Authorization: `Bearer ${c.token}` }, cache: "no-store",
       });
       const ok = r.ok;
-      const j  = ok ? await r.json().catch(() => null) : null;
+      const j  = ok ? await r.json().catch(()=>null) : null;
       const raw = j && typeof j.result === "string" ? j.result : null;
-      diag && (diag.reads = diag.reads || [], diag.reads.push({ flavor:c.flavor, key, status: ok ? (raw ? "hit" : "miss-null") : `http-${r.status}` }));
+      diag && (diag.reads = diag.reads || []).push({ flavor:c.flavor, key, status: ok ? (raw ? "hit" : "miss-null") : `http-${r.status}` });
       if (raw) return { raw, flavor: c.flavor };
     } catch (e) {
-      diag && (diag.reads = diag.reads || [], diag.reads.push({ flavor:c.flavor, key, status:`err:${String(e?.message||e)}` }));
+      diag && (diag.reads = diag.reads || []).push({ flavor:c.flavor, key, status:`err:${String(e?.message||e)}` });
     }
   }
   return { raw: null, flavor: null };
 }
 async function kvSET(key, valueString, diag) {
-  let saved = [];
-  for (const c of kvCfgs().filter(x => x.flavor.endsWith(":rw"))) {
+  const saved = [];
+  for (const c of kvCfgs().filter(x=>x.flavor.endsWith(":rw"))) {
     try {
       const r = await fetch(`${c.url}/set/${encodeURIComponent(key)}`, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${c.token}`,
-          "Content-Type": "application/json",
-        },
+        headers: { Authorization: `Bearer ${c.token}`, "Content-Type": "application/json" },
         cache: "no-store",
         body: JSON.stringify({ value: valueString }),
       });
       if (r.ok) saved.push(c.flavor);
-      diag && (diag.writes = diag.writes || [], diag.writes.push({ flavor:c.flavor, key, status:r.ok ? "ok" : `http-${r.status}` }));
+      diag && (diag.writes = diag.writes || []).push({ flavor:c.flavor, key, status:r.ok ? "ok" : `http-${r.status}` });
     } catch (e) {
-      diag && (diag.writes = diag.writes || [], diag.writes.push({ flavor:c.flavor, key, status:`err:${String(e?.message||e)}` }));
+      diag && (diag.writes = diag.writes || []).push({ flavor:c.flavor, key, status:`err:${String(e?.message||e)}` });
     }
   }
   return saved;
@@ -120,20 +118,33 @@ function kickoffDate(x){
 }
 function inSlotLocal(item, slot) {
   const d = kickoffDate(item);
-  if (!d) return false;  // strogo: bez vremena ne prolazi
+  if (!d) return false;  // STROGO: bez vremena ne prolazi
   const h = hourInTZ(d, TZ);
   if (slot === "late") return h < 10;            // 00–09
   if (slot === "am")   return h >= 10 && h < 15; // 10–14
   return h >= 15;                                 // 15–23
 }
 
+/* ---------------- bans / filters ---------------- */
+const YOUTH_PATTERNS = [
+  /\bU(-|\s)?(17|18|19|20|21|22|23)\b/i,
+  /\bPrimavera\b/i,
+  /\bYouth\b/i,
+];
+function isYouthOrBanned(item){
+  const ln = (item?.league_name || item?.league?.name || "").toString();
+  const tnH = (item?.home || item?.teams?.home?.name || "").toString();
+  const tnA = (item?.away || item?.teams?.away?.name || "").toString();
+  const s = `${ln} ${tnH} ${tnA}`;
+  return YOUTH_PATTERNS.some(rx => rx.test(s));
+}
+
 /* ---------------- API-Football ---------------- */
-const AF_BASE = "https://v3.football.api-sports.io";
 function afKey(){ return process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || ""; }
 async function afFetch(path, params={}){
   const key = afKey();
   if (!key) throw new Error("Missing API-Football key");
-  const url = new URL(`${AF_BASE}${path}`);
+  const url = new URL(`https://v3.football.api-sports.io${path}`);
   Object.entries(params).forEach(([k,v])=> (v!=null) && url.searchParams.set(k,String(v)));
   const r = await fetch(url, { headers:{ "x-apisports-key": key }, cache:"no-store" });
   const ct = r.headers.get("content-type")||"";
@@ -160,7 +171,6 @@ function mapFixtureToItem(fx){
     datetime_local: kick ? { starting_at: { date_time: String(kick).replace("T"," ").replace("Z","") } } : null,
     kickoff_utc: kick,
     timestamp: ts,
-    // stub polja; popunićemo posle sa /odds
     market: "1X2",
     selection_label: null,
     pick: null,
@@ -172,68 +182,67 @@ function mapFixtureToItem(fx){
   };
 }
 
-/* -------- pick/odds helpers (novo) -------- */
+/* -------- odds helpers -------- */
 function best1x2FromBookmakers(bookmakers){
   let best = null, books = 0;
-  for(const b of bookmakers || []){
+  for (const b of bookmakers || []) {
     books++;
-    for(const bet of b.bets || []){
+    for (const bet of b.bets || []) {
       const name = String(bet.name||"").toLowerCase();
-      if(!(name.includes("match winner") || name==="1x2" || name.includes("winner"))) continue;
+      if (!(name.includes("match winner") || name==="1x2" || name.includes("winner"))) continue;
       const vals = bet.values || [];
-      const vHome = vals.find(v=>/^home$/i.test(v.value||""));
-      const vDraw = vals.find(v=>/^draw$/i.test(v.value||""));
-      const vAway = vals.find(v=>/^away$/i.test(v.value||""));
-      if(!(vHome && vDraw && vAway)) continue;
-      const oH = parseFloat(vHome.odd), oD = parseFloat(vDraw.odd), oA = parseFloat(vAway.odd);
-      if(!isFinite(oH)||!isFinite(oD)||!isFinite(oA)) continue;
+      const vH = vals.find(v=>/^home$/i.test(v.value||""));
+      const vD = vals.find(v=>/^draw$/i.test(v.value||""));
+      const vA = vals.find(v=>/^away$/i.test(v.value||""));
+      if (!(vH && vD && vA)) continue;
+      const oH = parseFloat(vH.odd), oD = parseFloat(vD.odd), oA = parseFloat(vA.odd);
+      if (!isFinite(oH)||!isFinite(oD)||!isFinite(oA)) continue;
       const pH = 1/oH, pD = 1/oD, pA = 1/oA, S = pH+pD+pA;
       const cand = [
         {code:"1", label:"Home", prob:pH/S, price:oH},
         {code:"X", label:"Draw", prob:pD/S, price:oD},
         {code:"2", label:"Away", prob:pA/S, price:oA},
-      ].sort((a,b)=>b.prob-a.prob)[0];
-      if(!best || cand.prob>best.model_prob || (Math.abs(cand.prob-best.model_prob)<1e-9 && cand.price<best.odds.price)){
-        best = { pick_code:cand.code, pick:cand.label, model_prob:cand.prob, odds:{ price:cand.price } };
+      ].sort((a,b)=> b.prob - a.prob)[0];
+      if (!best || cand.prob > best.model_prob || (Math.abs(cand.prob - best.model_prob) < 1e-9 && cand.price < best.odds.price)) {
+        best = { pick_code: cand.code, pick: cand.label, model_prob: cand.prob, odds: { price: cand.price }, books_count: 1 };
       }
     }
   }
-  if(best) best.odds.books_count = books;
+  if (best) best.odds.books_count = best.books_count;
   return best;
 }
 
 async function enrichWithOdds(items){
-  const ids = items.map(x=>Number(x.fixture_id)).filter(n=>Number.isFinite(n));
-  const lanes = 4;
-  const buckets = Array.from({length: lanes}, ()=>[]);
-  ids.forEach((id,i)=> buckets[i%lanes].push(id));
-
+  const ids = items.map(x=>Number(x.fixture_id)).filter(Number.isFinite);
+  const buckets = Array.from({length: LANES}, ()=>[]);
+  ids.forEach((id,i)=> buckets[i%LANES].push(id));
   const byId = new Map(items.map(it=>[Number(it.fixture_id), it]));
   let called = 0, filled = 0;
 
   const lane = async subset=>{
-    for(const id of subset){
-      try{
+    for (const id of subset) {
+      try {
         const jo = await afFetch("/odds", { fixture: id });
         called++;
         const bookmakers = jo?.response?.[0]?.bookmakers || [];
         const best = best1x2FromBookmakers(bookmakers);
-        if(best){
+        if (best) {
           const it = byId.get(id);
-          if(it){
+          if (it) {
             it.selection_label = best.pick;
             it.pick = best.pick;
-            it.pick_code = best.pick_code || best.pick_code || (best.pick === "Home" ? "1" : best.pick === "Draw" ? "X" : "2");
+            it.pick_code = best.pick_code || (best.pick === "Home" ? "1" : best.pick === "Draw" ? "X" : "2");
             it.model_prob = best.model_prob;
-            it.confidence_pct = Math.round(100*best.model_prob);
-            it.odds = { price: best.odds.price, books_count: best.odds.books_count || best.books_count || 1 };
+            it.confidence_pct = Math.round(100 * best.model_prob);
+            it.odds = { price: best.odds.price, books_count: best.odds.books_count || 1 };
             filled++;
           }
         }
-      }catch{/* skip one */}
-      await new Promise(r=>setTimeout(r, 120));
+      } catch { /* ignore */ }
+      await new Promise(r=>setTimeout(r,120));
     }
   };
+
   await Promise.all(buckets.map(lane));
   return { called, filled };
 }
@@ -249,7 +258,7 @@ export default async function handler(req, res) {
   const diag = wantDebug ? {} : null;
 
   try {
-    // 1) Učitaj iz KV
+    // 1) Kandidati iz KV (vb:day -> vbl_full -> vbl)
     const prefer = [
       `vb:day:${ymd}:${slot}`,
       `vb:day:${ymd}:union`,
@@ -264,30 +273,10 @@ export default async function handler(req, res) {
       if (arr && arr.length) { rawArr = arr; src = k; break; }
     }
 
-    // 2) Ako nema ništa → fixtures za dan
-    let items = null;
+    // 2) Ako nema ništa → fixtures za YMD
+    let items;
     if (rawArr && rawArr.length) {
-      const looksLikeIdsOnly = rawArr.every(v =>
-        typeof v === "number" || (typeof v === "string" && /^\d+$/.test(v)) ||
-        (v && typeof v === "object" && v.fixture_id == null && v.fixture?.id == null && v.kickoff_utc == null)
-      );
-      if (looksLikeIdsOnly) {
-        // ako je vbl lista ID-jeva, dovuci pune fixture objekte
-        const ids = Array.from(new Set(rawArr.map(v => Number(v)).filter(Number.isFinite))).slice(0, 60);
-        const got = [];
-        for (const id of ids) {
-          try {
-            const jf = await afFetch("/fixtures", { id });
-            const fx = Array.isArray(jf?.response) ? jf.response[0] : null;
-            if (fx) got.push(mapFixtureToItem(fx));
-          } catch {}
-          await new Promise(r=>setTimeout(r,120));
-        }
-        items = got;
-        src = `${src}→af:fixtures[id]`;
-      } else {
-        items = rawArr;
-      }
+      items = rawArr;
     } else {
       const jf = await afFetch("/fixtures", { date: ymd, timezone: TZ });
       const resp = Array.isArray(jf?.response) ? jf.response : [];
@@ -295,38 +284,51 @@ export default async function handler(req, res) {
       src = "fallback:af-fixtures";
     }
 
-    // 3) Slot-filter (strogo) i sort
-    const filtered = items
+    // 3) Strogi slot + youth/primavera ban + sort po vremenu
+    const slotFiltered = items
       .filter(x => inSlotLocal(x, slot))
+      .filter(x => !isYouthOrBanned(x))
       .sort((a,b)=> (Date.parse(a.kickoff_utc||0) - Date.parse(b.kickoff_utc||0)))
       .slice(0, 60);
 
-    // 4) **ENRICH ODDS for filtered only** (malo poziva)
-    const { called, filled } = await enrichWithOdds(filtered);
+    // 4) Popuni /odds SAMO za slotirane (malo poziva)
+    const { called, filled } = await enrichWithOdds(slotFiltered);
 
-    // 5) Upis u vb:day:* (box format) + MIRROR u vbl* (plain array)
-    const boxed = JSON.stringify({ value: JSON.stringify(filtered) });
+    // 5) Odbaci sve bez pick-a/odds-a i one sa kvotom < MIN_ODDS
+    const withPicks = slotFiltered
+      .filter(x => x.pick && x.odds && Number(x.odds.price) >= MIN_ODDS);
+
+    // 6) Sort po confidence, pa po kickoff-u; preseci na TARGET_N
+    withPicks.sort((a,b)=>
+      (b.confidence_pct - a.confidence_pct) ||
+      (Date.parse(a.kickoff_utc||0) - Date.parse(b.kickoff_utc||0))
+    );
+    const shortList = withPicks.slice(0, TARGET_N);
+
+    // 7) Upis u vb:day:* (box format) + mirror u vbl_full (do 60) i vbl (TARGET_N)
+    const boxedFull = JSON.stringify({ value: JSON.stringify(withPicks) });
+    const boxedShort = JSON.stringify({ value: JSON.stringify(shortList) });
     const kSlot   = `vb:day:${ymd}:${slot}`;
     const kUnion  = `vb:day:${ymd}:union`;
     const kLast   = `vb:day:${ymd}:last`;
-    const s1 = await kvSET(kSlot,  boxed, diag);
-    const s2 = await kvSET(kUnion, boxed, diag);
-    const s3 = await kvSET(kLast,  boxed, diag);
+    const s1 = await kvSET(kSlot,  boxedFull, diag);
+    const s2 = await kvSET(kUnion, boxedFull, diag);
+    const s3 = await kvSET(kLast,  boxedFull, diag);
 
-    const vblFull = JSON.stringify(filtered.slice(0, 60));
-    const vblCut  = JSON.stringify(filtered.slice(0, 25));
+    // mirror (reader-friendly)
+    const vblFull = JSON.stringify(withPicks);
+    const vblCut  = JSON.stringify(shortList);
     const s4 = await kvSET(`vbl_full:${ymd}:${slot}`, vblFull, diag);
     const s5 = await kvSET(`vbl:${ymd}:${slot}`,      vblCut,  diag);
 
-    const after = filtered.length;
     return res.status(200).json({
       ok: true,
       ymd,
       mutated: true,
-      counts: { union: after, last: after, combined: after },
+      counts: { union: withPicks.length, last: withPicks.length, combined: withPicks.length },
       source: src,
       saved_backends: Array.from(new Set([...(s1||[]), ...(s2||[]), ...(s3||[]), ...(s4||[]), ...(s5||[])])),
-      ...(wantDebug ? { debug: { after, slot, odds_called: called, odds_filled: filled } } : {})
+      ...(wantDebug ? { debug: { slot, odds_called: called, odds_filled: filled, kept: withPicks.length, returned: shortList.length } } : {})
     });
 
   } catch (e) {
