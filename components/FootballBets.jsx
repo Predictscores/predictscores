@@ -3,7 +3,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import HistoryPanel from "./HistoryPanel";
-import TicketPanel from "./TicketPanel"; // ⬅️ NOVO: desni panel za BTTS/OU/HTFT
+import TicketPanel from "./TicketPanel"; // desni panel BTTS/OU/HTFT
 
 const TZ = "Europe/Belgrade";
 
@@ -19,7 +19,7 @@ function currentSlot(tz = TZ) {
   return h < 10 ? "late" : h < 15 ? "am" : "pm";
 }
 
-// ⬇️ vikend i pravilo za N po slotu
+// vikend pravilo za broj predloga
 function isWeekend(tz = TZ) {
   const wd = new Intl.DateTimeFormat("en-GB", { weekday: "short", timeZone: tz }).format(new Date());
   return wd === "Sat" || wd === "Sun";
@@ -64,8 +64,7 @@ function teamName(side) {
 }
 
 function normalizeBet(it) {
-  const league =
-    it?.league_name || it?.league?.name || it?.league || it?.competition || "";
+  const league = it?.league_name || it?.league?.name || it?.league || it?.competition || "";
   const date = parseKickoff(it);
 
   const home = teamName(it?.teams?.home || it?.home);
@@ -76,13 +75,7 @@ function normalizeBet(it) {
     it?.selection_label ||
     it?.pick ||
     it?.selection ||
-    (it?.pick_code === "1"
-      ? "Home"
-      : it?.pick_code === "2"
-      ? "Away"
-      : it?.pick_code === "X"
-      ? "Draw"
-      : "");
+    (it?.pick_code === "1" ? "Home" : it?.pick_code === "2" ? "Away" : it?.pick_code === "X" ? "Draw" : "");
 
   let odds =
     typeof it?.odds === "object" && it?.odds
@@ -101,10 +94,7 @@ function normalizeBet(it) {
   conf = Number.isFinite(conf) ? Math.max(0, Math.min(100, conf)) : 0;
 
   return {
-    id:
-      it?.fixture_id ??
-      it?.fixture?.id ??
-      `${home}-${away}-${Date.parse(date || new Date())}`,
+    id: it?.fixture_id ?? it?.fixture?.id ?? `${home}-${away}-${Date.parse(date || new Date())}`,
     league,
     date,
     home,
@@ -119,7 +109,8 @@ function normalizeBet(it) {
 
 /* ===================== data ===================== */
 function useLockedValueBets() {
-  const [items, setItems] = useState([]);
+  const [items, setItems] = useState([]);         // 1X2 za levi deo
+  const [tickets, setTickets] = useState({ btts: [], ou25: [], htft: [] }); // za desni stub
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -128,16 +119,11 @@ function useLockedValueBets() {
       setLoading(true);
       setError(null);
       const slot = currentSlot(TZ);
-      const n = desiredCountForSlot(slot, TZ); // broj stavki po slotu/danu
-      const r = await fetch(`/api/value-bets-locked?slot=${slot}&n=${n}`, {
-        cache: "no-store",
-      });
+      const n = desiredCountForSlot(slot, TZ);
+      const r = await fetch(`/api/value-bets-locked?slot=${slot}&n=${n}`, { cache: "no-store" });
       const ct = r.headers.get("content-type") || "";
-      const body = ct.includes("application/json")
-        ? await r.json()
-        : await r.text().then((t) => {
-            try { return JSON.parse(t); } catch { return { ok: false, error: "non-JSON" }; }
-          });
+      const body = ct.includes("application/json") ? await r.json() : await r.text().then(t => { try { return JSON.parse(t); } catch { return {}; } });
+
       const arr = Array.isArray(body?.items)
         ? body.items
         : Array.isArray(body?.football)
@@ -145,17 +131,25 @@ function useLockedValueBets() {
         : Array.isArray(body)
         ? body
         : [];
+
       setItems(arr.map(normalizeBet));
+      const tk = body?.tickets && typeof body.tickets === "object" ? body.tickets : { btts: [], ou25: [], htft: [] };
+      setTickets({
+        btts: Array.isArray(tk.btts) ? tk.btts : [],
+        ou25: Array.isArray(tk.ou25) ? tk.ou25 : [],
+        htft: Array.isArray(tk.htft) ? tk.htft : [],
+      });
     } catch (e) {
       setError(String(e?.message || e));
       setItems([]);
+      setTickets({ btts: [], ou25: [], htft: [] });
     } finally {
       setLoading(false);
     }
   }
 
   useEffect(() => { load(); }, []);
-  return { items, loading, error, reload: load };
+  return { items, tickets, loading, error, reload: load };
 }
 
 /* ===================== UI ===================== */
@@ -179,11 +173,7 @@ function Row({ b }) {
         <span className="font-semibold">{b.market}</span>
         {b.market ? " → " : ""}
         {b.sel || "—"}
-        {b.odds ? (
-          <span className="text-slate-300"> ({b.odds.toFixed(2)})</span>
-        ) : (
-          <span className="text-slate-500"> (—)</span>
-        )}
+        {b.odds ? <span className="text-slate-300"> ({b.odds.toFixed(2)})</span> : <span className="text-slate-500"> (—)</span>}
       </div>
       <div className="mt-2">
         <ConfidenceBar pct={b.conf} />
@@ -211,43 +201,38 @@ function Section({ title, rows = [] }) {
 
 /* ===================== page ===================== */
 export default function FootballBets() {
-  const { items, loading, error } = useLockedValueBets();
+  const { items, tickets, loading, error } = useLockedValueBets();
   const [tab, setTab] = useState("ko"); // ko | conf | hist
 
-  const koRows = useMemo(() => {
-    return [...items].sort((a, b) => (a.date?.getTime?.() || 9e15) - (b.date?.getTime?.() || 9e15));
-  }, [items]);
+  const koRows = useMemo(() => [...items].sort((a, b) => (a.date?.getTime?.() || 9e15) - (b.date?.getTime?.() || 9e15)), [items]);
+  const confRows = useMemo(() => [...items].sort((a, b) => b.conf - a.conf), [items]);
 
-  const confRows = useMemo(() => {
-    return [...items].sort((a, b) => b.conf - a.conf);
-  }, [items]);
+  // TicketPanel očekuje listu predloga različitih marketa; spajamo u jedan niz
+  const ticketBets = useMemo(
+    () => [...(tickets?.btts || []), ...(tickets?.ou25 || []), ...(tickets?.htft || [])],
+    [tickets]
+  );
 
   return (
     <div className="space-y-4">
       {/* TAB dugmad */}
       <div className="flex items-center gap-2">
         <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${
-            tab === "ko" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
-          }`}
+          className={`px-3 py-1.5 rounded-lg text-sm ${tab === "ko" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"}`}
           onClick={() => setTab("ko")}
           type="button"
         >
           Kick-Off
         </button>
         <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${
-            tab === "conf" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
-          }`}
+          className={`px-3 py-1.5 rounded-lg text-sm ${tab === "conf" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"}`}
           onClick={() => setTab("conf")}
           type="button"
         >
           Confidence
         </button>
         <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${
-            tab === "hist" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
-          }`}
+          className={`px-3 py-1.5 rounded-lg text-sm ${tab === "hist" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"}`}
           onClick={() => setTab("hist")}
           type="button"
         >
@@ -267,10 +252,8 @@ export default function FootballBets() {
             {tab === "ko" && <Section title="Kick-Off" rows={koRows} />}
             {tab === "conf" && <Section title="Confidence" rows={confRows} />}
           </div>
-
-          {/* Desni panel: BTTS / OU 2.5 / HT-FT iz locked feed-a */}
           <div className="lg:col-span-1">
-            <TicketPanel slot={currentSlot(TZ)} />
+            <TicketPanel bets={ticketBets} />
           </div>
         </div>
       )}
