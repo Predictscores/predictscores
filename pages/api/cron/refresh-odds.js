@@ -1,10 +1,12 @@
 // pages/api/cron/refresh-odds.js
 // Seed-uje listu fixtures za zadati slot i cache-uje osnovne meta/odds podatke.
-// FIX: dodata PAGINACIJA preko svih strana /fixtures za ymd + slot-filter (late 00–09, am 10–14, pm 15–23).
+// PAGINACIJA: prolazimo kroz sve strane /fixtures za ymd i punimo KV po slotu.
+// FIX1: inSlotLocal je "lax" kada vreme nedostaje (sprečava prazan slot).
+// FIX2: haveVbl je true samo ako vbl niz postoji i ima length > 0 (prazan [] ne zaključava seed).
+
 export const config = { api: { bodyParser: false } };
 
 const TZ = "Europe/Belgrade";
-const AF_BASE = "https://v3.football.api-sports.io";
 
 /* ---------------- KV helpers ---------------- */
 function kvBackends() {
@@ -77,19 +79,22 @@ function hourInTZ(d=new Date(), tz=TZ){
   const fmt = new Intl.DateTimeFormat("en-GB",{timeZone:tz,hour:"2-digit",hour12:false});
   return parseInt(fmt.format(d),10);
 }
-// USKLAĐENO:
 function deriveSlot(h){ if(h<10) return "late"; if(h<15) return "am"; return "pm"; }
 
 /* --------------- slot helpers --------------- */
 function kickoffFromMeta(meta){
-  const s = meta?.kickoff_utc || meta?.datetime_local?.starting_at?.date_time || meta?.fixture?.date || null;
+  const s =
+    meta?.kickoff_utc ||
+    meta?.datetime_local?.starting_at?.date_time ||
+    meta?.fixture?.date ||
+    null;
   if (!s || typeof s !== "string") return null;
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : d;
 }
 function inSlotLocal(meta, slot){
   const d = kickoffFromMeta(meta);
-  // **LAX seed**: kad nema vremena, NE izbacuj iz slota (sprečava prazan feed u late)
+  // FIX1: kada nemamo vreme, NEMOJ izbaciti iz slota (lax seed)
   if (!d) return true;
   const h = hourInTZ(d, TZ);
   if (slot === "late") return h < 10;            // 00–09
@@ -184,7 +189,7 @@ export default async function handler(req,res){
     const all = await fetchAllFixturesForDate(ymd);
     const inspected = all.length;
 
-    // 2) map to meta and strict slot-filter
+    // 2) map meta i primeni slot-filter
     const metaById = {};
     for (const it of all) {
       const id = Number(it?.fixture?.id);
@@ -205,7 +210,6 @@ export default async function handler(req,res){
     const filtered = slotRows.length;
     const pickedIds = slotRows.slice(0, 60).map(r => r.id); // samo slot
 
-    // Ako posle *celog dana* i dalje nema mečeva u slotu:
     if (!pickedIds.length && !force) {
       return res.status(200).json({
         ok: true, ymd, slot,
@@ -216,7 +220,10 @@ export default async function handler(req,res){
     }
 
     // 3) odds fetch + kreiranje vbl_full/vbl za SLOT
-    const haveVbl = !!arrFromAny(toObj((await kvGETraw(`vbl:${ymd}:${slot}`)).raw));
+    // FIX2: treat empty [] as "not present"
+    const existingVbl = arrFromAny(toObj((await kvGETraw(`vbl:${ymd}:${slot}`)).raw));
+    const haveVbl = Array.isArray(existingVbl) && existingVbl.length > 0;
+
     const createdLocked = [];
     let called = 0, cached = 0;
 
@@ -236,7 +243,7 @@ export default async function handler(req,res){
             const bookmakers = (jo?.response?.[0]?.bookmakers) || [];
             const best = best1x2FromBookmakers(bookmakers);
             const meta = metaById?.[id] || {};
-            if(best){ // meta je već u slotu (strict)
+            if(best){
               createdLocked.push({
                 fixture_id: id,
                 league: meta.league || null,
