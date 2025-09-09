@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import HistoryPanel from "./HistoryPanel";
-import TicketPanel from "./TicketPanel"; // ⬅️ novo
+import TicketPanel from "./TicketPanel";
 
 const TZ = "Europe/Belgrade";
 
@@ -31,7 +31,6 @@ function toISO(x) {
 function fmtKickoff(iso) {
   if (!iso) return "";
   const d = new Date(iso);
-  // prikaz u Europe/Belgrade (bez biblioteka)
   return d.toLocaleString("sr-RS", {
     timeZone: TZ,
     hour: "2-digit",
@@ -49,50 +48,76 @@ function hasAnyTickets(t) {
   return (b + o + h) > 0;
 }
 
-/* ---------------- hooks ---------------- */
+/* ---------------- football feed ---------------- */
 
 function useFootballFeed() {
   const [items, setItems] = useState([]);
-  const [tickets, setTickets] = useState(null);  // ⬅️ novo
+  const [tickets, setTickets] = useState({});
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState(null);
 
   useEffect(() => {
     let alive = true;
-
     (async () => {
       setLoading(true);
       setErr(null);
-
-      // 1) Zaključani VB (iz ovoga čitamo i 1X2 i tikete)
       const vb = await safeJson(`/api/value-bets-locked?slim=1`);
       if (!alive) return;
-
       if (vb?.ok) {
-        // API može vratiti { items: [], tickets: { btts:[], ou25:[], htft:[] }, ymd, slot, ... }
-        const it = Array.isArray(vb.items) ? vb.items : [];
-        const tk = vb?.tickets && typeof vb.tickets === "object" ? vb.tickets : {};
-        setItems(it);
-        setTickets(tk);
+        setItems(Array.isArray(vb.items) ? vb.items : []);
+        setTickets(vb?.tickets && typeof vb.tickets === "object" ? vb.tickets : {});
       } else {
         setErr(vb?.error || "N/A");
         setItems([]);
         setTickets({});
       }
-
       setLoading(false);
     })();
-
     return () => { alive = false; };
   }, []);
 
   return { items, tickets, loading, err };
 }
 
-/* ---------------- presentational ---------------- */
+/* ---------------- crypto feed ---------------- */
+
+function useCryptoFeed() {
+  const [signals, setSignals] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      setLoading(true);
+      setErr(null);
+      // koristi tvoj postojeći API za kripto signale
+      const r = await safeJson(`/api/crypto`);
+      if (!alive) return;
+      if (r?.ok) {
+        // podrži više formata: r.signals || r.items || r.data
+        const arr = Array.isArray(r.signals) ? r.signals
+                  : Array.isArray(r.items)   ? r.items
+                  : Array.isArray(r.data)    ? r.data
+                  : [];
+        setSignals(arr);
+      } else {
+        setErr(r?.error || "N/A");
+        setSignals([]);
+      }
+      setLoading(false);
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  return { signals, loading, err };
+}
+
+/* ---------------- presentational blocks ---------------- */
 
 function ItemCard({ it }) {
   const k = toISO(it);
+  const conf = it?.confidence_pct ?? (it?.model_prob != null ? Math.round(it.model_prob*100) : undefined);
   return (
     <div className="rounded-2xl p-4 shadow-md bg-black/40 border border-white/10">
       <div className="text-sm opacity-70">{it.league_name} · {it.league_country}</div>
@@ -101,66 +126,77 @@ function ItemCard({ it }) {
       </div>
       <div className="mt-1 text-sm opacity-80">Kick-off: {fmtKickoff(k)}</div>
       <div className="mt-2 text-sm">
-        <span className="opacity-70">Market:</span> <b>{it.market}</b> · <span className="opacity-70">Pick:</span> <b>{it.pick}</b>
+        <span className="opacity-70">Market:</span> <b>{it.market}</b> · <span className="opacity-70">Pick:</span> <b>{it.pick || it.selection_label}</b>
       </div>
       <div className="mt-1 text-sm">
-        <span className="opacity-70">Conf:</span> <b>{(it.confidence_pct ?? Math.round((it.model_prob ?? 0)*100))}%</b>
+        {conf != null ? (<><span className="opacity-70">Conf:</span> <b>{conf}%</b></>) : null}
         {it?.odds?.price ? <> · <span className="opacity-70">Odds:</span> <b>{it.odds.price}</b></> : null}
       </div>
     </div>
   );
 }
 
-function TicketsAside({ tickets }) {
-  if (!hasAnyTickets(tickets)) {
-    return (
-      <aside aria-label="Tickets" className="space-y-3">
-        <div className="rounded-2xl p-4 bg-black/30 border border-white/10">
-          <div className="text-sm opacity-70">Tickets</div>
-          <div className="mt-1 text-sm opacity-70">Nema dostupnih BTTS / OU2.5 / HT-FT tiketa.</div>
-        </div>
-      </aside>
-    );
-  }
-
-  const group = [
-    { key: "btts",  title: "BTTS (Oba daju gol)" },
-    { key: "ou25",  title: "Over/Under 2.5" },
-    { key: "htft",  title: "HT–FT" },
-  ];
-
+function CryptoCard({ s }) {
+  const sym = s?.symbol || s?.pair || s?.ticker || "—";
+  const sig = (s?.signal || s?.side || s?.direction || "").toUpperCase();
+  const price = s?.price ?? s?.last ?? s?.close;
+  const conf = s?.confidence ?? s?.score ?? s?.strength;
   return (
-    <aside aria-label="Tickets" className="space-y-4">
-      {group.map(g => {
-        const arr = Array.isArray(tickets[g.key]) ? tickets[g.key] : [];
-        if (!arr.length) return null;
-        return (
-          <div key={g.key} className="rounded-2xl p-4 bg-black/30 border border-white/10">
-            <div className="text-sm font-semibold">{g.title}</div>
-            <div className="mt-3 space-y-3">
-              {arr.map((it, idx) => (
-                <div key={idx} className="text-sm">
-                  <div className="opacity-70">{it?.league_name} · {it?.league_country}</div>
-                  <div className="font-medium">{it?.home} — {it?.away}</div>
-                  <div className="opacity-80">Kick-off: {fmtKickoff(toISO(it))}</div>
-                  <div className="mt-0.5">
-                    <span className="opacity-70">Pick:</span> <b>{it?.selection_label || it?.pick || it?.market}</b>
-                    {it?.odds?.price ? <> · <span className="opacity-70">Odds:</span> <b>{it.odds.price}</b></> : null}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        );
-      })}
-    </aside>
+    <div className="rounded-2xl p-4 shadow-md bg-black/40 border border-white/10">
+      <div className="text-sm opacity-70">Crypto</div>
+      <div className="mt-1 text-lg font-semibold">{sym}</div>
+      <div className="mt-1 text-sm"><span className="opacity-70">Signal:</span> <b>{sig || "—"}</b></div>
+      {price != null ? <div className="mt-1 text-sm"><span className="opacity-70">Price:</span> <b>{price}</b></div> : null}
+      {conf != null ? <div className="mt-1 text-sm"><span className="opacity-70">Confidence:</span> <b>{Math.round(conf)}%</b></div> : null}
+    </div>
   );
 }
 
-function FootballBody() {
-  const { items, tickets, loading, err } = useFootballFeed();
+/* ---------------- COMBINED tab ---------------- */
 
-  // Sortiranja za dva pod-taba
+function CombinedBody() {
+  const { items, loading: fLoading } = useFootballFeed();
+  const { signals, loading: cLoading } = useCryptoFeed();
+
+  const topFootball = useMemo(() => [...items].slice(0, 3), [items]);  // Top 3 singla
+  const topCrypto   = useMemo(() => [...signals].slice(0, 3), [signals]); // Top 3 kripto
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div>
+        <div className="mb-2 text-sm opacity-70">Football · Top 3 (singl)</div>
+        {fLoading ? (
+          <div className="text-sm opacity-70">Učitavanje…</div>
+        ) : topFootball.length ? (
+          <div className="space-y-4">
+            {topFootball.map((it, i) => <ItemCard key={i} it={it} />)}
+          </div>
+        ) : (
+          <div className="text-sm opacity-70 rounded-2xl p-4 bg-black/20 border border-white/10">Nema 1X2 singlova za prikaz.</div>
+        )}
+      </div>
+
+      <div>
+        <div className="mb-2 text-sm opacity-70">Crypto · Top 3</div>
+        {cLoading ? (
+          <div className="text-sm opacity-70">Učitavanje…</div>
+        ) : topCrypto.length ? (
+          <div className="space-y-4">
+            {topCrypto.map((s, i) => <CryptoCard key={i} s={s} />)}
+          </div>
+        ) : (
+          <div className="text-sm opacity-70 rounded-2xl p-4 bg-black/20 border border-white/10">Nema crypto signala za prikaz.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- FOOTBALL tab (sa pod-tabovima) ---------------- */
+
+function FootballBody({ subTab /* "kickoff" | "confidence" | "history" */ }) {
+  const { items, tickets, loading } = useFootballFeed();
+
   const byKickoff = useMemo(() => {
     return [...items].sort((a, b) => {
       const ka = new Date(toISO(a)).getTime() || 0;
@@ -183,62 +219,145 @@ function FootballBody() {
     </div>
   );
 
+  const showTickets = subTab === "kickoff" || subTab === "confidence";
+
+  if (subTab === "history") {
+    // HISTORY pod-tab: BEZ tiketa, full width
+    return (
+      <div className="space-y-4">
+        <div className="mb-2 text-sm opacity-70">History (14d)</div>
+        <HistoryPanel />
+      </div>
+    );
+  }
+
+  const list = subTab === "kickoff" ? byKickoff : byConfidence;
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-      {/* Levo: 1X2 lista (2 kolone na većim ekranima) */}
-      <div className="lg:col-span-2 space-y-6">
-        <div>
-          <div className="mb-2 text-sm opacity-70">Kick-Off</div>
-          {loading ? (
-            <div className="text-sm opacity-70">Učitavanje…</div>
-          ) : (byKickoff.length ? (
-            <div className="grid md:grid-cols-2 gap-4">
-              {byKickoff.map((it, i) => <ItemCard key={i} it={it} />)}
-            </div>
-          ) : leftEmptyMsg)}
+      {/* Levo: 1X2 lista */}
+      <div className={showTickets ? "lg:col-span-2" : "lg:col-span-3"}>
+        <div className="mb-2 text-sm opacity-70">
+          {subTab === "kickoff" ? "Kick-Off" : "Confidence"}
         </div>
-
-        <div>
-          <div className="mb-2 text-sm opacity-70">Confidence</div>
-          {loading ? (
-            <div className="text-sm opacity-70">Učitavanje…</div>
-          ) : (byConfidence.length ? (
-            <div className="grid md:grid-cols-2 gap-4">
-              {byConfidence.map((it, i) => <ItemCard key={i} it={it} />)}
-            </div>
-          ) : leftEmptyMsg)}
-        </div>
-
-        {/* History ostaje kako je (placeholder ili tvoj stvarni panel) */}
-        <div>
-          <div className="mb-2 text-sm opacity-70">History (14d)</div>
-          <HistoryPanel />
-        </div>
+        {loading ? (
+          <div className="text-sm opacity-70">Učitavanje…</div>
+        ) : (list.length ? (
+          <div className="grid md:grid-cols-2 gap-4">
+            {list.map((it, i) => <ItemCard key={i} it={it} />)}
+          </div>
+        ) : leftEmptyMsg)}
       </div>
 
-      {/* Desno: Tickets stub (vidljiv bez obzira na items[]) */}
-      <div className="lg:col-span-1">
-        <TicketsAside tickets={tickets} />
-      </div>
+      {/* Desno: Tickets (samo na Kick-Off i Confidence) */}
+      {showTickets ? (
+        <div className="lg:col-span-1">
+          <aside aria-label="Tickets">
+            {hasAnyTickets(tickets) ? (
+              <TicketPanel tickets={tickets} />
+            ) : (
+              <div className="rounded-2xl p-4 bg-black/30 border border-white/10">
+                <div className="text-sm opacity-70">Tickets</div>
+                <div className="mt-1 text-sm opacity-70">Nema dostupnih BTTS / OU2.5 / HT-FT tiketa.</div>
+              </div>
+            )}
+          </aside>
+        </div>
+      ) : null}
     </div>
   );
 }
 
+/* ---------------- CRYPTO tab ---------------- */
+
+function CryptoBody() {
+  const { signals, loading } = useCryptoFeed();
+
+  return (
+    <div>
+      <div className="mb-2 text-sm opacity-70">Crypto · Signals</div>
+      {loading ? (
+        <div className="text-sm opacity-70">Učitavanje…</div>
+      ) : signals.length ? (
+        <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {signals.map((s, i) => <CryptoCard key={i} s={s} />)}
+        </div>
+      ) : (
+        <div className="text-sm opacity-70 rounded-2xl p-4 bg-black/20 border border-white/10">Nema crypto signala za prikaz.</div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- top-level tabs ---------------- */
+
 export default function CombinedBets() {
-  // Pretpostavljam da već imaš tabove Combined / Football / Crypto u ovoj komponenti.
-  // Da ne menjamo postojeći raspored i logiku, ovde samo renderujemo FootballBody
-  // u "Football" sekciji. Ako već imaš tvoje tabove, zameni njihov Football sadržaj
-  // ovim <FootballBody />. Ako nemaš tabove — ostavi ovako.
+  const [mainTab, setMainTab] = useState("combined"); // "combined" | "football" | "crypto"
+  const [footballTab, setFootballTab] = useState("kickoff"); // "kickoff" | "confidence" | "history"
 
   return (
     <div className="space-y-8">
-      {/* Combined i Crypto sekcije ostaju kakve jesu u tvom originalnom fajlu.
-         Ako tvoj original već ima više tabova, zadrži ih i samo ubaci <FootballBody /> u Football tab. */}
+      {/* Main tabs header */}
+      <div className="flex items-center gap-2">
+        {[
+          { key: "combined", label: "Combined" },
+          { key: "football", label: "Football" },
+          { key: "crypto",   label: "Crypto"   },
+        ].map(t => (
+          <button
+            key={t.key}
+            onClick={() => setMainTab(t.key)}
+            className={`px-4 py-2 rounded-xl border transition ${
+              mainTab === t.key
+              ? "bg-white/10 border-white/20"
+              : "bg-black/20 border-white/10 hover:bg-black/30"
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
 
-      {/* FOOTBALL TAB */}
-      <section aria-label="Football">
-        <FootballBody />
-      </section>
+      {/* Main tab content */}
+      {mainTab === "combined" && (
+        <section aria-label="Combined">
+          <CombinedBody />
+        </section>
+      )}
+
+      {mainTab === "football" && (
+        <section aria-label="Football" className="space-y-6">
+          {/* Football sub-tabs */}
+          <div className="flex items-center gap-2">
+            {[
+              { key: "kickoff",    label: "Kick-Off"   },
+              { key: "confidence", label: "Confidence" },
+              { key: "history",    label: "History"    },
+            ].map(t => (
+              <button
+                key={t.key}
+                onClick={() => setFootballTab(t.key)}
+                className={`px-3 py-1.5 rounded-lg border text-sm transition ${
+                  footballTab === t.key
+                  ? "bg-white/10 border-white/20"
+                  : "bg-black/20 border-white/10 hover:bg-black/30"
+                }`}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Football content (sub-tab) */}
+          <FootballBody subTab={footballTab} />
+        </section>
+      )}
+
+      {mainTab === "crypto" && (
+        <section aria-label="Crypto">
+          <CryptoBody />
+        </section>
+      )}
     </div>
   );
 }
