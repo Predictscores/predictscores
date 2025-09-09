@@ -3,6 +3,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import HistoryPanel from "./HistoryPanel";
+import TicketPanel from "./TicketPanel"; // ⬅️ NOVO: desni panel za BTTS/OU/HTFT
 
 const TZ = "Europe/Belgrade";
 
@@ -266,7 +267,11 @@ export default function FootballBets() {
             {tab === "ko" && <Section title="Kick-Off" rows={koRows} />}
             {tab === "conf" && <Section title="Confidence" rows={confRows} />}
           </div>
-          <div className="lg:col-span-1">{/* desni panel po želji */}</div>
+
+          {/* Desni panel: BTTS / OU 2.5 / HT-FT iz locked feed-a */}
+          <div className="lg:col-span-1">
+            <TicketPanel slot={currentSlot(TZ)} />
+          </div>
         </div>
       )}
     </div>
