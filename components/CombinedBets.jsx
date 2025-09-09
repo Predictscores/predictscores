@@ -48,6 +48,15 @@ function hasAnyTickets(t) {
   return (b + o + h) > 0;
 }
 
+function num(x) {
+  const v = Number(x);
+  return Number.isFinite(v) ? v : null;
+}
+function pct(x) {
+  const v = num(x);
+  return v == null ? null : Math.round(v * 100) / 100;
+}
+
 /* ---------------- football feed ---------------- */
 
 function useFootballFeed() {
@@ -111,33 +120,27 @@ function useCryptoFeed() {
   return { signals, loading, err };
 }
 
-/* ---------------- tiny utils for crypto visuals (SVG sparkline) ---------------- */
+/* ---------------- sparkline (SVG) ---------------- */
 
-function toSparkData(s) {
-  // očekuje s.sparkline (niz cena) ili s.history (array of {time, price/close/last})
+function toSparkSeries(s) {
+  // dozvoljeni ulazi: s.sparkline=[...prices] ili s.history=[{price|close|last}]
   if (Array.isArray(s?.sparkline) && s.sparkline.length) {
     return s.sparkline.map(Number).filter(v => Number.isFinite(v));
   }
   if (Array.isArray(s?.history) && s.history.length) {
     return s.history
-      .map(pt => Number(pt?.price ?? pt?.close ?? pt?.last))
-      .filter(v => Number.isFinite(v));
+      .map(pt => num(pt?.price ?? pt?.close ?? pt?.last))
+      .filter(v => v != null);
   }
   return [];
 }
 
-function pct(v) {
-  if (v == null || Number.isNaN(Number(v))) return null;
-  return Math.round(Number(v) * 100) / 100;
-}
-
-function SparklineSVG({ series, height = 80 }) {
-  const w = 260; // virtuelna širina (skalira se preko viewBox)
+function SparklineSVG({ series, height = 80, color = "blue" }) {
+  const w = 260;
   const h = height;
   const n = series?.length || 0;
-  if (!n) {
-    return <div className="h-20 rounded-xl bg-blue-900/20 border border-blue-300/10" />;
-  }
+  if (!n) return <div className="h-20 rounded-xl bg-blue-900/20 border border-blue-300/10" />;
+
   const min = Math.min(...series);
   const max = Math.max(...series);
   const span = max - min || 1;
@@ -148,22 +151,31 @@ function SparklineSVG({ series, height = 80 }) {
     return `${x.toFixed(2)},${y.toFixed(2)}`;
   }).join(" ");
 
-  // za fill: putanja do dna
   const fillPath = `M0,${h} L${pts} L${w},${h} Z`;
+
+  const palette = {
+    green: {
+      stroke: "rgba(74,222,128,0.95)",   // green-400
+      fill:   "rgba(74,222,128,0.15)",
+    },
+    red: {
+      stroke: "rgba(248,113,113,0.95)",  // red-400
+      fill:   "rgba(248,113,113,0.15)",
+    },
+    blue: {
+      stroke: "rgba(147,197,253,0.9)",   // blue-300
+      fill:   "rgba(59,130,246,0.15)",   // blue-500-ish
+    }
+  };
+  const c = palette[color] || palette.blue;
 
   return (
     <svg width="100%" height={h} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none">
-      <defs>
-        <linearGradient id="sgFill" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="rgba(59,130,246,0.35)" />
-          <stop offset="100%" stopColor="rgba(59,130,246,0.05)" />
-        </linearGradient>
-      </defs>
-      <path d={fillPath} fill="url(#sgFill)" />
+      <path d={fillPath} fill={c.fill} />
       <polyline
         points={pts}
         fill="none"
-        stroke="rgba(147,197,253,0.9)" /* blue-300 */
+        stroke={c.stroke}
         strokeWidth="2"
         strokeLinejoin="round"
         strokeLinecap="round"
@@ -172,17 +184,15 @@ function SparklineSVG({ series, height = 80 }) {
   );
 }
 
-/* ---------------- presentational blocks ---------------- */
+/* ---------------- presentational (plava tema) ---------------- */
 
 function Card({ children }) {
-  // plava tema (usklađeno sa History karticama)
   return (
     <div className="rounded-2xl p-4 shadow-md bg-blue-900/30 border border-blue-300/20">
       {children}
     </div>
   );
 }
-
 function SectionTitle({ children }) {
   return <div className="mb-2 text-sm opacity-80 text-blue-50">{children}</div>;
 }
@@ -208,45 +218,110 @@ function ItemCard({ it }) {
   );
 }
 
-function CryptoCard({ s }) {
-  const sym = s?.symbol || s?.pair || s?.ticker || "—";
-  const sig = (s?.signal || s?.side || s?.direction || "").toUpperCase();
-  const price = s?.price ?? s?.last ?? s?.close;
-  const conf = s?.confidence ?? s?.score ?? s?.strength;
-  const ch24 = s?.change_24h ?? s?.changePct ?? s?.change ?? s?.pct_24h;
-  const series = toSparkData(s);
+/* ---------------- crypto cards ---------------- */
 
-  const pos = String(sig).includes("LONG") || String(sig).includes("BUY");
-  const neg = String(sig).includes("SHORT") || String(sig).includes("SELL");
-  const tag =
-    pos ? "LONG" :
-    neg ? "SHORT" :
-    (sig || "—");
+function normalizeSignal(s) {
+  const symbol = s?.symbol || s?.pair || s?.ticker || "—";
+  const sideRaw = (s?.signal || s?.side || s?.direction || "").toString().toUpperCase();
+  const side = sideRaw.includes("LONG") || sideRaw.includes("BUY") ? "LONG"
+             : sideRaw.includes("SHORT") || sideRaw.includes("SELL") ? "SHORT"
+             : sideRaw || "—";
+
+  const priceNow = num(s?.price ?? s?.last ?? s?.close);
+
+  // entry candidates
+  const entry = num(
+    s?.entry ?? s?.entry_price ?? s?.entryPrice ?? s?.open ?? s?.buy_price ?? s?.buyPrice
+  );
+
+  // exit/target candidates (prefer TP/target; za short/long očekivanje računamo vs entry)
+  const exit = num(
+    s?.exit ?? s?.exit_price ?? s?.exitPrice ?? s?.target ?? s?.take_profit ?? s?.tp ?? s?.sell_price ?? s?.sellPrice
+  );
+
+  // Ako API šalje direktan očekivani procenat, uzmi; inače deriviraj iz entry/exit
+  const expDirect = num(
+    s?.expected_pct ?? s?.expectedChange ?? s?.exp_pct ?? s?.expChange ?? s?.expected
+  );
+
+  let expectedPct = expDirect;
+  if (expectedPct == null && entry != null && exit != null && entry > 0) {
+    if (side === "SHORT") expectedPct = ((entry - exit) / entry) * 100;
+    else expectedPct = ((exit - entry) / entry) * 100; // LONG ili nepoznato
+  }
+
+  // 24h promene i sl.
+  const ch24 = num(s?.change_24h ?? s?.changePct ?? s?.change ?? s?.pct_24h);
+  const confidence = num(s?.confidence ?? s?.score ?? s?.strength);
+
+  const series = toSparkSeries(s);
+
+  return {
+    symbol, side, priceNow, entry, exit, expectedPct, ch24, confidence, series,
+  };
+}
+
+function Arrow({ dir }) {
+  // dir: "up" | "down" | null
+  if (dir === "up") return <span className="ml-1 text-green-300">▲</span>;
+  if (dir === "down") return <span className="ml-1 text-rose-300">▼</span>;
+  return null;
+}
+
+function CryptoCard({ s }) {
+  const N = normalizeSignal(s);
+  const pos = N.side === "LONG";
+  const neg = N.side === "SHORT";
+
+  const tagClass = pos
+    ? "bg-green-500/10 border-green-400/30 text-green-200"
+    : neg
+    ? "bg-rose-500/10 border-rose-400/30 text-rose-200"
+    : "bg-blue-500/10 border-blue-400/30 text-blue-100";
+
+  const sparkColor = pos ? "green" : neg ? "red" : "blue";
 
   return (
     <Card>
       <div className="text-sm opacity-80 text-blue-100">Crypto</div>
+
+      {/* Header */}
       <div className="mt-1 flex items-center justify-between">
-        <div className="text-lg font-semibold text-blue-50">{sym}</div>
-        <span className={`px-2 py-0.5 rounded-md text-xs border ${
-          pos ? "bg-green-500/10 border-green-400/30 text-green-200"
-              : neg ? "bg-rose-500/10 border-rose-400/30 text-rose-200"
-                    : "bg-blue-500/10 border-blue-400/30 text-blue-100"
-        }`}>
-          {tag}
+        <div className="text-lg font-semibold text-blue-50">{N.symbol}</div>
+        <span className={`px-2 py-0.5 rounded-md text-xs border flex items-center gap-1 ${tagClass}`}>
+          {N.side}
+          <Arrow dir={pos ? "up" : neg ? "down" : null} />
         </span>
       </div>
 
-      <div className="mt-1 text-sm text-blue-100/90">
-        {price != null ? <>Price: <b>{price}</b></> : <>Price: <b>—</b></>}
-        {ch24 != null ? <> · 24h: <b className={Number(ch24) >= 0 ? "text-green-200" : "text-rose-200"}>
-          {pct(ch24)}%
-        </b></> : null}
-        {conf != null ? <> · Confidence: <b>{Math.round(conf)}%</b></> : null}
+      {/* Metrics row */}
+      <div className="mt-1 text-sm text-blue-100/90 flex flex-wrap gap-x-4 gap-y-1">
+        <div>Price: <b>{N.priceNow != null ? N.priceNow : "—"}</b></div>
+        <div>Entry: <b>{N.entry != null ? N.entry : "—"}</b></div>
+        <div>Exit: <b>{N.exit != null ? N.exit : "—"}</b></div>
+        <div>
+          Exp:{" "}
+          {N.expectedPct != null ? (
+            <b className={N.expectedPct >= 0 ? "text-green-200" : "text-rose-200"}>
+              {pct(N.expectedPct)}%
+            </b>
+          ) : (
+            <b>—</b>
+          )}
+        </div>
       </div>
 
+      {/* Extra row */}
+      <div className="mt-1 text-sm text-blue-100/80 flex flex-wrap gap-x-4 gap-y-1">
+        {N.ch24 != null ? (
+          <div>24h: <b className={N.ch24 >= 0 ? "text-green-200" : "text-rose-200"}>{pct(N.ch24)}%</b></div>
+        ) : null}
+        {N.confidence != null ? <div>Confidence: <b>{Math.round(N.confidence)}%</b></div> : null}
+      </div>
+
+      {/* Chart */}
       <div className="mt-3">
-        <SparklineSVG series={series} />
+        <SparklineSVG series={N.series} color={sparkColor} />
       </div>
     </Card>
   );
@@ -376,7 +451,6 @@ function FootballBody({ subTab /* "kickoff" | "confidence" | "history" */ }) {
 
 function CryptoBody() {
   const { signals, loading } = useCryptoFeed();
-
   return (
     <div className="space-y-4">
       <SectionTitle>Crypto · Signals</SectionTitle>
