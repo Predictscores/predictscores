@@ -5,7 +5,7 @@
 
 export const config = { api: { bodyParser: false } };
 
-const TZ = "Europe/Belgrade";
+const TZ = (process.env.TZ_DISPLAY && process.env.TZ_DISPLAY.trim()) || "Europe/Belgrade";
 
 /* ---------------- KV (Vercel REST) ---------------- */
 function kvCfgs() {
