@@ -2,7 +2,8 @@ name: Crypto Watchdog
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # menjaj na ritam koji želiš (5/10/15 min)
+    - cron: "*/00 * * * *"   # menjaj na ritam koji želiš (5/10/15 min)
+    - cron: "*/30 * * * *"   # menjaj na ritam koji želiš (5/10/15 min)
   workflow_dispatch: {}      # ručni trigger iz Actions taba
 
 jobs:
