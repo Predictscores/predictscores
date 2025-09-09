@@ -1,253 +1,242 @@
 // pages/api/value-bets-locked.js
-import { kv } from '@vercel/kv';
+// Response za UI ("football" tab) sa tvrdim cap-om po slotu i danu u nedelji.
+// Weekday: late=6, am=15, pm=15;  Weekend (Sat/Sun): late=6, am=20, pm=20.
+// DOPUNA: ubacuje tickets (BTTS/OU2.5/HT-FT) direktno u payload iz KV ključeva tickets:<YMD>(:slot)
 
-/** TZ i slot definicija */
-const TZ = process.env.TZ_DISPLAY || 'Europe/Belgrade';
-const SLOT_ORDER = ['late', 'am', 'pm'];
+export const config = { api: { bodyParser: false } };
 
-function ymdInTZ(d = new Date(), tz = TZ) {
-  const f = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
-  const [{ value: y }, , { value: m }, , { value: da }] = f.formatToParts(d);
-  return `${y}-${m}-${da}`;
-}
-function hourInTZ(iso, tz = TZ) {
-  try {
-    const d = new Date(iso);
-    const f = new Intl.DateTimeFormat('en', { timeZone: tz, hour: '2-digit', hour12: false });
-    const [{ value: h }] = f.formatToParts(d).filter(p => p.type === 'hour');
-    return Number(h);
-  } catch { return null; }
-}
-function slotForHour(h) {
-  if (h == null) return null;
-  if (h < 10) return 'late';
-  if (h < 15) return 'am';
-  return 'pm';
-}
-function slotForKickoffISO(iso, tz = TZ) {
-  return slotForHour(hourInTZ(iso, tz));
-}
-function inSlotLocal(iso, slot, tz = TZ) {
-  const s = slotForKickoffISO(iso, tz);
-  return !slot || !s ? false : s === slot;
-}
+const TZ = "Europe/Belgrade";
+const MIN_ODDS = 1.5;
 
-/** robustan extract kickoff ISO iz raznih struktura */
-function kickoffISO(it) {
-  return (
-    it?.kickoff_utc ||
-    it?.kickoff ||
-    it?.time?.starting_at?.date_time ||
-    it?.datetime_local?.starting_at?.date_time ||
-    it?.datetime_local?.date_time ||
-    it?.fixture?.date ||
-    null
-  );
-}
-
-/** utili */
-const arr = (x) => (Array.isArray(x) ? x : x ? [x] : []);
-const uniqBy = (xs, keyFn) => {
-  const seen = new Set();
+/* ---------------- KV helpers ---------------- */
+function kvBackends() {
   const out = [];
-  for (const x of xs) {
-    const k = keyFn(x);
-    if (!seen.has(k)) { seen.add(k); out.push(x); }
+  const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
+  const bU = process.env.UPSTASH_REDIS_REST_URL, bT = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (aU && aT) out.push({ flavor: "vercel-kv", url: aU.replace(/\/+$/,""), tok: aT });
+  if (bU && bT) out.push({ flavor: "upstash-redis", url: bU.replace(/\/+$/,""), tok: bT });
+  return out;
+}
+async function kvGETraw(key, trace) {
+  for (const b of kvBackends()) {
+    try {
+      const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`, {
+        headers: { Authorization: `Bearer ${b.tok}` }, cache: "no-store",
+      });
+      const ok = r.ok;
+      const j = ok ? await r.json().catch(()=>null) : null;
+      const val = (typeof j?.result === "string" && j.result) ? j.result : null;
+      trace && trace.push({ key, flavor:b.flavor, status: ok ? (val?"hit":"miss") : `http-${r.status}` });
+      if (val) return { raw: val, flavor: b.flavor };
+    } catch (e) {
+      trace && trace.push({ key, flavor:b.flavor, status:`err:${String(e?.message||e)}` });
+    }
+  }
+  return { raw: null, flavor: null };
+}
+
+/* ---------------- utils ---------------- */
+function toObj(s){ if(!s) return null; try{ return JSON.parse(s); }catch{ return null; } }
+function arrFromAny(x){
+  if (!x) return null;
+  if (Array.isArray(x)) return x;
+  if (Array.isArray(x?.items)) return x.items;
+  if (Array.isArray(x?.football)) return x.football;
+  if (Array.isArray(x?.value_bets)) return x.value_bets;
+  if (Array.isArray(x?.list)) return x.list;
+  if (Array.isArray(x?.data)) return x.data;
+  if (x && typeof x === "object" && typeof x.value === "string") {
+    try { const v = JSON.parse(x.value); if (Array.isArray(v)) return v; } catch {}
+  }
+  return null;
+}
+function ymdInTZ(d=new Date(), tz=TZ){
+  const fmt = new Intl.DateTimeFormat("en-CA",{ timeZone:tz, year:"numeric", month:"2-digit", day:"2-digit" });
+  const p = fmt.formatToParts(d).reduce((a,x)=>(a[x.type]=x.value,a),{});
+  return `${p.year}-${p.month}-${p.day}`;
+}
+function hourInTZ(d=new Date(), tz=TZ){
+  const fmt = new Intl.DateTimeFormat("en-GB",{ timeZone:tz, hour:"2-digit", hour12:false });
+  return parseInt(fmt.format(d),10);
+}
+function deriveSlot(h){ if (h<10) return "late"; if (h<15) return "am"; return "pm"; }
+
+function kickoffFromMeta(it){
+  const s =
+    it?.kickoff_utc ||
+    it?.datetime_local?.starting_at?.date_time ||
+    it?.fixture?.date || null;
+  if (!s || typeof s !== "string") return null;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+function inSlotLocal(it, slot){
+  const d = kickoffFromMeta(it);
+  if (!d) return true; // lax: ako nema vremena, nemoj ga izbaciti
+  const h = hourInTZ(d, TZ);
+  if (slot === "late") return h < 10;            // 00–09
+  if (slot === "am")   return h >= 10 && h < 15; // 10–14
+  return h >= 15;                                 // 15–23
+}
+
+const YOUTH_PATTERNS = [
+  /\bU(-|\s)?(17|18|19|20|21|22|23)\b/i,
+  /\bPrimavera\b/i,
+  /\bYouth\b/i,
+  /\bReserve(s)?\b/i,
+  /\bU\d{2}\b/i,
+];
+function isYouthOrBanned(it){
+  const ln = (it?.league_name || it?.league?.name || "").toString();
+  const h = (it?.home || it?.teams?.home?.name || "").toString();
+  const a = (it?.away || it?.teams?.away?.name || "").toString();
+  const s = `${ln} ${h} ${a}`;
+  return YOUTH_PATTERNS.some(rx => rx.test(s));
+}
+
+function dedupByFixture(arr) {
+  const seen = new Set(); const out = [];
+  for (const it of arr||[]) {
+    const id = Number(it?.fixture_id ?? it?.fixture?.id ?? it?.id);
+    if (!id || seen.has(id)) continue;
+    seen.add(id); out.push(it);
   }
   return out;
-};
-const num = (x) => (Number.isFinite(Number(x)) ? Number(x) : null);
-
-/** scoring bez “čvrstih pragova” (čisto data-driven rang) */
-function evScore(it) {
-  const mp = num(it?.model_prob);
-  const imp = num(it?.implied_prob) ?? (num(it?.market_odds) ? 1 / num(it.market_odds) : null);
-  const edge = (mp != null && imp != null) ? (mp - imp) : 0;
-  const conf = num(it?.confidence_pct) ?? (mp != null ? mp * 100 : 0);
-  // ELR/Kelly signal ako imamo kvotu
-  const odds = num(it?.market_odds);
-  const elr = (mp != null && odds != null) ? Math.log( (mp * odds) || 1 ) : 0;
-  return 1000 * edge + 5 * elr + 0.1 * conf; // linearna kombinacija, bez rezanja
+}
+function confidence(it){
+  if (Number.isFinite(it?.confidence_pct)) return Number(it.confidence_pct);
+  if (Number.isFinite(it?.model_prob)) return Math.round(100*Number(it.model_prob));
+  return 0;
+}
+function kickoffMs(it){
+  const d = kickoffFromMeta(it);
+  return d ? d.getTime() : Number.MAX_SAFE_INTEGER;
 }
 
-/** cap po slotu za tikete (bez obzira na UI) */
-function capsFor(slot) {
-  // Želeo si 6/15/15 i 6/20/20 — PM/LATE širi.
-  const wide = slot === 'pm' || slot === 'late';
+function capFor(ymd, slot){
+  // weekend detection in TZ
+  const d = new Date(`${ymd}T12:00:00Z`); // neutral UTC noon
+  const dow = new Intl.DateTimeFormat("en-GB",{ timeZone:TZ, weekday:"short"}).format(d); // e.g., Mon..Sun
+  const isWeekend = (dow === "Sat" || dow === "Sun");
+  if (slot === "late") return 6;
+  if (isWeekend) return 20;
+  return 15;
+}
+
+/* --------------- tickets read helper --------------- */
+async function readTickets(ymd, slot, trace){
+  const tried = [];
+  // Preferiraj per-slot tikete, pa tek onda dnevne
+  const { raw:rawSlot } = await kvGETraw(`tickets:${ymd}:${slot}`, trace && tried);
+  let obj = toObj(rawSlot);
+  let source = rawSlot ? `tickets:${ymd}:${slot}` : null;
+  if (!obj || typeof obj !== "object") {
+    const { raw:rawDay } = await kvGETraw(`tickets:${ymd}`, trace && tried);
+    obj = toObj(rawDay);
+    if (rawDay) source = source || `tickets:${ymd}`;
+  }
+  const empty = { btts:[], ou25:[], htft:[] };
+  if (!obj || typeof obj !== "object") return { tickets: empty, source: source || null, tried };
+  // slot-filter + higijena (ban + min odds) + sort
+  const clean = (arr=[]) => (arr||[])
+    .filter(it => inSlotLocal(it, slot))
+    .filter(it => !isYouthOrBanned(it))
+    .filter(it => !it.market_odds || Number(it.market_odds) >= MIN_ODDS)
+    .sort((a,b)=> (Number(b?.confidence_pct||0) - Number(a?.confidence_pct||0)) ||
+                  (Date.parse(a?.kickoff_utc||0) - Date.parse(b?.kickoff_utc||0)));
   return {
-    btts: 6,
-    ou25: wide ? 20 : 15,
-    htft: wide ? 20 : 15,
+    tickets: {
+      btts: clean(obj.btts),
+      ou25: clean(obj.ou25),
+      htft: clean(obj.htft),
+    },
+    source: source || null,
+    tried
   };
 }
 
-async function getKV(key) {
-  const v = await kv.get(key);
-  return { key, status: v ? 'hit' : 'miss', value: v };
-}
-
-/** čita 1×2 kandidate iz više izvora i garantuje rezultat za traženi slot */
-async function readItemsForSlot(ymd, slot, trace) {
-  // prioritet: striktni slot → fallback union → fallback last
-  const keys = [
-    `vbl_full:${ymd}:${slot}`,
-    `vbl:${ymd}:${slot}`,
-    `vb:day:${ymd}:${slot}`,
-    `vb:day:${ymd}:union`,
-    `vb:day:${ymd}:last`,
-  ];
-  let picked = null;
-  for (const k of keys) {
-    const r = await getKV(k);
-    trace.push({ key: k, flavor: 'vercel-kv', status: r.status });
-    if (r.value && Array.isArray(r.value) && r.value.length) {
-      picked = { key: k, list: r.value };
-      break;
-    }
-  }
-  const before = picked?.list?.length || 0;
-  let list = arr(picked?.list);
-
-  // uvek preseci na slot lokalno (ako nije već isečeno na writer-u)
-  list = list.filter((it) => inSlotLocal(kickoffISO(it), slot, TZ));
-
-  // ako je i dalje prazno, pokušaj iz union/last dodatno filtriranje po slotu
-  if (!list.length) {
-    for (const k of [`vb:day:${ymd}:union`, `vb:day:${ymd}:last`]) {
-      const r = await getKV(k);
-      trace.push({ key: k, flavor: 'vercel-kv', status: r.status });
-      if (r.value && Array.isArray(r.value) && r.value.length) {
-        const tmp = r.value.filter((it) => inSlotLocal(kickoffISO(it), slot, TZ));
-        if (tmp.length) {
-          list = tmp;
-          break;
-        }
-      }
-    }
-  }
-
-  // blago sortiranje (raniji kick-off, pa veći konf.)
-  list.sort((a, b) => {
-    const ta = new Date(kickoffISO(a) || 0).getTime();
-    const tb = new Date(kickoffISO(b) || 0).getTime();
-    if (ta !== tb) return ta - tb;
-    const ca = num(a?.confidence_pct) ?? 0;
-    const cb = num(b?.confidence_pct) ?? 0;
-    return cb - ca;
-  });
-
-  return { items: list, before, after: list.length, source: picked?.key || null };
-}
-
-/** čita i “puni” tikete po slotu (slot → dnevni → drugi slotovi), bez duplikata */
-async function readTicketsFilled(ymd, slot, trace) {
-  const cap = capsFor(slot);
-  const order = [
-    `tickets:${ymd}:${slot}`, // željeni slot
-    `tickets:${ymd}`,         // dnevni
-    // susedni slotovi kao backfill
-    ...SLOT_ORDER.filter(s => s !== slot).map(s => `tickets:${ymd}:${s}`),
-  ];
-
-  let collected = { btts: [], ou25: [], htft: [] };
-  let sourceHit = null;
-
-  const pushUniq = (list, add) => {
-    const all = uniqBy([...list, ...arr(add)], (x) =>
-      `${x?.fixture_id || x?.id || x?.fixture || 'x'}|${x?.market || x?.market_label || 'm'}`
-    );
-    return all;
-  };
-
-  for (const k of order) {
-    const r = await getKV(k);
-    trace.push({ key: k, flavor: 'vercel-kv', status: r.status });
-    if (r.status === 'hit' && r.value && typeof r.value === 'object') {
-      if (!sourceHit) sourceHit = k;
-      const v = r.value;
-      collected.btts = pushUniq(collected.btts, v.btts);
-      collected.ou25 = pushUniq(collected.ou25, v.ou25);
-      collected.htft = pushUniq(collected.htft, v.htft);
-
-      // preseci na traženi slot i samo mečevi koji još nisu počeli
-      const now = Date.now();
-      const inSlotNotStarted = (x) => {
-        const iso = kickoffISO(x);
-        const t = new Date(iso || 0).getTime();
-        return inSlotLocal(iso, slot, TZ) && (t > now);
-      };
-      collected.btts = collected.btts.filter(inSlotNotStarted);
-      collected.ou25 = collected.ou25.filter(inSlotNotStarted);
-      collected.htft = collected.htft.filter(inSlotNotStarted);
-
-      // sortiraj po data-driven skoru (EV/ELR/Conf), pa preseci na cap
-      const topN = (xs, n) => arr(xs).sort((a, b) => evScore(b) - evScore(a)).slice(0, n);
-
-      const needMore =
-        (collected.btts.length < cap.btts) ||
-        (collected.ou25.length < cap.ou25) ||
-        (collected.htft.length < cap.htft);
-
-      if (!needMore) {
-        collected = {
-          btts: topN(collected.btts, cap.btts),
-          ou25: topN(collected.ou25, cap.ou25),
-          htft: topN(collected.htft, cap.htft),
-        };
-        return { tickets: collected, tickets_source: sourceHit, policy_cap: cap };
-      }
-      // ako i dalje fali – nastavi kroz naredne izvore u `order`
-    }
-  }
-
-  // završni top-N čak i ako nije pun (nema dovoljno u danu)
-  const topN = (xs, n) => arr(xs).sort((a, b) => evScore(b) - evScore(a)).slice(0, n);
-  collected = {
-    btts: topN(collected.btts, cap.btts),
-    ou25: topN(collected.ou25, cap.ou25),
-    htft: topN(collected.htft, cap.htft),
-  };
-
-  return { tickets: collected, tickets_source: sourceHit, policy_cap: cap };
-}
-
-export default async function handler(req, res) {
-  try {
+/* ---------------- handler ---------------- */
+export default async function handler(req,res){
+  try{
+    res.setHeader("Cache-Control","no-store");
     const q = req.query || {};
     const now = new Date();
-    const ymd = q.ymd || ymdInTZ(now, TZ);
-    const slot = (q.slot || slotForHour(hourInTZ(now, TZ))).toLowerCase();
-    const debug = String(q.debug || '') === '1' || String(q.debug || '').toLowerCase() === 'true';
+    const ymd = String(q.ymd||"").trim() || ymdInTZ(now, TZ);
+    const slot = (String(q.slot||"").trim().toLowerCase() || deriveSlot(hourInTZ(now, TZ)));
+    const wantDebug = String(q.debug||"") === "1" || String(q.debug||"").toLowerCase() === "true";
+    const trace = wantDebug ? [] : null;
 
-    const trace = [];
+    // 1) pokupi kandidate iz više izvora (vbl_full, vbl, vb:day:<slot>)
+    const triedKeys = [
+      `vbl_full:${ymd}:${slot}`,
+      `vbl:${ymd}:${slot}`,
+      `vb:day:${ymd}:${slot}`,
+      `vb:day:${ymd}:union`,
+      `vb:day:${ymd}:last`,
+    ];
+    let pool = [];
+    let sources = [];
+    for (const k of triedKeys) {
+      const { raw } = await kvGETraw(k, trace);
+      const arr = arrFromAny(toObj(raw));
+      if (Array.isArray(arr) && arr.length) {
+        pool.push(...arr);
+        sources.push(k);
+      }
+    }
+    pool = dedupByFixture(pool);
 
-    // 1) 1×2 predlozi
-    const { items, before, after, source } = await readItemsForSlot(ymd, slot, trace);
+    // Ako nema ničega, vrati prazan odgovor (ne diramo dalje logike)
+    if (!pool.length) {
+      const { tickets, source:tsrc, tried:ttried } = await readTickets(ymd, slot, trace);
+      return res.status(200).json({
+        ok:true, slot, ymd,
+        items:[], football:[], top3:[],
+        tickets,
+        source: sources.length ? sources.join(" + ") : null,
+        tickets_source: tsrc,
+        policy_cap: capFor(ymd, slot),
+        ...(wantDebug ? { debug:{ tried: triedKeys, trace, tickets_tried: ttried, before: 0, after: 0 } } : {})
+      });
+    }
 
-    // 2) Tiketi – uvek puni koliko je moguće, per-slot prioritet
-    const { tickets, tickets_source, policy_cap } = await readTicketsFilled(ymd, slot, trace);
+    // 2) filtriraj slot + ban + min odds
+    pool = pool
+      .filter(it => inSlotLocal(it, slot))
+      .filter(it => !isYouthOrBanned(it))
+      .filter(it => !it.odds || Number(it?.odds?.price ?? 0) >= MIN_ODDS);
 
-    const body = {
+    // 3) sort: confidence desc, pa kickoff asc
+    pool.sort((a,b)=>
+      (confidence(b) - confidence(a)) ||
+      (kickoffMs(a) - kickoffMs(b))
+    );
+
+    // 4) cap po slotu i danu
+    const cap = capFor(ymd, slot);
+    const items = pool.slice(0, cap);
+
+    // 5) tiketi iz KV
+    const { tickets, source:tsrc, tried:ttried } = await readTickets(ymd, slot, trace);
+
+    // 6) izlaz u formatu koji UI očekuje
+    const top3 = items.slice(0,3);
+    const payload = {
       ok: true,
       slot,
       ymd,
       items,
-      football: [],  // (ostavljeno zbog kompatibilnosti UI)
-      top3: [],
-      tickets,
-      tickets_source: tickets_source || null,
-      policy_cap: policy_cap?.ou25 || 15, // za screenshot-kompat
-      source: source ? source.replace(`${ymd}:`, '') : null,
+      football: items,   // isti set za "football" tab
+      top3,
+      tickets,           // NOVO: BTTS / OU2.5 / HT-FT
+      source: sources.join(" + "),
+      tickets_source: tsrc,
+      policy_cap: cap,
     };
+    if (wantDebug) payload.debug = { tried: triedKeys, trace, tickets_tried: ttried, before: pool.length, after: items.length };
+    return res.status(200).json(payload);
 
-    if (debug) {
-      body.debug = { trace, before, after };
-    }
-
-    res.setHeader('Cache-Control', 'no-store');
-    return res.status(200).json(body);
-  } catch (e) {
-    console.error('value-bets-locked error', e);
-    return res.status(200).json({ ok: false, error: String(e?.message || e) });
+  }catch(e){
+    return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
 }
