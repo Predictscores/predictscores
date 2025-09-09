@@ -13,7 +13,7 @@
 
 export const config = { api: { bodyParser: false } };
 
-const TZ = "Europe/Belgrade";
+const TZ = (process.env.TZ_DISPLAY && process.env.TZ_DISPLAY.trim()) || "Europe/Belgrade";
 const TARGET_N = 15;     // vbl kratka lista
 const MIN_ODDS = 1.5;    // min kvota za SVE markete (1X2 + tickets)
 const LANES = 4;         // paralelizacija za /odds
