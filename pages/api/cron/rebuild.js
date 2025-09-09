@@ -124,6 +124,13 @@ async function fetchAllFixturesForDate(ymd){
   const j = await afFetch("/fixtures", { date:ymd }, afFixturesHeaders());
   return j?.response || [];
 }
+function slotForKickoffISO(iso){
+  const h = new Date(iso).toLocaleString("en-GB",{ hour:"2-digit", hour12:false, timeZone:TZ });
+  const v = parseInt(h,10);
+  if (v<10) return "late"; if (v<15) return "am"; return "pm";
+}
+
+/* ---------- market helpers (iz AF /odds strukture) ---------- */
 function norm(s){ return String(s||"").toLowerCase(); }
 function best1x2(bookmakers,minOdds=MIN_ODDS){
   let best=null, books=0;
@@ -232,11 +239,6 @@ function bestHTFT(bookmakers,minOdds=MIN_ODDS){
   if (best) best.bookmakers_count=Math.max(1,books);
   return best;
 }
-function slotForKickoffISO(iso){
-  const h = new Date(iso).toLocaleString("en-GB",{ hour:"2-digit", hour12:false, timeZone:TZ });
-  const v = parseInt(h,10);
-  if (v<10) return "late"; if (v<15) return "am"; return "pm";
-}
 
 export default async function handler(req,res){
   res.setHeader("Cache-Control","no-store");
@@ -248,23 +250,21 @@ export default async function handler(req,res){
     const wantDebug = String(q.debug||"") === "1" || String(q.debug||"").toLowerCase() === "true";
     const diag = wantDebug ? { reads:[], writes:[] } : null;
 
-    // ulaz: preferiraj već pripremljene liste (slot → union → last → fixtures)
+    // 0) Preferiraj već pripremljene liste (slot → union → last)
     const prefer = [
       `vb:day:${ymd}:${slot}`,
       `vb:day:${ymd}:union`,
       `vb:day:${ymd}:last`,
       `vbl_full:${ymd}:${slot}`,
-      `vbl:${ymd}:${slot}`,
-      `fixtures:${ymd}:${slot}`
+      `vbl:${ymd}:${slot}`
     ];
     let rawArr = null, src = null;
     for (const k of prefer){
       const { raw } = await kvGET(k, diag);
-      const arr = arrFromAny(J(raw)); // FIX: nema više 'unpack'
+      const arr = arrFromAny(J(raw));
       if (arr && arr.length){ rawArr = arr; src = k; break; }
     }
 
-    // --- igla lista brojeva (ID-jevi), izgradi meta pa radi /odds ---
     let items = [];
     let ids = [];
 
@@ -273,25 +273,51 @@ export default async function handler(req,res){
 
     if (isNumericArray) {
       ids = rawArr.map(v => Number(v)).filter(Boolean);
-      const fixtures = await fetchAllFixturesForDate(ymd);
-      const byIdMeta = new Map(fixtures.map(fx => [Number(fx?.fixture?.id), mapFixtureToItem(fx)]));
-      items = ids.map(id => byIdMeta.get(id) || { fixture_id:id, kickoff_utc:null, home:null, away:null, league_name:null });
-    } else {
-      items = (rawArr || []).filter(x => x && typeof x === "object");
+    } else if (Array.isArray(rawArr)) {
+      items = rawArr.filter(x => x && typeof x === "object");
       ids = items.map(x => Number(x?.fixture_id || x?.id)).filter(Boolean);
     }
 
-    items = (items || [])
-      .filter(x => !isYouthOrBanned(x))
-      .filter(x => {
-        const iso = x?.kickoff_utc || x?.kickoff || x?.datetime_local?.starting_at?.date_time || x?.fixture?.date;
-        return iso ? slotForKickoffISO(iso) === slot : true;
+    // 1) Slot filter na items; ako posle toga nema ID-eva → F A L L B A C K na fixtures for date
+    if (items.length) {
+      items = items
+        .filter(x => !isYouthOrBanned(x))
+        .filter(x => {
+          const iso = x?.kickoff_utc || x?.kickoff || x?.datetime_local?.starting_at?.date_time || x?.fixture?.date;
+          return iso ? slotForKickoffISO(iso) === slot : true;
+        });
+      const byId0 = new Map(items.map(x => [Number(x.fixture_id || x.id), x]));
+      ids = ids.filter(id => byId0.has(id));
+    }
+    if (!ids.length) {
+      // Fallback: povuci sve fixtures za dan i zadrži samo tekući slot
+      const fixtures = await fetchAllFixturesForDate(ymd);
+      const slotFx = fixtures.filter(fx => {
+        const iso = fx?.fixture?.date;
+        return iso ? slotForKickoffISO(iso) === slot : false;
       });
-    const byId = new Map(items.map(x => [x.fixture_id, x]));
-    ids = ids.filter(id => byId.has(id));
+      items = slotFx.map(mapFixtureToItem);
+      ids = items.map(it => it.fixture_id).filter(Boolean);
+      src = src || "fixtures:fallback";
+    }
 
-    const tickets = { btts:[], ou25:[], htft:[] };
+    // 2) Ako i dalje nema ništa, upiši prazno ali vrati counts
+    if (!ids.length) {
+      await kvSET(`vb:day:${ymd}:${slot}`, JSON.stringify({ value: JSON.stringify([]) }), diag);
+      await kvSET(`vbl_full:${ymd}:${slot}`, JSON.stringify([]), diag);
+      await kvSET(`vbl:${ymd}:${slot}`, JSON.stringify([]), diag);
+      await kvSET(`tickets:${ymd}:${slot}`, JSON.stringify({ btts:[], ou25:[], htft:[] }), diag);
+      return res.status(200).json({
+        ok:true, ymd, slot,
+        counts:{ base:(rawArr||[]).length||0, after_filters:0, odds_called:0, filled:0 },
+        source: src || "empty"
+      });
+    }
+
+    // 3) /odds po fixture-u (AF) i formiranje 1X2 + tiketa
+    const byId = new Map(items.map(x => [x.fixture_id, x]));
     let called=0, filled=0;
+    const tickets = { btts:[], ou25:[], htft:[] };
 
     const lane = async subset=>{
       for (const id of subset){
@@ -347,10 +373,11 @@ export default async function handler(req,res){
       .sort((a,b)=> (scoreForSort(b)-scoreForSort(a)) || (Date.parse(a.kickoff_utc||0)-Date.parse(b.kickoff_utc||0)) );
     const shortList = withPicks.slice(0, TARGET_N);
 
+    // Upisi po slotu
     await kvSET(`vb:day:${ymd}:${slot}`, JSON.stringify({ value: JSON.stringify(withPicks) }), diag);
 
     const prevUnionRaw = (await kvGET(`vb:day:${ymd}:union`, diag)).raw;
-    const prevUnionArr = arrFromAny(J(prevUnionRaw)) || []; // FIX: nema 'unpack'
+    const prevUnionArr = arrFromAny(J(prevUnionRaw)) || [];
     const unionBag = new Map();
     for (const it of [...prevUnionArr, ...withPicks]){
       const fid=Number(it?.fixture_id); if (!fid) continue;
@@ -364,16 +391,7 @@ export default async function handler(req,res){
     await kvSET(`vbl_full:${ymd}:${slot}`, JSON.stringify(withPicks), diag);
     await kvSET(`vbl:${ymd}:${slot}`, JSON.stringify(shortList), diag);
 
-    const top3 = withPicks.slice(0,3);
-    const prevC = (await kvGET(`vb:day:${ymd}:combined`, diag)).raw;
-    const prevA = arrFromAny(J(prevC)) || []; // FIX: nema 'unpack'
-    const dedup = new Map();
-    for (const it of [...prevA, ...top3]){
-      const fid=Number(it?.fixture_id); if (!fid) continue;
-      if (!dedup.has(fid)) dedup.set(fid,it);
-    }
-    await kvSET(`vb:day:${ymd}:combined`, JSON.stringify(Array.from(dedup.values()).slice(0,6)), diag);
-
+    // tiketi (slot → per-slot + dnevni merge)
     const sortT = (a,b)=> (scoreForSort(b)-scoreForSort(a)) || (Date.parse(a.kickoff_utc||0)-Date.parse(b.kickoff_utc||0));
     const slotTickets = {
       btts: (tickets.btts||[]).sort(sortT).slice(0,TICKETS_PER_MARKET),
@@ -410,8 +428,8 @@ export default async function handler(req,res){
 
     return res.status(200).json({
       ok:true, ymd, slot,
-      counts:{ base:(rawArr||[]).length, after_filters:(items||[]).length, odds_called:ids.length, filled },
-      source: src || "built",
+      counts:{ base:(rawArr||[]).length||0, after_filters:items.length, odds_called:ids.length, filled },
+      source: src || "fixtures:fallback",
       ...debugBlock
     });
 
