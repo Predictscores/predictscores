@@ -482,11 +482,9 @@ export default function CombinedBets() {
   const [footballTab, setFootballTab] = useState("kickoff"); // "kickoff" | "confidence" | "history"
 
   return (
-    <div className="space-y-8 text-blue-50 [font-variant-numeric:tabular-nums]">
-      {/* suptilni gradijent pozadine (ako parent nema) */}
-      <div className="relative -mx-4 px-4">
-        <div className="pointer-events-none absolute inset-0 -z-10 bg-gradient-to-b from-[#0b1533] via-[#0a1840] to-[#07102a]" />
-      </div>
+    <div className="space-y-8 text-blue-50 [font-variant-numeric:tabular-nums]" data-ui-version="blue-v2">
+      {/* Global blue gradient background (fixed, iza svega) */}
+      <div className="fixed inset-0 -z-10 bg-gradient-to-b from-[#0b1533] via-[#0a1840] to-[#07102a]" />
 
       {/* Main tabs header */}
       <div className="flex items-center gap-2">
