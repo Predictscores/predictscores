@@ -2,12 +2,18 @@ name: Snapshots (AM/PM/LATE)
 
 on:
   schedule:
-    # SRB 10:00 -> 08:00 UTC
+    # AM 10:00 Europe/Belgrade -> 08:00 UTC (uz "airbag" -2/+2 min)
+    - cron: "58 7 * * *"
     - cron: "0 8 * * *"
-    # SRB 15:00 -> 13:00 UTC
+    - cron: "2 8 * * *"
+    # PM 15:00 Europe/Belgrade -> 13:00 UTC (uz "airbag" -2/+2 min)
+    - cron: "58 12 * * *"
     - cron: "0 13 * * *"
-    # SRB 00:00 -> 22:00 UTC (prethodni dan po UTC)
+    - cron: "2 13 * * *"
+    # LATE 00:00 Europe/Belgrade -> 22:00 UTC (prethodni dan po UTC; uz "airbag" -2/+2 min)
+    - cron: "58 21 * * *"
     - cron: "0 22 * * *"
+    - cron: "2 22 * * *"
   workflow_dispatch:
     inputs:
       slot:
@@ -20,7 +26,8 @@ on:
         default: ""
 
 concurrency:
-  group: snapshots-fixed-${{ github.run_id }}-${{ github.event.schedule || 'manual' }}
+  # Fiksna grupa da ne trče paralelno (drugi run čeka prvi i uradi samo precheck → skip)
+  group: snapshots-fixed
   cancel-in-progress: false
 
 jobs:
@@ -30,30 +37,37 @@ jobs:
       TZ: Europe/Belgrade
 
     steps:
-      - name: Resolve BASE, SLOT, and YMD (Europe/Belgrade)
+      - name: Ensure jq is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null 2>&1 || { sudo apt-get update -y && sudo apt-get install -y jq; }
+
+      - name: Resolve BASE, SLOT, and YMD (with guard & precheck)
         id: ctx
         env:
           FALLBACK_BASE: https://predictscores.vercel.app
           INP_SLOT: ${{ inputs.slot }}
           INP_BASE: ${{ inputs.base }}
           SCH: ${{ github.event.schedule }}
+        shell: bash
         run: |
           set -euo pipefail
 
           # Base URL
-          BASE="$INP_BASE"
+          BASE="${INP_BASE:-}"
           if [ -z "$BASE" ]; then BASE="$FALLBACK_BASE"; fi
 
-          # Slot (if auto)
+          # Mapiraj slot iz schedule stringa (ili auto)
           if [ "${INP_SLOT:-auto}" != "auto" ]; then
             SLOT="${INP_SLOT}"
           else
             case "$SCH" in
-              "0 8 * * *")  SLOT="am"  ;;
-              "0 13 * * *") SLOT="pm"  ;;
-              "0 22 * * *") SLOT="late";;
-              *) # fallback po lokalnom satu
-                 H=$(TZ=Europe/Belgrade date +%H)
+              "58 7 * * *"|"0 8 * * *"|"2 8 * * *")   SLOT="am"  ;;
+              "58 12 * * *"|"0 13 * * *"|"2 13 * * *") SLOT="pm"  ;;
+              "58 21 * * *"|"0 22 * * *"|"2 22 * * *") SLOT="late";;
+              *) # fallback po lokalnom satu (Belgrade)
+                 H=$(TZ="$TZ" date +%H)
                  if [ "$H" -lt 10 ]; then SLOT="late";
                  elif [ "$H" -lt 15 ]; then SLOT="am";
                  else SLOT="pm"; fi
@@ -61,7 +75,56 @@ jobs:
             esac
           fi
 
-          YMD=$(TZ=Europe/Belgrade date +%F)
+          YMD=$(TZ="$TZ" date +%F)
+
+          # Minute-window guard (±10 min) oko 00:00 / 10:00 / 15:00 u Europe/Belgrade
+          now_hm=$(TZ="$TZ" date +%H:%M)
+          H=${now_hm%%:*}; M=${now_hm##*:}
+          m=$((10#$H*60 + 10#$M))
+          mod=1440
+
+          dist() { # kružna udaljenost na 0..1439
+            local a=$1 b=$2 d=$(( (a - b) % mod ))
+            (( d<0 )) && d=$((d+mod))
+            local e=$(( mod - d ))
+            if (( d < e )); then echo $d; else echo $e; fi
+          }
+
+          t_late=0
+          t_am=$((10*60))
+          t_pm=$((15*60))
+          d_late=$(dist $m $t_late)
+          d_am=$(dist $m $t_am)
+          d_pm=$(dist $m $t_pm)
+
+          run_guard=false
+          case "$SLOT" in
+            late) (( d_late <= 10 )) && run_guard=true ;;
+            am)   (( d_am   <= 10 )) && run_guard=true ;;
+            pm)   (( d_pm   <= 10 )) && run_guard=true ;;
+          esac
+
+          if [ "$run_guard" != "true" ]; then
+            echo "Outside minute-window @ $now_hm $TZ (SLOT=$SLOT). Skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "base=$BASE" >> "$GITHUB_OUTPUT"
+            echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
+            echo "ymd=$YMD"   >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Precheck: ako već imamo locked vrednosti za slot (današnji), preskoči sve
+          resp=$(curl -fsS "$BASE/api/value-bets-locked?slot=$SLOT&slim=1" || echo "[]")
+          # Broj stavki robustno (radi i ako je array i ako je objekat)
+          count=$(echo "$resp" | jq -r 'if type=="array" then length elif has("items") then (.items|length) elif has("value") then (.value|length) else 0 end' 2>/dev/null || echo 0)
+
+          if [ "$count" -gt 0 ]; then
+            echo "Locked feed already present for $SLOT ($count items). Skipping heavy calls."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No locked feed for $SLOT yet → will run."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
 
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
@@ -70,12 +133,15 @@ jobs:
           echo "BASE=$BASE"
           echo "SLOT=$SLOT"
           echo "YMD=$YMD"
+          echo "Within window: $run_guard | precheck count=$count"
 
-      # 1) Rebuild (prvi prolaz: povuci mečeve, pokušaj pickove)
+      # 1) Rebuild (prvi prolaz)
       - name: Rebuild snapshot (pass 1)
+        if: steps.ctx.outputs.run == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
+        shell: bash
         run: |
           set -euo pipefail
           echo "::group::rebuild-1"
@@ -83,11 +149,13 @@ jobs:
           echo "::endgroup::"
           sleep 2
 
-      # 2) Refresh odds (posle prvog rebuild-a) + force seed
+      # 2) Refresh odds (force) – kratko, u 2 batch-a
       - name: Refresh odds (batch, force)
+        if: steps.ctx.outputs.run == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
+        shell: bash
         run: |
           set -euo pipefail
           for i in 1 2; do
@@ -97,11 +165,13 @@ jobs:
             sleep 3
           done
 
-      # 3) Rebuild (drugi prolaz: sada sa osveženim kvotama/locked)
+      # 3) Rebuild (final)
       - name: Rebuild snapshot (final)
+        if: steps.ctx.outputs.run == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
+        shell: bash
         run: |
           set -euo pipefail
           echo "::group::rebuild-2"
@@ -109,11 +179,13 @@ jobs:
           echo "::endgroup::"
           sleep 2
 
-      # 4) Insights (Zašto…)
+      # 4) Insights
       - name: Build insights
+        if: steps.ctx.outputs.run == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
+        shell: bash
         run: |
           set -euo pipefail
           echo "::group::insights-build"
@@ -122,9 +194,11 @@ jobs:
 
       # 5) Apply learning
       - name: Apply learning
+        if: steps.ctx.outputs.run == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
+        shell: bash
         run: |
           set -euo pipefail
           echo "::group::apply-learning"
@@ -136,6 +210,7 @@ jobs:
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
+        shell: bash
         run: |
           set -euo pipefail
           echo "::group::value-bets-locked"
