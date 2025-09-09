@@ -1,6 +1,14 @@
 import React, { useEffect, useMemo, useState } from "react";
 import HistoryPanel from "./HistoryPanel";
 import TicketPanel from "./TicketPanel";
+import {
+  AreaChart,
+  Area,
+  ResponsiveContainer,
+  Tooltip,
+  YAxis,
+  XAxis,
+} from "recharts";
 
 const TZ = "Europe/Belgrade";
 
@@ -91,11 +99,9 @@ function useCryptoFeed() {
     (async () => {
       setLoading(true);
       setErr(null);
-      // koristi tvoj postojeći API za kripto signale
       const r = await safeJson(`/api/crypto`);
       if (!alive) return;
       if (r?.ok) {
-        // podrži više formata: r.signals || r.items || r.data
         const arr = Array.isArray(r.signals) ? r.signals
                   : Array.isArray(r.items)   ? r.items
                   : Array.isArray(r.data)    ? r.data
@@ -113,25 +119,91 @@ function useCryptoFeed() {
   return { signals, loading, err };
 }
 
+/* ---------------- tiny utils for crypto visuals ---------------- */
+
+function toSparkData(s) {
+  // očekuje s.sparkline (niz cena) ili s.history (array of {time, price})
+  if (Array.isArray(s?.sparkline) && s.sparkline.length) {
+    return s.sparkline.map((p, i) => ({ x: i, y: Number(p) }));
+  }
+  if (Array.isArray(s?.history) && s.history.length) {
+    return s.history.map((pt, i) => ({
+      x: pt?.time ?? i,
+      y: Number(pt?.price ?? pt?.close ?? pt?.last ?? 0),
+    }));
+  }
+  return [];
+}
+
+function pct(v) {
+  if (v == null || Number.isNaN(Number(v))) return null;
+  return Math.round(Number(v) * 100) / 100;
+}
+
 /* ---------------- presentational blocks ---------------- */
+
+function Card({ children }) {
+  // plava tema (usklađeno sa History karticama)
+  return (
+    <div className="rounded-2xl p-4 shadow-md bg-blue-900/30 border border-blue-300/20">
+      {children}
+    </div>
+  );
+}
+
+function SectionTitle({ children }) {
+  return <div className="mb-2 text-sm opacity-80 text-blue-50">{children}</div>;
+}
 
 function ItemCard({ it }) {
   const k = toISO(it);
   const conf = it?.confidence_pct ?? (it?.model_prob != null ? Math.round(it.model_prob*100) : undefined);
   return (
-    <div className="rounded-2xl p-4 shadow-md bg-black/40 border border-white/10">
-      <div className="text-sm opacity-70">{it.league_name} · {it.league_country}</div>
-      <div className="mt-1 text-lg font-semibold">
+    <Card>
+      <div className="text-sm opacity-80 text-blue-100">{it.league_name} · {it.league_country}</div>
+      <div className="mt-1 text-lg font-semibold text-blue-50">
         {it.home} — {it.away}
       </div>
-      <div className="mt-1 text-sm opacity-80">Kick-off: {fmtKickoff(k)}</div>
-      <div className="mt-2 text-sm">
-        <span className="opacity-70">Market:</span> <b>{it.market}</b> · <span className="opacity-70">Pick:</span> <b>{it.pick || it.selection_label}</b>
+      <div className="mt-1 text-sm opacity-90 text-blue-100">Kick-off: {fmtKickoff(k)}</div>
+      <div className="mt-2 text-sm text-blue-50/90">
+        <span className="opacity-80">Market:</span> <b>{it.market}</b> · <span className="opacity-80">Pick:</span> <b>{it.pick || it.selection_label}</b>
       </div>
-      <div className="mt-1 text-sm">
-        {conf != null ? (<><span className="opacity-70">Conf:</span> <b>{conf}%</b></>) : null}
-        {it?.odds?.price ? <> · <span className="opacity-70">Odds:</span> <b>{it.odds.price}</b></> : null}
+      <div className="mt-1 text-sm text-blue-50/90">
+        {conf != null ? (<><span className="opacity-80">Conf:</span> <b>{conf}%</b></>) : null}
+        {it?.odds?.price ? <> · <span className="opacity-80">Odds:</span> <b>{it.odds.price}</b></> : null}
       </div>
+    </Card>
+  );
+}
+
+/* Chart koji ne puca na SSR (render tek na klijentu) */
+function CryptoSparkline({ data }) {
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => { setMounted(true); }, []);
+  if (!mounted || !data?.length) return (
+    <div className="h-16 rounded-xl bg-blue-900/20 border border-blue-300/10" />
+  );
+
+  return (
+    <div className="h-20">
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart data={data}>
+          <YAxis domain={["auto", "auto"]} hide />
+          <XAxis dataKey="x" hide />
+          <Tooltip
+            contentStyle={{ background: "rgba(10,24,61,0.9)", border: "1px solid rgba(147,197,253,0.2)" }}
+            formatter={(v) => [v, "Price"]}
+          />
+          <Area
+            type="monotone"
+            dataKey="y"
+            fill="rgba(59,130,246,0.25)"
+            stroke="rgba(147,197,253,0.85)"
+            strokeWidth={2}
+            activeDot={{ r: 3 }}
+          />
+        </AreaChart>
+      </ResponsiveContainer>
     </div>
   );
 }
@@ -141,14 +213,42 @@ function CryptoCard({ s }) {
   const sig = (s?.signal || s?.side || s?.direction || "").toUpperCase();
   const price = s?.price ?? s?.last ?? s?.close;
   const conf = s?.confidence ?? s?.score ?? s?.strength;
+  const ch24 = s?.change_24h ?? s?.changePct ?? s?.change ?? s?.pct_24h;
+
+  const data = toSparkData(s);
+  const pos = String(sig).includes("LONG") || String(sig).includes("BUY");
+  const neg = String(sig).includes("SHORT") || String(sig).includes("SELL");
+  const tag =
+    pos ? "LONG" :
+    neg ? "SHORT" :
+    (sig || "—");
+
   return (
-    <div className="rounded-2xl p-4 shadow-md bg-black/40 border border-white/10">
-      <div className="text-sm opacity-70">Crypto</div>
-      <div className="mt-1 text-lg font-semibold">{sym}</div>
-      <div className="mt-1 text-sm"><span className="opacity-70">Signal:</span> <b>{sig || "—"}</b></div>
-      {price != null ? <div className="mt-1 text-sm"><span className="opacity-70">Price:</span> <b>{price}</b></div> : null}
-      {conf != null ? <div className="mt-1 text-sm"><span className="opacity-70">Confidence:</span> <b>{Math.round(conf)}%</b></div> : null}
-    </div>
+    <Card>
+      <div className="text-sm opacity-80 text-blue-100">Crypto</div>
+      <div className="mt-1 flex items-center justify-between">
+        <div className="text-lg font-semibold text-blue-50">{sym}</div>
+        <span className={`px-2 py-0.5 rounded-md text-xs border ${
+          pos ? "bg-green-500/10 border-green-400/30 text-green-200"
+              : neg ? "bg-rose-500/10 border-rose-400/30 text-rose-200"
+                    : "bg-blue-500/10 border-blue-400/30 text-blue-100"
+        }`}>
+          {tag}
+        </span>
+      </div>
+
+      <div className="mt-1 text-sm text-blue-100/90">
+        {price != null ? <>Price: <b>{price}</b></> : <>Price: <b>—</b></>}
+        {ch24 != null ? <> · 24h: <b className={Number(ch24) >= 0 ? "text-green-200" : "text-rose-200"}>
+          {pct(ch24)}%
+        </b></> : null}
+        {conf != null ? <> · Confidence: <b>{Math.round(conf)}%</b></> : null}
+      </div>
+
+      <div className="mt-3">
+        <CryptoSparkline data={data} />
+      </div>
+    </Card>
   );
 }
 
@@ -162,30 +262,36 @@ function CombinedBody() {
   const topCrypto   = useMemo(() => [...signals].slice(0, 3), [signals]); // Top 3 kripto
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <div className="space-y-8">
+      {/* Football gore */}
       <div>
-        <div className="mb-2 text-sm opacity-70">Football · Top 3 (singl)</div>
+        <SectionTitle>Football · Top 3 (singl)</SectionTitle>
         {fLoading ? (
-          <div className="text-sm opacity-70">Učitavanje…</div>
+          <div className="text-sm opacity-80 text-blue-100">Učitavanje…</div>
         ) : topFootball.length ? (
-          <div className="space-y-4">
+          <div className="grid md:grid-cols-3 gap-4">
             {topFootball.map((it, i) => <ItemCard key={i} it={it} />)}
           </div>
         ) : (
-          <div className="text-sm opacity-70 rounded-2xl p-4 bg-black/20 border border-white/10">Nema 1X2 singlova za prikaz.</div>
+          <div className="text-sm opacity-80 text-blue-100 rounded-2xl p-4 bg-blue-900/20 border border-blue-300/20">
+            Nema 1X2 singlova za prikaz.
+          </div>
         )}
       </div>
 
+      {/* Crypto dole */}
       <div>
-        <div className="mb-2 text-sm opacity-70">Crypto · Top 3</div>
+        <SectionTitle>Crypto · Top 3</SectionTitle>
         {cLoading ? (
-          <div className="text-sm opacity-70">Učitavanje…</div>
+          <div className="text-sm opacity-80 text-blue-100">Učitavanje…</div>
         ) : topCrypto.length ? (
-          <div className="space-y-4">
+          <div className="grid md:grid-cols-3 gap-4">
             {topCrypto.map((s, i) => <CryptoCard key={i} s={s} />)}
           </div>
         ) : (
-          <div className="text-sm opacity-70 rounded-2xl p-4 bg-black/20 border border-white/10">Nema crypto signala za prikaz.</div>
+          <div className="text-sm opacity-80 text-blue-100 rounded-2xl p-4 bg-blue-900/20 border border-blue-300/20">
+            Nema crypto signala za prikaz.
+          </div>
         )}
       </div>
     </div>
@@ -214,7 +320,7 @@ function FootballBody({ subTab /* "kickoff" | "confidence" | "history" */ }) {
   }, [items]);
 
   const leftEmptyMsg = (
-    <div className="rounded-2xl p-4 bg-black/20 border border-white/10 text-sm opacity-80">
+    <div className="rounded-2xl p-4 bg-blue-900/20 border border-blue-300/20 text-sm opacity-90 text-blue-100">
       Nema 1X2 singlova za prikaz (items[] je prazan).
     </div>
   );
@@ -225,7 +331,7 @@ function FootballBody({ subTab /* "kickoff" | "confidence" | "history" */ }) {
     // HISTORY pod-tab: BEZ tiketa, full width
     return (
       <div className="space-y-4">
-        <div className="mb-2 text-sm opacity-70">History (14d)</div>
+        <SectionTitle>History (14d)</SectionTitle>
         <HistoryPanel />
       </div>
     );
@@ -237,11 +343,9 @@ function FootballBody({ subTab /* "kickoff" | "confidence" | "history" */ }) {
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
       {/* Levo: 1X2 lista */}
       <div className={showTickets ? "lg:col-span-2" : "lg:col-span-3"}>
-        <div className="mb-2 text-sm opacity-70">
-          {subTab === "kickoff" ? "Kick-Off" : "Confidence"}
-        </div>
+        <SectionTitle>{subTab === "kickoff" ? "Kick-Off" : "Confidence"}</SectionTitle>
         {loading ? (
-          <div className="text-sm opacity-70">Učitavanje…</div>
+          <div className="text-sm opacity-80 text-blue-100">Učitavanje…</div>
         ) : (list.length ? (
           <div className="grid md:grid-cols-2 gap-4">
             {list.map((it, i) => <ItemCard key={i} it={it} />)}
@@ -249,17 +353,17 @@ function FootballBody({ subTab /* "kickoff" | "confidence" | "history" */ }) {
         ) : leftEmptyMsg)}
       </div>
 
-      {/* Desno: Tickets (samo na Kick-Off i Confidence) */}
+      {/* Desno: Tickets (samo Kick-Off i Confidence) */}
       {showTickets ? (
         <div className="lg:col-span-1">
           <aside aria-label="Tickets">
             {hasAnyTickets(tickets) ? (
               <TicketPanel tickets={tickets} />
             ) : (
-              <div className="rounded-2xl p-4 bg-black/30 border border-white/10">
-                <div className="text-sm opacity-70">Tickets</div>
-                <div className="mt-1 text-sm opacity-70">Nema dostupnih BTTS / OU2.5 / HT-FT tiketa.</div>
-              </div>
+              <Card>
+                <div className="text-sm opacity-80 text-blue-100">Tickets</div>
+                <div className="mt-1 text-sm opacity-80 text-blue-100">Nema dostupnih BTTS / OU2.5 / HT-FT tiketa.</div>
+              </Card>
             )}
           </aside>
         </div>
@@ -274,16 +378,18 @@ function CryptoBody() {
   const { signals, loading } = useCryptoFeed();
 
   return (
-    <div>
-      <div className="mb-2 text-sm opacity-70">Crypto · Signals</div>
+    <div className="space-y-4">
+      <SectionTitle>Crypto · Signals</SectionTitle>
       {loading ? (
-        <div className="text-sm opacity-70">Učitavanje…</div>
+        <div className="text-sm opacity-80 text-blue-100">Učitavanje…</div>
       ) : signals.length ? (
         <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
           {signals.map((s, i) => <CryptoCard key={i} s={s} />)}
         </div>
       ) : (
-        <div className="text-sm opacity-70 rounded-2xl p-4 bg-black/20 border border-white/10">Nema crypto signala za prikaz.</div>
+        <div className="text-sm opacity-80 text-blue-100 rounded-2xl p-4 bg-blue-900/20 border border-blue-300/20">
+          Nema crypto signala za prikaz.
+        </div>
       )}
     </div>
   );
@@ -309,8 +415,8 @@ export default function CombinedBets() {
             onClick={() => setMainTab(t.key)}
             className={`px-4 py-2 rounded-xl border transition ${
               mainTab === t.key
-              ? "bg-white/10 border-white/20"
-              : "bg-black/20 border-white/10 hover:bg-black/30"
+              ? "bg-blue-900/30 border-blue-300/30 text-blue-50"
+              : "bg-blue-900/10 border-blue-300/20 text-blue-100 hover:bg-blue-900/20"
             }`}
           >
             {t.label}
@@ -339,8 +445,8 @@ export default function CombinedBets() {
                 onClick={() => setFootballTab(t.key)}
                 className={`px-3 py-1.5 rounded-lg border text-sm transition ${
                   footballTab === t.key
-                  ? "bg-white/10 border-white/20"
-                  : "bg-black/20 border-white/10 hover:bg-black/30"
+                  ? "bg-blue-900/30 border-blue-300/30 text-blue-50"
+                  : "bg-blue-900/10 border-blue-300/20 text-blue-100 hover:bg-blue-900/20"
                 }`}
               >
                 {t.label}
