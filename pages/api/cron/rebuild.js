@@ -107,7 +107,7 @@ function isYouthOrBanned(item){
 /* ---------- API-Football ---------- */
 const AF_BASE = "https://v3.football.api-sports.io";
 const afFixturesHeaders = () => ({ "x-apisports-key": (process.env.API_FOOTBALL_KEY || "").trim() });
-const afOddsHeaders     = () => ({ "x-apisports-key": (process.env.API_FOOTBALL_KEY || "").trim() }); // <<<<< ključno
+const afOddsHeaders     = () => ({ "x-apisports-key": (process.env.API_FOOTBALL_KEY || "").trim() });
 
 async function afFetch(path, params={}, headers=afFixturesHeaders()){
   const url = new URL(`${AF_BASE}${path}`);
@@ -412,12 +412,25 @@ export default async function handler(req,res){
       htft: merge(dayObj.htft, slotTickets.htft),
     }), diag);
 
+    // --- DEBUG blok formiran posebno (izbegava SWC/parse glitch) ---
+    const debugBlock = wantDebug ? {
+      diag,
+      vbl: {
+        kept: withPicks.length,
+        returned: shortList.length,
+        tickets: {
+          slot_btts: slotTickets.btts.length,
+          slot_ou25: slotTickets.ou25.length,
+          slot_htft: slotTickets.htft.length,
+        },
+      }
+    } : {};
+
     return res.status(200).json({
       ok:true, ymd, slot,
       counts:{ base:(rawArr||[]).length, after_filters:(items||[]).length, odds_called:ids.length, filled },
       source: src || "built",
-      ...(wantDebug ? { diag, vbl:{ kept:withPicks.length, returned:shortList.length,
-        tickets:{ slot_btts:slotTickets.btts.length, slot_ou25:slotTickets.ou25.length, slot_htft:slotTickets.htft.length } } : {})
+      ...debugBlock
     });
 
   }catch(e){
