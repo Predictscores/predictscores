@@ -13,22 +13,21 @@ function kvCfgs() {
   const url = (process.env.KV_REST_API_URL || "").replace(/\/+$/, "");
   const rw  = process.env.KV_REST_API_TOKEN || "";
   const ro  = process.env.KV_REST_API_READ_ONLY_TOKEN || "";
-  const list = [];
-  if (url && rw) list.push({ flavor: "vercel-kv:rw", url, token: rw });
-  if (url && ro) list.push({ flavor: "vercel-kv:ro", url, token: ro });
-  return list;
+  const ups = (process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/+$/, "");
+  const upT = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+  const cfgs = [];
+  if (url && rw) cfgs.push({ flavor:"vercel-kv:rw", url, token:rw });
+  if (url && ro) cfgs.push({ flavor:"vercel-kv:ro", url, token:ro });
+  if (ups && upT) cfgs.push({ flavor:"upstash:rw", url:ups, token:upT });
+  return cfgs;
 }
 async function kvGET(key, diag){
   for (const c of kvCfgs()){
     try{
-      const r = await fetch(`${c.url}/get/${encodeURIComponent(key)}`, {
-        headers:{ Authorization:`Bearer ${c.token}` },
-        cache:"no-store",
-      });
-      const j = r.ok ? await r.json().catch(()=>null) : null;
-      const raw = j && typeof j.result==="string" ? j.result : null;
-      diag && (diag.reads = diag.reads || []).push({ flavor:c.flavor, key, status: r.ok ? (raw?"hit":"miss-null") : `http-${r.status}` });
-      if (raw) return { raw, flavor:c.flavor };
+      const r = await fetch(`${c.url}/get/${encodeURIComponent(key)}`, { headers:{ Authorization:`Bearer ${c.token}` }, cache:"no-store" });
+      const ok=r.ok; const j= ok ? await r.json().catch(()=>null) : null;
+      diag && (diag.reads = diag.reads || []).push({ flavor:c.flavor, key, ok, status: ok?(j?.result?"hit":"miss"):`http-${r.status}` });
+      if (ok && typeof j?.result === "string" && j.result) return { raw:j.result, flavor:c.flavor };
     }catch(e){
       diag && (diag.reads = diag.reads || []).push({ flavor:c.flavor, key, status:`err:${String(e?.message||e)}` });
     }
@@ -64,20 +63,8 @@ function arrFromAny(x){
   if (typeof x==="string"){ const v=J(x); if (Array.isArray(v)) return v; if (v&&typeof v==="object") return arrFromAny(v); }
   return null;
 }
-function unpack(raw){
-  if (!raw || typeof raw!=="string") return null;
-  let v = J(raw);
-  if (Array.isArray(v)) return v;
-  if (v && typeof v==="object" && "value" in v){
-    if (Array.isArray(v.value)) return v.value;
-    if (typeof v.value==="string"){ const v2=J(v.value); if (Array.isArray(v2)) return v2; if (v2&&typeof v2==="object") return arrFromAny(v2); }
-    return null;
-  }
-  if (v && typeof v==="object") return arrFromAny(v);
-  return null;
-}
 
-/* ---------- time/slot helpers ---------- */
+/* ---------- helpers ---------- */
 function ymdInTZ(d=new Date(), tz=TZ){
   const fmt = new Intl.DateTimeFormat("en-CA",{ timeZone:tz, year:"numeric", month:"2-digit", day:"2-digit" });
   const p = fmt.formatToParts(d).reduce((a,x)=>(a[x.type]=x.value,a),{});
@@ -109,62 +96,40 @@ const AF_BASE = "https://v3.football.api-sports.io";
 const afFixturesHeaders = () => ({ "x-apisports-key": (process.env.API_FOOTBALL_KEY || "").trim() });
 const afOddsHeaders     = () => ({ "x-apisports-key": (process.env.API_FOOTBALL_KEY || "").trim() });
 
-async function afFetch(path, params={}, headers=afFixturesHeaders()){
-  const url = new URL(`${AF_BASE}${path}`);
-  Object.entries(params).forEach(([k,v])=> (v!=null) && url.searchParams.set(k,String(v)));
+async function afFetch(path, params={}, headers={}){
+  const usp = new URLSearchParams(params||{});
+  const url = `${AF_BASE}${path}?${usp.toString()}`;
   const r = await fetch(url, { headers, cache:"no-store" });
-  const t = await r.text();
-  let j=null; try{ j=JSON.parse(t);}catch{}
-  if (!j) throw new Error(`AF parse error ${r.status}`);
-  return j;
+  if (!r.ok) throw new Error(`AF ${path} ${r.status}`);
+  return await r.json();
 }
 function mapFixtureToItem(fx){
-  const id = Number(fx?.fixture?.id);
-  const ts = Number(fx?.fixture?.timestamp||0)*1000 || Date.parse(fx?.fixture?.date||0) || 0;
-  const kick = new Date(ts).toISOString();
+  const f = fx?.fixture || {};
+  const l = fx?.league || {};
+  const t = fx?.teams || {};
+  const home = t?.home?.name || "";
+  const away = t?.away?.name || "";
+  const kickoff_utc = f?.date || null;
   return {
-    fixture_id:id,
-    league:{ id:fx?.league?.id, name:fx?.league?.name, country:fx?.league?.country, season:fx?.league?.season },
-    league_name:fx?.league?.name,
-    league_country:fx?.league?.country,
-    teams:{ home:fx?.teams?.home?.name, away:fx?.teams?.away?.name, home_id:fx?.teams?.home?.id, away_id:fx?.teams?.away?.id },
-    home:fx?.teams?.home?.name, away:fx?.teams?.away?.name,
-    kickoff:(fx?.fixture?.date||"").replace("T"," ").slice(0,16),
-    kickoff_utc:kick,
-    market:"1X2", market_label:"1X2",
-    pick:null, pick_code:null, selection_label:null,
-    model_prob:null, confidence_pct:null, odds:null,
-    fixture:{ id, timestamp:ts, date:kick },
+    fixture_id: Number(f?.id)||0,
+    league: { id:Number(l?.id)||0, name:l?.name||"", country:l?.country||"" },
+    league_name: l?.name || "",
+    league_country: l?.country || "",
+    teams: t,
+    home, away,
+    kickoff_utc,
   };
 }
-
-/* ---------- fetch fixtures for date (p0 bez page) ---------- */
 async function fetchAllFixturesForDate(ymd){
-  const tries = [
-    { tag:"date+tz", params:{ date: ymd, timezone: TZ } },
-    { tag:"date",    params:{ date: ymd } },
-    { tag:"from-to", params:{ from: ymd, to: ymd } },
-    { tag:"date+UTC",params:{ date: ymd, timezone: "UTC" } },
-  ];
-  const bag = new Map();
-  for (const t of tries){
-    const j0 = await afFetch("/fixtures",{...t.params},afFixturesHeaders());
-    const arr0 = Array.isArray(j0?.response) ? j0.response : [];
-    for (const fx of arr0){ const id=fx?.fixture?.id; if(id && !bag.has(id)) bag.set(id, fx); }
-    const tot = Number(j0?.paging?.total||1);
-    for(let page=2; page<=Math.min(tot,12); page++){
-      const j = await afFetch("/fixtures",{...t.params,page},afFixturesHeaders());
-      const arr = Array.isArray(j?.response) ? j.response : [];
-      for (const fx of arr){ const id=fx?.fixture?.id; if(id && !bag.has(id)) bag.set(id, fx); }
-    }
-  }
-  return Array.from(bag.values());
+  const j = await afFetch("/fixtures", { date:ymd }, afFixturesHeaders());
+  return j?.response || [];
 }
-
-/* ---------- odds pickers ---------- */
+function norm(s){ return String(s||"").toLowerCase(); }
 function best1x2(bookmakers,minOdds=MIN_ODDS){
   let best=null, books=0;
   for (const b of bookmakers||[]){
+    const nm=norm(b.name);
+    if (!nm || /special/i.test(nm)) continue;
     for (const bet of b.bets||[]){
       const nm=String(bet.name||"").toLowerCase();
       if (!(nm.includes("1x2")||nm.includes("match winner")||nm.includes("winner"))) continue;
@@ -186,7 +151,7 @@ function best1x2(bookmakers,minOdds=MIN_ODDS){
       cands.sort((a,b)=>b.prob-a.prob);
       const pick=cands[0];
       const chosen={ pick_code:pick.code, pick:pick.label, model_prob:pick.prob, odds:{ price:pick.odd, books_count:1 } };
-      if (!best || chosen.model_prob>best.model_prob || (Math.abs(chosen.model_prob-best.model_prob)<1e-9 && chosen.odds.price<best.odds.price))
+      if (!best || chosen.model_prob>best.model_prob || (Math.abs(pick.prob-best.model_prob)<1e-9 && chosen.odds.price<best.odds.price))
         best=chosen;
     }
   }
@@ -196,23 +161,24 @@ function best1x2(bookmakers,minOdds=MIN_ODDS){
 function bestBTTS(bookmakers,minOdds=MIN_ODDS){
   let best=null, books=0;
   for (const b of bookmakers||[]){
+    const nm=norm(b.name);
+    if (!nm || /special/i.test(nm)) continue;
     for (const bet of b.bets||[]){
       const nm=String(bet.name||"").toLowerCase();
-      if (!(nm.includes("both teams to score")||nm.includes("btts"))) continue;
+      if (!(nm.includes("btts")||nm.includes("both teams to score")||nm.includes("gg"))) continue;
       books++;
       const vals=bet.values||[];
-      const y=vals.find(v=>/yes/i.test(v.value||""));
-      const n=vals.find(v=>/no/i.test(v.value||""));
-      const oY=y?parseFloat(y.odd):NaN, oN=n?parseFloat(n.odd):NaN;
-      const hasY=isFinite(oY), hasN=isFinite(oN);
-      if (!hasY && !hasN) continue;
-      const pY=hasY?1/oY:0, pN=hasN?1/oN:0, S=pY+pN||1;
-      const c=[]; if (hasY&&oY>=minOdds) c.push({sel:"Yes",odd:oY,prob:pY/S}); if (hasN&&oN>=minOdds) c.push({sel:"No",odd:oN,prob:pN/S});
-      if (!c.length) continue;
-      c.sort((a,b)=>b.prob-a.prob);
-      const pick=c[0];
-      if (!best || pick.prob>best.model_prob || (Math.abs(pick.prob-best.model_prob)<1e-9 && pick.odd<best.market_odds))
-        best={ market:"BTTS", selection:pick.sel, market_odds:pick.odd, model_prob:pick.prob, bookmakers_count:1 };
+      const vY=vals.find(v=>/^yes$/i.test(v.value||""));
+      const vN=vals.find(v=>/^no$/i.test(v.value||""));
+      if (!vY && !vN) continue;
+      const cand=[vY,vN].filter(Boolean).map(v=>({ pick:v.value, odd:parseFloat(v.odd) }))
+        .filter(x=>isFinite(x.odd) && x.odd>=minOdds)
+        .map(x=>({ selection:x.pick, market_odds:x.odd, model_prob:1/x.odd }));
+      if (!cand.length) continue;
+      cand.sort((a,b)=>b.model_prob-a.model_prob);
+      const top=cand[0];
+      if (!best || top.model_prob>best.model_prob || (Math.abs(top.model_prob-best.model_prob)<1e-9 && top.market_odds<best.market_odds))
+        best={ market:"BTTS", selection:top.selection, market_odds:top.market_odds, model_prob:top.model_prob, bookmakers_count:1 };
     }
   }
   if (best) best.bookmakers_count=Math.max(1,books);
@@ -220,25 +186,22 @@ function bestBTTS(bookmakers,minOdds=MIN_ODDS){
 }
 function bestOU25(bookmakers,minOdds=MIN_ODDS){
   let best=null, books=0;
-  const has25=s=>/\b2\.5\b/.test(String(s||""));
   for (const b of bookmakers||[]){
+    const nm=norm(b.name);
+    if (!nm || /special/i.test(nm)) continue;
     for (const bet of b.bets||[]){
       const nm=String(bet.name||"").toLowerCase();
-      if (!(nm.includes("over/under")||nm.includes("total"))) continue;
-      const vals=bet.values||[];
-      const candOver=vals.find(v=>/over/i.test(v.value||"")&&(has25(v.value)||has25(v.handicap)));
-      const candUnder=vals.find(v=>/under/i.test(v.value||"")&&(has25(v.value)||has25(v.handicap)));
-      const oO=candOver?parseFloat(candOver.odd):NaN, oU=candUnder?parseFloat(candUnder.odd):NaN;
-      const hasO=isFinite(oO), hasU=isFinite(oU);
-      if (!hasO && !hasU) continue;
+      if (!(nm.includes("over/under")||nm.includes("totals"))) continue;
       books++;
-      const pO=hasO?1/oO:0, pU=hasU?1/oU:0, S=pO+pU||1;
-      const c=[]; if (hasO&&oO>=minOdds) c.push({sel:"Over 2.5",odd:oO,prob:pO/S}); if (hasU&&oU>=minOdds) c.push({sel:"Under 2.5",odd:oU,prob:pU/S});
-      if (!c.length) continue;
-      c.sort((a,b)=>b.prob-a.prob);
-      const pick=c[0];
-      if (!best || pick.prob>best.model_prob || (Math.abs(pick.prob-best.model_prob)<1e-9 && pick.odd<best.market_odds))
-        best={ market:"OU 2.5", selection:pick.sel, market_odds:pick.odd, model_prob:pick.prob, bookmakers_count:1 };
+      const vals=(bet.values||[]).filter(v=>String(v.value||"").includes("2.5"));
+      const cand=vals.map(v=>({ selection:v.value, odd:parseFloat(v.odd) }))
+        .filter(x=>isFinite(x.odd) && x.odd>=minOdds)
+        .map(x=>({ selection:x.selection, market_odds:x.odd, model_prob:1/x.odd }));
+      if (!cand.length) continue;
+      cand.sort((a,b)=>b.model_prob-a.model_prob);
+      const top=cand[0];
+      if (!best || top.model_prob>best.model_prob || (Math.abs(top.model_prob-best.model_prob)<1e-9 && top.market_odds<best.market_odds))
+        best={ market:"OU 2.5", selection:top.selection, market_odds:top.market_odds, model_prob:top.model_prob, bookmakers_count:1 };
     }
   }
   if (best) best.bookmakers_count=Math.max(1,books);
@@ -246,8 +209,9 @@ function bestOU25(bookmakers,minOdds=MIN_ODDS){
 }
 function bestHTFT(bookmakers,minOdds=MIN_ODDS){
   let best=null, books=0;
-  const norm=s=>String(s||"").toLowerCase();
   for (const b of bookmakers||[]){
+    const nm=norm(b.name);
+    if (!nm || /special/i.test(nm)) continue;
     for (const bet of b.bets||[]){
       const nm=norm(bet.name);
       if (!(nm.includes("ht/ft")||nm.includes("half time/full time"))) continue;
@@ -278,12 +242,12 @@ export default async function handler(req,res){
   const q = req.query || {};
   try{
     const now = new Date();
-    const ymd  = (q.ymd && /^\d{4}-\d{2}-\d{2}$/.test(String(q.ymd))) ? String(q.ymd) : ymdInTZ(now, TZ);
-    const slot = (q.slot && /^(am|pm|late)$/.test(String(q.slot))) ? String(q.slot) : deriveSlot(hourInTZ(now, TZ));
-    const wantDebug = String(q.debug ?? "") === "1";
-    const diag = wantDebug ? {} : null;
+    const ymd = String(q.ymd||"").trim() || ymdInTZ(now, TZ);
+    const slot = (String(q.slot||"").trim().toLowerCase() || deriveSlot(hourInTZ(now, TZ)));
+    const wantDebug = String(q.debug||"") === "1" || String(q.debug||"").toLowerCase() === "true";
+    const diag = wantDebug ? { reads:[], writes:[] } : null;
 
-    // Kandidati iz KV
+    // ulaz: preferiraj već pripremljene liste (slot → union → last → fixtures)
     const prefer = [
       `vb:day:${ymd}:${slot}`,
       `vb:day:${ymd}:union`,
@@ -295,11 +259,11 @@ export default async function handler(req,res){
     let rawArr = null, src = null;
     for (const k of prefer){
       const { raw } = await kvGET(k, diag);
-      const arr = arrFromAny(unpack(raw));
+      const arr = arrFromAny(J(raw));
       if (arr && arr.length){ rawArr = arr; src = k; break; }
     }
 
-    // --- NOVO: ako je stigla lista brojeva (ID-jevi), izgradi meta pa radi /odds ---
+    // --- igla lista brojeva (ID-jevi), izgradi meta pa radi /odds ---
     let items = [];
     let ids = [];
 
@@ -318,15 +282,23 @@ export default async function handler(req,res){
       ids = items.map(x => Number(x?.fixture_id || x?.id)).filter(Boolean);
     }
 
-    // filteri + mape
-    items = (items || []).filter(x => !isYouthOrBanned(x));
+    // filteri + mape (DODAT SLOT FILTER)
+    items = (items || [])
+      .filter(x => !isYouthOrBanned(x))
+      .filter(x => {
+        const iso = x?.kickoff_utc || x?.kickoff || x?.datetime_local?.starting_at?.date_time || x?.fixture?.date;
+        return iso ? slotForKickoffISO(iso) === slot : true;
+      });
     const byId = new Map(items.map(x => [x.fixture_id, x]));
+    // ograniči ids na stvarno prisutne u slotu
+    ids = ids.filter(id => byId.has(id));
 
     const tickets = { btts:[], ou25:[], htft:[] };
     let called=0, filled=0;
 
     const lane = async subset=>{
       for (const id of subset){
+        if (!byId.has(id)) continue;
         try{
           const jo = await afFetch("/odds",{ fixture:id }, afOddsHeaders());
           called++;
@@ -346,30 +318,25 @@ export default async function handler(req,res){
           }
 
           const baseMeta = byId.get(id) || { fixture_id:id };
-          const base = {
-            fixture_id:id,
-            league:baseMeta.league, league_name:baseMeta.league_name, league_country:baseMeta.league_country,
-            teams:baseMeta.teams, home:baseMeta.home, away:baseMeta.away,
-            kickoff:baseMeta.kickoff, kickoff_utc:baseMeta.kickoff_utc,
-          };
+          const bookmakers_count = (bookmakers||[]).length || 1;
 
           const btts = bestBTTS(bookmakers, MIN_ODDS);
-          if (btts) tickets.btts.push({ ...base, market:"BTTS", market_label:"Both Teams To Score",
+          if (btts) tickets.btts.push({ ...baseMeta, market:"BTTS", market_label:"Both Teams To Score",
             selection:btts.selection, market_odds:btts.market_odds, model_prob:btts.model_prob,
             implied_prob:implied(btts.market_odds), confidence_pct:Math.round(100*btts.model_prob),
-            bookmakers_count:btts.bookmakers_count||1 });
+            bookmakers_count:btts.bookmakers_count||bookmakers_count });
 
           const ou25 = bestOU25(bookmakers, MIN_ODDS);
-          if (ou25) tickets.ou25.push({ ...base, market:"OU 2.5", market_label:"Over/Under 2.5",
+          if (ou25) tickets.ou25.push({ ...baseMeta, market:"OU 2.5", market_label:"Over/Under 2.5",
             selection:ou25.selection, market_odds:ou25.market_odds, model_prob:ou25.model_prob,
             implied_prob:implied(ou25.market_odds), confidence_pct:Math.round(100*ou25.model_prob),
-            bookmakers_count:ou25.bookmakers_count||1 });
+            bookmakers_count:ou25.bookmakers_count||bookmakers_count });
 
           const htft = bestHTFT(bookmakers, MIN_ODDS);
-          if (htft) tickets.htft.push({ ...base, market:"HT/FT", market_label:"HT-FT",
+          if (htft) tickets.htft.push({ ...baseMeta, market:"HT/FT", market_label:"HT-FT",
             selection:htft.selection, market_odds:htft.market_odds, model_prob:htft.model_prob,
             implied_prob:implied(htft.market_odds), confidence_pct:Math.round(100*htft.model_prob),
-            bookmakers_count:htft.bookmakers_count||1 });
+            bookmakers_count:htft.bookmakers_count||bookmakers_count });
         }catch(e){ /* ignore per-fixture fail */ }
       }
     };
@@ -401,11 +368,10 @@ export default async function handler(req,res){
     const prevA = arrFromAny(unpack(prevC)) || [];
     const dedup = new Map();
     for (const it of [...prevA, ...top3]){ const fid=Number(it?.fixture_id); if (!fid) continue; if (!dedup.has(fid)) dedup.set(fid,it); }
-    const merged = Array.from(dedup.values()).sort((a,b)=>scoreForSort(b)-scoreForSort(a)).slice(0,3);
-    await kvSET(`vb:day:${ymd}:combined`, JSON.stringify({ value: JSON.stringify(merged) }), diag);
+    await kvSET(`vb:day:${ymd}:combined`, JSON.stringify(Array.from(dedup.values()).slice(0,6)), diag);
 
-    // tickets (po slotu + dnevno)
-    const sortT=(a,b)=> (b.confidence_pct-a.confidence_pct) || (Date.parse(a.kickoff_utc||0)-Date.parse(b.kickoff_utc||0));
+    // TIKETI (slot → per-slot + dnevni union)
+    const sortT = (a,b)=> (scoreForSort(b)-scoreForSort(a)) || (Date.parse(a.kickoff_utc||0)-Date.parse(b.kickoff_utc||0));
     const slotTickets = {
       btts: (tickets.btts||[]).sort(sortT).slice(0,TICKETS_PER_MARKET),
       ou25: (tickets.ou25||[]).sort(sortT).slice(0,TICKETS_PER_MARKET),
