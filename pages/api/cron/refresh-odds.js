@@ -1,7 +1,13 @@
 // pages/api/cron/refresh-odds.js
-// Osvežava kvote za fixture ID listu i garantuje da lista postoji i kada nema fixtures:multi.
-// Fallback redom: vb:day:<YMD>:<slot> → vb:day:<YMD>:union → vb:day:<YMD>:last → vbl_full:<YMD>:<slot> → fixtures:multi → AF /fixtures.
-// Ako lista nastane iz fallback-a, seed-uje se u KV: fixtures:<YMD>:<slot> i fixtures:multi (back-compat).
+// - Napravi/nađi listu fixture ID-eva za ymd+slot (fallback preko više izvora)
+// - Osveži kvote za te ID-eve (API-Football /odds)
+// - Seed-uje fixtures:<YMD>:<slot> i fixtures:multi u KV
+// - Radi i sa direct api-sports.io i sa RapidAPI varijantom (auto-detekcija)
+//
+// ENV:
+//   TZ_DISPLAY=Europe/Belgrade
+//   API_FOOTBALL_KEY=<key>
+//   KV_REST_API_URL, KV_REST_API_TOKEN (i opc. KV_REST_API_READ_ONLY_TOKEN)
 
 export const config = { api: { bodyParser: false } };
 
@@ -56,7 +62,7 @@ const J = s => { try { return JSON.parse(String(s||"")); } catch { return null; 
 function arrFromAny(x){
   if (!x) return null;
   if (Array.isArray(x)) return x;
-  if (typeof x === "object") {
+  if (typeof x === "object" && x) {
     if (Array.isArray(x.value)) return x.value;
     if (typeof x.value === "string") { const v = J(x.value); if (Array.isArray(v)) return v; if (v && typeof v==="object") return arrFromAny(v); }
     if (Array.isArray(x.items)) return x.items;
@@ -106,20 +112,34 @@ function isYouthOrBanned(item){
   return /\bU(-|\s)?(17|18|19|20|21|22|23)\b/i.test(s) || /\bPrimavera\b/i.test(s) || /\bYouth\b/i.test(s);
 }
 
-/* ---------------- API-Football ---------------- */
-function afKey(){ return process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || ""; }
-async function afFetch(path, params={}){
-  const key = afKey();
-  if (!key) throw new Error("Missing API-Football key");
-  const url = new URL(`https://v3.football.api-sports.io${path}`);
+/* ---------------- API-Football: auto-host helpers ---------------- */
+function afBaseDirect(){ return "https://v3.football.api-sports.io"; }
+function afBaseRapid(){  return "https://api-football-v1.p.rapidapi.com/v3"; }
+function afHeadersDirect(){
+  const key = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || "";
+  return { "x-apisports-key": key };
+}
+function afHeadersRapid(){
+  const key = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || "";
+  return { "x-rapidapi-key": key, "x-rapidapi-host": "api-football-v1.p.rapidapi.com" };
+}
+async function afFetchTry(base, headers, path, params={}, diagTag, diag){
+  const url = new URL(`${base}${path}`);
   Object.entries(params).forEach(([k,v])=> (v!=null) && url.searchParams.set(k,String(v)));
-  const r = await fetch(url, { headers:{ "x-apisports-key": key }, cache:"no-store" });
-  const ct = r.headers.get("content-type")||"";
+  const r = await fetch(url, { headers, cache:"no-store" });
   const t = await r.text();
-  if (!ct.includes("application/json")) throw new Error(`AF non-JSON ${r.status}: ${t.slice(0,120)}`);
-  let j; try{ j=JSON.parse(t);}catch{ j=null; }
-  if (!j) throw new Error("AF parse error");
-  return j;
+  let j=null; try { j = JSON.parse(t); } catch {}
+  if (diag) (diag.af = diag.af || []).push({ host: base, path, params, status: r.status, ok: r.ok, results: j?.results, errors: j?.errors, tag: diagTag });
+  return { ok: r.ok, json: j || {}, text: t };
+}
+// Proba oba hosta: direct pa rapid; vrati prvi sa response.length > 0 ili poslednji pokušaj
+async function afFetch(path, params={}, diag){
+  // pokušaj direct
+  let res = await afFetchTry(afBaseDirect(), afHeadersDirect(), path, params, "direct", diag);
+  if (Array.isArray(res.json?.response) && res.json.response.length > 0) return res.json;
+  // pokušaj rapid
+  const res2 = await afFetchTry(afBaseRapid(), afHeadersRapid(), path, params, "rapid", diag);
+  return res2.json; // vraćamo i ako je prazno – pozivalac odlučuje šta dalje
 }
 function mapFixture(fx){
   const id = Number(fx?.fixture?.id);
@@ -133,20 +153,22 @@ function mapFixture(fx){
     kickoff_utc: kick,
   };
 }
-async function fetchFixturesIDsByDateAndSlot(ymd, slot){
-  const bag = new Map();
+
+/* ---------------- fixtures fetch ---------------- */
+async function fetchFixturesIDsByDateStrict(ymd, slot, diag){
+  // više varijanti istog datuma; filtriramo po slotu
   const tries = [
     { params: { date: ymd, timezone: TZ } },
     { params: { date: ymd } },
     { params: { from: ymd, to: ymd, timezone: TZ } },
     { params: { from: ymd, to: ymd } },
-    { params: { date: ymd, timezone: "UTC" } },
   ];
-  const HARD_CAP_PAGES = 12;
+  const bag = new Map();
   for (const t of tries) {
+    // paginacija (ako postoji)
     let page = 1;
-    while (true) {
-      const jf = await afFetch("/fixtures", { ...t.params, page });
+    for (;;) {
+      const jf = await afFetch("/fixtures", { ...t.params, page }, diag);
       const arr = Array.isArray(jf?.response) ? jf.response : [];
       for (const fx of arr) {
         const it = mapFixture(fx);
@@ -159,19 +181,52 @@ async function fetchFixturesIDsByDateAndSlot(ymd, slot){
       const tot = Number(jf?.paging?.total || page);
       if (!tot || cur >= tot) break;
       page++;
-      if (page > HARD_CAP_PAGES) break;
+      if (page > 12) break;
     }
+    if (bag.size) break;
+  }
+  return Array.from(bag.keys());
+}
+async function fetchFixturesIDsWholeDay(ymd, slot, diag){
+  // ceo dan, bez slot filtera iz API-ja (slot filtriramo lokalno)
+  const tries = [
+    { params: { date: ymd, timezone: TZ } },
+    { params: { date: ymd } },
+    { params: { from: ymd, to: ymd, timezone: TZ } },
+    { params: { from: ymd, to: ymd } },
+  ];
+  const bag = new Map();
+  for (const t of tries) {
+    let page = 1;
+    for (;;) {
+      const jf = await afFetch("/fixtures", { ...t.params, page }, diag);
+      const arr = Array.isArray(jf?.response) ? jf.response : [];
+      for (const fx of arr) {
+        const it = mapFixture(fx);
+        if (!it.fixture_id) continue;
+        if (isYouthOrBanned(it)) continue;
+        // lokalni slot filter
+        if (slotForKickoffISO(it.kickoff_utc) !== slot) continue;
+        if (!bag.has(it.fixture_id)) bag.set(it.fixture_id, it);
+      }
+      const cur = Number(jf?.paging?.current || page);
+      const tot = Number(jf?.paging?.total || page);
+      if (!tot || cur >= tot) break;
+      page++;
+      if (page > 12) break;
+    }
+    if (bag.size) break;
   }
   return Array.from(bag.keys());
 }
 
-/* ---------------- odds refresher ---------------- */
+/* ---------------- odds refresher (AF /odds) ---------------- */
 async function refreshOddsForIDs(ids, diag){
   let touched = 0;
   for (const id of ids) {
     try {
-      const jo = await afFetch("/odds", { fixture: id });
-      diag && (diag.odds = diag.odds || []).push({ fixture:id, ok:Boolean(jo?.response?.length) });
+      const jo = await afFetch("/odds", { fixture: id }, diag);
+      diag && (diag.odds = diag.odds || []).push({ fixture:id, ok:Boolean(jo?.response && jo.response.length) });
       touched++;
     } catch (e) {
       diag && (diag.odds = diag.odds || []).push({ fixture:id, ok:false, err:String(e?.message||e) });
@@ -195,7 +250,7 @@ export default async function handler(req, res) {
       : deriveSlot(hourInTZ(now, TZ));
     const tried = [];
     let pickedKey = null;
-    let list = [];            // ← uvek ARRAY, nikad null
+    let list = [];     // uvek array
     let seeded = false;
 
     async function takeFromKey(key, picker){
@@ -203,54 +258,62 @@ export default async function handler(req, res) {
       const { raw } = await kvGET(key, diag);
       const arr = arrFromAny(unpack(raw));
       if (!Array.isArray(arr) || arr.length === 0) return false;
-      const ids = (picker ? picker(arr) : arr).map(x => Number(picker ? x : x)).filter(Boolean);
+      const ids = (picker ? arr.map(picker) : arr).map(x => Number(x)).filter(Boolean);
       if (!ids.length) return false;
-      // set only if we still don't have items
-      if (list.length === 0) {
-        list = Array.from(new Set(ids));
-        pickedKey = key;
-      }
+      if (list.length === 0) { list = Array.from(new Set(ids)); pickedKey = key; }
       return true;
     }
 
-    // Fallback chain (svaka grana bezbedno čuva list kao array)
-    await takeFromKey(`vb:day:${ymd}:${slot}`, arr => arr.map(x => x?.fixture_id));
-    if (list.length === 0) await takeFromKey(`vb:day:${ymd}:union`, arr => arr.map(x => x?.fixture_id));
-    if (list.length === 0) await takeFromKey(`vb:day:${ymd}:last`,  arr => arr.map(x => x?.fixture_id));
+    // 1) KV fallback lanci
+    await takeFromKey(`vb:day:${ymd}:${slot}`, x => x?.fixture_id);
+    if (list.length === 0) await takeFromKey(`vb:day:${ymd}:union`, x => x?.fixture_id);
+    if (list.length === 0) await takeFromKey(`vb:day:${ymd}:last`,  x => x?.fixture_id);
     if (list.length === 0) await takeFromKey(`vbl_full:${ymd}:${slot}`);
     if (list.length === 0) await takeFromKey(`fixtures:multi`);
 
-    // Ako i dalje nemamo listu — povuci iz AF i seed-uj
+    // 2) Ako KV nije dao ništa — probaj AF striktno pa ceo dan
     if (list.length === 0) {
-      const ids = await fetchFixturesIDsByDateAndSlot(ymd, slot);
-      if (ids && ids.length) {
-        list = Array.from(new Set(ids));
-        // seed
+      const strict = await fetchFixturesIDsByDateStrict(ymd, slot, diag);
+      if (strict.length) {
+        list = strict;
+      } else {
+        const whole = await fetchFixturesIDsWholeDay(ymd, slot, diag);
+        if (whole.length) list = whole;
+      }
+      if (list.length) {
         await kvSET(`fixtures:${ymd}:${slot}`, JSON.stringify(list), diag);
         await kvSET(`fixtures:multi`, JSON.stringify(list), diag);
         seeded = true;
       }
     }
 
+    // 3) Ako i dalje ništa — vrati dijagnostiku
     if (list.length === 0) {
       return res.status(200).json({
-        ok: true, ymd, slot,
+        ok: true,
+        ymd, slot,
         inspected: 0, filtered: 0, targeted: 0, touched: 0,
         source: "refresh-odds:no-slot-matches",
-        debug: wantDebug ? { tried, pickedKey, listLen: 0, forceSeed: seeded } : undefined
+        debug: wantDebug ? { tried, pickedKey, listLen: 0, forceSeed: seeded, af: diag?.af } : undefined
       });
     }
 
-    const touched = await refreshOddsForIDs(list, diag);
+    // 4) Osveži kvote
+    const ids = Array.from(new Set(list));
+    const touched = await refreshOddsForIDs(ids, diag);
 
     return res.status(200).json({
-      ok: true, ymd, slot,
-      inspected: list.length, filtered: 0, targeted: list.length, touched,
+      ok: true,
+      ymd, slot,
+      inspected: ids.length,
+      filtered: 0,
+      targeted: ids.length,
+      touched,
       source: pickedKey ? `refresh-odds:${pickedKey}` : "refresh-odds:fallback",
-      debug: wantDebug ? { tried, pickedKey, listLen: list.length, forceSeed: seeded } : undefined
+      debug: wantDebug ? { tried, pickedKey, listLen: ids.length, forceSeed: seeded, af: diag?.af } : undefined
     });
 
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
-  }
+  } 
 }
