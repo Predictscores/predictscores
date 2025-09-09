@@ -100,11 +100,12 @@ function kickoffFromMeta(meta){
 }
 function inSlotLocal(meta, slot){
   const d = kickoffFromMeta(meta);
-  if (!d) return false; // ovde smo striktni (seed ne popušta bez vremena)
+- if (!d) return false; // strogo: bez vremena izbaci
++ if (!d) return true;  // lax seed: bez vremena NE izbacuj
   const h = hourInTZ(d, TZ);
-  if (slot === "late") return h < 10;            // 00–09
-  if (slot === "am")   return h >= 10 && h < 15; // 10–14
-  return h >= 15;                                 // 15–23
+  if (slot === "late") return h < 10;
+  if (slot === "am")   return h >= 10 && h < 15;
+  return h >= 15;
 }
 
 /* --------------- API-Football --------------- */
