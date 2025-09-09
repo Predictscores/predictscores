@@ -299,17 +299,30 @@ export default async function handler(req,res){
       if (arr && arr.length){ rawArr = arr; src = k; break; }
     }
 
-    // Ako nema – povuci sve fixtures za ymd i filtriraj slot
-    if (!rawArr){
+    // --- NOVO: ako je stigla lista brojeva (ID-jevi), izgradi meta pa radi /odds ---
+    let items = [];
+    let ids = [];
+
+    const isNumericArray = Array.isArray(rawArr) && rawArr.length > 0 &&
+      rawArr.every(v => typeof v === "number" || /^\d+$/.test(String(v)));
+
+    if (isNumericArray) {
+      ids = rawArr.map(v => Number(v)).filter(Boolean);
+      // uzmi sve fixturе za dan i upari
       const fixtures = await fetchAllFixturesForDate(ymd);
-      rawArr = fixtures.map(mapFixtureToItem).filter(x => slotForKickoffISO(x.kickoff_utc) === slot);
+      const byIdMeta = new Map(fixtures.map(fx => [Number(fx?.fixture?.id), mapFixtureToItem(fx)]));
+      items = ids.map(id => byIdMeta.get(id) || { fixture_id:id, kickoff_utc:null, home:null, away:null, league_name:null });
+    } else {
+      // očekujemo listu objekata
+      items = (rawArr || []).filter(x => x && typeof x === "object");
+      ids = items.map(x => Number(x?.fixture_id || x?.id)).filter(Boolean);
     }
 
-    let items = (rawArr||[]).filter(x => !isYouthOrBanned(x));
-    const ids = items.map(x=>x.fixture_id).filter(Boolean);
-    const byId = new Map(items.map(x=>[x.fixture_id,x]));
-    const tickets = { btts:[], ou25:[], htft:[] };
+    // filteri + mape
+    items = (items || []).filter(x => !isYouthOrBanned(x));
+    const byId = new Map(items.map(x => [x.fixture_id, x]));
 
+    const tickets = { btts:[], ou25:[], htft:[] };
     let called=0, filled=0;
 
     const lane = async subset=>{
@@ -319,26 +332,26 @@ export default async function handler(req,res){
           called++;
           const bookmakers = jo?.response?.[0]?.bookmakers || [];
 
-          // 1X2
           const b1 = best1x2(bookmakers, MIN_ODDS);
           if (b1){
-            const it = byId.get(id);
-            if (it){
-              it.selection_label = b1.pick;
-              it.pick = b1.pick;
-              it.pick_code = b1.pick_code || (b1.pick==="Home"?"1":b1.pick==="Draw"?"X":"2");
-              it.model_prob = b1.model_prob;
-              it.confidence_pct = Math.round(100*b1.model_prob);
-              it.odds = { price:b1.odds.price, books_count:b1.odds.books_count||1 };
-              filled++;
-            }
+            const it = byId.get(id) || { fixture_id:id };
+            it.selection_label = b1.pick;
+            it.pick = b1.pick;
+            it.pick_code = b1.pick_code || (b1.pick==="Home"?"1":b1.pick==="Draw"?"X":"2");
+            it.model_prob = b1.model_prob;
+            it.confidence_pct = Math.round(100*b1.model_prob);
+            it.odds = { price:b1.odds.price, books_count:b1.odds.books_count||1 };
+            byId.set(id, it);
+            filled++;
           }
 
-          const baseMeta = byId.get(id);
-          const base = baseMeta ? {
-            fixture_id:id, league:baseMeta.league, league_name:baseMeta.league_name, league_country:baseMeta.league_country,
-            teams:baseMeta.teams, home:baseMeta.home, away:baseMeta.away, kickoff:baseMeta.kickoff, kickoff_utc:baseMeta.kickoff_utc,
-          } : { fixture_id:id };
+          const baseMeta = byId.get(id) || { fixture_id:id };
+          const base = {
+            fixture_id:id,
+            league:baseMeta.league, league_name:baseMeta.league_name, league_country:baseMeta.league_country,
+            teams:baseMeta.teams, home:baseMeta.home, away:baseMeta.away,
+            kickoff:baseMeta.kickoff, kickoff_utc:baseMeta.kickoff_utc,
+          };
 
           const btts = bestBTTS(bookmakers, MIN_ODDS);
           if (btts) tickets.btts.push({ ...base, market:"BTTS", market_label:"Both Teams To Score",
@@ -357,15 +370,16 @@ export default async function handler(req,res){
             selection:htft.selection, market_odds:htft.market_odds, model_prob:htft.model_prob,
             implied_prob:implied(htft.market_odds), confidence_pct:Math.round(100*htft.model_prob),
             bookmakers_count:htft.bookmakers_count||1 });
-        }catch(e){ /* per-fixture failure ignored */ }
+        }catch(e){ /* ignore per-fixture fail */ }
       }
     };
 
+    // paralelno /odds
     const CHUNK = Math.ceil((ids.length||1)/LANES);
     const parts=[]; for (let i=0;i<ids.length;i+=CHUNK) parts.push(ids.slice(i,i+CHUNK));
     await Promise.all(parts.map(lane));
 
-    const withPicks = (items||[])
+    const withPicks = Array.from(byId.values())
       .filter(x=>x?.odds?.price && x?.model_prob)
       .sort((a,b)=> (scoreForSort(b)-scoreForSort(a)) || (Date.parse(a.kickoff_utc||0)-Date.parse(b.kickoff_utc||0)) );
     const shortList = withPicks.slice(0, TARGET_N);
@@ -412,7 +426,7 @@ export default async function handler(req,res){
       htft: merge(dayObj.htft, slotTickets.htft),
     }), diag);
 
-    // --- DEBUG blok formiran posebno (izbegava SWC/parse glitch) ---
+    // debug blok
     const debugBlock = wantDebug ? {
       diag,
       vbl: {
