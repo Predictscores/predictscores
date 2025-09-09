@@ -204,7 +204,7 @@ export default function FootballBets() {
   const { items, tickets, loading, error } = useLockedValueBets();
   const [tab, setTab] = useState("ko"); // ko | conf | hist
 
-  const koRows = useMemo(() => [...items].sort((a, b) => (a.date?.getTime?.() || 9e15) - (b.date?.getTime?.() || 9e15)), [items]);
+  const koRows   = useMemo(() => [...items].sort((a, b) => (a.date?.getTime?.() || 9e15) - (b.date?.getTime?.() || 9e15)), [items]);
   const confRows = useMemo(() => [...items].sort((a, b) => b.conf - a.conf), [items]);
 
   // TicketPanel očekuje listu predloga različitih marketa; spajamo u jedan niz
@@ -249,7 +249,7 @@ export default function FootballBets() {
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <div className="lg:col-span-2 space-y-4">
-            {tab === "ko" && <Section title="Kick-Off" rows={koRows} />}
+            {tab === "ko"   && <Section title="Kick-Off"    rows={koRows}   />}
             {tab === "conf" && <Section title="Confidence" rows={confRows} />}
           </div>
           <div className="lg:col-span-1">
