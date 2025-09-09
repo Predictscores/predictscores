@@ -1,14 +1,10 @@
 // pages/api/cron/refresh-odds.js
-// - Napravi/nađi listu fixture ID-eva za ymd+slot (fallback preko više izvora)
-// - Osveži kvote za te ID-eve (AF /odds) — ODDS_API_KEY ako postoji, inače API_FOOTBALL_KEY
-// - Seed-uje fixtures:<YMD>:<slot> i fixtures:multi u KV
-// ENV: TZ_DISPLAY, API_FOOTBALL_KEY, ODDS_API_KEY, KV_REST_API_URL, KV_REST_API_TOKEN
 
 export const config = { api: { bodyParser: false } };
 
 const TZ = (process.env.TZ_DISPLAY && process.env.TZ_DISPLAY.trim()) || "Europe/Belgrade";
 
-/* ---------------- KV (Vercel REST) ---------------- */
+/* ---------- KV helpers ---------- */
 function kvCfgs() {
   const url = (process.env.KV_REST_API_URL || "").replace(/\/+$/, "");
   const rw  = process.env.KV_REST_API_TOKEN || "";
@@ -22,18 +18,18 @@ async function kvGET(key, diag) {
   for (const c of kvCfgs()) {
     try {
       const r = await fetch(`${c.url}/get/${encodeURIComponent(key)}`, {
-        headers: { Authorization: `Bearer ${c.token}` }, cache: "no-store",
+        headers: { Authorization: `Bearer ${c.token}` },
+        cache: "no-store",
       });
-      const ok = r.ok;
-      const j  = ok ? await r.json().catch(()=>null) : null;
+      const j = r.ok ? await r.json().catch(()=>null) : null;
       const raw = j && typeof j.result === "string" ? j.result : null;
-      diag && (diag.reads = diag.reads || []).push({ flavor:c.flavor, key, status: ok ? (raw ? "hit" : "miss-null") : `http-${r.status}` });
+      diag && (diag.reads = diag.reads || []).push({ flavor:c.flavor, key, status: r.ok ? (raw ? "hit" : "miss-null") : `http-${r.status}` });
       if (raw) return { raw, flavor: c.flavor };
     } catch (e) {
       diag && (diag.reads = diag.reads || []).push({ flavor:c.flavor, key, status:`err:${String(e?.message||e)}` });
     }
   }
-  return { raw: null, flavor: null };
+  return { raw:null, flavor:null };
 }
 async function kvSET(key, valueString, diag) {
   const saved = [];
@@ -41,7 +37,7 @@ async function kvSET(key, valueString, diag) {
     try {
       const r = await fetch(`${c.url}/set/${encodeURIComponent(key)}`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${c.token}`, "Content-Type": "application/json" },
+        headers: { Authorization: `Bearer ${c.token}`, "Content-Type":"application/json" },
         cache: "no-store",
         body: valueString,
       });
@@ -57,33 +53,29 @@ const J = s => { try { return JSON.parse(String(s||"")); } catch { return null; 
 function arrFromAny(x){
   if (!x) return null;
   if (Array.isArray(x)) return x;
-  if (typeof x === "object" && x) {
+  if (typeof x === "object") {
     if (Array.isArray(x.value)) return x.value;
     if (typeof x.value === "string") { const v = J(x.value); if (Array.isArray(v)) return v; if (v && typeof v==="object") return arrFromAny(v); }
     if (Array.isArray(x.items)) return x.items;
     if (Array.isArray(x.data))  return x.data;
   }
-  if (typeof x === "string") {
-    const v = J(x);
-    if (Array.isArray(v)) return v;
-    if (v && typeof v === "object") return arrFromAny(v);
-  }
+  if (typeof x === "string") { const v = J(x); if (Array.isArray(v)) return v; if (v && typeof v==="object") return arrFromAny(v); }
   return null;
 }
-function unpack(raw) {
-  if (!raw || typeof raw !== "string") return null;
-  let v1 = J(raw);
-  if (Array.isArray(v1)) return v1;
-  if (v1 && typeof v1 === "object" && "value" in v1) {
-    if (Array.isArray(v1.value)) return v1.value;
-    if (typeof v1.value === "string") { const v2 = J(v1.value); if (Array.isArray(v2)) return v2; if (v2 && typeof v2==="object") return arrFromAny(v2); }
+function unpack(raw){
+  if (!raw || typeof raw!=="string") return null;
+  let v = J(raw);
+  if (Array.isArray(v)) return v;
+  if (v && typeof v==="object" && "value" in v){
+    if (Array.isArray(v.value)) return v.value;
+    if (typeof v.value === "string"){ const v2 = J(v.value); if (Array.isArray(v2)) return v2; if (v2 && typeof v2==="object") return arrFromAny(v2); }
     return null;
   }
-  if (v1 && typeof v1 === "object") return arrFromAny(v1);
+  if (v && typeof v==="object") return arrFromAny(v);
   return null;
 }
 
-/* ---------------- time/slot helpers ---------------- */
+/* ---------- time/slot ---------- */
 function ymdInTZ(d=new Date(), tz=TZ){
   const fmt = new Intl.DateTimeFormat("en-CA",{ timeZone:tz, year:"numeric", month:"2-digit", day:"2-digit" });
   const p = fmt.formatToParts(d).reduce((a,x)=>(a[x.type]=x.value,a),{});
@@ -96,8 +88,7 @@ function hourInTZ(d=new Date(), tz=TZ){
 function deriveSlot(h){ if (h<10) return "late"; if (h<15) return "am"; return "pm"; }
 function slotForKickoffISO(iso){
   const h = new Date(iso).toLocaleString("en-GB",{ hour:"2-digit", hour12:false, timeZone:TZ });
-  const H = parseInt(h,10);
-  return deriveSlot(H);
+  return deriveSlot(parseInt(h,10));
 }
 function isYouthOrBanned(item){
   const ln = (item?.league_name || item?.league?.name || "").toString();
@@ -107,24 +98,23 @@ function isYouthOrBanned(item){
   return /\bU(-|\s)?(17|18|19|20|21|22|23)\b/i.test(s) || /\bPrimavera\b/i.test(s) || /\bYouth\b/i.test(s);
 }
 
-/* ---------------- API-Football: direct host ---------------- */
+/* ---------- API-Football ---------- */
 const AF_BASE = "https://v3.football.api-sports.io";
-const afFixturesHeaders = () => ({ "x-apisports-key": (process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || "").trim() });
-const afOddsHeaders     = () => ({ "x-apisports-key": (process.env.ODDS_API_KEY || process.env.API_FOOTBALL_KEY || "").trim() });
+const afFixturesHeaders = () => ({ "x-apisports-key": (process.env.API_FOOTBALL_KEY || "").trim() });
+const afOddsHeaders     = () => ({ "x-apisports-key": (process.env.API_FOOTBALL_KEY || "").trim() }); // <<<<< ključno
 
-async function afFetch(base, headers, path, params={}, diagTag, diag){
-  const url = new URL(`${base}${path}`);
+async function afFetch(path, params={}, headers=afFixturesHeaders(), diagTag, diag){
+  const url = new URL(`${AF_BASE}${path}`);
   Object.entries(params).forEach(([k,v])=> (v!=null) && url.searchParams.set(k,String(v)));
   const r = await fetch(url, { headers, cache:"no-store" });
   const t = await r.text();
   let j=null; try { j = JSON.parse(t); } catch {}
-  if (diag) (diag.af = diag.af || []).push({ host: base, tag: diagTag, path, params, status: r.status, ok: r.ok, results: j?.results, errors: j?.errors });
+  if (diag) (diag.af = diag.af || []).push({ host: AF_BASE, tag: diagTag, path, params, status: r.status, ok: r.ok, results: j?.results, errors: j?.errors });
   return j || {};
 }
-
 function mapFixture(fx){
   const id = Number(fx?.fixture?.id);
-  const ts = Number(fx?.fixture?.timestamp || 0)*1000 || Date.parse(fx?.fixture?.date || 0) || 0;
+  const ts = Number(fx?.fixture?.timestamp||0)*1000 || Date.parse(fx?.fixture?.date||0) || 0;
   const kick = new Date(ts).toISOString();
   return {
     fixture_id: id,
@@ -135,37 +125,23 @@ function mapFixture(fx){
   };
 }
 
-/* ---------------- fixtures fetch (bez page na prvom pozivu) ---------------- */
+/* ---------- fixtures (p0 bez page; paging samo ako treba) ---------- */
 async function fetchFixturesIDsByDateStrict(ymd, slot, diag){
   const variants = [
-    { params: { date: ymd, timezone: TZ }, tag: "date+tz" },
-    { params: { date: ymd },               tag: "date"    },
-    { params: { from: ymd, to: ymd },      tag: "from-to" }, // bez timezone za ovaj mod
+    { tag:"date+tz", params:{ date: ymd, timezone: TZ } },
+    { tag:"date",    params:{ date: ymd } },
+    { tag:"from-to", params:{ from: ymd, to: ymd } },
   ];
   const bag = new Map();
-  for (const v of variants) {
-    // 1) prvi poziv BEZ page
-    const jf0 = await afFetch(AF_BASE, afFixturesHeaders(), "/fixtures", { ...v.params }, `fixtures:${v.tag}:p0`, diag);
-    const arr0 = Array.isArray(jf0?.response) ? jf0.response : [];
-    for (const fx of arr0) {
-      const it = mapFixture(fx);
-      if (!it.fixture_id) continue;
-      if (slotForKickoffISO(it.kickoff_utc) !== slot) continue;
-      if (isYouthOrBanned(it)) continue;
-      bag.set(it.fixture_id, it);
-    }
-    // 2) dodatne strane samo ako postoji paging.total > 1
-    const tot = Number(jf0?.paging?.total || 1);
-    for (let page = 2; page <= Math.min(tot, 12); page++) {
-      const jf = await afFetch(AF_BASE, afFixturesHeaders(), "/fixtures", { ...v.params, page }, `fixtures:${v.tag}:p${page}`, diag);
-      const arr = Array.isArray(jf?.response) ? jf.response : [];
-      for (const fx of arr) {
-        const it = mapFixture(fx);
-        if (!it.fixture_id) continue;
-        if (slotForKickoffISO(it.kickoff_utc) !== slot) continue;
-        if (isYouthOrBanned(it)) continue;
-        bag.set(it.fixture_id, it);
-      }
+  for (const v of variants){
+    const j0 = await afFetch("/fixtures",{...v.params},afFixturesHeaders(),`fixtures:${v.tag}:p0`,diag);
+    const arr0 = Array.isArray(j0?.response) ? j0.response : [];
+    for (const fx of arr0){ const m=mapFixture(fx); if(!m.fixture_id) continue; if(isYouthOrBanned(m)) continue; if (slotForKickoffISO(m.kickoff_utc)!==slot) continue; bag.set(m.fixture_id,m); }
+    const tot = Number(j0?.paging?.total||1);
+    for(let page=2; page<=Math.min(tot,12); page++){
+      const j = await afFetch("/fixtures",{...v.params,page},afFixturesHeaders(),`fixtures:${v.tag}:p${page}`,diag);
+      const arr = Array.isArray(j?.response) ? j.response : [];
+      for (const fx of arr){ const m=mapFixture(fx); if(!m.fixture_id) continue; if(isYouthOrBanned(m)) continue; if (slotForKickoffISO(m.kickoff_utc)!==slot) continue; bag.set(m.fixture_id,m); }
     }
     if (bag.size) break;
   }
@@ -173,132 +149,109 @@ async function fetchFixturesIDsByDateStrict(ymd, slot, diag){
 }
 async function fetchFixturesIDsWholeDay(ymd, slot, diag){
   const variants = [
-    { params: { date: ymd, timezone: TZ }, tag: "date+tz" },
-    { params: { date: ymd },               tag: "date"    },
-    { params: { from: ymd, to: ymd },      tag: "from-to" },
+    { tag:"date+tz", params:{ date: ymd, timezone: TZ } },
+    { tag:"date",    params:{ date: ymd } },
+    { tag:"from-to", params:{ from: ymd, to: ymd } },
   ];
   const bag = new Map();
-  for (const v of variants) {
-    const jf0 = await afFetch(AF_BASE, afFixturesHeaders(), "/fixtures", { ...v.params }, `fixtures:${v.tag}:p0`, diag);
-    const arr0 = Array.isArray(jf0?.response) ? jf0.response : [];
-    for (const fx of arr0) {
-      const it = mapFixture(fx);
-      if (!it.fixture_id) continue;
-      if (isYouthOrBanned(it)) continue;
-      if (slotForKickoffISO(it.kickoff_utc) !== slot) continue;
-      bag.set(it.fixture_id, it);
-    }
-    const tot = Number(jf0?.paging?.total || 1);
-    for (let page = 2; page <= Math.min(tot, 12); page++) {
-      const jf = await afFetch(AF_BASE, afFixturesHeaders(), "/fixtures", { ...v.params, page }, `fixtures:${v.tag}:p${page}`, diag);
-      const arr = Array.isArray(jf?.response) ? jf.response : [];
-      for (const fx of arr) {
-        const it = mapFixture(fx);
-        if (!it.fixture_id) continue;
-        if (isYouthOrBanned(it)) continue;
-        if (slotForKickoffISO(it.kickoff_utc) !== slot) continue;
-        bag.set(it.fixture_id, it);
-      }
+  for (const v of variants){
+    const j0 = await afFetch("/fixtures",{...v.params},afFixturesHeaders(),`fixtures:${v.tag}:p0`,diag);
+    const arr0 = Array.isArray(j0?.response) ? j0.response : [];
+    for (const fx of arr0){ const m=mapFixture(fx); if(!m.fixture_id) continue; if(isYouthOrBanned(m)) continue; if (slotForKickoffISO(m.kickoff_utc)!==slot) continue; bag.set(m.fixture_id,m); }
+    const tot = Number(j0?.paging?.total||1);
+    for(let page=2; page<=Math.min(tot,12); page++){
+      const j = await afFetch("/fixtures",{...v.params,page},afFixturesHeaders(),`fixtures:${v.tag}:p${page}`,diag);
+      const arr = Array.isArray(j?.response) ? j.response : [];
+      for (const fx of arr){ const m=mapFixture(fx); if(!m.fixture_id) continue; if(isYouthOrBanned(m)) continue; if (slotForKickoffISO(m.kickoff_utc)!==slot) continue; bag.set(m.fixture_id,m); }
     }
     if (bag.size) break;
   }
   return Array.from(bag.keys());
 }
 
-/* ---------------- odds refresher (AF /odds, koristi ODDS_API_KEY) ---------------- */
+/* ---------- odds (API-Football; koristi API_FOOTBALL_KEY) ---------- */
 async function refreshOddsForIDs(ids, diag){
   let touched = 0;
-  for (const id of ids) {
-    try {
-      const jo = await afFetch(AF_BASE, afOddsHeaders(), "/odds", { fixture: id }, "odds", diag);
-      diag && (diag.odds = diag.odds || []).push({ fixture:id, ok:Boolean(jo?.response && jo.response.length) });
+  for (const id of ids){
+    try{
+      const jo = await afFetch("/odds", { fixture:id }, afOddsHeaders(), "odds", diag);
+      diag && (diag.odds = diag.odds || []).push({ fixture:id, ok:Boolean(jo?.response?.length) });
       touched++;
-    } catch (e) {
+    }catch(e){
       diag && (diag.odds = diag.odds || []).push({ fixture:id, ok:false, err:String(e?.message||e) });
     }
   }
   return touched;
 }
 
-/* ---------------- handler ---------------- */
-export default async function handler(req, res) {
+/* ---------- handler ---------- */
+export default async function handler(req,res){
   res.setHeader("Cache-Control","no-store");
   const q = req.query || {};
   const wantDebug = String(q.debug ?? "") === "1";
   const diag = wantDebug ? {} : null;
 
-  try {
+  try{
     const now = new Date();
-    const ymd = (q.ymd && /^\d{4}-\d{2}-\d{2}$/.test(String(q.ymd))) ? String(q.ymd) : ymdInTZ(now, TZ);
-    const slot = (q.slot && /^(am|pm|late)$/.test(String(q.slot)))
-      ? String(q.slot)
-      : deriveSlot(hourInTZ(now, TZ));
+    const ymd  = (q.ymd && /^\d{4}-\d{2}-\d{2}$/.test(String(q.ymd))) ? String(q.ymd) : ymdInTZ(now, TZ);
+    const slot = (q.slot && /^(am|pm|late)$/.test(String(q.slot))) ? String(q.slot) : deriveSlot(hourInTZ(now, TZ));
+
     const tried = [];
     let pickedKey = null;
-    let list = [];     // uvek array
+    let list = [];
     let seeded = false;
 
     async function takeFromKey(key, picker){
       tried.push(key);
       const { raw } = await kvGET(key, diag);
       const arr = arrFromAny(unpack(raw));
-      if (!Array.isArray(arr) || arr.length === 0) return false;
-      const ids = (picker ? arr.map(picker) : arr).map(x => Number(x)).filter(Boolean);
+      if (!Array.isArray(arr) || arr.length===0) return false;
+      const ids = (picker ? arr.map(picker) : arr).map(x=>Number(x)).filter(Boolean);
       if (!ids.length) return false;
-      if (list.length === 0) { list = Array.from(new Set(ids)); pickedKey = key; }
+      if (list.length===0){ list = Array.from(new Set(ids)); pickedKey = key; }
       return true;
     }
 
-    // 1) KV fallback lanci
-    await takeFromKey(`vb:day:${ymd}:${slot}`, x => x?.fixture_id);
-    if (list.length === 0) await takeFromKey(`vb:day:${ymd}:union`, x => x?.fixture_id);
-    if (list.length === 0) await takeFromKey(`vb:day:${ymd}:last`,  x => x?.fixture_id);
-    if (list.length === 0) await takeFromKey(`vbl_full:${ymd}:${slot}`);
-    if (list.length === 0) await takeFromKey(`fixtures:multi`);
+    await takeFromKey(`vb:day:${ymd}:${slot}`, x=>x?.fixture_id);
+    if (list.length===0) await takeFromKey(`vb:day:${ymd}:union`, x=>x?.fixture_id);
+    if (list.length===0) await takeFromKey(`vb:day:${ymd}:last`,  x=>x?.fixture_id);
+    if (list.length===0) await takeFromKey(`vbl_full:${ymd}:${slot}`);
+    if (list.length===0) await takeFromKey(`fixtures:multi`);
 
-    // 2) Ako KV nije dao ništa — probaj AF striktno pa ceo dan
-    if (list.length === 0) {
+    if (list.length===0){
       const strict = await fetchFixturesIDsByDateStrict(ymd, slot, diag);
-      if (strict.length) {
-        list = strict;
-      } else {
+      if (strict.length) list = strict;
+      else {
         const whole = await fetchFixturesIDsWholeDay(ymd, slot, diag);
         if (whole.length) list = whole;
       }
-      if (list.length) {
+      if (list.length){
         await kvSET(`fixtures:${ymd}:${slot}`, JSON.stringify(list), diag);
         await kvSET(`fixtures:multi`, JSON.stringify(list), diag);
         seeded = true;
       }
     }
 
-    // 3) Ako i dalje ništa — vrati dijagnostiku
-    if (list.length === 0) {
+    if (list.length===0){
       return res.status(200).json({
-        ok: true,
-        ymd, slot,
-        inspected: 0, filtered: 0, targeted: 0, touched: 0,
-        source: "refresh-odds:no-slot-matches",
-        debug: wantDebug ? { tried, pickedKey, listLen: 0, forceSeed: seeded, af: diag?.af } : undefined
+        ok:true, ymd, slot,
+        inspected:0, filtered:0, targeted:0, touched:0,
+        source:"refresh-odds:no-slot-matches",
+        debug: wantDebug ? { tried, pickedKey, listLen:0, forceSeed:seeded, af: diag?.af } : undefined
       });
     }
 
-    // 4) Osveži kvote (koristi ODDS_API_KEY)
     const ids = Array.from(new Set(list));
     const touched = await refreshOddsForIDs(ids, diag);
 
     return res.status(200).json({
-      ok: true,
-      ymd, slot,
-      inspected: ids.length,
-      filtered: 0,
-      targeted: ids.length,
-      touched,
+      ok:true, ymd, slot,
+      inspected: ids.length, filtered:0, targeted: ids.length, touched,
       source: pickedKey ? `refresh-odds:${pickedKey}` : "refresh-odds:fallback",
       debug: wantDebug ? { tried, pickedKey, listLen: ids.length, forceSeed: seeded, af: diag?.af, odds: diag?.odds } : undefined
     });
 
-  } catch (e) {
+  }catch(e){
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
-  } 
+  }
 }
