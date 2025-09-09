@@ -1,14 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import HistoryPanel from "./HistoryPanel";
 import TicketPanel from "./TicketPanel";
-import {
-  AreaChart,
-  Area,
-  ResponsiveContainer,
-  Tooltip,
-  YAxis,
-  XAxis,
-} from "recharts";
 
 const TZ = "Europe/Belgrade";
 
@@ -119,18 +111,17 @@ function useCryptoFeed() {
   return { signals, loading, err };
 }
 
-/* ---------------- tiny utils for crypto visuals ---------------- */
+/* ---------------- tiny utils for crypto visuals (SVG sparkline) ---------------- */
 
 function toSparkData(s) {
-  // očekuje s.sparkline (niz cena) ili s.history (array of {time, price})
+  // očekuje s.sparkline (niz cena) ili s.history (array of {time, price/close/last})
   if (Array.isArray(s?.sparkline) && s.sparkline.length) {
-    return s.sparkline.map((p, i) => ({ x: i, y: Number(p) }));
+    return s.sparkline.map(Number).filter(v => Number.isFinite(v));
   }
   if (Array.isArray(s?.history) && s.history.length) {
-    return s.history.map((pt, i) => ({
-      x: pt?.time ?? i,
-      y: Number(pt?.price ?? pt?.close ?? pt?.last ?? 0),
-    }));
+    return s.history
+      .map(pt => Number(pt?.price ?? pt?.close ?? pt?.last))
+      .filter(v => Number.isFinite(v));
   }
   return [];
 }
@@ -138,6 +129,47 @@ function toSparkData(s) {
 function pct(v) {
   if (v == null || Number.isNaN(Number(v))) return null;
   return Math.round(Number(v) * 100) / 100;
+}
+
+function SparklineSVG({ series, height = 80 }) {
+  const w = 260; // virtuelna širina (skalira se preko viewBox)
+  const h = height;
+  const n = series?.length || 0;
+  if (!n) {
+    return <div className="h-20 rounded-xl bg-blue-900/20 border border-blue-300/10" />;
+  }
+  const min = Math.min(...series);
+  const max = Math.max(...series);
+  const span = max - min || 1;
+
+  const pts = series.map((v, i) => {
+    const x = (i / (n - 1)) * w;
+    const y = h - ((v - min) / span) * h;
+    return `${x.toFixed(2)},${y.toFixed(2)}`;
+  }).join(" ");
+
+  // za fill: putanja do dna
+  const fillPath = `M0,${h} L${pts} L${w},${h} Z`;
+
+  return (
+    <svg width="100%" height={h} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none">
+      <defs>
+        <linearGradient id="sgFill" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="rgba(59,130,246,0.35)" />
+          <stop offset="100%" stopColor="rgba(59,130,246,0.05)" />
+        </linearGradient>
+      </defs>
+      <path d={fillPath} fill="url(#sgFill)" />
+      <polyline
+        points={pts}
+        fill="none"
+        stroke="rgba(147,197,253,0.9)" /* blue-300 */
+        strokeWidth="2"
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
 }
 
 /* ---------------- presentational blocks ---------------- */
@@ -176,46 +208,14 @@ function ItemCard({ it }) {
   );
 }
 
-/* Chart koji ne puca na SSR (render tek na klijentu) */
-function CryptoSparkline({ data }) {
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => { setMounted(true); }, []);
-  if (!mounted || !data?.length) return (
-    <div className="h-16 rounded-xl bg-blue-900/20 border border-blue-300/10" />
-  );
-
-  return (
-    <div className="h-20">
-      <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={data}>
-          <YAxis domain={["auto", "auto"]} hide />
-          <XAxis dataKey="x" hide />
-          <Tooltip
-            contentStyle={{ background: "rgba(10,24,61,0.9)", border: "1px solid rgba(147,197,253,0.2)" }}
-            formatter={(v) => [v, "Price"]}
-          />
-          <Area
-            type="monotone"
-            dataKey="y"
-            fill="rgba(59,130,246,0.25)"
-            stroke="rgba(147,197,253,0.85)"
-            strokeWidth={2}
-            activeDot={{ r: 3 }}
-          />
-        </AreaChart>
-      </ResponsiveContainer>
-    </div>
-  );
-}
-
 function CryptoCard({ s }) {
   const sym = s?.symbol || s?.pair || s?.ticker || "—";
   const sig = (s?.signal || s?.side || s?.direction || "").toUpperCase();
   const price = s?.price ?? s?.last ?? s?.close;
   const conf = s?.confidence ?? s?.score ?? s?.strength;
   const ch24 = s?.change_24h ?? s?.changePct ?? s?.change ?? s?.pct_24h;
+  const series = toSparkData(s);
 
-  const data = toSparkData(s);
   const pos = String(sig).includes("LONG") || String(sig).includes("BUY");
   const neg = String(sig).includes("SHORT") || String(sig).includes("SELL");
   const tag =
@@ -246,7 +246,7 @@ function CryptoCard({ s }) {
       </div>
 
       <div className="mt-3">
-        <CryptoSparkline data={data} />
+        <SparklineSVG series={series} />
       </div>
     </Card>
   );
