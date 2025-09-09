@@ -234,7 +234,8 @@ function bestHTFT(bookmakers,minOdds=MIN_ODDS){
 }
 function slotForKickoffISO(iso){
   const h = new Date(iso).toLocaleString("en-GB",{ hour:"2-digit", hour12:false, timeZone:TZ });
-  return deriveSlot(parseInt(h,10));
+  const v = parseInt(h,10);
+  if (v<10) return "late"; if (v<15) return "am"; return "pm";
 }
 
 export default async function handler(req,res){
@@ -259,7 +260,7 @@ export default async function handler(req,res){
     let rawArr = null, src = null;
     for (const k of prefer){
       const { raw } = await kvGET(k, diag);
-      const arr = arrFromAny(J(raw));
+      const arr = arrFromAny(J(raw)); // FIX: nema više 'unpack'
       if (arr && arr.length){ rawArr = arr; src = k; break; }
     }
 
@@ -272,17 +273,14 @@ export default async function handler(req,res){
 
     if (isNumericArray) {
       ids = rawArr.map(v => Number(v)).filter(Boolean);
-      // uzmi sve fixturе za dan i upari
       const fixtures = await fetchAllFixturesForDate(ymd);
       const byIdMeta = new Map(fixtures.map(fx => [Number(fx?.fixture?.id), mapFixtureToItem(fx)]));
       items = ids.map(id => byIdMeta.get(id) || { fixture_id:id, kickoff_utc:null, home:null, away:null, league_name:null });
     } else {
-      // očekujemo listu objekata
       items = (rawArr || []).filter(x => x && typeof x === "object");
       ids = items.map(x => Number(x?.fixture_id || x?.id)).filter(Boolean);
     }
 
-    // filteri + mape (DODAT SLOT FILTER)
     items = (items || [])
       .filter(x => !isYouthOrBanned(x))
       .filter(x => {
@@ -290,7 +288,6 @@ export default async function handler(req,res){
         return iso ? slotForKickoffISO(iso) === slot : true;
       });
     const byId = new Map(items.map(x => [x.fixture_id, x]));
-    // ograniči ids na stvarno prisutne u slotu
     ids = ids.filter(id => byId.has(id));
 
     const tickets = { btts:[], ou25:[], htft:[] };
@@ -341,7 +338,6 @@ export default async function handler(req,res){
       }
     };
 
-    // paralelno /odds
     const CHUNK = Math.ceil((ids.length||1)/LANES);
     const parts=[]; for (let i=0;i<ids.length;i+=CHUNK) parts.push(ids.slice(i,i+CHUNK));
     await Promise.all(parts.map(lane));
@@ -351,26 +347,33 @@ export default async function handler(req,res){
       .sort((a,b)=> (scoreForSort(b)-scoreForSort(a)) || (Date.parse(a.kickoff_utc||0)-Date.parse(b.kickoff_utc||0)) );
     const shortList = withPicks.slice(0, TARGET_N);
 
-    // Upisi
     await kvSET(`vb:day:${ymd}:${slot}`, JSON.stringify({ value: JSON.stringify(withPicks) }), diag);
+
     const prevUnionRaw = (await kvGET(`vb:day:${ymd}:union`, diag)).raw;
-    const prevUnionArr = arrFromAny(unpack(prevUnionRaw)) || [];
+    const prevUnionArr = arrFromAny(J(prevUnionRaw)) || []; // FIX: nema 'unpack'
     const unionBag = new Map();
-    for (const it of [...prevUnionArr, ...withPicks]){ const fid=Number(it?.fixture_id); if (!fid) continue; if (!unionBag.has(fid)) unionBag.set(fid,it); }
+    for (const it of [...prevUnionArr, ...withPicks]){
+      const fid=Number(it?.fixture_id); if (!fid) continue;
+      if (!unionBag.has(fid)) unionBag.set(fid,it);
+    }
     await kvSET(`vb:day:${ymd}:union`, JSON.stringify({ value: JSON.stringify(Array.from(unionBag.values())) }), diag);
-    if (withPicks.length) await kvSET(`vb:day:${ymd}:last`, JSON.stringify({ value: JSON.stringify(withPicks) }), diag);
+
+    if (withPicks.length) {
+      await kvSET(`vb:day:${ymd}:last`, JSON.stringify({ value: JSON.stringify(withPicks) }), diag);
+    }
     await kvSET(`vbl_full:${ymd}:${slot}`, JSON.stringify(withPicks), diag);
     await kvSET(`vbl:${ymd}:${slot}`, JSON.stringify(shortList), diag);
 
-    // combined top3
     const top3 = withPicks.slice(0,3);
     const prevC = (await kvGET(`vb:day:${ymd}:combined`, diag)).raw;
-    const prevA = arrFromAny(unpack(prevC)) || [];
+    const prevA = arrFromAny(J(prevC)) || []; // FIX: nema 'unpack'
     const dedup = new Map();
-    for (const it of [...prevA, ...top3]){ const fid=Number(it?.fixture_id); if (!fid) continue; if (!dedup.has(fid)) dedup.set(fid,it); }
+    for (const it of [...prevA, ...top3]){
+      const fid=Number(it?.fixture_id); if (!fid) continue;
+      if (!dedup.has(fid)) dedup.set(fid,it);
+    }
     await kvSET(`vb:day:${ymd}:combined`, JSON.stringify(Array.from(dedup.values()).slice(0,6)), diag);
 
-    // TIKETI (slot → per-slot + dnevni union)
     const sortT = (a,b)=> (scoreForSort(b)-scoreForSort(a)) || (Date.parse(a.kickoff_utc||0)-Date.parse(b.kickoff_utc||0));
     const slotTickets = {
       btts: (tickets.btts||[]).sort(sortT).slice(0,TICKETS_PER_MARKET),
@@ -392,7 +395,6 @@ export default async function handler(req,res){
       htft: merge(dayObj.htft, slotTickets.htft),
     }), diag);
 
-    // debug blok
     const debugBlock = wantDebug ? {
       diag,
       vbl: {
