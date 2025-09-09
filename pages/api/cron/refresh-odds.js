@@ -1,12 +1,11 @@
 // pages/api/cron/refresh-odds.js
 // Osvežava kvote za fixture ID listu i garantuje da lista postoji i kada nema fixtures:multi.
-// Fallback redom: vb:day:<YMD>:<slot> → vb:day:<YMD>:union → vb:day:<YMD>:last → vbl_full:<YMD>:<slot> → AF /fixtures (po datumu i slotu).
+// Fallback redom: vb:day:<YMD>:<slot> → vb:day:<YMD>:union → vb:day:<YMD>:last → vbl_full:<YMD>:<slot> → fixtures:multi → AF /fixtures.
 // Ako lista nastane iz fallback-a, seed-uje se u KV: fixtures:<YMD>:<slot> i fixtures:multi (back-compat).
 
 export const config = { api: { bodyParser: false } };
 
 const TZ = "Europe/Belgrade";
-const DEFAULT_MIN_ODDS = 1.01; // osvežavanje kvota ne filtrira strogo
 
 /* ---------------- KV (Vercel REST) ---------------- */
 function kvCfgs() {
@@ -129,7 +128,6 @@ function mapFixture(fx){
   return {
     fixture_id: id,
     league_name: fx?.league?.name,
-    league: { id: fx?.league?.id, name: fx?.league?.name, country: fx?.league?.country, season: fx?.league?.season },
     teams: { home: fx?.teams?.home?.name, away: fx?.teams?.away?.name },
     home: fx?.teams?.home?.name, away: fx?.teams?.away?.name,
     kickoff_utc: kick,
@@ -147,7 +145,6 @@ async function fetchFixturesIDsByDateAndSlot(ymd, slot){
   const HARD_CAP_PAGES = 12;
   for (const t of tries) {
     let page = 1;
-    // eslint-disable-next-line no-constant-condition
     while (true) {
       const jf = await afFetch("/fixtures", { ...t.params, page });
       const arr = Array.isArray(jf?.response) ? jf.response : [];
@@ -173,9 +170,7 @@ async function refreshOddsForIDs(ids, diag){
   let touched = 0;
   for (const id of ids) {
     try {
-      // Samo pozovi /odds — rebuild će posle čitati svež odgovor
       const jo = await afFetch("/odds", { fixture: id });
-      // (opciono) možeš da keširaš u KV: af:odds:<id> ako želiš
       diag && (diag.odds = diag.odds || []).push({ fixture:id, ok:Boolean(jo?.response?.length) });
       touched++;
     } catch (e) {
@@ -198,74 +193,61 @@ export default async function handler(req, res) {
     const slot = (q.slot && /^(am|pm|late)$/.test(String(q.slot)))
       ? String(q.slot)
       : deriveSlot(hourInTZ(now, TZ));
-    const force = String(q.force ?? "") === "1";
-
-    // 1) Probaj da pročitaš listu ID-eva iz raznih izvora (redosled):
     const tried = [];
     let pickedKey = null;
-    let list = [];
+    let list = [];            // ← uvek ARRAY, nikad null
+    let seeded = false;
 
-    async function tryKey(key, picker){
+    async function takeFromKey(key, picker){
       tried.push(key);
       const { raw } = await kvGET(key, diag);
       const arr = arrFromAny(unpack(raw));
-      if (!arr || !arr.length) return null;
-      const ids = (picker ? picker(arr) : arr).map(x => Number(x)).filter(Boolean);
-      if (ids.length) { pickedKey = key; return Array.from(new Set(ids)); }
-      return null;
+      if (!Array.isArray(arr) || arr.length === 0) return false;
+      const ids = (picker ? picker(arr) : arr).map(x => Number(picker ? x : x)).filter(Boolean);
+      if (!ids.length) return false;
+      // set only if we still don't have items
+      if (list.length === 0) {
+        list = Array.from(new Set(ids));
+        pickedKey = key;
+      }
+      return true;
     }
 
-    // vb:day:<YMD>:<slot> (BOXED ARRAY of picks)
-    list = list.length ? list : await tryKey(`vb:day:${ymd}:${slot}`, arr => arr.map(x => x?.fixture_id));
-    // vb:day:<YMD>:union
-    list = list.length ? list : await tryKey(`vb:day:${ymd}:union`, arr => arr.map(x => x?.fixture_id));
-    // vb:day:<YMD>:last
-    list = list.length ? list : await tryKey(`vb:day:${ymd}:last`,  arr => arr.map(x => x?.fixture_id));
-    // vbl_full:<YMD>:<slot> (PLAIN ARRAY)
-    list = list.length ? list : await tryKey(`vbl_full:${ymd}:${slot}`);
+    // Fallback chain (svaka grana bezbedno čuva list kao array)
+    await takeFromKey(`vb:day:${ymd}:${slot}`, arr => arr.map(x => x?.fixture_id));
+    if (list.length === 0) await takeFromKey(`vb:day:${ymd}:union`, arr => arr.map(x => x?.fixture_id));
+    if (list.length === 0) await takeFromKey(`vb:day:${ymd}:last`,  arr => arr.map(x => x?.fixture_id));
+    if (list.length === 0) await takeFromKey(`vbl_full:${ymd}:${slot}`);
+    if (list.length === 0) await takeFromKey(`fixtures:multi`);
 
-    // fixtures:multi (legacy)
-    list = list.length ? list : await tryKey(`fixtures:multi`);
-
-    // 2) Ako i dalje nema liste — uzmi iz AF /fixtures i seed-uj
-    let seeded = false;
-    if (!list.length) {
+    // Ako i dalje nemamo listu — povuci iz AF i seed-uj
+    if (list.length === 0) {
       const ids = await fetchFixturesIDsByDateAndSlot(ymd, slot);
-      if (ids.length) {
-        list = ids;
+      if (ids && ids.length) {
+        list = Array.from(new Set(ids));
+        // seed
+        await kvSET(`fixtures:${ymd}:${slot}`, JSON.stringify(list), diag);
+        await kvSET(`fixtures:multi`, JSON.stringify(list), diag);
         seeded = true;
-        // seed: fixtures:<YMD>:<slot>
-        await kvSET(`fixtures:${ymd}:${slot}`, JSON.stringify(ids), diag);
-        // back-compat: fixtures:multi (isti sadržaj)
-        await kvSET(`fixtures:multi`, JSON.stringify(ids), diag);
       }
     }
 
-    // 3) Ako i dalje nema liste — vrati prazno ali sa dijagnostikom
-    if (!list.length) {
+    if (list.length === 0) {
       return res.status(200).json({
-        ok: true,
-        ymd, slot,
+        ok: true, ymd, slot,
         inspected: 0, filtered: 0, targeted: 0, touched: 0,
         source: "refresh-odds:no-slot-matches",
-        debug: wantDebug ? { tried, pickedKey, listLen: 0, saved_backends: [], forceSeed: seeded } : undefined
+        debug: wantDebug ? { tried, pickedKey, listLen: 0, forceSeed: seeded } : undefined
       });
     }
 
-    // 4) Osveži kvote za pronađene fixtur-e
-    const ids = Array.from(new Set(list));
-    const touched = await refreshOddsForIDs(ids, diag);
+    const touched = await refreshOddsForIDs(list, diag);
 
-    // 5) Vrati rezultat
     return res.status(200).json({
-      ok: true,
-      ymd, slot,
-      inspected: ids.length,
-      filtered: 0,
-      targeted: ids.length,
-      touched,
+      ok: true, ymd, slot,
+      inspected: list.length, filtered: 0, targeted: list.length, touched,
       source: pickedKey ? `refresh-odds:${pickedKey}` : "refresh-odds:fallback",
-      debug: wantDebug ? { tried, pickedKey, listLen: ids.length, saved_backends: ["vercel-kv"], forceSeed: seeded } : undefined
+      debug: wantDebug ? { tried, pickedKey, listLen: list.length, forceSeed: seeded } : undefined
     });
 
   } catch (e) {
