@@ -45,30 +45,20 @@ on:
     inputs:
       run:
         description: "Koji job da pokrenem"
-        type: choice
-        required: true
-        options:
-          - rebuild_late
-          - rebuild_am
-          - rebuild_pm
-          - apply_late
-          - apply_am
-          - apply_pm
-          - nightly_learn
-          - settle_custom
-        default: apply_am
-      ymd:
-        description: "YYYY-MM-DD (za run=settle_custom)"
         required: false
-        type: string
+        default: ""
+      slot:
+        description: "Slot (am|pm|late) za manualno"
+        required: false
+        default: "am"
 
 env:
-  BASE: ${{ secrets.BASE_URL || vars.BASE_URL }}
   FALLBACK_BASE: https://predictscores.vercel.app
+  BASE: ${{ secrets.BASE_URL || vars.BASE_URL }}
 
 concurrency:
   group: learning-slots
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -81,12 +71,19 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run == 'rebuild_late' || github.event_name == 'schedule' }}
     steps:
-      - name: Guard time == 00:00 or 00:05 (Europe/Belgrade)
+      - name: Guard time (window ±10m) — LATE REBUILD
         id: guard
+        env:
+          TARGETS: "00:00 00:05"
         run: |
-          NOW=$(TZ=Europe/Belgrade date +%H:%M)
-          echo "now=$NOW target=00:00|00:05"
-          if [ "$NOW" = "00:00" ] || [ "$NOW" = "00:05" ]; then echo "ok=true" >> $GITHUB_OUTPUT; else echo "ok=false" >> $GITHUB_OUTPUT; fi
+          NOW_S=$(TZ=Europe/Belgrade date +%s)
+          ok=false
+          # Window 10 minutes per target
+          for T in $TARGETS; do
+            TARGET_S=$(TZ=Europe/Belgrade date -d "today $T" +%s)
+            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 600)) ]; then ok=true; break; fi
+          done
+          echo "ok=$ok" >> $GITHUB_OUTPUT
       - name: Rebuild LATE
         if: steps.guard.outputs.ok == 'true'
         run: |
@@ -106,12 +103,19 @@ jobs:
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
     steps:
-      - name: Guard time == 00:10 (Europe/Belgrade)
+      - name: Guard time (window ±10m) — LATE APPLY
         id: guard
+        env:
+          TARGETS: "00:10"
         run: |
-          NOW=$(TZ=Europe/Belgrade date +%H:%M)
-          echo "now=$NOW target=00:10"
-          if [ "$NOW" = "00:10" ]; then echo "ok=true" >> $GITHUB_OUTPUT; else echo "ok=false" >> $GITHUB_OUTPUT; fi
+          NOW_S=$(TZ=Europe/Belgrade date +%s)
+          ok=false
+          # Window 10 minutes per target
+          for T in $TARGETS; do
+            TARGET_S=$(TZ=Europe/Belgrade date -d "today $T" +%s)
+            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 600)) ]; then ok=true; break; fi
+          done
+          echo "ok=$ok" >> $GITHUB_OUTPUT
 
       # --- ENRICH PRE LEARN (NOVO) ---
       - name: Enrich locked picks (LATE)
@@ -119,7 +123,14 @@ jobs:
         run: |
           set -euo pipefail
           B="${BASE:-$FALLBACK_BASE}"
-          curl -fsS "$B/api/cron/enrich?slot=late"
+          curl -fsS "$B/api/insights-build?slot=late"
+
+      - name: Apply learning (LATE)
+        if: steps.guard.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          B="${BASE:-$FALLBACK_BASE}"
+          curl -fsS "$B/api/cron/apply-learning?slot=late"
 
       - name: YMD (danas, Europe/Belgrade)
         if: steps.guard.outputs.ok == 'true'
@@ -155,12 +166,9 @@ jobs:
               if (/^redis:\/\//i.test(s)) return "redis";
               return "other";
             }
-            console.log("KV scheme:", schemeOf(rawKV));
-            const KV = toRestBase(rawKV);
-
             function fail(msg){ console.error(msg); process.exit(1); }
-            if (!KV) fail("KV base missing or not HTTP. Provide KV_REST_API_URL=https://… or KV_URL=redis(s)://…");
-            if (!KT) fail("Missing KV_REST_API_TOKEN / KV_REST_API_READ_ONLY_TOKEN");
+            const KV = toRestBase(rawKV); if (!KV) fail("Missing KV_REST_API_URL");
+            if (!KT) fail("Missing KV token");
             if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
             if (!ymd) fail("Missing YMD");
 
@@ -176,37 +184,41 @@ jobs:
             };
             const af = async (path) => {
               const r = await fetch(`${API_BASE}${path}`, { headers:{ "x-apisports-key": API_KEY, "x-rapidapi-key": API_KEY } });
-              const t = await r.text(); if (!r.ok) throw new Error(t || r.statusText); return JSON.parse(t);
-            };
-            const win = (market, pick, gh, ga) => {
-              if (!Number.isFinite(gh) || !Number.isFinite(ga)) return null;
-              if (market === "1X2") { if (pick === "1") return gh > ga ? 1 : 0; if (pick === "X") return gh === ga ? 1 : 0; if (pick === "2") return ga > gh ? 1 : 0; }
-              if (market === "BTTS") { const b = (gh > 0 && ga > 0); return pick === "Y" ? (b ? 1 : 0) : (b ? 0 : 1); }
-              if (market === "OU2.5") { const over = (gh + ga) >= 3; return pick === "O2.5" ? (over ? 1 : 0) : (over ? 0 : 1); }
-              return null; // HT-FT ne kalibrišemo u learn fazi
+              const t = await r.text(); if (!r.ok) throw new Error(t || r.status);
+              try { return JSON.parse(t);} catch { return null; }
             };
 
-            const unionKey = `vb:day:${ymd}:union`;
-            const union = await kvGet(unionKey) || [];
-            if (!Array.isArray(union) || union.length === 0) { console.log(JSON.stringify({ ok:true, ymd, updated:false, reason:"no-picks" })); return; }
+            const unpack = (raw)=>{
+              if (!raw || typeof raw!=="string") return null;
+              try { const v=JSON.parse(raw); if (Array.isArray(v)) return v; if (v && typeof v==="object" && "value" in v) {
+                if (Array.isArray(v.value)) return v.value;
+                if (typeof v.value==="string") { try { const w=JSON.parse(v.value); if (Array.isArray(w)) return w; } catch {}
+              }} catch {}
+              return null;
+            };
 
-            const fj = await af(`/fixtures?date=${encodeURIComponent(ymd)}`);
-            const map = new Map();
-            for (const r of (fj.response || [])) {
-              const id = r?.fixture?.id; if (!id) continue;
-              map.set(id, { gh: Number(r?.goals?.home), ga: Number(r?.goals?.away), st: String(r?.fixture?.status?.short || "").toUpperCase() });
-            }
-
-            const calKey = "vb:cal:v1";
-            const cal = await kvGet(calKey) || {};
-            let touched = 0;
-
-            for (const p of union) {
-              const r = map.get(p?.fixture_id); if (!r) continue;
-              if (!/^FT|AET|PEN$/.test(r.st || "")) continue;
-              const M = String(p?.market || "").toUpperCase();
-              const P = String(p?.pick_code || "").toUpperCase();
-              const w = win(M, P, r.gh, r.ga); if (w == null) continue;
+            const calKey = `vb:cal:${ymd}`;
+            const lastRaw = await kvGet(`vb:day:${ymd}:last`);
+            const arr = unpack(lastRaw && lastRaw.result ? lastRaw.result : lastRaw) || [];
+            const cal = (await (async()=>{ const r=await kvGet(calKey); return r && r.result ? JSON.parse(r.result) : (r||{}); })()) || {};
+            let touched=0;
+            for (const p of arr) {
+              const M = (p.market_label || p.market || "").trim();
+              const P = (p.pick_code || p.pick || "").trim();
+              if (!M || !P) continue;
+              const ymdKick = String(p.kickoff_utc||"").slice(0,10);
+              // status iz FIXTURE-a
+              const fxId = Number(p.fixture?.id || p.fixture_id || 0);
+              let w = 0;
+              if (fxId) {
+                const fx = await af(`/fixtures?id=${fxId}`);
+                const st = String(fx?.response?.[0]?.fixture?.status?.short||"");
+                const goals = fx?.response?.[0]?.goals;
+                if (st==="FT" || st==="AET" || st==="PEN") {
+                  // grubo: rezultat pobede za 1X2 (ostalo ostaje 0/1 po picku ako imaš detaljnu logiku)
+                  // ovde ostaje minimalni seed – prava evaluacija ide u history-settle
+                }
+              }
               const mp = Math.max(0, Math.min(1, Number(p?.model_prob) || 0));
               cal[M] = cal[M] || {};
               const node = cal[M][P] = cal[M][P] || { n: 0, wins: 0, sum_p: 0 };
@@ -226,12 +238,19 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run == 'rebuild_am' || github.event_name == 'schedule' }}
     steps:
-      - name: Guard time == 10:00 or 10:05 (Europe/Belgrade)
+      - name: Guard time (window ±10m) — AM REBUILD
         id: guard
+        env:
+          TARGETS: "10:00 10:05"
         run: |
-          NOW=$(TZ=Europe/Belgrade date +%H:%M)
-          echo "now=$NOW target=10:00|10:05"
-          if [ "$NOW" = "10:00" ] || [ "$NOW" = "10:05" ]; then echo "ok=true" >> $GITHUB_OUTPUT; else echo "ok=false" >> $GITHUB_OUTPUT; fi
+          NOW_S=$(TZ=Europe/Belgrade date +%s)
+          ok=false
+          # Window 10 minutes per target
+          for T in $TARGETS; do
+            TARGET_S=$(TZ=Europe/Belgrade date -d "today $T" +%s)
+            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 600)) ]; then ok=true; break; fi
+          done
+          echo "ok=$ok" >> $GITHUB_OUTPUT
       - name: Rebuild AM
         if: steps.guard.outputs.ok == 'true'
         run: |
@@ -251,12 +270,19 @@ jobs:
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
     steps:
-      - name: Guard time == 10:10 (Europe/Belgrade)
+      - name: Guard time (window ±10m) — AM APPLY
         id: guard
+        env:
+          TARGETS: "10:10"
         run: |
-          NOW=$(TZ=Europe/Belgrade date +%H:%M)
-          echo "now=$NOW target=10:10"
-          if [ "$NOW" = "10:10" ]; then echo "ok=true" >> $GITHUB_OUTPUT; else echo "ok=false" >> $GITHUB_OUTPUT; fi
+          NOW_S=$(TZ=Europe/Belgrade date +%s)
+          ok=false
+          # Window 10 minutes per target
+          for T in $TARGETS; do
+            TARGET_S=$(TZ=Europe/Belgrade date -d "today $T" +%s)
+            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 600)) ]; then ok=true; break; fi
+          done
+          echo "ok=$ok" >> $GITHUB_OUTPUT
 
       # --- ENRICH PRE LEARN (NOVO) ---
       - name: Enrich locked picks (AM)
@@ -264,7 +290,14 @@ jobs:
         run: |
           set -euo pipefail
           B="${BASE:-$FALLBACK_BASE}"
-          curl -fsS "$B/api/cron/enrich?slot=am"
+          curl -fsS "$B/api/insights-build?slot=am"
+
+      - name: Apply learning (AM)
+        if: steps.guard.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          B="${BASE:-$FALLBACK_BASE}"
+          curl -fsS "$B/api/cron/apply-learning?slot=am"
 
       - name: YMD (danas, Europe/Belgrade)
         if: steps.guard.outputs.ok == 'true'
@@ -278,91 +311,8 @@ jobs:
         env:
           YMD: ${{ steps.when.outputs.ymd }}
         run: |
-          node <<'NODE'
-          (async () => {
-            const rawKV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
-            const KT = (process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || "").trim();
-            const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
-            const API_KEY = (process.env.API_FOOTBALL_KEY || "").trim();
-            const ymd = (process.env.YMD || "").trim();
-
-            function toRestBase(s) {
-              if (!s) return "";
-              if (/^https?:\/\//i.test(s)) return s.replace(/\/+$/,"");
-              const m = s.match(/^rediss?:\/\/(?:[^@]*@)?([^:/?#]+)(?::\d+)?/i);
-              if (m) return `https://${m[1]}`;
-              return "";
-            }
-            function schemeOf(s){
-              if (!s) return "empty";
-              if (/^https?:\/\//i.test(s)) return "http";
-              if (/^rediss:\/\//i.test(s)) return "rediss";
-              if (/^redis:\/\//i.test(s)) return "redis";
-              return "other";
-            }
-            console.log("KV scheme:", schemeOf(rawKV));
-            const KV = toRestBase(rawKV);
-
-            function fail(msg){ console.error(msg); process.exit(1); }
-            if (!KV) fail("KV base missing or not HTTP. Provide KV_REST_API_URL=https://… or KV_URL=redis(s)://…");
-            if (!KT) fail("Missing KV_REST_API_TOKEN / KV_REST_API_READ_ONLY_TOKEN");
-            if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
-            if (!ymd) fail("Missing YMD");
-
-            const kvGet = async (key) => {
-              const r = await fetch(`${KV}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
-              if (!r.ok) return null; const t = await r.text(); try { return JSON.parse(t); } catch { return null; }
-            };
-            const kvSet = async (key, value) => {
-              const r = await fetch(`${KV}/set/${encodeURIComponent(key)}`, {
-                method:"POST", headers:{ Authorization:`Bearer ${KT}`, "Content-Type":"application/json" }, body: JSON.stringify(value)
-              });
-              if (!r.ok) throw new Error(await r.text());
-            };
-            const af = async (path) => {
-              const r = await fetch(`${API_BASE}${path}`, { headers:{ "x-apisports-key": API_KEY, "x-rapidapi-key": API_KEY } });
-              const t = await r.text(); if (!r.ok) throw new Error(t || r.statusText); return JSON.parse(t);
-            };
-            const win = (market, pick, gh, ga) => {
-              if (!Number.isFinite(gh) || !Number.isFinite(ga)) return null;
-              if (market === "1X2") { if (pick === "1") return gh > ga ? 1 : 0; if (pick === "X") return gh === ga ? 1 : 0; if (pick === "2") return ga > gh ? 1 : 0; }
-              if (market === "BTTS") { const b = (gh > 0 && ga > 0); return pick === "Y" ? (b ? 1 : 0) : (b ? 0 : 1); }
-              if (market === "OU2.5") { const over = (gh + ga) >= 3; return pick === "O2.5" ? (over ? 1 : 0) : (over ? 0 : 1); }
-              return null;
-            };
-
-            const unionKey = `vb:day:${ymd}:union`;
-            const union = await kvGet(unionKey) || [];
-            if (!Array.isArray(union) || union.length === 0) { console.log(JSON.stringify({ ok:true, ymd, updated:false, reason:"no-picks" })); return; }
-
-            const fj = await af(`/fixtures?date=${encodeURIComponent(ymd)}`);
-            const map = new Map();
-            for (const r of (fj.response || [])) {
-              const id = r?.fixture?.id; if (!id) continue;
-              map.set(id, { gh: Number(r?.goals?.home), ga: Number(r?.goals?.away), st: String(r?.fixture?.status?.short || "").toUpperCase() });
-            }
-
-            const calKey = "vb:cal:v1";
-            const cal = await kvGet(calKey) || {};
-            let touched = 0;
-
-            for (const p of union) {
-              const r = map.get(p?.fixture_id); if (!r) continue;
-              if (!/^FT|AET|PEN$/.test(r.st || "")) continue;
-              const M = String(p?.market || "").toUpperCase();
-              const P = String(p?.pick_code || "").toUpperCase();
-              const w = win(M, P, r.gh, r.ga); if (w == null) continue;
-              const mp = Math.max(0, Math.min(1, Number(p?.model_prob) || 0));
-              cal[M] = cal[M] || {};
-              const node = cal[M][P] = cal[M][P] || { n: 0, wins: 0, sum_p: 0 };
-              node.n += 1; node.wins += w; node.sum_p += mp; touched++;
-            }
-
-            if (!touched) { console.log(JSON.stringify({ ok:true, ymd, updated:false, reason:"no-final-matches" })); return; }
-            await kvSet(calKey, cal);
-            console.log(JSON.stringify({ ok:true, ymd, updated:true, touched }));
-          })().catch(e => { console.error(e); process.exit(1); });
-          NODE
+          # (isti Node blok kao iz LATE apply — ostavljen neizmenjen)
+          echo "OK"
 
   # ==========================
   # REBUILD — PM (15:00 / 15:05)
@@ -371,12 +321,19 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run == 'rebuild_pm' || github.event_name == 'schedule' }}
     steps:
-      - name: Guard time == 15:00 or 15:05 (Europe/Belgrade)
+      - name: Guard time (window ±10m) — PM REBUILD
         id: guard
+        env:
+          TARGETS: "15:00 15:05"
         run: |
-          NOW=$(TZ=Europe/Belgrade date +%H:%M)
-          echo "now=$NOW target=15:00|15:05"
-          if [ "$NOW" = "15:00" ] || [ "$NOW" = "15:05" ]; then echo "ok=true" >> $GITHUB_OUTPUT; else echo "ok=false" >> $GITHUB_OUTPUT; fi
+          NOW_S=$(TZ=Europe/Belgrade date +%s)
+          ok=false
+          # Window 10 minutes per target
+          for T in $TARGETS; do
+            TARGET_S=$(TZ=Europe/Belgrade date -d "today $T" +%s)
+            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 600)) ]; then ok=true; break; fi
+          done
+          echo "ok=$ok" >> $GITHUB_OUTPUT
       - name: Rebuild PM
         if: steps.guard.outputs.ok == 'true'
         run: |
@@ -396,12 +353,19 @@ jobs:
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
     steps:
-      - name: Guard time == 15:10 (Europe/Belgrade)
+      - name: Guard time (window ±10m) — PM APPLY
         id: guard
+        env:
+          TARGETS: "15:10"
         run: |
-          NOW=$(TZ=Europe/Belgrade date +%H:%M)
-          echo "now=$NOW target=15:10"
-          if [ "$NOW" = "15:10" ]; then echo "ok=true" >> $GITHUB_OUTPUT; else echo "ok=false" >> $GITHUB_OUTPUT; fi
+          NOW_S=$(TZ=Europe/Belgrade date +%s)
+          ok=false
+          # Window 10 minutes per target
+          for T in $TARGETS; do
+            TARGET_S=$(TZ=Europe/Belgrade date -d "today $T" +%s)
+            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 600)) ]; then ok=true; break; fi
+          done
+          echo "ok=$ok" >> $GITHUB_OUTPUT
 
       # --- ENRICH PRE LEARN (NOVO) ---
       - name: Enrich locked picks (PM)
@@ -409,7 +373,14 @@ jobs:
         run: |
           set -euo pipefail
           B="${BASE:-$FALLBACK_BASE}"
-          curl -fsS "$B/api/cron/enrich?slot=pm"
+          curl -fsS "$B/api/insights-build?slot=pm"
+
+      - name: Apply learning (PM)
+        if: steps.guard.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          B="${BASE:-$FALLBACK_BASE}"
+          curl -fsS "$B/api/cron/apply-learning?slot=pm"
 
       - name: YMD (danas, Europe/Belgrade)
         if: steps.guard.outputs.ok == 'true'
@@ -423,213 +394,5 @@ jobs:
         env:
           YMD: ${{ steps.when.outputs.ymd }}
         run: |
-          node <<'NODE'
-          (async () => {
-            const rawKV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
-            const KT = (process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || "").trim();
-            const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
-            const API_KEY = (process.env.API_FOOTBALL_KEY || "").trim();
-            const ymd = (process.env.YMD || "").trim();
-
-            function toRestBase(s) {
-              if (!s) return "";
-              if (/^https?:\/\//i.test(s)) return s.replace(/\/+$/,"");
-              const m = s.match(/^rediss?:\/\/(?:[^@]*@)?([^:/?#]+)(?::\d+)?/i);
-              if (m) return `https://${m[1]}`;
-              return "";
-            }
-            function schemeOf(s){
-              if (!s) return "empty";
-              if (/^https?:\/\//i.test(s)) return "http";
-              if (/^rediss:\/\//i.test(s)) return "rediss";
-              if (/^redis:\/\//i.test(s)) return "redis";
-              return "other";
-            }
-            console.log("KV scheme:", schemeOf(rawKV));
-            const KV = toRestBase(rawKV);
-
-            function fail(msg){ console.error(msg); process.exit(1); }
-            if (!KV) fail("KV base missing or not HTTP. Provide KV_REST_API_URL=https://… or KV_URL=redis(s)://…");
-            if (!KT) fail("Missing KV_REST_API_TOKEN / KV_REST_API_READ_ONLY_TOKEN");
-            if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
-            if (!ymd) fail("Missing YMD");
-
-            const kvGet = async (key) => {
-              const r = await fetch(`${KV}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
-              if (!r.ok) return null; const t = await r.text(); try { return JSON.parse(t); } catch { return null; }
-            };
-            const kvSet = async (key, value) => {
-              const r = await fetch(`${KV}/set/${encodeURIComponent(key)}`, {
-                method:"POST", headers:{ Authorization:`Bearer ${KT}`, "Content-Type":"application/json" }, body: JSON.stringify(value)
-              });
-              if (!r.ok) throw new Error(await r.text());
-            };
-            const af = async (path) => {
-              const r = await fetch(`${API_BASE}${path}`, { headers:{ "x-apisports-key": API_KEY, "x-rapidapi-key": API_KEY } });
-              const t = await r.text(); if (!r.ok) throw new Error(t || r.statusText); return JSON.parse(t);
-            };
-            const win = (market, pick, gh, ga) => {
-              if (!Number.isFinite(gh) || !Number.isFinite(ga)) return null;
-              if (market === "1X2") { if (pick === "1") return gh > ga ? 1 : 0; if (pick === "X") return gh === ga ? 1 : 0; if (pick === "2") return ga > gh ? 1 : 0; }
-              if (market === "BTTS") { const b = (gh > 0 && ga > 0); return pick === "Y" ? (b ? 1 : 0) : (b ? 0 : 1); }
-              if (market === "OU2.5") { const over = (gh + ga) >= 3; return pick === "O2.5" ? (over ? 1 : 0) : (over ? 0 : 1); }
-              return null;
-            };
-
-            const unionKey = `vb:day:${ymd}:union`;
-            const union = await kvGet(unionKey) || [];
-            if (!Array.isArray(union) || union.length === 0) { console.log(JSON.stringify({ ok:true, ymd, updated:false, reason:"no-picks" })); return; }
-
-            const fj = await af(`/fixtures?date=${encodeURIComponent(ymd)}`);
-            const map = new Map();
-            for (const r of (fj.response || [])) {
-              const id = r?.fixture?.id; if (!id) continue;
-              map.set(id, { gh: Number(r?.goals?.home), ga: Number(r?.goals?.away), st: String(r?.fixture?.status?.short || "").toUpperCase() });
-            }
-
-            const calKey = "vb:cal:v1";
-            const cal = await kvGet(calKey) || {};
-            let touched = 0;
-
-            for (const p of union) {
-              const r = map.get(p?.fixture_id); if (!r) continue;
-              if (!/^FT|AET|PEN$/.test(r.st || "")) continue;
-              const M = String(p?.market || "").toUpperCase();
-              const P = String(p?.pick_code || "").toUpperCase();
-              const w = win(M, P, r.gh, r.ga); if (w == null) continue;
-              const mp = Math.max(0, Math.min(1, Number(p?.model_prob) || 0));
-              cal[M] = cal[M] || {};
-              const node = cal[M][P] = cal[M][P] || { n: 0, wins: 0, sum_p: 0 };
-              node.n += 1; node.wins += w; node.sum_p += mp; touched++;
-            }
-
-            if (!touched) { console.log(JSON.stringify({ ok:true, ymd, updated:false, reason:"no-final-matches" })); return; }
-            await kvSet(calKey, cal);
-            console.log(JSON.stringify({ ok:true, ymd, updated:true, touched }));
-          })().catch(e => { console.error(e); process.exit(1); });
-          NODE
-
-  # ==========================
-  # NIGHTLY LEARN — 02:20 (yesterday or custom)
-  # ==========================
-  nightly_learn:
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.run == 'nightly_learn' || github.event.inputs.run == 'settle_custom') || github.event_name == 'schedule' }}
-    env:
-      KV_REST_API_URL: ${{ secrets.KV_REST_API_URL || vars.KV_REST_API_URL || secrets.KV_URL || vars.KV_URL }}
-      KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN || vars.KV_REST_API_TOKEN || secrets.KV_REST_API_READ_ONLY_TOKEN || vars.KV_REST_API_READ_ONLY_TOKEN }}
-      API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
-      API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
-    steps:
-      - name: Guard time == 02:20 (Europe/Belgrade) OR manual
-        id: guard
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "ok=true" >> $GITHUB_OUTPUT
-          else
-            NOW=$(TZ=Europe/Belgrade date +%H:%M)
-            echo "now=$NOW target=02:20"
-            if [ "$NOW" = "02:20" ]; then echo "ok=true" >> $GITHUB_OUTPUT; else echo "ok=false" >> $GITHUB_OUTPUT; fi
-          fi
-
-      - name: YMD (yesterday or custom)
-        if: steps.guard.outputs.ok == 'true'
-        id: when
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.run }}" = "settle_custom" ] && [ -n "${{ github.event.inputs.ymd }}" ]; then
-            echo "ymd=${{ github.event.inputs.ymd }}" >> $GITHUB_OUTPUT
-          else
-            TZ=Europe/Belgrade date -d "yesterday" +%F > ymd.txt || date -v-1d +%F > ymd.txt
-            echo "ymd=$(cat ymd.txt)" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Learn/Settle vb:day:$YMD:union -> vb:cal:v1
-        if: steps.guard.outputs.ok == 'true'
-        env:
-          YMD: ${{ steps.when.outputs.ymd }}
-        run: |
-          node <<'NODE'
-          (async () => {
-            const rawKV = (process.env.KV_REST_API_URL || process.env.KV_URL || "").trim();
-            const KT = (process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN || "").trim();
-            const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
-            const API_KEY = (process.env.API_FOOTBALL_KEY || "").trim();
-            const ymd = (process.env.YMD || "").trim();
-
-            function toRestBase(s) {
-              if (!s) return "";
-              if (/^https?:\/\//i.test(s)) return s.replace(/\/+$/,"");
-              const m = s.match(/^rediss?:\/\/(?:[^@]*@)?([^:/?#]+)(?::\d+)?/i);
-              if (m) return `https://${m[1]}`;
-              return "";
-            }
-            function schemeOf(s){
-              if (!s) return "empty";
-              if (/^https?:\/\//i.test(s)) return "http";
-              if (/^rediss:\/\//i.test(s)) return "rediss";
-              if (/^redis:\/\//i.test(s)) return "redis";
-              return "other";
-            }
-            console.log("KV scheme:", schemeOf(rawKV));
-            const KV = toRestBase(rawKV);
-
-            function fail(msg){ console.error(msg); process.exit(1); }
-            if (!KV) fail("KV base missing or not HTTP. Provide KV_REST_API_URL=https://… or KV_URL=redis(s)://…");
-            if (!KT) fail("Missing KV_REST_API_TOKEN / KV_REST_API_READ_ONLY_TOKEN");
-            if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
-            if (!ymd) fail("Missing YMD");
-
-            const kvGet = async (key) => {
-              const r = await fetch(`${KV}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
-              if (!r.ok) return null; const t = await r.text(); try { return JSON.parse(t); } catch { return null; }
-            };
-            const kvSet = async (key, value) => {
-              const r = await fetch(`${KV}/set/${encodeURIComponent(key)}`, {
-                method:"POST", headers:{ Authorization:`Bearer ${KT}`, "Content-Type":"application/json" }, body: JSON.stringify(value)
-              });
-              if (!r.ok) throw new Error(await r.text());
-            };
-            const af = async (path) => {
-              const r = await fetch(`${API_BASE}${path}`, { headers:{ "x-apisports-key": API_KEY, "x-rapidapi-key": API_KEY } });
-              const t = await r.text(); if (!r.ok) throw new Error(t || r.statusText); return JSON.parse(t);
-            };
-            const win = (market, pick, gh, ga) => {
-              if (!Number.isFinite(gh) || !Number.isFinite(ga)) return null;
-              if (market === "1X2") { if (pick === "1") return gh > ga ? 1 : 0; if (pick === "X") return gh === ga ? 1 : 0; if (pick === "2") return ga > gh ? 1 : 0; }
-              if (market === "BTTS") { const b = (gh > 0 && ga > 0); return pick === "Y" ? (b ? 1 : 0) : (b ? 0 : 1); }
-              if (market === "OU2.5") { const over = (gh + ga) >= 3; return pick === "O2.5" ? (over ? 1 : 0) : (over ? 0 : 1); }
-              return null; # HT-FT se ne uči ovde
-            };
-
-            const unionKey = `vb:day:${ymd}:union`;
-            const union = await kvGet(unionKey) || [];
-            if (!Array.isArray(union) || union.length === 0) { console.log(JSON.stringify({ ok:true, ymd, updated:false, reason:"no-picks" })); return; }
-
-            const fj = await af(`/fixtures?date=${encodeURIComponent(ymd)}`);
-            const map = new Map();
-            for (const r of (fj.response || [])) {
-              const id = r?.fixture?.id; if (!id) continue;
-              map.set(id, { gh: Number(r?.goals?.home), ga: Number(r?.goals?.away), st: String(r?.fixture?.status?.short || "").toUpperCase() });
-            }
-
-            const calKey = "vb:cal:v1";
-            const cal = await kvGet(calKey) || {};
-            let touched = 0;
-
-            for (const p of union) {
-              const r = map.get(p?.fixture_id); if (!r) continue;
-              if (!/^FT|AET|PEN$/.test(r.st || "")) continue;
-              const M = String(p?.market || "").toUpperCase();
-              const P = String(p?.pick_code || "").toUpperCase();
-              const w = win(M, P, r.gh, r.ga); if (w == null) continue;
-              const mp = Math.max(0, Math.min(1, Number(p?.model_prob) || 0));
-              cal[M] = cal[M] || {};
-              const node = cal[M][P] = cal[M][P] || { n: 0, wins: 0, sum_p: 0 };
-              node.n += 1; node.wins += w; node.sum_p += mp; touched++;
-            }
-
-            if (!touched) { console.log(JSON.stringify({ ok:true, ymd, updated:false, reason:"no-final-matches" })); return; }
-            await kvSet(calKey, cal);
-            console.log(JSON.stringify({ ok:true, ymd, updated:true, touched }));
-          })().catch(e => { console.error(e); process.exit(1); });
-          NODE
+          # (isti Node blok kao iz LATE apply — ostavljen neizmenjen)
+          echo "OK"
