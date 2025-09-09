@@ -14,16 +14,17 @@ on:
         description: "Slot to run (auto|am|pm|late)"
         required: false
         default: "auto"
-        type: choice
-        options: [auto, am, pm, late]
       base:
-        description: "Override base URL (optional)"
+        description: "Base URL (override)"
         required: false
         default: ""
-        type: string
+
+concurrency:
+  group: snapshots-fixed-${{ github.run_id }}-${{ github.event.schedule || 'manual' }}
+  cancel-in-progress: false
 
 jobs:
-  snapshots:
+  run:
     runs-on: ubuntu-latest
     env:
       TZ: Europe/Belgrade
@@ -40,40 +41,50 @@ jobs:
           set -euo pipefail
 
           # Base URL
-          BASE="${INP_BASE:-}"
-          if [ -z "$BASE" ]; then
-            BASE="${FALLBACK_BASE}"
-          fi
-          echo "BASE=$BASE"
-          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          BASE="$INP_BASE"
+          if [ -z "$BASE" ]; then BASE="$FALLBACK_BASE"; fi
 
-          # Determine slot
-          SLOT=""
-          if [ -n "${INP_SLOT:-}" ] && [ "${INP_SLOT}" != "auto" ]; then
+          # Slot (if auto)
+          if [ "${INP_SLOT:-auto}" != "auto" ]; then
             SLOT="${INP_SLOT}"
-          elif [ -n "${SCH:-}" ]; then
-            case "$SCH" in
-              "0 8 * * *")  SLOT="am"  ;;  # 10:00 SRB
-              "0 13 * * *") SLOT="pm"  ;;  # 15:00 SRB
-              "0 22 * * *") SLOT="late";;  # 00:00 SRB
-              *)            SLOT="am"  ;;
-            esac
           else
-            HOUR=$(TZ=Europe/Belgrade date +%H)
-            if   [ "$HOUR" -lt 10 ]; then SLOT="late"
-            elif [ "$HOUR" -lt 15 ]; then SLOT="am"
-            else SLOT="pm"
-            fi
+            case "$SCH" in
+              "0 8 * * *")  SLOT="am"  ;;
+              "0 13 * * *") SLOT="pm"  ;;
+              "0 22 * * *") SLOT="late";;
+              *) # fallback po lokalnom satu
+                 H=$(TZ=Europe/Belgrade date +%H)
+                 if [ "$H" -lt 10 ]; then SLOT="late";
+                 elif [ "$H" -lt 15 ]; then SLOT="am";
+                 else SLOT="pm"; fi
+                 ;;
+            esac
           fi
-          echo "SLOT=$SLOT"
-          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
 
-          # Local date (SRB)
           YMD=$(TZ=Europe/Belgrade date +%F)
-          echo "YMD=$YMD"
-          echo "ymd=$YMD" >> "$GITHUB_OUTPUT"
 
-      - name: Refresh odds (batch)
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
+          echo "ymd=$YMD"   >> "$GITHUB_OUTPUT"
+
+          echo "BASE=$BASE"
+          echo "SLOT=$SLOT"
+          echo "YMD=$YMD"
+
+      # 1) Rebuild (prvi prolaz: povuci mečeve, pokušaj pickove)
+      - name: Rebuild snapshot (pass 1)
+        env:
+          BASE: ${{ steps.ctx.outputs.base }}
+          SLOT: ${{ steps.ctx.outputs.slot }}
+        run: |
+          set -euo pipefail
+          echo "::group::rebuild-1"
+          curl -fsSL "$BASE/api/cron/rebuild?slot=$SLOT&debug=1" | tee /tmp/rebuild-1.json
+          echo "::endgroup::"
+          sleep 2
+
+      # 2) Refresh odds (posle prvog rebuild-a) + force seed
+      - name: Refresh odds (batch, force)
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
@@ -81,22 +92,25 @@ jobs:
           set -euo pipefail
           for i in 1 2; do
             echo "::group::refresh-odds [$i]"
-            curl -fsSL "$BASE/api/cron/refresh-odds?slot=$SLOT" | tee "/tmp/refresh-$i.json"
+            curl -fsSL "$BASE/api/cron/refresh-odds?slot=$SLOT&force=1" | tee "/tmp/refresh-$i.json"
             echo "::endgroup::"
             sleep 3
           done
 
-      - name: Rebuild snapshot
+      # 3) Rebuild (drugi prolaz: sada sa osveženim kvotama/locked)
+      - name: Rebuild snapshot (final)
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
         run: |
           set -euo pipefail
-          echo "::group::rebuild"
-          curl -fsSL "$BASE/api/cron/rebuild?slot=$SLOT" | tee /tmp/rebuild.json
+          echo "::group::rebuild-2"
+          curl -fsSL "$BASE/api/cron/rebuild?slot=$SLOT&debug=1" | tee /tmp/rebuild-2.json
           echo "::endgroup::"
+          sleep 2
 
-      - name: Build insights (why bullets)
+      # 4) Insights (Zašto…)
+      - name: Build insights
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
@@ -106,6 +120,7 @@ jobs:
           curl -fsSL "$BASE/api/insights-build?slot=$SLOT" | tee /tmp/insights.json
           echo "::endgroup::"
 
+      # 5) Apply learning
       - name: Apply learning
         env:
           BASE: ${{ steps.ctx.outputs.base }}
@@ -116,6 +131,7 @@ jobs:
           curl -fsSL "$BASE/api/cron/apply-learning?slot=$SLOT" | tee /tmp/learn.json
           echo "::endgroup::"
 
+      # 6) Sanity check
       - name: Sanity check (locked feed)
         env:
           BASE: ${{ steps.ctx.outputs.base }}
