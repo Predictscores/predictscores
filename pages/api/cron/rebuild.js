@@ -1,15 +1,7 @@
 // pages/api/cron/rebuild.js
-// Rekonstrukcija "locked" feed-a za slot + upis dnevnih “tickets” (BTTS / OU2.5 / HT-FT).
+// Rekonstrukcija "locked" feed-a za slot + upis dnevnih “tickets”.
 // Slotovi (Europe/Belgrade): late 00–09, am 10–14, pm 15–23.
-// Pravila: bez U-liga/Primavera/Youth, MIN_ODDS ≥ 1.50 (koristi se i za tickets).
-// Upisi:
-//  - vb:day:<YMD>:(<slot>|union|last)   [BOXED]
-//  - vbl_full:<YMD>:<slot>               [PLAIN ARRAY]
-//  - vbl:<YMD>:<slot>                    [PLAIN ARRAY, kratka lista]
-//  - vb:day:<YMD>:combined               [BOXED Top-3 za dan]
-//  - hist:<YMD> (ako je prazan)          [BOXED seed iz combined]
-//  - tickets:<YMD>:<slot>                [PLAIN {btts,ou25,htft}]
-//  - tickets:<YMD>                       [PLAIN merge & trim po marketu]
+// Fixtures: API_FOOTBALL_KEY; Odds: ODDS_API_KEY (fallback na API_FOOTBALL_KEY)
 
 export const config = { api: { bodyParser: false } };
 
@@ -19,7 +11,7 @@ const MIN_ODDS = 1.5;    // min kvota za SVE markete (1X2 + tickets)
 const LANES = 4;         // paralelizacija za /odds
 const TICKETS_PER_MARKET = Number(process.env.TICKETS_PER_MARKET || 4);
 
-/* ---------------- KV (Vercel REST) ---------------- */
+/* ---------------- KV ---------------- */
 function kvCfgs() {
   const url = (process.env.KV_REST_API_URL || "").replace(/\/+$/, "");
   const rw  = process.env.KV_REST_API_TOKEN || "";
@@ -69,7 +61,6 @@ function arrFromAny(x){
   if (!x) return null;
   if (Array.isArray(x)) return x;
   if (typeof x === "object" && x) {
-    // heuristike
     if (Array.isArray(x.value)) return x.value;
     if (typeof x.value === "string") {
       const v = J(x.value); if (Array.isArray(v)) return v;
@@ -113,13 +104,8 @@ function hourInTZ(d=new Date(), tz=TZ){
   return parseInt(fmt.format(d),10);
 }
 function deriveSlot(h){ if (h<10) return "late"; if (h<15) return "am"; return "pm"; }
-function kickoffDate(x){
-  const s = (x?.kickoff || x?.datetime_local?.starting_at?.date_time || x?.datetime_local?.date_time || x?.fixture?.date || "").toString();
-  const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
-  return m ? m[1] : null;
-}
 function implied(odd){ const o = Number(odd||0); if (!isFinite(o) || o<=0) return 0; return 1/o; }
-function scoreForSort(x){ // kombinacija confidence + edge (prox: prob - implied)
+function scoreForSort(x){
   const mp = Math.max(0, Math.min(1, Number(x?.model_prob) || 0));
   const imp = implied(x?.odds?.price || x?.market_odds || 0);
   const edge = Math.max(0, mp - imp);
@@ -139,11 +125,7 @@ function dedupByFixture(arr){
   }
   return Array.from(bag.values());
 }
-const YOUTH_PATTERNS = [
-  /\bU(-|\s)?(17|18|19|20|21|22|23)\b/i,
-  /\bPrimavera\b/i,
-  /\bYouth\b/i,
-];
+const YOUTH_PATTERNS = [ /\bU(-|\s)?(17|18|19|20|21|22|23)\b/i, /\bPrimavera\b/i, /\bYouth\b/i ];
 function isYouthOrBanned(item){
   const ln = (item?.league_name || item?.league?.name || "").toString();
   const tnH = (item?.home || item?.teams?.home?.name || "").toString();
@@ -153,13 +135,14 @@ function isYouthOrBanned(item){
 }
 
 /* ---------------- API-Football ---------------- */
-function afKey(){ return process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || ""; }
-async function afFetch(path, params={}){
-  const key = afKey();
-  if (!key) throw new Error("Missing API-Football key");
-  const url = new URL(`https://v3.football.api-sports.io${path}`);
+const AF_BASE = "https://v3.football.api-sports.io";
+const afFixturesHeaders = () => ({ "x-apisports-key": (process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || "").trim() });
+const afOddsHeaders     = () => ({ "x-apisports-key": (process.env.ODDS_API_KEY || process.env.API_FOOTBALL_KEY || "").trim() });
+
+async function afFetch(path, params={}, headers=afFixturesHeaders()){
+  const url = new URL(`${AF_BASE}${path}`);
   Object.entries(params).forEach(([k,v])=> (v!=null) && url.searchParams.set(k,String(v)));
-  const r = await fetch(url, { headers:{ "x-apisports-key": key }, cache:"no-store" });
+  const r = await fetch(url, { headers, cache:"no-store" });
   const ct = r.headers.get("content-type")||"";
   const t = await r.text();
   if (!ct.includes("application/json")) throw new Error(`AF non-JSON ${r.status}: ${t.slice(0,120)}`);
@@ -178,7 +161,6 @@ function mapFixtureToItem(fx){
     league_country: fx?.league?.country,
     teams: { home: fx?.teams?.home?.name, away: fx?.teams?.away?.name, home_id: fx?.teams?.home?.id, away_id: fx?.teams?.away?.id },
     home: fx?.teams?.home?.name, away: fx?.teams?.away?.name,
-    datetime_local: { starting_at: { date_time: fx?.fixture?.date?.replace("T"," ").slice(0,16) } },
     kickoff: (fx?.fixture?.date || "").replace("T"," ").slice(0,16),
     kickoff_utc: kick,
     market: "1X2",
@@ -191,36 +173,39 @@ function mapFixtureToItem(fx){
   };
 }
 
-/* -------- robust fixtures for date (handles backfill) -------- */
+/* -------- robust fixtures for date (bez `page` na prvom upitu) -------- */
 async function fetchAllFixturesForDate(ymd){
   const tries = [
     { tag: "date+tz",    params: { date: ymd, timezone: TZ } },
     { tag: "date",       params: { date: ymd } },
-    { tag: "from-to+tz", params: { from: ymd, to: ymd, timezone: TZ } },
-    { tag: "from-to",    params: { from: ymd, to: ymd } },
+    { tag: "from-to",    params: { from: ymd, to: ymd } },       // bez timezone
     { tag: "date+UTC",   params: { date: ymd, timezone: "UTC" } },
   ];
   const HARD_CAP_PAGES = 12;
   const bag = new Map();
   for (const t of tries) {
-    let page = 1;
-    while (page <= HARD_CAP_PAGES) {
-      const jf = await afFetch("/fixtures", { ...t.params, page });
+    // prvi upit bez page
+    const jf0 = await afFetch("/fixtures", { ...t.params }, afFixturesHeaders());
+    const arr0 = Array.isArray(jf0?.response) ? jf0.response : [];
+    for (const fx of arr0) {
+      const id = fx?.fixture?.id;
+      if (id && !bag.has(id)) bag.set(id, fx);
+    }
+    // dodatne strane samo ako paging.total > 1
+    const tot = Number(jf0?.paging?.total || 1);
+    for (let page = 2; page <= Math.min(tot, HARD_CAP_PAGES); page++) {
+      const jf = await afFetch("/fixtures", { ...t.params, page }, afFixturesHeaders());
       const arr = Array.isArray(jf?.response) ? jf.response : [];
       for (const fx of arr) {
         const id = fx?.fixture?.id;
         if (id && !bag.has(id)) bag.set(id, fx);
       }
-      const cur = Number(jf?.paging?.current || page);
-      const tot = Number(jf?.paging?.total || page);
-      if (!tot || cur >= tot) break;
-      page++;
     }
   }
   return Array.from(bag.values());
 }
 
-/* -------- 1X2 from bookmakers -------- */
+/* -------- 1X2 / BTTS / OU2.5 / HTFT helpers (isti kao ranije) -------- */
 function best1x2FromBookmakers(bookmakers, minOdds = MIN_ODDS) {
   let best = null, books = 0;
   for (const b of bookmakers || []) {
@@ -262,8 +247,6 @@ function best1x2FromBookmakers(bookmakers, minOdds = MIN_ODDS) {
   if (best) best.odds.books_count = Math.max(1, books);
   return best;
 }
-
-/* -------- BTTS -------- */
 function bestBTTS(bookmakers, minOdds = MIN_ODDS) {
   let best = null, books = 0;
   for (const b of bookmakers || []) {
@@ -293,8 +276,6 @@ function bestBTTS(bookmakers, minOdds = MIN_ODDS) {
   if (best) best.bookmakers_count = Math.max(1, books);
   return best;
 }
-
-// OU 2.5 (Over/Under line 2.5)
 function bestOU25(bookmakers, minOdds = MIN_ODDS) {
   let best = null, books = 0;
   const has25 = (s) => /\b2\.5\b/.test(String(s||""));
@@ -325,8 +306,6 @@ function bestOU25(bookmakers, minOdds = MIN_ODDS) {
   if (best) best.bookmakers_count = Math.max(1, books);
   return best;
 }
-
-// HT/FT (Half-Time/Full-Time)
 function bestHTFT(bookmakers, minOdds = MIN_ODDS) {
   let best = null, books = 0;
   const norm = (s) => String(s||"").toLowerCase();
@@ -338,17 +317,11 @@ function bestHTFT(bookmakers, minOdds = MIN_ODDS) {
       const vals = bet.values || [];
       const mapVal = (v) => {
         const val = norm(v.value);
-        // pokušaj normalizacije u "Home/Draw/Away"
-        const rep = val
-          .replace(/\b(home)\b/ig, "Home")
-          .replace(/\b(away)\b/ig, "Away")
-          .replace(/\b(draw)\b/ig, "Draw")
-          .replace(/\s+/g," ");
+        const rep = val.replace(/\b(home)\b/ig, "Home").replace(/\b(away)\b/ig, "Away").replace(/\b(draw)\b/ig, "Draw").replace(/\s+/g," ");
         return { label: v.value, odd: parseFloat(v.odd), rep };
       };
       const cand = vals.map(mapVal).filter(x => isFinite(x.odd) && x.odd >= minOdds);
       if (!cand.length) continue;
-      // normalizovana verovatnoća po marginama (uzmi sve ponuđene ishode koje bookmaker daje)
       const probs = cand.map(c => ({ ...c, p: 1/c.odd }));
       const S = probs.reduce((a,x)=>a+x.p, 0) || 1;
       probs.forEach(x => x.p /= S);
@@ -405,7 +378,7 @@ export default async function handler(req, res) {
     // 3) Filter out youth/primavera i sl.
     let items = (baseArr || []).filter(x => !isYouthOrBanned(x));
 
-    // 4) Popuni 1X2/tickets iz API-Football odds (paralelizacija)
+    // 4) Popuni 1X2/tickets iz AF odds (koristi ODDS_API_KEY ako postoji)
     const ids = items.map(x => x.fixture_id).filter(Boolean);
     const byId = new Map(items.map(x => [x.fixture_id, x]));
     const tickets = { btts: [], ou25: [], htft: [] };
@@ -415,7 +388,7 @@ export default async function handler(req, res) {
     const lane = async subset=>{
       for (const id of subset) {
         try {
-          const jo = await afFetch("/odds", { fixture: id });
+          const jo = await afFetch("/odds", { fixture: id }, afOddsHeaders());
           called++;
           const bookmakers = jo?.response?.[0]?.bookmakers || [];
 
@@ -434,8 +407,8 @@ export default async function handler(req, res) {
             }
           }
 
-          // TICKETS (BTTS / OU 2.5 / HT-FT)
-          const meta = byId.get(id); // sadrži league/teams/kickoff_utc
+          // TICKETS
+          const meta = byId.get(id);
           const base = meta ? {
             fixture_id: id,
             league: meta.league, league_name: meta.league_name, league_country: meta.league_country,
@@ -444,47 +417,22 @@ export default async function handler(req, res) {
           } : { fixture_id: id };
 
           const btts = bestBTTS(bookmakers, MIN_ODDS);
-          if (btts) {
-            tickets.btts.push({
-              ...base,
-              market: "BTTS",
-              market_label: "Both Teams To Score",
-              selection: btts.selection,
-              market_odds: btts.market_odds,
-              model_prob: btts.model_prob,
-              implied_prob: implied(btts.market_odds),
-              confidence_pct: Math.round(100 * btts.model_prob),
-              bookmakers_count: btts.bookmakers_count || 1,
-            });
-          }
+          if (btts) tickets.btts.push({ ...base, market:"BTTS", market_label:"Both Teams To Score",
+            selection:btts.selection, market_odds:btts.market_odds, model_prob:btts.model_prob,
+            implied_prob: implied(btts.market_odds), confidence_pct: Math.round(100*btts.model_prob),
+            bookmakers_count: btts.bookmakers_count || 1 });
+
           const ou25 = bestOU25(bookmakers, MIN_ODDS);
-          if (ou25) {
-            tickets.ou25.push({
-              ...base,
-              market: "OU 2.5",
-              market_label: "Over/Under 2.5",
-              selection: ou25.selection,
-              market_odds: ou25.market_odds,
-              model_prob: ou25.model_prob,
-              implied_prob: implied(ou25.market_odds),
-              confidence_pct: Math.round(100 * ou25.model_prob),
-              bookmakers_count: ou25.bookmakers_count || 1,
-            });
-          }
+          if (ou25) tickets.ou25.push({ ...base, market:"OU 2.5", market_label:"Over/Under 2.5",
+            selection:ou25.selection, market_odds:ou25.market_odds, model_prob:ou25.model_prob,
+            implied_prob: implied(ou25.market_odds), confidence_pct: Math.round(100*ou25.model_prob),
+            bookmakers_count: ou25.bookmakers_count || 1 });
+
           const htft = bestHTFT(bookmakers, MIN_ODDS);
-          if (htft) {
-            tickets.htft.push({
-              ...base,
-              market: "HT/FT",
-              market_label: "HT-FT",
-              selection: htft.selection,
-              market_odds: htft.market_odds,
-              model_prob: htft.model_prob,
-              implied_prob: implied(htft.market_odds),
-              confidence_pct: Math.round(100 * htft.model_prob),
-              bookmakers_count: htft.bookmakers_count || 1,
-            });
-          }
+          if (htft) tickets.htft.push({ ...base, market:"HT/FT", market_label:"HT-FT",
+            selection:htft.selection, market_odds:htft.market_odds, model_prob:htft.model_prob,
+            implied_prob: implied(htft.market_odds), confidence_pct: Math.round(100*htft.model_prob),
+            bookmakers_count: htft.bookmakers_count || 1 });
         } catch (e) {
           // ignore single-id failure
         }
@@ -505,7 +453,7 @@ export default async function handler(req, res) {
       );
     const shortList = withPicks.slice(0, TARGET_N);
 
-    // 6) Upis vbl/vb:day (bez brisanja union/last kad je prazno)
+    // 6) Upis vbl/vb:day
     const boxedFull  = JSON.stringify({ value: JSON.stringify(withPicks) });
     const boxedShort = JSON.stringify({ value: JSON.stringify(shortList) });
 
@@ -513,10 +461,8 @@ export default async function handler(req, res) {
     const kUnion = `vb:day:${ymd}:union`;
     const kLast  = `vb:day:${ymd}:last`;
 
-    // 6a) Slot – uvek upiši snapshot slota (može biti i prazan)
     const s1 = await kvSET(kSlot, boxedFull, diag);
 
-    // 6b) UNION = stari ∪ novi (dedup po fixture_id), ne prepisuj praznim
     const prevUnionRaw = (await kvGET(kUnion, diag)).raw;
     const prevUnionArr = arrFromAny(unpack(prevUnionRaw)) || [];
     const unionBag = new Map();
@@ -528,11 +474,8 @@ export default async function handler(req, res) {
     const unionMerged = Array.from(unionBag.values());
     const s2 = await kvSET(kUnion, JSON.stringify({ value: JSON.stringify(unionMerged) }), diag);
 
-    // 6c) LAST = ažuriraj samo ako ima novih pickova
     let s3 = null;
-    if (withPicks.length > 0) {
-      s3 = await kvSET(kLast, boxedFull, diag);
-    }
+    if (withPicks.length > 0) s3 = await kvSET(kLast, boxedFull, diag);
 
     const s4 = await kvSET(`vbl_full:${ymd}:${slot}`, JSON.stringify(withPicks), diag);
     const s5 = await kvSET(`vbl:${ymd}:${slot}`,      JSON.stringify(shortList), diag);
@@ -566,7 +509,7 @@ export default async function handler(req, res) {
     };
     const s7 = await kvSET(`tickets:${ymd}:${slot}`, JSON.stringify(slotTickets), diag);
 
-    // dnevni merge (uzmi postojeće, spoji, dedup po fixture_id, sort, trim)
+    // dnevni merge
     const dayRaw = (await kvGET(`tickets:${ymd}`, diag)).raw;
     const dayObj = dayRaw ? J(dayRaw) : { btts:[], ou25:[], htft:[] };
     const mergeCat = (oldArr, addArr) => {
@@ -576,12 +519,16 @@ export default async function handler(req, res) {
         if (!fid) continue;
         if (!bag.has(fid)) bag.set(fid, it);
         else {
-          // zadrži jači (viši confidence, pa raniji kickoff)
           const a = bag.get(fid), b = it;
-          if (sortTickets(b,a) < 0) bag.set(fid, b);
+          const cmp = (b.confidence_pct - a.confidence_pct) ||
+                      (Date.parse(a.kickoff_utc||0) - Date.parse(b.kickoff_utc||0));
+          if (cmp < 0) bag.set(fid, b);
         }
       }
-      return Array.from(bag.values()).sort(sortTickets).slice(0, TICKETS_PER_MARKET);
+      return Array.from(bag.values()).sort((a,b)=>
+        (b.confidence_pct - a.confidence_pct) ||
+        (Date.parse(a.kickoff_utc||0) - Date.parse(b.kickoff_utc||0))
+      ).slice(0, TICKETS_PER_MARKET);
     };
     const mergedDayTickets = {
       btts: mergeCat(dayObj.btts, slotTickets.btts),
