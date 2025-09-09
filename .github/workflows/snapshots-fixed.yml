@@ -2,15 +2,15 @@ name: Snapshots (AM/PM/LATE)
 
 on:
   schedule:
-    # AM 10:00 Europe/Belgrade -> 08:00 UTC (uz "airbag" -2/+2 min)
+    # AM 10:00 Europe/Belgrade -> 08:00 UTC (airbag -2/+2 min)
     - cron: "58 7 * * *"
     - cron: "0 8 * * *"
     - cron: "2 8 * * *"
-    # PM 15:00 Europe/Belgrade -> 13:00 UTC (uz "airbag" -2/+2 min)
+    # PM 15:00 Europe/Belgrade -> 13:00 UTC (airbag -2/+2 min)
     - cron: "58 12 * * *"
     - cron: "0 13 * * *"
     - cron: "2 13 * * *"
-    # LATE 00:00 Europe/Belgrade -> 22:00 UTC (prethodni dan po UTC; uz "airbag" -2/+2 min)
+    # LATE 00:00 Europe/Belgrade -> 22:00 UTC (prethodni dan UTC; airbag -2/+2 min)
     - cron: "58 21 * * *"
     - cron: "0 22 * * *"
     - cron: "2 22 * * *"
@@ -26,7 +26,6 @@ on:
         default: ""
 
 concurrency:
-  # Fiksna grupa da ne trče paralelno (drugi run čeka prvi i uradi samo precheck → skip)
   group: snapshots-fixed
   cancel-in-progress: false
 
@@ -56,46 +55,48 @@ jobs:
 
           # Base URL
           BASE="${INP_BASE:-}"
-          if [ -z "$BASE" ]; then BASE="$FALLBACK_BASE"; fi
+          if [ -z "$BASE" ]; then BASE="${FALLBACK_BASE:-}"; fi
 
-          # Mapiraj slot iz schedule stringa (ili auto)
+          # Slot (auto vs schedule)
           if [ "${INP_SLOT:-auto}" != "auto" ]; then
             SLOT="${INP_SLOT}"
           else
-            case "$SCH" in
-              "58 7 * * *"|"0 8 * * *"|"2 8 * * *")   SLOT="am"  ;;
-              "58 12 * * *"|"0 13 * * *"|"2 13 * * *") SLOT="pm"  ;;
-              "58 21 * * *"|"0 22 * * *"|"2 22 * * *") SLOT="late";;
-              *) # fallback po lokalnom satu (Belgrade)
-                 H=$(TZ="$TZ" date +%H)
-                 if [ "$H" -lt 10 ]; then SLOT="late";
-                 elif [ "$H" -lt 15 ]; then SLOT="am";
-                 else SLOT="pm"; fi
-                 ;;
+            case "${SCH:-}" in
+              "58 7 * * *"|"0 8 * * *"|"2 8 * * *")     SLOT="am"  ;;
+              "58 12 * * *"|"0 13 * * *"|"2 13 * * *")  SLOT="pm"  ;;
+              "58 21 * * *"|"0 22 * * *"|"2 22 * * *")  SLOT="late";;
+              *)  # fallback po lokalnom satu
+                  H=$(TZ="${TZ:-Europe/Belgrade}" date +%H)
+                  if [ "$H" -lt 10 ]; then SLOT="late";
+                  elif [ "$H" -lt 15 ]; then SLOT="am";
+                  else SLOT="pm"; fi
+                  ;;
             esac
           fi
 
-          YMD=$(TZ="$TZ" date +%F)
+          YMD=$(TZ="${TZ:-Europe/Belgrade}" date +%F)
 
-          # Minute-window guard (±10 min) oko 00:00 / 10:00 / 15:00 u Europe/Belgrade
-          now_hm=$(TZ="$TZ" date +%H:%M)
+          # Minute-window guard (±10 min) oko 00:00 / 10:00 / 15:00
+          now_hm=$(TZ="${TZ:-Europe/Belgrade}" date +%H:%M)
           H=${now_hm%%:*}; M=${now_hm##*:}
           m=$((10#$H*60 + 10#$M))
           mod=1440
 
-          dist() { # kružna udaljenost na 0..1439
-            local a=$1 b=$2 d=$(( (a - b) % mod ))
-            (( d<0 )) && d=$((d+mod))
-            local e=$(( mod - d ))
-            if (( d < e )); then echo $d; else echo $e; fi
+          circ_dist () {
+            local a b d e
+            a=${1:-0}; b=${2:-0}
+            d=$(( (a - b) % mod ))
+            (( d < 0 )) && d=$((d + mod))
+            e=$(( mod - d ))
+            if (( d < e )); then echo "$d"; else echo "$e"; fi
           }
 
           t_late=0
           t_am=$((10*60))
           t_pm=$((15*60))
-          d_late=$(dist $m $t_late)
-          d_am=$(dist $m $t_am)
-          d_pm=$(dist $m $t_pm)
+          d_late=$(circ_dist "$m" "$t_late")
+          d_am=$(circ_dist "$m" "$t_am")
+          d_pm=$(circ_dist "$m" "$t_pm")
 
           run_guard=false
           case "$SLOT" in
@@ -104,36 +105,40 @@ jobs:
             pm)   (( d_pm   <= 10 )) && run_guard=true ;;
           esac
 
-          if [ "$run_guard" != "true" ]; then
-            echo "Outside minute-window @ $now_hm $TZ (SLOT=$SLOT). Skipping."
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "base=$BASE" >> "$GITHUB_OUTPUT"
-            echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
-            echo "ymd=$YMD"   >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Precheck: ako već imamo locked vrednosti za slot (današnji), preskoči sve
-          resp=$(curl -fsS "$BASE/api/value-bets-locked?slot=$SLOT&slim=1" || echo "[]")
-          # Broj stavki robustno (radi i ako je array i ako je objekat)
-          count=$(echo "$resp" | jq -r 'if type=="array" then length elif has("items") then (.items|length) elif has("value") then (.value|length) else 0 end' 2>/dev/null || echo 0)
-
-          if [ "$count" -gt 0 ]; then
-            echo "Locked feed already present for $SLOT ($count items). Skipping heavy calls."
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "No locked feed for $SLOT yet → will run."
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          echo "base=$BASE" >> "$GITHUB_OUTPUT"
-          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
-          echo "ymd=$YMD"   >> "$GITHUB_OUTPUT"
-
           echo "BASE=$BASE"
           echo "SLOT=$SLOT"
           echo "YMD=$YMD"
-          echo "Within window: $run_guard | precheck count=$count"
+          echo "now=$now_hm ${TZ:-}"
+          echo "dist(late/am/pm)=$d_late/$d_am/$d_pm | guard=$run_guard"
+
+          if [ "$run_guard" != "true" ]; then
+            {
+              echo "run=false"
+              echo "base=$BASE"
+              echo "slot=$SLOT"
+              echo "ymd=$YMD"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Precheck: ako locked feed već postoji za taj slot, preskoči teške korake
+          resp="$(curl -fsS "$BASE/api/value-bets-locked?slot=$SLOT&slim=1" || echo "[]")"
+          count="$( (echo "$resp" | jq -r 'if type=="array" then length elif has("items") then (.items|length) elif has("value") then (try (.value|length) // 0) else 0 end') 2>/dev/null || echo 0 )"
+
+          if [ "${count:-0}" -gt 0 ]; then
+            echo "Locked feed already present for $SLOT ($count items). Skipping heavy calls."
+            run_value=false
+          else
+            echo "No locked feed for $SLOT yet → will run."
+            run_value=true
+          fi
+
+          {
+            echo "run=$run_value"
+            echo "base=$BASE"
+            echo "slot=$SLOT"
+            echo "ymd=$YMD"
+          } >> "$GITHUB_OUTPUT"
 
       # 1) Rebuild (prvi prolaz)
       - name: Rebuild snapshot (pass 1)
@@ -205,7 +210,7 @@ jobs:
           curl -fsSL "$BASE/api/cron/apply-learning?slot=$SLOT" | tee /tmp/learn.json
           echo "::endgroup::"
 
-      # 6) Sanity check
+      # 6) Sanity check (uvek OK, ne pravi dodatne AF pozive)
       - name: Sanity check (locked feed)
         env:
           BASE: ${{ steps.ctx.outputs.base }}
