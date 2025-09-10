@@ -71,17 +71,17 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run == 'rebuild_late' || github.event_name == 'schedule' }}
     steps:
-      - name: Guard time (window ±10m) — LATE REBUILD
+      - name: Guard time (window ±15m) — LATE REBUILD
         id: guard
         env:
           TARGETS: "00:00 00:05"
         run: |
           NOW_S=$(TZ=Europe/Belgrade date +%s)
           ok=false
-          # Window 10 minutes per target
+          # Window 15 minutes per target
           for T in $TARGETS; do
             TARGET_S=$(TZ=Europe/Belgrade date -d "today $T" +%s)
-            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 600)) ]; then ok=true; break; fi
+            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 900)) ]; then ok=true; break; fi
           done
           echo "ok=$ok" >> $GITHUB_OUTPUT
       - name: Rebuild LATE
@@ -96,6 +96,7 @@ jobs:
   # ==========================
   apply_late:
     runs-on: ubuntu-latest
+    needs: rebuild_late
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run == 'apply_late' || github.event_name == 'schedule' }}
     env:
       KV_REST_API_URL: ${{ secrets.KV_REST_API_URL || vars.KV_REST_API_URL || secrets.KV_URL || vars.KV_URL }}
@@ -103,21 +104,20 @@ jobs:
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
     steps:
-      - name: Guard time (window ±10m) — LATE APPLY
+      - name: Guard time (window ±15m) — LATE APPLY
         id: guard
         env:
           TARGETS: "00:10"
         run: |
           NOW_S=$(TZ=Europe/Belgrade date +%s)
           ok=false
-          # Window 10 minutes per target
+          # Window 15 minutes per target
           for T in $TARGETS; do
             TARGET_S=$(TZ=Europe/Belgrade date -d "today $T" +%s)
-            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 600)) ]; then ok=true; break; fi
+            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 900)) ]; then ok=true; break; fi
           done
           echo "ok=$ok" >> $GITHUB_OUTPUT
 
-      # --- ENRICH PRE LEARN (NOVO) ---
       - name: Enrich locked picks (LATE)
         if: steps.guard.outputs.ok == 'true'
         run: |
@@ -151,84 +151,32 @@ jobs:
             const API_BASE = (process.env.API_FOOTBALL_BASE_URL || "https://v3.football.api-sports.io").replace(/\/+$/,"");
             const API_KEY = (process.env.API_FOOTBALL_KEY || "").trim();
             const ymd = (process.env.YMD || "").trim();
-
-            function toRestBase(s) {
-              if (!s) return "";
-              if (/^https?:\/\//i.test(s)) return s.replace(/\/+$/,"");
-              const m = s.match(/^rediss?:\/\/(?:[^@]*@)?([^:/?#]+)(?::\d+)?/i);
-              if (m) return `https://${m[1]}`;
-              return "";
-            }
-            function schemeOf(s){
-              if (!s) return "empty";
-              if (/^https?:\/\//i.test(s)) return "http";
-              if (/^rediss:\/\//i.test(s)) return "rediss";
-              if (/^redis:\/\//i.test(s)) return "redis";
-              return "other";
-            }
-            function fail(msg){ console.error(msg); process.exit(1); }
-            const KV = toRestBase(rawKV); if (!KV) fail("Missing KV_REST_API_URL");
-            if (!KT) fail("Missing KV token");
-            if (!API_KEY) fail("Missing API_FOOTBALL_KEY");
-            if (!ymd) fail("Missing YMD");
-
-            const kvGet = async (key) => {
-              const r = await fetch(`${KV}/get/${encodeURIComponent(key)}`, { headers:{ Authorization: `Bearer ${KT}` } });
-              if (!r.ok) return null; const t = await r.text(); try { return JSON.parse(t); } catch { return null; }
-            };
-            const kvSet = async (key, value) => {
-              const r = await fetch(`${KV}/set/${encodeURIComponent(key)}`, {
-                method:"POST", headers:{ Authorization:`Bearer ${KT}`, "Content-Type":"application/json" }, body: JSON.stringify(value)
-              });
-              if (!r.ok) throw new Error(await r.text());
-            };
-            const af = async (path) => {
-              const r = await fetch(`${API_BASE}${path}`, { headers:{ "x-apisports-key": API_KEY, "x-rapidapi-key": API_KEY } });
-              const t = await r.text(); if (!r.ok) throw new Error(t || r.status);
-              try { return JSON.parse(t);} catch { return null; }
-            };
-
-            const unpack = (raw)=>{
-              if (!raw || typeof raw!=="string") return null;
-              try { const v=JSON.parse(raw); if (Array.isArray(v)) return v; if (v && typeof v==="object" && "value" in v) {
-                if (Array.isArray(v.value)) return v.value;
-                if (typeof v.value==="string") { try { const w=JSON.parse(v.value); if (Array.isArray(w)) return w; } catch {}
-              }} catch {}
-              return null;
-            };
-
-            const calKey = `vb:cal:${ymd}`;
-            const lastRaw = await kvGet(`vb:day:${ymd}:last`);
-            const arr = unpack(lastRaw && lastRaw.result ? lastRaw.result : lastRaw) || [];
-            const cal = (await (async()=>{ const r=await kvGet(calKey); return r && r.result ? JSON.parse(r.result) : (r||{}); })()) || {};
+            function toRestBase(s){ if(!s) return ""; if(/^https?:\/\//i.test(s)) return s.replace(/\/+$/,""); const m=s.match(/^rediss?:\/\/(?:[^@]*@)?([^:/?#]+)(?::\d+)?/i); return m?`https://${m[1]}`:""; }
+            function fail(m){ console.error(m); process.exit(1); }
+            const KV = toRestBase(rawKV); if(!KV) fail("Missing KV_REST_API_URL");
+            if(!KT) fail("Missing KV token"); if(!API_KEY) fail("Missing API_FOOTBALL_KEY"); if(!ymd) fail("Missing YMD");
+            const kvGet = async (k)=>{ const r=await fetch(`${KV}/get/${encodeURIComponent(k)}`, { headers:{ Authorization:`Bearer ${KT}` } }); if(!r.ok) return null; const t=await r.text(); try{return JSON.parse(t);}catch{return null;} };
+            const kvSet = async (k,v)=>{ const r=await fetch(`${KV}/set/${encodeURIComponent(k)}`, { method:"POST", headers:{ Authorization:`Bearer ${KT}`, "Content-Type":"application/json" }, body: JSON.stringify(v) }); if(!r.ok) throw new Error(await r.text()); };
+            const af = async (p)=>{ const r=await fetch(`${API_BASE}${p}`, { headers:{ "x-apisports-key": API_KEY, "x-rapidapi-key": API_KEY } }); const t=await r.text(); if(!r.ok) throw new Error(t||r.status); try{return JSON.parse(t);}catch{return null;} };
+            const unpack=(raw)=>{ if(!raw||typeof raw!=="string") return null; try{ const v=JSON.parse(raw); if(Array.isArray(v)) return v; if(v&&typeof v==="object"&&"value" in v){ if(Array.isArray(v.value)) return v.value; if(typeof v.value==="string"){ try{ const w=JSON.parse(v.value); if(Array.isArray(w)) return w; }catch{} } }catch{} return null; };
+            const calKey=`vb:cal:${ymd}`;
+            const lastRaw=await kvGet(`vb:day:${ymd}:last`);
+            const arr=unpack(lastRaw && lastRaw.result ? lastRaw.result : lastRaw) || [];
+            const cal=(await (async()=>{ const r=await kvGet(calKey); return r && r.result ? JSON.parse(r.result) : (r||{}); })()) || {};
             let touched=0;
-            for (const p of arr) {
-              const M = (p.market_label || p.market || "").trim();
-              const P = (p.pick_code || p.pick || "").trim();
-              if (!M || !P) continue;
-              const ymdKick = String(p.kickoff_utc||"").slice(0,10);
-              // status iz FIXTURE-a
-              const fxId = Number(p.fixture?.id || p.fixture_id || 0);
-              let w = 0;
-              if (fxId) {
-                const fx = await af(`/fixtures?id=${fxId}`);
-                const st = String(fx?.response?.[0]?.fixture?.status?.short||"");
-                const goals = fx?.response?.[0]?.goals;
-                if (st==="FT" || st==="AET" || st==="PEN") {
-                  // grubo: rezultat pobede za 1X2 (ostalo ostaje 0/1 po picku ako imaš detaljnu logiku)
-                  // ovde ostaje minimalni seed – prava evaluacija ide u history-settle
-                }
-              }
-              const mp = Math.max(0, Math.min(1, Number(p?.model_prob) || 0));
-              cal[M] = cal[M] || {};
-              const node = cal[M][P] = cal[M][P] || { n: 0, wins: 0, sum_p: 0 };
-              node.n += 1; node.wins += w; node.sum_p += mp; touched++;
+            for(const p of arr){
+              const M=(p.market_label||p.market||"").trim();
+              const P=(p.pick_code||p.pick||"").trim();
+              if(!M||!P) continue;
+              const fxId=Number(p.fixture?.id||p.fixture_id||0);
+              let w=0; if(fxId){ const fx=await af(`/fixtures?id=${fxId}`); const st=String(fx?.response?.[0]?.fixture?.status?.short||""); if(st==="FT"||st==="AET"||st==="PEN"){ /* settle logic minimal */ } }
+              const mp=Math.max(0, Math.min(1, Number(p?.model_prob)||0));
+              cal[M]=cal[M]||{}; const node=cal[M][P]=cal[M][P]||{n:0,wins:0,sum_p:0};
+              node.n+=1; node.wins+=w; node.sum_p+=mp; touched++;
             }
-
-            if (!touched) { console.log(JSON.stringify({ ok:true, ymd, updated:false, reason:"no-final-matches" })); return; }
-            await kvSet(calKey, cal);
-            console.log(JSON.stringify({ ok:true, ymd, updated:true, touched }));
-          })().catch(e => { console.error(e); process.exit(1); });
+            if(!touched){ console.log(JSON.stringify({ok:true, ymd, updated:false, reason:"no-final-matches"})); return; }
+            await kvSet(calKey, cal); console.log(JSON.stringify({ok:true, ymd, updated:true, touched}));
+          })().catch(e=>{ console.error(e); process.exit(1); });
           NODE
 
   # ==========================
@@ -238,17 +186,17 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run == 'rebuild_am' || github.event_name == 'schedule' }}
     steps:
-      - name: Guard time (window ±10m) — AM REBUILD
+      - name: Guard time (window ±15m) — AM REBUILD
         id: guard
         env:
           TARGETS: "10:00 10:05"
         run: |
           NOW_S=$(TZ=Europe/Belgrade date +%s)
           ok=false
-          # Window 10 minutes per target
+          # Window 15 minutes per target
           for T in $TARGETS; do
             TARGET_S=$(TZ=Europe/Belgrade date -d "today $T" +%s)
-            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 600)) ]; then ok=true; break; fi
+            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 900)) ]; then ok=true; break; fi
           done
           echo "ok=$ok" >> $GITHUB_OUTPUT
       - name: Rebuild AM
@@ -263,6 +211,7 @@ jobs:
   # ==========================
   apply_am:
     runs-on: ubuntu-latest
+    needs: rebuild_am
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run == 'apply_am' || github.event_name == 'schedule' }}
     env:
       KV_REST_API_URL: ${{ secrets.KV_REST_API_URL || vars.KV_REST_API_URL || secrets.KV_URL || vars.KV_URL }}
@@ -270,21 +219,20 @@ jobs:
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
     steps:
-      - name: Guard time (window ±10m) — AM APPLY
+      - name: Guard time (window ±15m) — AM APPLY
         id: guard
         env:
           TARGETS: "10:10"
         run: |
           NOW_S=$(TZ=Europe/Belgrade date +%s)
           ok=false
-          # Window 10 minutes per target
+          # Window 15 minutes per target
           for T in $TARGETS; do
             TARGET_S=$(TZ=Europe/Belgrade date -d "today $T" +%s)
-            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 600)) ]; then ok=true; break; fi
+            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 900)) ]; then ok=true; break; fi
           done
           echo "ok=$ok" >> $GITHUB_OUTPUT
 
-      # --- ENRICH PRE LEARN (NOVO) ---
       - name: Enrich locked picks (AM)
         if: steps.guard.outputs.ok == 'true'
         run: |
@@ -321,17 +269,17 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run == 'rebuild_pm' || github.event_name == 'schedule' }}
     steps:
-      - name: Guard time (window ±10m) — PM REBUILD
+      - name: Guard time (window ±15m) — PM REBUILD
         id: guard
         env:
           TARGETS: "15:00 15:05"
         run: |
           NOW_S=$(TZ=Europe/Belgrade date +%s)
           ok=false
-          # Window 10 minutes per target
+          # Window 15 minutes per target
           for T in $TARGETS; do
             TARGET_S=$(TZ=Europe/Belgrade date -d "today $T" +%s)
-            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 600)) ]; then ok=true; break; fi
+            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 900)) ]; then ok=true; break; fi
           done
           echo "ok=$ok" >> $GITHUB_OUTPUT
       - name: Rebuild PM
@@ -346,6 +294,7 @@ jobs:
   # ==========================
   apply_pm:
     runs-on: ubuntu-latest
+    needs: rebuild_pm
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run == 'apply_pm' || github.event_name == 'schedule' }}
     env:
       KV_REST_API_URL: ${{ secrets.KV_REST_API_URL || vars.KV_REST_API_URL || secrets.KV_URL || vars.KV_URL }}
@@ -353,21 +302,20 @@ jobs:
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY || vars.API_FOOTBALL_KEY }}
       API_FOOTBALL_BASE_URL: ${{ secrets.API_FOOTBALL_BASE_URL || vars.API_FOOTBALL_BASE_URL }}
     steps:
-      - name: Guard time (window ±10m) — PM APPLY
+      - name: Guard time (window ±15m) — PM APPLY
         id: guard
         env:
           TARGETS: "15:10"
         run: |
           NOW_S=$(TZ=Europe/Belgrade date +%s)
           ok=false
-          # Window 10 minutes per target
+          # Window 15 minutes per target
           for T in $TARGETS; do
             TARGET_S=$(TZ=Europe/Belgrade date -d "today $T" +%s)
-            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 600)) ]; then ok=true; break; fi
+            if [ "$NOW_S" -ge "$TARGET_S" ] && [ "$NOW_S" -lt $((TARGET_S + 900)) ]; then ok=true; break; fi
           done
           echo "ok=$ok" >> $GITHUB_OUTPUT
 
-      # --- ENRICH PRE LEARN (NOVO) ---
       - name: Enrich locked picks (PM)
         if: steps.guard.outputs.ok == 'true'
         run: |
