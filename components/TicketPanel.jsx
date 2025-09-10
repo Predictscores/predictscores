@@ -1,22 +1,16 @@
-// FILE: components/TicketPanel.jsx
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
 
-// Maks kvote po kategoriji (možeš prebaciti u ENV ako želiš)
 const MAX_BTTS = Number(process.env.NEXT_PUBLIC_TKT_MAX_ODDS_BTTS || 4.0);
 const MAX_OU   = Number(process.env.NEXT_PUBLIC_TKT_MAX_ODDS_OU   || 4.0);
 const MAX_HTFT = Number(process.env.NEXT_PUBLIC_TKT_MAX_ODDS_HTFT || 9.0);
 
-// Default filteri
-const MIN_CONF = 0;          // ti ćeš odlučiti na UI filteru; ovde default=0
-const MIN_BKS_OU_BTTS = 1;   // minimalan broj bukija (po želji pooštri)
+const MIN_CONF = 0;
+const MIN_BKS_OU_BTTS = 1;
 const MIN_BKS_HTFT = 1;
 
-// Pomoćne
-const toTime = (iso) => {
-  try { return new Date(String(iso)); } catch { return null; }
-};
+const toTime = (iso) => { try { return new Date(String(iso)); } catch { return null; } };
 const niceTime = (iso) => {
   const d = toTime(iso);
   return d ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—";
@@ -41,7 +35,6 @@ function meetsBookies(kind, n) {
   return true;
 }
 
-// Čitanje ?slot iz URL-a, ako nije prosleđen kroz prop
 function slotFromUrl() {
   if (typeof window === "undefined") return undefined;
   try {
@@ -50,7 +43,6 @@ function slotFromUrl() {
   } catch { return undefined; }
 }
 
-// Ako ne proslediš `bets`, komponenta sama čita locked feed
 function useLocked(slot) {
   const eff = slot ?? slotFromUrl();
   const [data, setData] = useState(null);
@@ -72,15 +64,6 @@ function useLocked(slot) {
   return { data, loading, err };
 }
 
-/**
- * Tickets right-rail panel (BTTS / OU 2.5 / HT/FT)
- *
- * Korišćenje:
- *   <TicketPanel />           // sam će da učita /api/value-bets-locked?slot=...
- *   <TicketPanel slot="pm" /> // eksplicitno za slot
- *
- * Ako ipak proslediš `bets`, koristiće njih (ali i dalje prikazuje samo BTTS/OU/HTFT).
- */
 export default function TicketPanel({
   bets,
   slot,
@@ -89,13 +72,10 @@ export default function TicketPanel({
   hideFriendlies = false,
   minConfidence = MIN_CONF,
 }) {
-  // Ako nema bets, čitamo locked feed
   const { data, loading, err } = useLocked(bets?.length ? undefined : slot);
 
-  // Izvor podataka: ili `bets` (ako prosleđeno), ili `data.tickets.*`
   const source = useMemo(() => {
     if (Array.isArray(bets) && bets.length > 0) {
-      // očekujemo da su to već "ticket-like" zapisi
       return {
         btts: bets.filter(p => String(p.market || p.market_label).toLowerCase().includes("btts")),
         ou25: bets.filter(p => {
@@ -113,7 +93,6 @@ export default function TicketPanel({
     return { btts: t.btts || [], ou25: t.ou25 || [], htft: t.htft || [], cap: data?.policy_cap ?? 3 };
   }, [bets, data]);
 
-  // Primena filtera i rangiranje
   const lists = useMemo(() => {
     const cook = (arr, kind) => {
       const filtered = (arr || []).filter((t) => {
@@ -132,7 +111,7 @@ export default function TicketPanel({
           if (sb !== sa) return sb - sa;
           const tb = toTime(b.kickoff_utc)?.getTime() || 0;
           const ta = toTime(a.kickoff_utc)?.getTime() || 0;
-          return ta - tb; // ranije prvo
+          return ta - tb;
         });
       return sorted.slice(0, maxPerMarket);
     };
@@ -175,7 +154,7 @@ export default function TicketPanel({
                   className="rounded-xl bg-white/5 p-3"
                 >
                   <div className="text-sm font-semibold truncate">
-                    {(t.teams?.home || t.home?.name || "—")} — {(t.teams?.away || t.away?.name || "—")}
+                    {(t.teams?.home?.name || t.home || t.home?.name || "—")} — {(t.teams?.away?.name || t.away || t.away?.name || "—")}
                   </div>
                   <div className="mt-0.5 text-xs opacity-70 truncate">
                     {(t.league?.name || "—")} · {niceTime(t.kickoff_utc || t?.datetime_local?.starting_at?.date_time)}
