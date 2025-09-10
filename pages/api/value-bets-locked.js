@@ -4,6 +4,7 @@ import { } from 'url'; // placeholder: zadržava ES module sintaksu u Next okru�
 export const config = { api: { bodyParser: false } };
 
 const TZ = "Europe/Belgrade";
+const SLOT_CAP = Number(process.env.SLOT_ITEMS_CAP || "20"); // cap za 1X2 po slotu
 
 /* ---------------- KV (REST) ---------------- */
 function kvBackends() {
@@ -71,6 +72,28 @@ function confidence(it){
   if (Number.isFinite(it?.model_prob)) return Math.round(100*Number(it.model_prob));
   return 0;
 }
+function isFinished(it){
+  const s = String(it?.fixture?.status?.short || it?.status?.short || "").toUpperCase();
+  return s === "FT" || s === "AET" || s === "PEN";
+}
+function inSlot(d, slot){
+  const h = hourInTZ(d, TZ);
+  return (slot==="late" ? h < 10 : slot==="am" ? (h>=10 && h<15) : h>=15);
+}
+function slotFilterActive(list, slot){
+  const now = Date.now();
+  return list.filter(it=>{
+    const d = kickoffFromMeta(it); if (!d) return false;
+    if (!inSlot(d, slot)) return false;
+    if (isFinished(it)) return false;
+    return d.getTime() > now; // samo budući/krenuće
+  });
+}
+function sortCmp(a,b){
+  const dA = kickoffFromMeta(a)?.getTime()||0;
+  const dB = kickoffFromMeta(b)?.getTime()||0;
+  return (confidence(b)-confidence(a)) || (dA - dB);
+}
 
 /* ---------------- items (1X2) reader ---------------- */
 async function readItems(ymd, slot, trace){
@@ -84,25 +107,23 @@ async function readItems(ymd, slot, trace){
     const { raw } = await kvGETraw(k, trace);
     const arr = arrFromAny(J(raw));
     if (Array.isArray(arr) && arr.length) {
-      const only = arr.filter(it => {
-        const d = kickoffFromMeta(it); if (!d) return false;
-        const h = hourInTZ(d, TZ);
-        return (slot==="late"? h<10 : slot==="am"? (h>=10 && h<15) : h>=15);
-      });
+      const only = slotFilterActive(arr, slot);
       if (only.length) {
-        only.sort((a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0)));
-        return { items: only, source: k, before: arr.length, after: only.length };
+        const sorted = only.sort(sortCmp).slice(0, SLOT_CAP); // **cap**
+        return { items: sorted, source: k, before: arr.length, after: sorted.length };
       }
     }
   }
 
-  // 2) fallback: UNION/LAST **bez slot filtera** (da UI nikad nije prazan)
+  // 2) fallback: UNION/LAST **sa slot filterom + cap** (da UI nije prazan, ali ostaje striktan prikaz)
   const fallbackKeys = [`vb:day:${ymd}:union`, `vb:day:${ymd}:last`];
   for (const k of fallbackKeys) {
     const { raw } = await kvGETraw(k, trace);
     const arr = arrFromAny(J(raw));
     if (Array.isArray(arr) && arr.length) {
-      const list = [...arr].sort((a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0))).slice(0,15);
+      const only = slotFilterActive(arr, slot);
+      if (!only.length) continue;
+      const list = only.sort(sortCmp).slice(0, SLOT_CAP);
       return { items: list, source: k, before: arr.length, after: list.length };
     }
   }
@@ -115,7 +136,8 @@ async function readTickets(ymd, slot, trace){
   const now = Date.now();
   const keep = (x)=> {
     const t = kickoffFromMeta(x)?.getTime() || 0;
-    return t > now; // samo mečevi koji još nisu počeli
+    const fin = isFinished(x);
+    return !fin && t > now; // samo mečevi koji još nisu počeli
   };
 
   // prioritet: per-slot → dnevni
@@ -132,7 +154,7 @@ async function readTickets(ymd, slot, trace){
   }
   if (!obj) return { tickets:{ btts:[], ou25:[], htft:[] }, source: src, tried };
 
-  const sortT = (a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0));
+  const sortT = (a,b)=> sortCmp(a,b);
   return {
     tickets: {
       btts: (obj.btts||[]).filter(keep).sort(sortT),
@@ -169,6 +191,7 @@ export default async function handler(req,res){
       source,
       tickets_source: tsrc,
       policy_cap: 15,
+      slot_cap: SLOT_CAP,
       ...(wantDebug ? { debug:{ trace, before, after, tickets_tried:ttried } } : {})
     };
     return res.status(200).json(payload);
