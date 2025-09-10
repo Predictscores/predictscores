@@ -159,38 +159,6 @@ function ConfidenceBar({ pct }) {
   );
 }
 
-function confBucket(pct) {
-  const v = Number(pct || 0);
-  if (v >= 90) return "Top pick";
-  if (v >= 75) return "High";
-  if (v >= 50) return "Moderate";
-  return "Low";
-}
-function bucketCls(name, active) {
-  const base = "px-2 py-0.5 rounded-md text-[11px] border";
-  const map = {
-    "Low": ["bg-amber-500/10 text-amber-200 border-amber-500/30", "bg-amber-500/25 text-amber-100 border-amber-400/50"],
-    "Moderate": ["bg-sky-500/10 text-sky-200 border-sky-500/30", "bg-sky-500/25 text-sky-100 border-sky-400/50"],
-    "High": ["bg-emerald-500/10 text-emerald-200 border-emerald-500/30", "bg-emerald-500/25 text-emerald-100 border-emerald-400/50"],
-    "Top pick": ["bg-orange-500/10 text-orange-200 border-orange-500/30", "bg-orange-500/25 text-orange-100 border-orange-400/50"],
-  };
-  const [idle, on] = map[name] || ["bg-slate-500/10 text-slate-200 border-slate-500/30", "bg-slate-500/25 text-slate-100 border-slate-400/50"];
-  return `${base} ${active ? on : idle}`;
-}
-function ConfidenceLegend({ value }) {
-  const b = confBucket(value);
-  const items = ["Low", "Moderate", "High", "Top pick"];
-  return (
-    <div className="flex flex-wrap gap-1.5">
-      {items.map((name) => (
-        <span key={name} className={bucketCls(name, b === name)}>
-          {name === "Top pick" ? "Top pick 🔥" : name}
-        </span>
-      ))}
-    </div>
-  );
-}
-
 function WhyLine({ explain }) {
   const bullets = Array.isArray(explain?.bullets) ? explain.bullets : [];
   const text = bullets
@@ -229,10 +197,10 @@ function MarketBadge({ market }) {
   );
 }
 
-/* ---------- Football card (Confidence % + Legend) ---------- */
+/* ---------- Football card (Confidence % + 🔥 iznad 90%) ---------- */
 function FootballCard({ bet }) {
   const confPct = Math.round(Number(bet.conf || 0));
-  const bucket = confBucket(confPct);
+  const hot = confPct >= 90;
 
   return (
     <div className="p-4 rounded-xl bg-[#1f2339]">
@@ -240,11 +208,6 @@ function FootballCard({ bet }) {
         <div>{bet.league} · {fmtLocal(bet.date)}</div>
         <div className="flex items-center gap-2">
           <MarketBadge market={bet.market} />
-          {bucket === "Top pick" ? (
-            <span className="px-2 py-0.5 rounded-md text-[11px] border bg-orange-500/20 text-orange-100 border-orange-400/40">
-              Top pick 🔥
-            </span>
-          ) : null}
         </div>
       </div>
 
@@ -263,18 +226,15 @@ function FootballCard({ bet }) {
         )}
       </div>
 
-      {/* Confidence bar + % */}
+      {/* Confidence bar + % (sa 🔥 ako >= 90%) */}
       <div className="mt-3">
         <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
           <span>Confidence</span>
-          <span className="text-slate-200 font-medium">{confPct}%</span>
+          <span className="text-slate-200 font-medium">
+            {confPct}%{hot ? " 🔥" : ""}
+          </span>
         </div>
         <ConfidenceBar pct={confPct} />
-      </div>
-
-      {/* Legend */}
-      <div className="mt-2">
-        <ConfidenceLegend value={confPct} />
       </div>
 
       {bet.explain ? (
@@ -367,7 +327,7 @@ function useCryptoTop3() {
   return { items, err, loading };
 }
 
-/* ===================== Football tab: 1X2 66% levo, Specials 33% desno ===================== */
+/* ===================== Football tab: 1X2 55% / Specials 45% ===================== */
 function FootballBody({ list }) {
   const [tab, setTab] = useState("ko"); // ko | conf | hist
 
@@ -433,10 +393,10 @@ function FootballBody({ list }) {
             {tab === "ko" ? "Kick-Off" : "Confidence"}
           </div>
 
-          {/* 66/33 layout: grid sa 3 kolone, levo span-2, desno span-1 */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            {/* Levo: 1X2 (66%) */}
-            <section className="md:col-span-2">
+          {/* 55/45 layout na md+: koristimo flex sa basis-[%] */}
+          <div className="flex flex-col md:flex-row md:gap-4 gap-4">
+            {/* 1X2 (55%) */}
+            <section className="md:basis-[55%] md:min-w-0">
               <div className="text-slate-200 font-semibold mb-2">Match Odds (1X2)</div>
               {!left.length ? (
                 <div className="text-slate-400 text-sm">Nema 1X2 ponuda.</div>
@@ -449,8 +409,8 @@ function FootballBody({ list }) {
               )}
             </section>
 
-            {/* Desno: Specials (33%) */}
-            <section className="md:col-span-1">
+            {/* Specials (45%) */}
+            <section className="md:basis-[45%] md:min-w-0">
               <div className="text-slate-200 font-semibold mb-2">Specials — BTTS / HT-FT / O/U 2.5</div>
               {!right.length ? (
                 <div className="text-slate-400 text-sm">Nema specijalnih tiketa.</div>
