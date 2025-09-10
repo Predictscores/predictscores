@@ -13,19 +13,28 @@ function normalizeConfidence(conf) {
 }
 
 export default function SignalCard({ data = {}, type }) {
+  // čitamo najčešća polja iz data, ali pravimo i fallback-ove:
   const {
     symbol,
-    price,
-    entryPrice,
-    sl,
-    tp,
-    expectedMove,
-    confidence,
+    price: _price,
+    entryPrice: _entryPrice,
+    sl: _sl,
+    tp: _tp,
+    expectedMove: _expectedMove,
+    confidence: _confidence,
     change1h,
     change24h,
     signal,
     bars = [],
   } = data;
+
+  // fallback-ovi (druga imena iz API-ja)
+  const price = _price ?? data.last ?? data.close ?? null;
+  const entry = _entryPrice ?? data.entry ?? data.entry_price ?? data.open ?? null;
+  const tp = _tp ?? data.takeProfit ?? data.tpPrice ?? data.exit ?? data.exit_price ?? null;
+  const sl = _sl ?? data.stopLoss ?? data.slPrice ?? null;
+  const expectedMove = _expectedMove ?? data.expected_pct ?? data.exp_pct ?? null;
+  const confidence = _confidence ?? data.confidence_pct ?? data.score ?? null;
 
   const confDisplay = normalizeConfidence(confidence);
 
@@ -46,7 +55,7 @@ export default function SignalCard({ data = {}, type }) {
           <div>
             Entry{' '}
             <span className={signal === 'LONG' ? 'text-green-400' : 'text-red-400'}>
-              ${fmt(entryPrice)} {signal === 'LONG' ? '↑' : '↓'}
+              ${fmt(entry)} {signal === 'LONG' ? '↑' : '↓'}
             </span>
           </div>
           <div className="mt-2 flex gap-2">
@@ -92,9 +101,9 @@ export default function SignalCard({ data = {}, type }) {
       {/* DESNO: prosleđujemo i symbol zbog fallback fetch-a */}
       <div className="w-[50%] pl-4 flex items-center justify-center">
         {Array.isArray(bars) && bars.length > 0 ? (
-          <TradingViewChart bars={bars} entry={entryPrice} sl={sl} tp={tp} symbol={symbol} />
+          <TradingViewChart bars={bars} entry={entry} sl={sl} tp={tp} symbol={symbol} />
         ) : (
-          <TradingViewChart bars={[]} entry={entryPrice} sl={sl} tp={tp} symbol={symbol} />
+          <TradingViewChart bars={[]} entry={entry} sl={sl} tp={tp} symbol={symbol} />
         )}
       </div>
     </div>
