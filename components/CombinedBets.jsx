@@ -20,6 +20,7 @@ async function safeJson(url) {
 
 function toISO(x) {
   return (
+    x?.kickoff_utc ||
     x?.datetime_local?.starting_at?.date_time ||
     x?.datetime_local?.date_time ||
     x?.time?.starting_at?.date_time ||
@@ -112,7 +113,7 @@ function useCryptoFeed() {
       }
       setLoading(false);
     })();
-    return () => { alive = false; };
+    return () => { alive = false;};
   }, []);
 
   return { signals, loading };
@@ -121,7 +122,6 @@ function useCryptoFeed() {
 /* ---------------- sparkline (SVG) ---------------- */
 
 function toSparkSeries(s) {
-  // ulaz: s.sparkline = [cena...], ili s.history = [{price|close|last}...]
   if (Array.isArray(s?.sparkline) && s.sparkline.length) {
     return s.sparkline.map(Number).filter(v => Number.isFinite(v));
   }
@@ -134,7 +134,7 @@ function toSparkSeries(s) {
 }
 
 function SparklineSVG({ series, height = 84, color = "blue" }) {
-  const w = 280; // virtuelna širina (responsive preko viewBox)
+  const w = 280;
   const h = height;
   const n = series?.length || 0;
   if (!n) return <div className="h-20 rounded-xl bg-blue-900/20 border border-blue-300/10" />;
@@ -152,9 +152,9 @@ function SparklineSVG({ series, height = 84, color = "blue" }) {
   const lastY = h - ((series[n - 1] - min) / span) * h;
 
   const palettes = {
-    green: { stroke: "rgba(74,222,128,0.95)", fill: "rgba(74,222,128,0.15)" },   // LONG
-    red:   { stroke: "rgba(248,113,113,0.95)", fill: "rgba(248,113,113,0.15)" }, // SHORT
-    blue:  { stroke: "rgba(147,197,253,0.9)",  fill: "rgba(59,130,246,0.15)"  }  // neutral
+    green: { stroke: "rgba(74,222,128,0.95)", fill: "rgba(74,222,128,0.15)" },
+    red:   { stroke: "rgba(248,113,113,0.95)", fill: "rgba(248,113,113,0.15)" },
+    blue:  { stroke: "rgba(147,197,253,0.9)",  fill: "rgba(59,130,246,0.15)" }
   };
   const c = palettes[color] || palettes.blue;
 
@@ -163,15 +163,7 @@ function SparklineSVG({ series, height = 84, color = "blue" }) {
   return (
     <svg width="100%" height={h} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none">
       <path d={fillPath} fill={c.fill} />
-      <polyline
-        points={pts}
-        fill="none"
-        stroke={c.stroke}
-        strokeWidth="2"
-        strokeLinejoin="round"
-        strokeLinecap="round"
-      />
-      {/* tačka + labela na poslednjoj vrednosti */}
+      <polyline points={pts} fill="none" stroke={c.stroke} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
       <circle cx={w} cy={lastY} r="3" fill={c.stroke} />
       <g transform={`translate(${w - 4}, ${Math.max(16, Math.min(h - 16, lastY))})`}>
         <rect x="-60" y="-12" width="60" height="24" rx="6" fill="rgba(10,24,61,0.85)" stroke="rgba(147,197,253,0.25)" />
@@ -183,7 +175,7 @@ function SparklineSVG({ series, height = 84, color = "blue" }) {
   );
 }
 
-/* ---------------- UI atoms (plava glass tema) ---------------- */
+/* ---------------- UI atoms ---------------- */
 
 const pillBase   = "inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-xs";
 const pillLong   = `${pillBase} bg-green-500/10 border-green-400/30 text-green-200`;
@@ -217,17 +209,28 @@ function SkeletonCard() {
 function ItemCard({ it }) {
   const k = toISO(it);
   const conf = it?.confidence_pct ?? (it?.model_prob != null ? Math.round(it.model_prob * 100) : undefined);
+
+  const home = it?.home ?? it?.teams?.home?.name ?? "—";
+  const away = it?.away ?? it?.teams?.away?.name ?? "—";
+  const marketLabel = it?.market || it?.market_label || "1X2";
+
+  const rawPrice = it?.odds?.price ?? it?.price ?? it?.market_odds;
+  const price = num(rawPrice);
+
   return (
     <Card>
-      <div className="text-sm opacity-80 text-blue-100">{it.league_name} · {it.league_country}</div>
-      <div className="mt-1 text-lg font-semibold text-blue-50">{it.home} — {it.away}</div>
+      <div className="text-sm opacity-80 text-blue-100">
+        {(it.league_name || it?.league?.name || "—")} · {(it.league_country || it?.league?.country || "—")}
+      </div>
+      <div className="mt-1 text-lg font-semibold text-blue-50">{home} — {away}</div>
       <div className="mt-1 text-sm opacity-90 text-blue-100">Kick-off: {fmtKickoff(k)}</div>
       <div className="mt-2 text-sm text-blue-50/90">
-        <span className="opacity-80">Market:</span> <b>{it.market}</b> · <span className="opacity-80">Pick:</span> <b>{it.pick || it.selection_label}</b>
+        <span className="opacity-80">Market:</span> <b>{marketLabel}</b> · <span className="opacity-80">Pick:</span>{" "}
+        <b>{it.pick || it.selection_label || it.pick_code || "—"}</b>
       </div>
       <div className="mt-1 text-sm text-blue-50/90">
         {conf != null ? (<><span className="opacity-80">Conf:</span> <b>{conf}%</b></>) : null}
-        {it?.odds?.price ? <> · <span className="opacity-80">Odds:</span> <b>{it.odds.price}</b></> : null}
+        {price != null ? <> · <span className="opacity-80">Odds:</span> <b>{fmt2(price)}</b></> : null}
       </div>
     </Card>
   );
@@ -244,18 +247,10 @@ function normalizeSignal(s) {
 
   const priceNow = num(s?.price ?? s?.last ?? s?.close);
 
-  // entry/exit kandidati
-  const entry = num(
-    s?.entry ?? s?.entry_price ?? s?.entryPrice ?? s?.open ?? s?.buy_price ?? s?.buyPrice
-  );
-  const exit = num(
-    s?.exit ?? s?.exit_price ?? s?.exitPrice ?? s?.target ?? s?.take_profit ?? s?.tp ?? s?.sell_price ?? s?.sellPrice
-  );
+  const entry = num(s?.entry ?? s?.entry_price ?? s?.entryPrice ?? s?.open ?? s?.buy_price ?? s?.buyPrice);
+  const exit  = num(s?.exit  ?? s?.exit_price  ?? s?.exitPrice  ?? s?.target ?? s?.take_profit ?? s?.tp ?? s?.sell_price ?? s?.sellPrice);
 
-  // očekivani % — direktan ili izveden iz entry/exit
-  const expDirect = num(
-    s?.expected_pct ?? s?.expectedChange ?? s?.exp_pct ?? s?.expChange ?? s?.expected
-  );
+  const expDirect = num(s?.expected_pct ?? s?.expectedChange ?? s?.exp_pct ?? s?.expChange ?? s?.expected);
   let expectedPct = expDirect;
   if (expectedPct == null && entry != null && exit != null && entry > 0) {
     expectedPct = (side === "SHORT")
@@ -281,7 +276,6 @@ function CryptoCard({ s }) {
     <Card>
       <div className="text-sm opacity-80 text-blue-100">Crypto</div>
 
-      {/* header */}
       <div className="mt-1 flex items-center justify-between">
         <div className="text-lg font-semibold text-blue-50">{N.symbol}</div>
         <span className={`${tagClass}`}>
@@ -290,11 +284,10 @@ function CryptoCard({ s }) {
         </span>
       </div>
 
-      {/* metrics row */}
       <div className="mt-2 text-sm text-blue-100/90 flex flex-wrap gap-x-4 gap-y-1">
         <div>Price: <b className="tabular-nums">{N.priceNow != null ? fmt2(N.priceNow) : "—"}</b></div>
         <div>Entry: <b className="tabular-nums">{N.entry != null ? fmt2(N.entry) : "—"}</b></div>
-        <div>Exit: <b className="tabular-nums">{N.exit != null ? fmt2(N.exit) : "—"}</b></div>
+        <div>Exit:  <b className="tabular-nums">{N.exit  != null ? fmt2(N.exit)  : "—"}</b></div>
         <div>
           Exp:{" "}
           {N.expectedPct != null ? (
@@ -305,7 +298,6 @@ function CryptoCard({ s }) {
         </div>
       </div>
 
-      {/* extra row */}
       <div className="mt-1 text-sm text-blue-100/80 flex flex-wrap gap-x-4 gap-y-1">
         {N.ch24 != null ? (
           <div>24h: <b className={`tabular-nums ${N.ch24 >= 0 ? "text-green-200" : "text-rose-200"}`}>{pct(N.ch24)}%</b></div>
@@ -313,7 +305,6 @@ function CryptoCard({ s }) {
         {N.confidence != null ? <div>Confidence: <b className="tabular-nums">{Math.round(N.confidence)}%</b></div> : null}
       </div>
 
-      {/* chart */}
       <div className="mt-3">
         <SparklineSVG series={N.series} color={sparkColor} />
       </div>
@@ -327,12 +318,11 @@ function CombinedBody() {
   const { items, loading: fLoading } = useFootballFeed();
   const { signals, loading: cLoading } = useCryptoFeed();
 
-  const topFootball = useMemo(() => [...items].slice(0, 3), [items]);   // Top 3 singla
-  const topCrypto   = useMemo(() => [...signals].slice(0, 3), [signals]); // Top 3 kripto
+  const topFootball = useMemo(() => [...items].slice(0, 3), [items]);
+  const topCrypto   = useMemo(() => [...signals].slice(0, 3), [signals]);
 
   return (
     <div className="space-y-8">
-      {/* Football gore (grid na desktopu, horizontal snap na mobilu) */}
       <div>
         <SectionTitle>Football · Top 3 (singl)</SectionTitle>
         {fLoading ? (
@@ -359,7 +349,6 @@ function CombinedBody() {
         )}
       </div>
 
-      {/* Crypto dole */}
       <div>
         <SectionTitle>Crypto · Top 3</SectionTitle>
         {cLoading ? (
@@ -380,7 +369,7 @@ function CombinedBody() {
 
 /* ---------------- FOOTBALL tab (sa pod-tabovima) ---------------- */
 
-function FootballBody({ subTab /* "kickoff" | "confidence" | "history" */ }) {
+function FootballBody({ subTab }) {
   const { items, tickets, loading } = useFootballFeed();
 
   const byKickoff = useMemo(() => {
@@ -406,7 +395,6 @@ function FootballBody({ subTab /* "kickoff" | "confidence" | "history" */ }) {
   const showTickets = subTab === "kickoff" || subTab === "confidence";
 
   if (subTab === "history") {
-    // HISTORY pod-tab: BEZ tiketa, full width
     return (
       <div className="space-y-4">
         <SectionTitle>History (14d)</SectionTitle>
@@ -419,7 +407,6 @@ function FootballBody({ subTab /* "kickoff" | "confidence" | "history" */ }) {
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-      {/* Levo: 1X2 lista */}
       <div className={showTickets ? "lg:col-span-2" : "lg:col-span-3"}>
         <SectionTitle>{subTab === "kickoff" ? "Kick-Off" : "Confidence"}</SectionTitle>
         {loading ? (
@@ -433,7 +420,6 @@ function FootballBody({ subTab /* "kickoff" | "confidence" | "history" */ }) {
         ) : leftEmptyMsg)}
       </div>
 
-      {/* Desno: Tickets (samo Kick-Off i Confidence) */}
       {showTickets ? (
         <div className="lg:col-span-1">
           <aside aria-label="Tickets">
@@ -478,15 +464,13 @@ function CryptoBody() {
 /* ---------------- top-level tabs ---------------- */
 
 export default function CombinedBets() {
-  const [mainTab, setMainTab] = useState("combined");   // "combined" | "football" | "crypto"
-  const [footballTab, setFootballTab] = useState("kickoff"); // "kickoff" | "confidence" | "history"
+  const [mainTab, setMainTab] = useState("combined");
+  const [footballTab, setFootballTab] = useState("kickoff");
 
   return (
     <div className="space-y-8 text-blue-50 [font-variant-numeric:tabular-nums]" data-ui-version="blue-v2">
-      {/* Global blue gradient background (fixed, iza svega) */}
       <div className="fixed inset-0 -z-10 bg-gradient-to-b from-[#0b1533] via-[#0a1840] to-[#07102a]" />
 
-      {/* Main tabs header */}
       <div className="flex items-center gap-2">
         {[
           { key: "combined", label: "Combined" },
@@ -503,7 +487,6 @@ export default function CombinedBets() {
         ))}
       </div>
 
-      {/* Main tab content */}
       {mainTab === "combined" && (
         <section aria-label="Combined">
           <CombinedBody />
@@ -512,7 +495,6 @@ export default function CombinedBets() {
 
       {mainTab === "football" && (
         <section aria-label="Football" className="space-y-6">
-          {/* Football sub-tabs */}
           <div className="flex items-center gap-2">
             {[
               { key: "kickoff",    label: "Kick-Off"   },
@@ -529,7 +511,6 @@ export default function CombinedBets() {
             ))}
           </div>
 
-          {/* Football content (sub-tab) */}
           <FootballBody subTab={footballTab} />
         </section>
       )}
