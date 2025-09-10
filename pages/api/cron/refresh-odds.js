@@ -184,6 +184,152 @@ async function refreshOddsForIDs(ids, diag){
   return touched;
 }
 
+/* ---------- ODDS_API (optional, minimal integration) ---------- */
+const OA_BASE = (process.env.ODDS_API_BASE_URL || "https://api.the-odds-api.com/v4").replace(/\/+$/,"");
+const OA_KEY  = (process.env.ODDS_API_KEY || "").trim();
+const OA_REGION  = (process.env.ODDS_API_REGION || "eu").trim();
+const OA_MARKETS = (process.env.ODDS_API_MARKETS || "h2h").trim();
+
+function slugTeam(s){
+  return String(s||"")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g,"")
+    .toLowerCase()
+    .replace(/\b(fc|fk|afc|sc|ac|cf|club|c\.f\.)\b/g,"")
+    .replace(/[^a-z0-9]+/g,"")
+    .trim();
+}
+function median(nums){
+  const arr = nums.filter(Number.isFinite).slice().sort((a,b)=>a-b);
+  if (!arr.length) return null;
+  const m = Math.floor(arr.length/2);
+  return arr.length%2 ? arr[m] : (arr[m-1]+arr[m])/2;
+}
+function noVigImplied(prices){
+  // prices: {home, draw, away} decimal odds (median)
+  const inv = {
+    home: prices.home ? 1/ prices.home : 0,
+    draw: prices.draw ? 1/ prices.draw : 0,
+    away: prices.away ? 1/ prices.away : 0,
+  };
+  const sum = inv.home + inv.draw + inv.away || 1;
+  return { home: inv.home/sum, draw: inv.draw/sum, away: inv.away/sum };
+}
+async function fetchOddsUpcoming(diag){
+  const url = `${OA_BASE}/sports/upcoming/odds/?apiKey=${encodeURIComponent(OA_KEY)}&regions=${encodeURIComponent(OA_REGION)}&markets=${encodeURIComponent(OA_MARKETS)}&dateFormat=iso&oddsFormat=decimal`;
+  try{
+    const r = await fetch(url, { cache:"no-store" });
+    const t = await r.text();
+    const j = JSON.parse(t);
+    diag && (diag.odds_api = diag.odds_api || []).push({ host: OA_BASE, path:"/sports/upcoming/odds", status: r.status, ok: r.ok, count: Array.isArray(j) ? j.length : 0 });
+    return Array.isArray(j) ? j : [];
+  }catch(e){
+    diag && (diag.odds_api = diag.odds_api || []).push({ host: OA_BASE, path:"/sports/upcoming/odds", err: String(e?.message||e) });
+    return [];
+  }
+}
+async function fetchFixtureMeta(ids, diag){
+  const out = {};
+  for (const id of ids){
+    try{
+      const j = await afFetch("/fixtures",{ id }, afFixturesHeaders(), "fixture:byid", diag);
+      const fx = Array.isArray(j?.response) ? j.response[0] : null;
+      if (fx){
+        const m = mapFixture(fx);
+        out[id] = m;
+      }
+    }catch(e){
+      // ignore
+    }
+  }
+  return out;
+}
+function matchEventForFixture(meta, events){
+  if (!meta) return null;
+  const ks = new Date(meta.kickoff_utc).getTime();
+  const sH = slugTeam(meta.home);
+  const sA = slugTeam(meta.away);
+  let best = null; let bestDelta = Infinity;
+  for (const ev of events){
+    const eh = slugTeam(ev?.home_team);
+    const ea = slugTeam(ev?.away_team);
+    if (!eh || !ea) continue;
+    // home/away order match (primarno); dopusti i obrnuto ako treba:
+    const teamMatch = (eh===sH && ea===sA) || (eh===sA && ea===sH);
+    if (!teamMatch) continue;
+    const ct = Date.parse(ev?.commence_time || 0) || 0;
+    const delta = Math.abs(ct - ks);
+    if (delta <= 1000*60*60*12 && delta < bestDelta){ // ±12h
+      best = ev; bestDelta = delta;
+    }
+  }
+  return best;
+}
+function aggregateH2H(event){
+  const books = Array.isArray(event?.bookmakers) ? event.bookmakers : [];
+  let homePrices = [], drawPrices = [], awayPrices = [];
+  const sH = slugTeam(event?.home_team);
+  const sA = slugTeam(event?.away_team);
+  let usedBooks = 0;
+
+  for (const b of books){
+    const markets = Array.isArray(b?.markets) ? b.markets : [];
+    const h2h = markets.find(m => (m?.key||"").toLowerCase() === "h2h");
+    if (!h2h || !Array.isArray(h2h.outcomes)) continue;
+    let found = { h:null, d:null, a:null };
+    for (const o of h2h.outcomes){
+      const name = slugTeam(o?.name);
+      const price = Number(o?.price);
+      if (!Number.isFinite(price)) continue;
+      if (name === sH) found.h = price;
+      else if (name === sA) found.a = price;
+      else if (name === "draw") found.d = price;
+    }
+    // Za soccer očekujemo i "draw". Ako ga nema, ovaj book preskačemo (da ne krivimo no-vig).
+    if (found.h && found.a && (found.d || found.d === 0)){
+      homePrices.push(found.h);
+      drawPrices.push(found.d);
+      awayPrices.push(found.a);
+      usedBooks++;
+    }
+  }
+
+  const med = { home: median(homePrices), draw: median(drawPrices), away: median(awayPrices) };
+  const nv  = noVigImplied(med);
+  const books_count = usedBooks;
+
+  return {
+    hda: {
+      home: { price: med.home, pi_novig: nv.home },
+      draw: { price: med.draw, pi_novig: nv.draw },
+      away: { price: med.away, pi_novig: nv.away },
+    },
+    books_count,
+    by_source: { af: 0, odds_api: books_count },
+    updated_at: new Date().toISOString(),
+  };
+}
+async function refreshOddsWithOddsAPI(ids, diag){
+  if (!OA_KEY) return { matched:0, saved:0 };
+  const events = await fetchOddsUpcoming(diag);
+  if (!events.length) return { matched:0, saved:0 };
+
+  const metaMap = await fetchFixtureMeta(ids, diag);
+  let matched = 0, saved = 0;
+
+  for (const id of ids){
+    const meta = metaMap[id];
+    const ev = matchEventForFixture(meta, events);
+    if (!ev) continue;
+    matched++;
+
+    const agg = aggregateH2H(ev);
+    // upis u KV kao agregat; ne dira postojeći AF zapis
+    await kvSET(`odds:agg:${id}`, JSON.stringify(agg), diag);
+    saved++;
+  }
+  return { matched, saved };
+}
+
 /* ---------- handler ---------- */
 export default async function handler(req,res){
   res.setHeader("Cache-Control","no-store");
@@ -242,13 +388,32 @@ export default async function handler(req,res){
     }
 
     const ids = Array.from(new Set(list));
+
+    // --- NEW: optional ODDS_API aggregation on shortlist (no UI/workflow change) ---
+    let oa = { matched:0, saved:0 };
+    try{
+      if (OA_KEY) {
+        // Shortlist – ograniči na max 20 po slotu da ostaneš daleko ispod limita
+        const shortlist = ids.slice(0, 20);
+        oa = await refreshOddsWithOddsAPI(shortlist, diag);
+      }
+    }catch(e){
+      diag && (diag.odds_api = diag.odds_api || []).push({ err: String(e?.message||e) });
+    }
+
+    // Uvek osveži AF /odds kao i do sada (postojeće ponašanje)
     const touched = await refreshOddsForIDs(ids, diag);
 
     return res.status(200).json({
       ok:true, ymd, slot,
       inspected: ids.length, filtered:0, targeted: ids.length, touched,
       source: pickedKey ? `refresh-odds:${pickedKey}` : "refresh-odds:fallback",
-      debug: wantDebug ? { tried, pickedKey, listLen: ids.length, forceSeed: seeded, af: diag?.af, odds: diag?.odds } : undefined
+      debug: wantDebug ? {
+        tried, pickedKey, listLen: ids.length, forceSeed: seeded,
+        af: diag?.af, odds: diag?.odds,
+        odds_api: diag?.odds_api, // vidiš host/path/status + matched/saved
+        oa_summary: oa
+      } : undefined
     });
 
   }catch(e){
