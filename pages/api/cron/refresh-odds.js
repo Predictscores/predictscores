@@ -184,11 +184,16 @@ async function refreshOddsForIDs(ids, diag){
   return touched;
 }
 
-/* ---------- ODDS_API (optional, minimal integration) ---------- */
+/* ---------- ODDS_API (bulk enrichment; optional) ---------- */
 const OA_BASE = (process.env.ODDS_API_BASE_URL || "https://api.the-odds-api.com/v4").replace(/\/+$/,"");
 const OA_KEY  = (process.env.ODDS_API_KEY || "").trim();
-const OA_REGION  = (process.env.ODDS_API_REGION || "eu").trim();
-const OA_MARKETS = (process.env.ODDS_API_MARKETS || "h2h").trim();
+const OA_REGION_STR  = (process.env.ODDS_API_REGION || process.env.ODDS_API_REGIONS || "eu").trim();
+const OA_MARKETS_STR = (process.env.ODDS_API_MARKETS || "h2h").trim();
+const OA_DAILY_CAP   = Math.max(1, Number(process.env.ODDS_API_DAILY_CAP || 150) || 150);
+
+function parseCSV(s){ return String(s||"").split(",").map(x=>x.trim()).filter(Boolean); }
+const OA_REGIONS  = parseCSV(OA_REGION_STR);
+const OA_MARKETS  = parseCSV(OA_MARKETS_STR);
 
 function slugTeam(s){
   return String(s||"")
@@ -205,7 +210,6 @@ function median(nums){
   return arr.length%2 ? arr[m] : (arr[m-1]+arr[m])/2;
 }
 function noVigImplied(prices){
-  // prices: {home, draw, away} decimal odds (median)
   const inv = {
     home: prices.home ? 1/ prices.home : 0,
     draw: prices.draw ? 1/ prices.draw : 0,
@@ -214,18 +218,67 @@ function noVigImplied(prices){
   const sum = inv.home + inv.draw + inv.away || 1;
   return { home: inv.home/sum, draw: inv.draw/sum, away: inv.away/sum };
 }
-async function fetchOddsUpcoming(diag){
-  const url = `${OA_BASE}/sports/upcoming/odds/?apiKey=${encodeURIComponent(OA_KEY)}&regions=${encodeURIComponent(OA_REGION)}&markets=${encodeURIComponent(OA_MARKETS)}&dateFormat=iso&oddsFormat=decimal`;
-  try{
-    const r = await fetch(url, { cache:"no-store" });
-    const t = await r.text();
-    const j = JSON.parse(t);
-    diag && (diag.odds_api = diag.odds_api || []).push({ host: OA_BASE, path:"/sports/upcoming/odds", status: r.status, ok: r.ok, count: Array.isArray(j) ? j.length : 0 });
-    return Array.isArray(j) ? j : [];
-  }catch(e){
-    diag && (diag.odds_api = diag.odds_api || []).push({ host: OA_BASE, path:"/sports/upcoming/odds", err: String(e?.message||e) });
-    return [];
+function mergeBookmakers(baseBooks=[], addBooks=[]){
+  const byKey = new Map((baseBooks||[]).map(b => [b.key || b.title, b]));
+  for (const b of (addBooks||[])){
+    const k = b.key || b.title;
+    if (!k) continue;
+    const exist = byKey.get(k);
+    if (!exist) { byKey.set(k, b); continue; }
+    const mMap = new Map((exist.markets||[]).map(m=>[m.key, m]));
+    for (const m of (b.markets||[])) if (!mMap.has(m.key)) mMap.set(m.key, m);
+    exist.markets = Array.from(mMap.values());
+    byKey.set(k, exist);
   }
+  return Array.from(byKey.values());
+}
+async function fetchOddsBulk(regions, markets, diag){
+  const calls = [];
+  const map = new Map();
+  let used = 0;
+
+  for (const region of regions){
+    for (const market of markets){
+      if (!OA_KEY) break;
+      if (used >= OA_DAILY_CAP) { calls.push({ note:"cap-reached", used, cap:OA_DAILY_CAP }); break; }
+
+      const url = `${OA_BASE}/sports/soccer/odds/?apiKey=${encodeURIComponent(OA_KEY)}&regions=${encodeURIComponent(region)}&markets=${encodeURIComponent(market)}&dateFormat=iso&oddsFormat=decimal`;
+      let arr = [];
+      let status = 0, ok=false, count=0, remaining=null;
+      try{
+        const r = await fetch(url, { cache:"no-store" });
+        status = r.status; ok = r.ok;
+        remaining = parseInt(r.headers.get("x-requests-remaining")||"",10);
+        const t = await r.text();
+        arr = JSON.parse(t);
+        count = Array.isArray(arr) ? arr.length : 0;
+      }catch(e){
+        calls.push({ host:OA_BASE, path:"/sports/soccer/odds", region, market, status, ok:false, err:String(e?.message||e) });
+        used++; // brojimo pokušaj
+        continue;
+      }
+
+      calls.push({ host:OA_BASE, path:"/sports/soccer/odds", region, market, status, ok, count, remaining });
+      used++;
+
+      if (Array.isArray(arr)){
+        for (const ev of arr){
+          const key = ev?.id || `${ev?.home_team||""}__${ev?.away_team||""}__${ev?.commence_time||""}`;
+          if (!key) continue;
+          const cur = map.get(key);
+          if (!cur){
+            map.set(key, { ...ev, bookmakers: Array.isArray(ev.bookmakers)?ev.bookmakers:[] });
+          }else{
+            cur.bookmakers = mergeBookmakers(cur.bookmakers, ev.bookmakers||[]);
+            map.set(key, cur);
+          }
+        }
+      }
+      if (Number.isFinite(remaining) && remaining <= 2){ calls.push({ note:"low-remaining", remaining }); break; }
+    }
+  }
+  diag && (diag.odds_api_calls = calls);
+  return Array.from(map.values());
 }
 async function fetchFixtureMeta(ids, diag){
   const out = {};
@@ -233,13 +286,8 @@ async function fetchFixtureMeta(ids, diag){
     try{
       const j = await afFetch("/fixtures",{ id }, afFixturesHeaders(), "fixture:byid", diag);
       const fx = Array.isArray(j?.response) ? j.response[0] : null;
-      if (fx){
-        const m = mapFixture(fx);
-        out[id] = m;
-      }
-    }catch(e){
-      // ignore
-    }
+      if (fx){ out[id] = mapFixture(fx); }
+    }catch(e){ /* ignore */ }
   }
   return out;
 }
@@ -253,28 +301,27 @@ function matchEventForFixture(meta, events){
     const eh = slugTeam(ev?.home_team);
     const ea = slugTeam(ev?.away_team);
     if (!eh || !ea) continue;
-    // home/away order match (primarno); dopusti i obrnuto ako treba:
     const teamMatch = (eh===sH && ea===sA) || (eh===sA && ea===sH);
     if (!teamMatch) continue;
     const ct = Date.parse(ev?.commence_time || 0) || 0;
     const delta = Math.abs(ct - ks);
-    if (delta <= 1000*60*60*12 && delta < bestDelta){ // ±12h
-      best = ev; bestDelta = delta;
-    }
+    if (delta <= 1000*60*60*12 && delta < bestDelta){ best = ev; bestDelta = delta; }
   }
   return best;
 }
 function aggregateH2H(event){
   const books = Array.isArray(event?.bookmakers) ? event.bookmakers : [];
-  let homePrices = [], drawPrices = [], awayPrices = [];
   const sH = slugTeam(event?.home_team);
   const sA = slugTeam(event?.away_team);
+
+  let homePrices = [], drawPrices = [], awayPrices = [];
   let usedBooks = 0;
 
   for (const b of books){
     const markets = Array.isArray(b?.markets) ? b.markets : [];
     const h2h = markets.find(m => (m?.key||"").toLowerCase() === "h2h");
     if (!h2h || !Array.isArray(h2h.outcomes)) continue;
+
     let found = { h:null, d:null, a:null };
     for (const o of h2h.outcomes){
       const name = slugTeam(o?.name);
@@ -284,7 +331,6 @@ function aggregateH2H(event){
       else if (name === sA) found.a = price;
       else if (name === "draw") found.d = price;
     }
-    // Za soccer očekujemo i "draw". Ako ga nema, ovaj book preskačemo (da ne krivimo no-vig).
     if (found.h && found.a && (found.d || found.d === 0)){
       homePrices.push(found.h);
       drawPrices.push(found.d);
@@ -305,13 +351,16 @@ function aggregateH2H(event){
     },
     books_count,
     by_source: { af: 0, odds_api: books_count },
+    regions: OA_REGIONS,
+    markets: OA_MARKETS,
     updated_at: new Date().toISOString(),
   };
 }
 async function refreshOddsWithOddsAPI(ids, diag){
-  if (!OA_KEY) return { matched:0, saved:0 };
-  const events = await fetchOddsUpcoming(diag);
-  if (!events.length) return { matched:0, saved:0 };
+  if (!OA_KEY) return { matched:0, saved:0, calls:0 };
+  // Bulk fetch across regions×markets; merge locally
+  const events = await fetchOddsBulk(OA_REGIONS.length?OA_REGIONS:["eu"], OA_MARKETS.length?OA_MARKETS:["h2h"], diag);
+  if (!events.length) return { matched:0, saved:0, calls: (diag?.odds_api_calls||[]).length };
 
   const metaMap = await fetchFixtureMeta(ids, diag);
   let matched = 0, saved = 0;
@@ -323,11 +372,10 @@ async function refreshOddsWithOddsAPI(ids, diag){
     matched++;
 
     const agg = aggregateH2H(ev);
-    // upis u KV kao agregat; ne dira postojeći AF zapis
     await kvSET(`odds:agg:${id}`, JSON.stringify(agg), diag);
     saved++;
   }
-  return { matched, saved };
+  return { matched, saved, calls: (diag?.odds_api_calls||[]).length };
 }
 
 /* ---------- handler ---------- */
@@ -389,12 +437,11 @@ export default async function handler(req,res){
 
     const ids = Array.from(new Set(list));
 
-    // --- NEW: optional ODDS_API aggregation on shortlist (no UI/workflow change) ---
-    let oa = { matched:0, saved:0 };
+    // --- ODDS_API enrichment on shortlist (bulk, regions×markets; safe & capped) ---
+    let oa = { matched:0, saved:0, calls:0 };
     try{
       if (OA_KEY) {
-        // Shortlist – ograniči na max 20 po slotu da ostaneš daleko ispod limita
-        const shortlist = ids.slice(0, 20);
+        const shortlist = ids.slice(0, 20); // držimo potrošnju niskom po slotu
         oa = await refreshOddsWithOddsAPI(shortlist, diag);
       }
     }catch(e){
@@ -411,7 +458,7 @@ export default async function handler(req,res){
       debug: wantDebug ? {
         tried, pickedKey, listLen: ids.length, forceSeed: seeded,
         af: diag?.af, odds: diag?.odds,
-        odds_api: diag?.odds_api, // vidiš host/path/status + matched/saved
+        odds_api_calls: diag?.odds_api_calls, // detalji per region/market
         oa_summary: oa
       } : undefined
     });
