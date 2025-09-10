@@ -4,7 +4,6 @@ import { } from 'url'; // placeholder: zadržava ES module sintaksu u Next okru�
 export const config = { api: { bodyParser: false } };
 
 const TZ = "Europe/Belgrade";
-const SLOT_CAP = Number(process.env.SLOT_ITEMS_CAP || "20"); // cap za 1X2 po slotu
 
 /* ---------------- KV (REST) ---------------- */
 function kvBackends() {
@@ -72,31 +71,26 @@ function confidence(it){
   if (Number.isFinite(it?.model_prob)) return Math.round(100*Number(it.model_prob));
   return 0;
 }
-function isFinished(it){
-  const s = String(it?.fixture?.status?.short || it?.status?.short || "").toUpperCase();
-  return s === "FT" || s === "AET" || s === "PEN";
+
+/* ---- vikend/cap u lokalnom TZ-u ---- */
+function isWeekendInTZ(d = new Date(), tz = TZ) {
+  const wk = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' }).format(d);
+  return wk === 'Sat' || wk === 'Sun';
 }
-function inSlot(d, slot){
-  const h = hourInTZ(d, TZ);
-  return (slot==="late" ? h < 10 : slot==="am" ? (h>=10 && h<15) : h>=15);
-}
-function slotFilterActive(list, slot){
-  const now = Date.now();
-  return list.filter(it=>{
-    const d = kickoffFromMeta(it); if (!d) return false;
-    if (!inSlot(d, slot)) return false;
-    if (isFinished(it)) return false;
-    return d.getTime() > now; // samo budući/krenuće
-  });
-}
-function sortCmp(a,b){
-  const dA = kickoffFromMeta(a)?.getTime()||0;
-  const dB = kickoffFromMeta(b)?.getTime()||0;
-  return (confidence(b)-confidence(a)) || (dA - dB);
+function capForSlot(slot, now = new Date()) {
+  const weekend = isWeekendInTZ(now, TZ);
+  const CAP_LATE = Number(process.env.CAP_LATE || 6);
+  const CAP_AM_WD = Number(process.env.CAP_AM_WD || 15);
+  const CAP_PM_WD = Number(process.env.CAP_PM_WD || 15);
+  const CAP_AM_WE = Number(process.env.CAP_AM_WE || 20);
+  const CAP_PM_WE = Number(process.env.CAP_PM_WE || 20);
+  if (slot === 'late') return CAP_LATE;
+  if (slot === 'am')   return weekend ? CAP_AM_WE : CAP_AM_WD;
+  return weekend ? CAP_PM_WE : CAP_PM_WD; // pm
 }
 
 /* ---------------- items (1X2) reader ---------------- */
-async function readItems(ymd, slot, trace){
+async function readItems(ymd, slot, trace, cap){
   // 1) probaj striktne slot ključeve
   const strictKeys = [
     `vbl_full:${ymd}:${slot}`,
@@ -107,23 +101,28 @@ async function readItems(ymd, slot, trace){
     const { raw } = await kvGETraw(k, trace);
     const arr = arrFromAny(J(raw));
     if (Array.isArray(arr) && arr.length) {
-      const only = slotFilterActive(arr, slot);
+      const only = arr.filter(it => {
+        const d = kickoffFromMeta(it); if (!d) return false;
+        const h = hourInTZ(d, TZ);
+        return (slot==="late"? h<10 : slot==="am"? (h>=10 && h<15) : h>=15);
+      });
       if (only.length) {
-        const sorted = only.sort(sortCmp).slice(0, SLOT_CAP); // **cap**
-        return { items: sorted, source: k, before: arr.length, after: sorted.length };
+        only.sort((a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0)));
+        const sliced = only.slice(0, Math.max(0, Number(cap)||0));
+        return { items: sliced, source: k, before: arr.length, after: sliced.length };
       }
     }
   }
 
-  // 2) fallback: UNION/LAST **sa slot filterom + cap** (da UI nije prazan, ali ostaje striktan prikaz)
+  // 2) fallback: UNION/LAST **bez slot filtera** (da UI nikad nije prazan)
   const fallbackKeys = [`vb:day:${ymd}:union`, `vb:day:${ymd}:last`];
   for (const k of fallbackKeys) {
     const { raw } = await kvGETraw(k, trace);
     const arr = arrFromAny(J(raw));
     if (Array.isArray(arr) && arr.length) {
-      const only = slotFilterActive(arr, slot);
-      if (!only.length) continue;
-      const list = only.sort(sortCmp).slice(0, SLOT_CAP);
+      const list = [...arr]
+        .sort((a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0)))
+        .slice(0, Math.max(0, Number(cap)||0));
       return { items: list, source: k, before: arr.length, after: list.length };
     }
   }
@@ -136,8 +135,7 @@ async function readTickets(ymd, slot, trace){
   const now = Date.now();
   const keep = (x)=> {
     const t = kickoffFromMeta(x)?.getTime() || 0;
-    const fin = isFinished(x);
-    return !fin && t > now; // samo mečevi koji još nisu počeli
+    return t > now; // samo mečevi koji još nisu počeli
   };
 
   // prioritet: per-slot → dnevni
@@ -154,7 +152,7 @@ async function readTickets(ymd, slot, trace){
   }
   if (!obj) return { tickets:{ btts:[], ou25:[], htft:[] }, source: src, tried };
 
-  const sortT = (a,b)=> sortCmp(a,b);
+  const sortT = (a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0));
   return {
     tickets: {
       btts: (obj.btts||[]).filter(keep).sort(sortT),
@@ -177,7 +175,9 @@ export default async function handler(req,res){
     const wantDebug = String(q.debug||"") === "1" || String(q.debug||"").toLowerCase() === "true";
     const trace = wantDebug ? [] : null;
 
-    const { items, source, before, after } = await readItems(ymd, slot, trace);
+    const slotCap = capForSlot(slot, now);
+
+    const { items, source, before, after } = await readItems(ymd, slot, trace, slotCap);
     const { tickets, source:tsrc, tried:ttried } = await readTickets(ymd, slot, trace);
 
     const payload = {
@@ -191,7 +191,7 @@ export default async function handler(req,res){
       source,
       tickets_source: tsrc,
       policy_cap: 15,
-      slot_cap: SLOT_CAP,
+      slot_cap: slotCap,
       ...(wantDebug ? { debug:{ trace, before, after, tickets_tried:ttried } } : {})
     };
     return res.status(200).json(payload);
