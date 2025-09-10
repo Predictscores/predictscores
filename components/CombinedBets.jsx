@@ -83,6 +83,23 @@ function teamName(side) {
   return "—";
 }
 
+/* ---------- market normalizer ---------- */
+function normMarket(raw) {
+  const s = String(raw || "").toLowerCase();
+  if (s.includes("btts") || s.includes("both teams to score")) return "BTTS";
+  if (s.includes("ht/ft") || s.includes("ht-ft") || s.includes("half time/full time")) return "HT-FT";
+  if (s.includes("over 2.5") || s.includes("under 2.5") || s.includes("ou2.5") || s.includes("o/u 2.5")) return "O/U 2.5";
+  if (s === "1x2" || s.includes("match result") || s.includes("full time result")) return "1X2";
+  return (s || "").trim() ? s.toUpperCase() : "1X2";
+}
+
+function impliedFromOdds(odds) {
+  const o = Number(odds);
+  if (!Number.isFinite(o) || o <= 1.0001) return null;
+  return 1 / o; // decimal odds → implied prob
+}
+
+/* ---------- bet normalizer ---------- */
 function normalizeBet(it) {
   const league =
     it?.league_name || it?.league?.name || it?.league || it?.competition || "";
@@ -91,7 +108,9 @@ function normalizeBet(it) {
   const home = teamName(it?.teams?.home || it?.home);
   const away = teamName(it?.teams?.away || it?.away);
 
-  const market = it?.market_label || it?.market || "1X2";
+  const rawMarket = it?.market_label || it?.market || "1X2";
+  const market = normMarket(rawMarket);
+
   const sel =
     it?.selection_label ||
     it?.pick ||
@@ -110,15 +129,23 @@ function normalizeBet(it) {
       : Number(it?.market_odds ?? it?.odds);
   odds = Number.isFinite(odds) ? odds : null;
 
+  // confidence (0–100)
   let conf = Number(
     it?.confidence_pct ??
       (typeof it?.model_prob === "number"
-        ? it.model_prob <= 1
-          ? it.model_prob * 100
-          : it.model_prob
+        ? it.model_prob <= 1 ? it.model_prob * 100 : it.model_prob
         : 0)
   );
   conf = Number.isFinite(conf) ? Math.max(0, Math.min(100, conf)) : 0;
+
+  // model probability (0–1) ako je dostupna
+  const modelP =
+    typeof it?.model_prob === "number"
+      ? (it.model_prob <= 1 ? it.model_prob : it.model_prob / 100)
+      : (typeof it?.confidence_pct === "number" ? Math.max(0, Math.min(100, it.confidence_pct)) / 100 : null);
+
+  const implied = impliedFromOdds(odds);
+  const evPct = (modelP != null && implied != null) ? (modelP - implied) * 100 : null;
 
   return {
     id:
@@ -133,10 +160,45 @@ function normalizeBet(it) {
     sel,
     odds,
     conf,
+    modelP,
+    implied,
+    evPct, // edge u %
     explain: it?.explain,
   };
 }
 
+/* ---------- tiny chart: Edge bar ---------- */
+function EdgeBar({ implied, modelP }) {
+  const imp = (implied != null) ? Math.max(0, Math.min(1, implied)) : null;
+  const mod = (modelP != null) ? Math.max(0, Math.min(1, modelP)) : null;
+  if (imp == null && mod == null) return null;
+
+  const wImp = Math.round((imp ?? 0) * 100);
+  const wMod = Math.round((mod ?? 0) * 100);
+
+  return (
+    <div className="mt-2">
+      <div className="flex justify-between text-[11px] text-slate-400 mb-1">
+        <span>Implied</span>
+        <span>Model</span>
+      </div>
+      <div className="grid grid-cols-2 gap-2 items-center">
+        <div className="h-2 rounded bg-white/10 overflow-hidden">
+          <div className="h-2 bg-gradient-to-r from-amber-400 to-amber-300" style={{ width: `${wImp}%` }} />
+        </div>
+        <div className="h-2 rounded bg-white/10 overflow-hidden">
+          <div className="h-2 bg-gradient-to-r from-emerald-500 to-emerald-400" style={{ width: `${wMod}%` }} />
+        </div>
+      </div>
+      <div className="flex justify-between text-[11px] text-slate-400 mt-1">
+        <span>{imp != null ? `${wImp}%` : "—"}</span>
+        <span>{mod != null ? `${wMod}%` : "—"}</span>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- UI helpers ---------- */
 function ConfidenceBar({ pct }) {
   const v = Math.max(0, Math.min(100, Number(pct || 0)));
   return (
@@ -170,28 +232,69 @@ function WhyLine({ explain }) {
   );
 }
 
+function MarketBadge({ market }) {
+  const m = String(market || "").toUpperCase();
+  const map = {
+    "1X2": "bg-cyan-500/15 text-cyan-200 border-cyan-500/30",
+    "BTTS": "bg-amber-500/15 text-amber-200 border-amber-500/30",
+    "HT-FT": "bg-fuchsia-500/15 text-fuchsia-200 border-fuchsia-500/30",
+    "O/U 2.5": "bg-emerald-500/15 text-emerald-200 border-emerald-500/30",
+  };
+  const cls = map[m] || "bg-slate-500/15 text-slate-200 border-slate-500/30";
+  return (
+    <span className={`px-2 py-0.5 rounded-md text-[11px] border ${cls}`}>{m}</span>
+  );
+}
+
+function EVBadge({ evPct }) {
+  if (evPct == null) return null;
+  const v = Math.round(evPct * 10) / 10;
+  const good = v >= 3;
+  const cls = good
+    ? "bg-emerald-500/15 text-emerald-200 border-emerald-500/30"
+    : "bg-slate-500/15 text-slate-200 border-slate-500/30";
+  return (
+    <span className={`px-2 py-0.5 rounded-md text-[11px] border ${cls}`}>
+      EV {v > 0 ? "+" : ""}{v}%
+    </span>
+  );
+}
+
+/* ---------- Football card (sa market/EV "chartom") ---------- */
 function FootballCard({ bet }) {
   return (
     <div className="p-4 rounded-xl bg-[#1f2339]">
-      <div className="text-xs text-slate-400">
-        {bet.league} · {fmtLocal(bet.date)}
+      <div className="flex items-center justify-between text-xs text-slate-400">
+        <div>{bet.league} · {fmtLocal(bet.date)}</div>
+        <div className="flex items-center gap-2">
+          <MarketBadge market={bet.market} />
+          <EVBadge evPct={bet.evPct} />
+        </div>
       </div>
-      <div className="font-semibold mt-0.5">
+
+      <div className="font-semibold mt-1">
         {bet.home} <span className="text-slate-400">vs</span> {bet.away}
       </div>
+
       <div className="text-sm text-slate-200 mt-1">
         <span className="font-semibold">{bet.market}</span>
         {bet.market ? " → " : ""}
         {bet.sel || "—"}
         {bet.odds ? (
-          <span className="text-slate-300"> ({bet.odds.toFixed(2)})</span>
+          <span className="text-slate-300"> ({Number(bet.odds).toFixed(2)})</span>
         ) : (
           <span className="text-slate-500"> (—)</span>
         )}
       </div>
+
+      {/* mini chart: implied vs model */}
+      <EdgeBar implied={bet.implied} modelP={bet.modelP} />
+
+      {/* confidence bar */}
       <div className="mt-2">
         <ConfidenceBar pct={bet.conf} />
       </div>
+
       {bet.explain ? (
         <div className="mt-2">
           <WhyLine explain={bet.explain} />
@@ -247,7 +350,6 @@ function useCryptoTop3() {
       setLoading(true);
       setErr(null);
       const j = await safeJson(`/api/crypto`);
-      // Normalizuj različite oblike: items / predictions / data / list / results / signals / direktan niz
       const arr = Array.isArray(j?.items)
         ? j.items
         : Array.isArray(j?.predictions)
@@ -265,7 +367,6 @@ function useCryptoTop3() {
         : Array.isArray(j)
         ? j
         : [];
-      // uzimamo top 3
       setItems(arr.slice(0, 3));
     } catch (e) {
       setErr(String(e?.message || e));
@@ -282,7 +383,103 @@ function useCryptoTop3() {
   return { items, err, loading };
 }
 
-/* ===================== sections ===================== */
+/* ===================== Football tab (sa market filterom) ===================== */
+function MarketFilter({ value, onChange }) {
+  const opts = ["All", "1X2", "BTTS", "HT-FT", "O/U 2.5"];
+  return (
+    <div className="flex items-center gap-2">
+      {opts.map((opt) => (
+        <button
+          key={opt}
+          onClick={() => onChange(opt)}
+          type="button"
+          className={`px-2.5 py-1 rounded-md text-[12px] border
+            ${value === opt ? "bg-[#202542] text-white border-white/10" : "bg-[#171a2b] text-slate-300 border-white/5"}`}
+        >
+          {opt}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function FootballBody({ list }) {
+  const [tab, setTab] = useState("ko"); // ko | conf | hist
+  const [mkt, setMkt] = useState("All"); // All | 1X2 | BTTS | HT-FT | O/U 2.5
+
+  const filtered = useMemo(() => {
+    if (mkt === "All") return list;
+    return list.filter((x) => String(x.market || "").toUpperCase() === mkt.toUpperCase());
+  }, [list, mkt]);
+
+  const koRows = useMemo(
+    () => [...filtered].sort((a, b) => (a.date?.getTime?.() || 9e15) - (b.date?.getTime?.() || 9e15)),
+    [filtered]
+  );
+  const confRows = useMemo(() => [...filtered].sort((a, b) => b.conf - a.conf), [filtered]);
+
+  return (
+    <div className="space-y-4">
+      {/* Unutrašnji tabovi + market filter */}
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="flex items-center gap-2">
+          <button
+            className={`px-3 py-1.5 rounded-lg text-sm ${
+              tab === "ko" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
+            }`}
+            onClick={() => setTab("ko")}
+            type="button"
+          >
+            Kick-Off
+          </button>
+          <button
+            className={`px-3 py-1.5 rounded-lg text-sm ${
+              tab === "conf" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
+            }`}
+            onClick={() => setTab("conf")}
+            type="button"
+          >
+            Confidence
+          </button>
+          <button
+            className={`px-3 py-1.5 rounded-lg text-sm ${
+              tab === "hist" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
+            }`}
+            onClick={() => setTab("hist")}
+            type="button"
+          >
+            History
+          </button>
+        </div>
+
+        <div className="ml-auto">
+          <MarketFilter value={mkt} onChange={setMkt} />
+        </div>
+      </div>
+
+      {tab === "hist" ? (
+        <HistoryPanel days={14} top={3} />
+      ) : (
+        <div className="rounded-2xl bg-[#15182a] p-4">
+          <div className="text-base font-semibold text-white mb-3">
+            {tab === "ko" ? "Kick-Off" : "Confidence"} {mkt !== "All" ? `· ${mkt}` : ""}
+          </div>
+          {!(tab === "ko" ? koRows : confRows).length ? (
+            <div className="text-slate-400 text-sm">Trenutno nema predloga.</div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+              {(tab === "ko" ? koRows : confRows).map((b) => (
+                <FootballCard key={b.id} bet={b} />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ===================== Crypto sekcija (ostaje kao i do sada) ===================== */
 function CombinedBody({ footballTop3, cryptoTop3 }) {
   return (
     <div className="space-y-4">
@@ -317,72 +514,8 @@ function CombinedBody({ footballTop3, cryptoTop3 }) {
   );
 }
 
-function FootballBody({ list }) {
-  const [tab, setTab] = useState("ko"); // ko | conf | hist
-
-  const koRows = useMemo(
-    () => [...list].sort((a, b) => (a.date?.getTime?.() || 9e15) - (b.date?.getTime?.() || 9e15)),
-    [list]
-  );
-  const confRows = useMemo(() => [...list].sort((a, b) => b.conf - a.conf), [list]);
-
-  return (
-    <div className="space-y-4">
-      {/* Unutrašnji tabovi */}
-      <div className="flex items-center gap-2">
-        <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${
-            tab === "ko" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
-          }`}
-          onClick={() => setTab("ko")}
-          type="button"
-        >
-          Kick-Off
-        </button>
-        <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${
-            tab === "conf" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
-          }`}
-          onClick={() => setTab("conf")}
-          type="button"
-        >
-          Confidence
-        </button>
-        <button
-          className={`px-3 py-1.5 rounded-lg text-sm ${
-            tab === "hist" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"
-          }`}
-          onClick={() => setTab("hist")}
-          type="button"
-        >
-          History
-        </button>
-      </div>
-
-      {tab === "hist" ? (
-        <HistoryPanel days={14} top={3} />
-      ) : (
-        <div className="rounded-2xl bg-[#15182a] p-4">
-          <div className="text-base font-semibold text-white mb-3">
-            {tab === "ko" ? "Kick-Off" : "Confidence"}
-          </div>
-          {!(tab === "ko" ? koRows : confRows).length ? (
-            <div className="text-slate-400 text-sm">Trenutno nema predloga.</div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-              {(tab === "ko" ? koRows : confRows).map((b) => (
-                <FootballCard key={b.id} bet={b} />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
+/* ===================== Crypto tab (ostaje) ===================== */
 function CryptoBody({ list }) {
-  // Samo Crypto tab – koristi isti puni prikaz kao i u "Combined"
   return (
     <div className="rounded-2xl bg-[#15182a] p-4">
       <div className="text-base font-semibold text-white mb-3">Crypto — Top 3</div>
