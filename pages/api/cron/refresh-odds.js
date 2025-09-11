@@ -189,7 +189,8 @@ const OA_BASE = (process.env.ODDS_API_BASE_URL || "https://api.the-odds-api.com/
 const OA_KEY  = (process.env.ODDS_API_KEY || "").trim();
 const OA_REGION_STR  = (process.env.ODDS_API_REGION || process.env.ODDS_API_REGIONS || "eu").trim();
 const OA_MARKETS_STR = (process.env.ODDS_API_MARKETS || "h2h").trim();
-const OA_DAILY_CAP   = Math.max(1, Number(process.env.ODDS_API_DAILY_CAP || 150) || 150);
+const OA_DAILY_CAP   = Math.max(1, Number(process.env.ODDS_API_DAILY_CAP || 150) || 150); // per-run cap (safety)
+const OA_BUDGET_PER_DAY = Math.max(1, Number(process.env.ODDS_API_DAILY_BUDGET || 15) || 15); // hard daily cap
 
 function parseCSV(s){ return String(s||"").split(",").map(x=>x.trim()).filter(Boolean); }
 const OA_REGIONS  = parseCSV(OA_REGION_STR);
@@ -232,7 +233,21 @@ function mergeBookmakers(baseBooks=[], addBooks=[]){
   }
   return Array.from(byKey.values());
 }
-async function fetchOddsBulk(regions, markets, diag){
+
+async function oaGetUsed(ymd, diag){
+  const { raw } = await kvGET(`oa:used:${ymd}`, diag);
+  if (!raw) return 0;
+  const val = J(raw);
+  if (typeof val === "number" && Number.isFinite(val)) return val;
+  if (val && typeof val === "object" && Number.isFinite(val.used)) return Number(val.used);
+  const n = parseInt(String(raw), 10);
+  return Number.isFinite(n) ? n : 0;
+}
+async function oaSetUsed(ymd, used, diag){
+  await kvSET(`oa:used:${ymd}`, JSON.stringify(used), diag);
+}
+
+async function fetchOddsBulk(regions, markets, capLimit, diag){
   const calls = [];
   const map = new Map();
   let used = 0;
@@ -240,7 +255,7 @@ async function fetchOddsBulk(regions, markets, diag){
   for (const region of regions){
     for (const market of markets){
       if (!OA_KEY) break;
-      if (used >= OA_DAILY_CAP) { calls.push({ note:"cap-reached", used, cap:OA_DAILY_CAP }); break; }
+      if (used >= capLimit) { calls.push({ note:"cap-reached", used, cap:capLimit }); break; }
 
       const url = `${OA_BASE}/sports/soccer/odds/?apiKey=${encodeURIComponent(OA_KEY)}&regions=${encodeURIComponent(region)}&markets=${encodeURIComponent(market)}&dateFormat=iso&oddsFormat=decimal`;
       let arr = [];
@@ -278,8 +293,9 @@ async function fetchOddsBulk(regions, markets, diag){
     }
   }
   diag && (diag.odds_api_calls = calls);
-  return Array.from(map.values());
+  return { events: Array.from(map.values()), used };
 }
+
 async function fetchFixtureMeta(ids, diag){
   const out = {};
   for (const id of ids){
@@ -356,11 +372,11 @@ function aggregateH2H(event){
     updated_at: new Date().toISOString(),
   };
 }
-async function refreshOddsWithOddsAPI(ids, diag){
-  if (!OA_KEY) return { matched:0, saved:0, calls:0 };
-  // Bulk fetch across regions×markets; merge locally
-  const events = await fetchOddsBulk(OA_REGIONS.length?OA_REGIONS:["eu"], OA_MARKETS.length?OA_MARKETS:["h2h"], diag);
-  if (!events.length) return { matched:0, saved:0, calls: (diag?.odds_api_calls||[]).length };
+
+async function refreshOddsWithOddsAPI(ids, diag, capLimit){
+  if (!OA_KEY || capLimit <= 0) return { matched:0, saved:0, calls:0 };
+  const { events, used } = await fetchOddsBulk(OA_REGIONS.length?OA_REGIONS:["eu"], OA_MARKETS.length?OA_MARKETS:["h2h"], capLimit, diag);
+  if (!events.length) return { matched:0, saved:0, calls: used };
 
   const metaMap = await fetchFixtureMeta(ids, diag);
   let matched = 0, saved = 0;
@@ -375,7 +391,7 @@ async function refreshOddsWithOddsAPI(ids, diag){
     await kvSET(`odds:agg:${id}`, JSON.stringify(agg), diag);
     saved++;
   }
-  return { matched, saved, calls: (diag?.odds_api_calls||[]).length };
+  return { matched, saved, calls: used };
 }
 
 /* ---------- handler ---------- */
@@ -437,12 +453,19 @@ export default async function handler(req,res){
 
     const ids = Array.from(new Set(list));
 
+    // --- Compute remaining daily OA budget (hard cap) ---
+    const usedStart = await oaGetUsed(ymd, diag);
+    const remaining = Math.max(0, OA_BUDGET_PER_DAY - usedStart);
+    const perRunCap = Math.max(0, Math.min(remaining, OA_DAILY_CAP));
+
     // --- ODDS_API enrichment on shortlist (bulk, regions×markets; safe & capped) ---
     let oa = { matched:0, saved:0, calls:0 };
     try{
-      if (OA_KEY) {
+      if (OA_KEY && perRunCap > 0) {
         const shortlist = ids.slice(0, 20); // držimo potrošnju niskom po slotu
-        oa = await refreshOddsWithOddsAPI(shortlist, diag);
+        oa = await refreshOddsWithOddsAPI(shortlist, diag, perRunCap);
+        // persist daily counter
+        await oaSetUsed(ymd, usedStart + oa.calls, diag);
       }
     }catch(e){
       diag && (diag.odds_api = diag.odds_api || []).push({ err: String(e?.message||e) });
@@ -459,7 +482,7 @@ export default async function handler(req,res){
         tried, pickedKey, listLen: ids.length, forceSeed: seeded,
         af: diag?.af, odds: diag?.odds,
         odds_api_calls: diag?.odds_api_calls, // detalji per region/market
-        oa_summary: oa
+        oa_summary: { ...oa, budget_per_day: OA_BUDGET_PER_DAY, used_start: usedStart, remaining_before: remaining, used_now: usedStart + oa.calls }
       } : undefined
     });
 
