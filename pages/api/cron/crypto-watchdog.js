@@ -1,7 +1,7 @@
 // pages/api/cron/crypto-watchdog.js
 // Watchdog: izračuna signale i napiše ih u KV (sa Entry/TP/SL), izolovano na kripto.
 
-import { buildSignals } from "./././lib/crypto-core";
+import { buildSignals } from "../../../lib/crypto-core";
 
 const {
   COINGECKO_API_KEY = "",
@@ -92,28 +92,24 @@ export default async function handler(req, res) {
 function enforcePolicy(list, cfg) {
   const out = [];
   for (const it of Array.isArray(list) ? list : []) {
-    // RR / ExpectedMove
     if (cfg.MIN_RR > 0 && !(Number.isFinite(it.rr) && it.rr >= cfg.MIN_RR)) continue;
     if (cfg.MIN_EM > 0 && !(Number.isFinite(it.expectedMove) && it.expectedMove >= cfg.MIN_EM)) continue;
 
-    // obavezno isti smer H1 i H4?
     const s1 = Math.sign(numOr0(it.h1_pct));
     const s4 = Math.sign(numOr0(it.h4_pct));
     if (cfg.REQUIRE_H1H4 && s1 !== 0 && s4 !== 0 && s1 !== s4) continue;
 
-    // isključi 7d iz konsenzusa? (samo sanity – ne računamo ceo confidence iznova)
     if (!cfg.INCLUDE_7D) {
       const m30 = Math.sign(numOr0(it.m30_pct));
       const h1 = Math.sign(numOr0(it.h1_pct));
       const h4 = Math.sign(numOr0(it.h4_pct));
       const d24 = Math.sign(numOr0(it.d24_pct));
       const sumNo7d = m30 + h1 + h4 + d24;
-      if (sumNo7d === 0) continue; // bez jasnog smera
+      if (sumNo7d === 0) continue;
       const dirNo7d = sumNo7d > 0 ? "LONG" : "SHORT";
-      if (dirNo7d !== it.signal) continue; // ako bi bez 7d promenio smer – odbaci
+      if (dirNo7d !== it.signal) continue;
     }
 
-    // divergence (ako imamo obe cene)
     if (cfg.DIVERGENCE_MAX > 0 && Number.isFinite(it.cg_price) && Number.isFinite(it.price)) {
       const divPct = Math.abs(it.price - it.cg_price) / Math.max(it.cg_price, 1e-9) * 100;
       if (divPct > cfg.DIVERGENCE_MAX) continue;
@@ -127,15 +123,12 @@ function enforcePolicy(list, cfg) {
 /* ---------- persistence & dedup ---------- */
 async function applyPersistenceAndDedup(items, cfg) {
   const now = Date.now();
-
-  // persist: ticker mora preživeti K uzastopnih snapshot-a
   const persistKey = "crypto:persist:v1";
-  const prevPersist = (await kvGetJSON(persistKey)) || {}; // {SYM:{dir,count,ts}}
+  const prevPersist = (await kvGetJSON(persistKey)) || {};
   const nextPersist = {};
 
-  // dedup: ne ponavljaj isti ticker u prozoru
   const dedupKey = "crypto:dedup:v1";
-  const prevDedup = (await kvGetJSON(dedupKey)) || {}; // {SYM:ts}
+  const prevDedup = (await kvGetJSON(dedupKey)) || {};
   const nextDedup = { ...prevDedup };
 
   const out = [];
@@ -143,34 +136,24 @@ async function applyPersistenceAndDedup(items, cfg) {
     const sym = String(it.symbol || it.ticker || "").toUpperCase();
     const dir = String(it.signal || it.direction || "").toUpperCase();
 
-    // DEDUP
     if (cfg.DEDUP_MIN > 0) {
       const lastTs = prevDedup[sym] || 0;
       const ageMin = (now - lastTs) / 60000;
-      if (ageMin < cfg.DEDUP_MIN) {
-        // još u dedup prozoru → preskoči
-        continue;
-      }
+      if (ageMin < cfg.DEDUP_MIN) continue;
     }
 
-    // PERSIST
     let rec = prevPersist[sym];
     if (!rec || rec.dir !== dir) rec = { dir, count: 0, ts: 0 };
     rec.count += 1;
     rec.ts = now;
     nextPersist[sym] = rec;
 
-    if (cfg.PERSIST_SNAPSHOTS > 0 && rec.count < cfg.PERSIST_SNAPSHOTS) {
-      // tek akumulira – još ne puštamo na listu
-      continue;
-    }
+    if (cfg.PERSIST_SNAPSHOTS > 0 && rec.count < cfg.PERSIST_SNAPSHOTS) continue;
 
-    // prošao! zabeleži dedup ts
     nextDedup[sym] = now;
     out.push(it);
   }
 
-  // snimi state (24h TTL)
   await kvSetJSON(persistKey, nextPersist, 24 * 3600);
   await kvSetJSON(dedupKey, nextDedup, 24 * 3600);
 
@@ -184,7 +167,7 @@ async function applyStickiness(items, cooldownMin) {
   const prev = await kvGetJSON(key);
   const now = Date.now();
   const bySymbol = {};
-  const STICKINESS_DELTA = 0.15; // mora biti "toliko" jači da promeni smer pre isteka cooldown-a
+  const STICKINESS_DELTA = 0.15;
 
   const filtered = (items || []).filter((it) => {
     const last = prev?.bySymbol?.[it.symbol];
@@ -219,18 +202,12 @@ async function kvGetJSON(key) {
   const raw = await r.json().catch(() => null);
   const val = raw?.result;
   if (!val) return null;
-  try {
-    return JSON.parse(val);
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(val); } catch { return null; }
 }
 async function kvSetJSON(key, obj, ttlSec) {
   if (!UPSTASH_REDIS_REST_URL) return;
   const value = JSON.stringify(obj);
-  const u = new URL(
-    `${UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}`
-  );
+  const u = new URL(`${UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}`);
   if (ttlSec && ttlSec > 0) u.searchParams.set("EX", String(ttlSec));
   await fetch(u.toString(), { headers: authHeader(), cache: "no-store" }).catch(() => {});
 }
@@ -249,22 +226,7 @@ function checkCronKey(req, expected) {
   if (auth.toLowerCase().startsWith("bearer ") && auth.slice(7) === expected) return true;
   return false;
 }
-function toNum(x, d = 0) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : d;
-}
-function clampInt(v, def, min, max) {
-  const n = parseInt(v, 10);
-  if (!Number.isFinite(n)) return def;
-  return Math.min(max, Math.max(min, n));
-}
-function parseBool(x, def = false) {
-  const s = String(x).toLowerCase();
-  if (s === "1" || s === "true") return true;
-  if (s === "0" || s === "false") return false;
-  return def;
-}
-function numOr0(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-}
+function toNum(x, d = 0) { const n = Number(x); return Number.isFinite(n) ? n : d; }
+function clampInt(v, def, min, max) { const n = parseInt(v, 10); if (!Number.isFinite(n)) return def; return Math.min(max, Math.max(min, n)); }
+function parseBool(x, def = false) { const s = String(x).toLowerCase(); if (s==="1"||s==="true") return true; if (s==="0"||s==="false") return false; return def; }
+function numOr0(v){ const n = Number(v); return Number.isFinite(n) ? n : 0; }
