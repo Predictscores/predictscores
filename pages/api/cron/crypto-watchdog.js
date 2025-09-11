@@ -1,5 +1,5 @@
 // pages/api/cron/crypto-watchdog.js
-// Watchdog: izračuna signale i napiše ih u KV (sa Entry/TP/SL), izolovano na kripto.
+// Watchdog: izračuna signale i napiše ih u KV (sa Entry/TP/SL), + upis u istoriju.
 
 import { buildSignals } from "../../../lib/crypto-core";
 
@@ -25,8 +25,12 @@ const {
   CRYPTO_DEDUP_WINDOW_MIN = "0",
   CRYPTO_PRICE_DIVERGENCE_MAX_PCT = "0",
 
-  // „lepljivost“ (anti-flip)
+  // „lepljivost“
   CRYPTO_COOLDOWN_MIN = "0",
+
+  // istorija/statistika
+  CRYPTO_HISTORY_TTL_DAYS = "60",
+  CRYPTO_HISTORY_MAX_IDS = "5000",
 } = process.env;
 
 const CFG = {
@@ -45,6 +49,9 @@ const CFG = {
   DIVERGENCE_MAX: toNum(CRYPTO_PRICE_DIVERGENCE_MAX_PCT, 0),
 
   COOLDOWN_MIN: clampInt(CRYPTO_COOLDOWN_MIN, 0, 0, 1440),
+
+  HIST_TTL_SEC: clampInt(CRYPTO_HISTORY_TTL_DAYS, 60, 1, 365) * 86400,
+  HIST_MAX_IDS: clampInt(CRYPTO_HISTORY_MAX_IDS, 5000, 100, 100000),
 };
 
 export default async function handler(req, res) {
@@ -55,7 +62,7 @@ export default async function handler(req, res) {
         .json({ ok: true, triggered: true, upstream: { ok: false, status: 401 } });
     }
 
-    // 1) gradi sirove kandidate
+    // 1) kandidati
     const itemsRaw = await buildSignals({
       cgApiKey: COINGECKO_API_KEY,
       minVol: CFG.MIN_VOL,
@@ -64,16 +71,19 @@ export default async function handler(req, res) {
       binanceTop: CFG.BINANCE_TOP,
     });
 
-    // 2) primeni policy filtere (RR/EM/H1=H4/7d/divergence)
+    // 2) policy filteri
     let items = enforcePolicy(itemsRaw, CFG);
 
-    // 3) dedup + persist + anti-flip cooldown
+    // 3) persist + dedup + anti-flip
     items = await applyPersistenceAndDedup(items, CFG);
     items = await applyStickiness(items, CFG.COOLDOWN_MIN);
 
-    // 4) upiši u KV
+    // 4) upiši u KV (snapshot)
     const payload = { ts: Date.now(), ttl_min: CFG.REFRESH_MIN, items };
     await kvSetJSON("crypto:signals:latest", payload, CFG.REFRESH_MIN * 60);
+
+    // 5) ⬇⬇⬇  NOVO: upiši svaki signal u istoriju  ⬇⬇⬇
+    await logHistory(items, payload.ts, CFG);
 
     return res.status(200).json({
       ok: true,
@@ -160,7 +170,7 @@ async function applyPersistenceAndDedup(items, cfg) {
   return out;
 }
 
-/* ---------- anti-flip (postojeci) ---------- */
+/* ---------- anti-flip ---------- */
 async function applyStickiness(items, cooldownMin) {
   if (!cooldownMin || cooldownMin <= 0) return items;
   const key = "crypto:signals:last";
@@ -188,12 +198,55 @@ async function applyStickiness(items, cooldownMin) {
   await kvSetJSON(key, { ts: now, bySymbol }, 24 * 3600);
   return filtered;
 
-  function snap(x) {
-    return { signal: x.signal, score: (x.confidence_pct - 55) / 40, confidence_pct: x.confidence_pct, ts: now };
-  }
+  function snap(x) { return { signal: x.signal, score: (x.confidence_pct - 55) / 40, confidence_pct: x.confidence_pct, ts: now }; }
 }
 
-/* ---------- KV helpers & utils ---------- */
+/* ---------- ISTORIJA: upis svakog signala ---------- */
+async function logHistory(items, snapshotTs, cfg) {
+  if (!Array.isArray(items) || !items.length) return;
+  const indexKey = "crypto:history:index";
+  const idx = (await kvGetJSON(indexKey)) || { ids: [] };
+
+  const toAdd = [];
+  for (const it of items) {
+    const sym = String(it.symbol || it.ticker || "").toUpperCase();
+    const id = `${sym}:${snapshotTs}`;
+    const rec = {
+      id,
+      ts: snapshotTs,
+      symbol: sym,
+      name: it.name || sym,
+      side: String(it.signal || it.direction || "").toUpperCase(),  // LONG/SHORT
+      exchange: it.exchange || null,
+      pair: it.pair || `${sym}-USDT`,
+      entry: Number.isFinite(it.entry) ? it.entry : null,
+      sl: Number.isFinite(it.sl) ? it.sl : null,
+      tp: Number.isFinite(it.tp) ? it.tp : null,
+      rr: Number.isFinite(it.rr) ? it.rr : null,
+      expectedMove: Number.isFinite(it.expectedMove) ? it.expectedMove : null,
+      confidence_pct: Number.isFinite(it.confidence_pct) ? it.confidence_pct : null,
+      valid_until: it.valid_until || null,
+
+      // outcome polja (popunjava evaluator)
+      outcome: null,            // "tp" | "sl" | "expired" | "tie"
+      win: null,                // 1/0
+      exit_price: null,
+      time_to_hit_min: null,
+      realized_rr: null,
+      evaluated_ts: null,
+    };
+
+    await kvSetJSON(`crypto:history:item:${id}`, rec, cfg.HIST_TTL_SEC);
+    toAdd.push(id);
+  }
+
+  // održi indeks poslednjih N id-jeva (FIFO)
+  const all = Array.isArray(idx.ids) ? idx.ids : [];
+  const newIds = [...toAdd, ...all].slice(0, cfg.HIST_MAX_IDS);
+  await kvSetJSON(indexKey, { ids: newIds, ts: Date.now() }, cfg.HIST_TTL_SEC);
+}
+
+/* ---------- KV & utils ---------- */
 async function kvGetJSON(key) {
   if (!UPSTASH_REDIS_REST_URL) return null;
   const u = `${UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(key)}`;
