@@ -7,7 +7,7 @@ import SignalCard from "./SignalCard";
 
 const TZ = "Europe/Belgrade";
 
-/* ===================== slot & date ===================== */
+/* ===================== slot ===================== */
 function currentSlot(tz = TZ) {
   const h = Number(
     new Intl.DateTimeFormat("en-GB", {
@@ -29,17 +29,6 @@ function desiredCountForSlot(slot, tz = TZ) {
   if (slot === "late") return 6;
   return isWeekend(tz) ? 20 : 15;
 }
-function ymdInTZ(d = new Date(), tz = TZ) {
-  const p = new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  })
-    .formatToParts(d)
-    .reduce((a, x) => ((a[x.type] = x.value), a), {});
-  return `${p.year}-${p.month}-${p.day}`;
-}
 
 /* ===================== helpers ===================== */
 async function safeJson(url) {
@@ -58,6 +47,7 @@ function parseKickoff(it) {
     it?.datetime_local?.starting_at?.date_time ||
     it?.datetime_local?.date_time ||
     it?.time?.starting_at?.date_time ||
+    it?.fixture?.date ||
     null;
   if (!iso) return null;
   const s = iso.includes("T") ? iso : iso.replace(" ", "T");
@@ -76,58 +66,85 @@ function teamName(side) {
   if (typeof side === "object") return side.name || side.team || "—";
   return "—";
 }
+function toDec(n) {
+  const v = Number(n);
+  return Number.isFinite(v) ? v : null;
+}
 
-/* ---------- market normalizer ---------- */
+/* ---------- market & selection normalizers ---------- */
 function normMarket(raw) {
   const s = String(raw || "").toLowerCase();
   if (s.includes("btts") || s.includes("both teams to score")) return "BTTS";
   if (s.includes("ht/ft") || s.includes("ht-ft") || s.includes("half time/full time")) return "HT-FT";
-  if (s.includes("over 2.5") || s.includes("under 2.5") || s.includes("ou2.5") || s.includes("o/u 2.5")) return "O/U 2.5";
+  if (s.includes("over 2.5") || s.includes("under 2.5") || s.includes("ou2.5") || s.includes("o/u 2.5") || s.includes("totals")) return "O/U 2.5";
   if (s === "1x2" || s.includes("match result") || s.includes("full time result")) return "1X2";
   return (s || "").trim() ? s.toUpperCase() : "1X2";
 }
+function mapHTFT(code) {
+  // "1/1","1/X","1/2","X/1","X/X","X/2","2/1","2/X","2/2"
+  const m = String(code || "").trim().toUpperCase();
+  const to = (c) => (c === "1" ? "Home" : c === "2" ? "Away" : c === "X" ? "Draw" : c);
+  const [a, b] = m.split("/");
+  if (!a || !b) return null;
+  return `${to(a)}–${to(b)}`;
+}
+function normalizeSelection(it, marketHint) {
+  const market = (marketHint && String(marketHint)) || normMarket(it?.market_label || it?.market || "");
+  const rawSel =
+    it?.selection_label ??
+    it?.selection?.label ??
+    it?.pick_label ??
+    it?.selection ??
+    it?.pick ??
+    null;
 
-/* ---------- HT-FT pretty helper ---------- */
-const MAP_T = { "1":"Home", "2":"Away", "x":"Draw", "d":"Draw", "h":"Home", "a":"Away" };
-function htftPrettyFrom(hay, code) {
-  const s = String(hay || "").toLowerCase();
-
-  // explicit code like 1-1, 1/x, h/a ...
-  const codeStr = String(code || "").toLowerCase();
-  let m = codeStr.match(/([12xdh])\s*[-/]\s*([12xdh])/);
-  if (m) {
-    const A = MAP_T[m[1]] || (m[1]==="x"||m[1]==="d"?"Draw":null);
-    const B = MAP_T[m[2]] || (m[2]==="x"||m[2]==="d"?"Draw":null);
-    if (A && B) return `${A}-${B}`;
+  if (rawSel) {
+    const s = String(rawSel).trim();
+    if (market === "BTTS") {
+      if (/^y(es)?$/i.test(s)) return "Yes";
+      if (/^n(o)?$/i.test(s)) return "No";
+      if (/both.*yes/i.test(s)) return "Yes";
+      if (/both.*no/i.test(s)) return "No";
+    }
+    if (market === "O/U 2.5") {
+      if (/^over/i.test(s)) return "Over 2.5";
+      if (/^under/i.test(s)) return "Under 2.5";
+    }
+    if (market === "HT-FT") {
+      // some providers label like "Home/Home" or "1/1"
+      if (/^[12X]\/[12X]$/.test(s.toUpperCase())) return mapHTFT(s);
+      if (/home|away|draw/i.test(s)) return s.replace("/", "–");
+    }
+    // fallback: return the label as-is
+    return s;
   }
 
-  // Home/Home, Away-Draw, H/H, A/D ...
-  m = s.match(/\b(home|away|draw|1|2|x|d|h|a)\s*[-/]\s*(home|away|draw|1|2|x|d|h|a)\b/);
-  if (m) {
-    const A = MAP_T[m[1]] || (m[1]==="x"||m[1]==="d"?"Draw":null) || (m[1]==="home"?"Home":m[1]==="away"?"Away":"Draw");
-    const B = MAP_T[m[2]] || (m[2]==="x"||m[2]==="d"?"Draw":null) || (m[2]==="home"?"Home":m[2]==="away"?"Away":"Draw");
-    return `${A}-${B}`;
+  // derive from codes if label missing
+  const pc = String(it?.pick_code || "").trim();
+  if (market === "BTTS") {
+    if (/yes/i.test(pc)) return "Yes";
+    if (/no/i.test(pc)) return "No";
+  }
+  if (market === "O/U 2.5") {
+    if (/over/i.test(pc)) return "Over 2.5";
+    if (/under/i.test(pc)) return "Under 2.5";
+  }
+  if (market === "HT-FT" && /^[12X]\/[12X]$/.test(pc.toUpperCase())) {
+    return mapHTFT(pc);
   }
 
-  // compact hh/ha/ad ...
-  m = s.match(/\b(hh|ha|hd|ah|aa|ad|dh|da|dd)\b/);
-  if (m) {
-    const pair = m[1];
-    const A = MAP_T[pair[0]];
-    const B = MAP_T[pair[1]] || (pair[1]==="d"?"Draw":null);
-    if (A && B) return `${A}-${B}`;
+  // 1X2 only: translate pick_code 1/X/2 to Home/Draw/Away
+  if (market === "1X2") {
+    if (pc === "1") return "Home";
+    if (pc === "X") return "Draw";
+    if (pc === "2") return "Away";
   }
 
-  // text like "home home" / "away draw"
-  m = s.match(/\b(home|away|draw)\s+(home|away|draw)\b/);
-  if (m) return `${m[1][0].toUpperCase()+m[1].slice(1)}-${m[2][0].toUpperCase()+m[2].slice(1)}`;
-
-  // nothing reliable
-  return null;
+  return "—";
 }
 
-/* ---------- bet normalizer (sa pretty selekcijama za BTTS/OU25/HTFT) ---------- */
-function normalizeBet(it) {
+/* ---------- bet normalizer ---------- */
+function normalizeBet(it, marketOverride) {
   const league =
     it?.league_name || it?.league?.name || it?.league || it?.competition || "";
   const date = parseKickoff(it);
@@ -135,19 +152,15 @@ function normalizeBet(it) {
   const home = teamName(it?.teams?.home || it?.home);
   const away = teamName(it?.teams?.away || it?.away);
 
-  const rawMarket = it?.market_label || it?.market || "1X2";
+  const rawMarket = marketOverride || it?.market_label || it?.market || "1X2";
   const market = normMarket(rawMarket);
 
-  const baseSel =
-    it?.selection_label ||
-    it?.pick ||
-    it?.selection ||
-    (it?.pick_code === "1" ? "Home" : it?.pick_code === "2" ? "Away" : it?.pick_code === "X" ? "Draw" : "");
+  const sel = normalizeSelection(it, market);
 
   let odds =
     typeof it?.odds === "object" && it?.odds
-      ? Number(it.odds.price)
-      : Number(it?.market_odds ?? it?.odds);
+      ? toDec(it.odds.price)
+      : toDec(it?.market_odds ?? it?.odds);
   odds = Number.isFinite(odds) ? odds : null;
 
   let conf = Number(
@@ -158,31 +171,12 @@ function normalizeBet(it) {
   );
   conf = Number.isFinite(conf) ? Math.max(0, Math.min(100, conf)) : 0;
 
-  // --- Pretty selection for specials ---
-  const hay = [
-    it?.selection_label, it?.pick, it?.selection, it?.market_label, it?.market_pick, it?.label
-  ].filter(Boolean).join(" ").toLowerCase();
-
-  let selPretty = baseSel;
-  if (market === "BTTS") {
-    if (/\b(yes|gg)\b/.test(hay) || /both\s+teams\s+to\s+score/.test(hay)) selPretty = "Yes";
-    else if (/\b(no|ng)\b/.test(hay)) selPretty = "No";
-  } else if (market === "O/U 2.5") {
-    if (/\bover\b/.test(hay)) selPretty = "Over 2.5";
-    else if (/\bunder\b/.test(hay)) selPretty = "Under 2.5";
-  } else if (market === "HT-FT") {
-    selPretty =
-      htftPrettyFrom(hay, it?.pick_code || it?.selection_code || it?.code) ||
-      selPretty;
-  }
-
   return {
     id:
-      it?.fixture_id ?? it?.fixture?.id ?? `${home}-${away}-${Date.parse(date || new Date())}`,
-    league, date, home, away, market,
-    sel: baseSel,
-    sel_pretty: selPretty,
-    odds, conf, explain: it?.explain,
+      it?.fixture_id ??
+      it?.fixture?.id ??
+      `${home}-${away}-${Date.parse(date || new Date())}-${market}-${sel}`,
+    league, date, home, away, market, sel, odds, conf, explain: it?.explain,
   };
 }
 
@@ -198,9 +192,9 @@ function ConfidenceBar({ pct }) {
 function confIcon(pct) {
   const v = Number(pct || 0);
   if (v >= 90) return "🔥";
-  if (v >= 75) return <span className="text-green-400">●</span>;
-  if (v >= 50) return <span className="text-sky-400">●</span>;
-  return <span className="text-amber-400">●</span>;
+  if (v >= 75) return <span className="text-green-400">●</span>;   // High
+  if (v >= 50) return <span className="text-sky-400">●</span>;     // Moderate
+  return <span className="text-amber-400">●</span>;                // Low
 }
 function WhyLine({ explain }) {
   const bullets = Array.isArray(explain?.bullets) ? explain.bullets : [];
@@ -252,8 +246,7 @@ function FootballCard({ bet }) {
 
       <div className="text-sm text-slate-200 mt-1">
         <span className="font-semibold">{bet.market}</span>
-        {bet.market ? " → " : ""}
-        {bet.sel_pretty || bet.sel || "—"}
+        {bet.market ? " → " : ""}{bet.sel || "—"}
         {bet.odds ? (
           <span className="text-slate-300"> ({Number(bet.odds).toFixed(2)})</span>
         ) : (
@@ -276,148 +269,140 @@ function FootballCard({ bet }) {
   );
 }
 
-/* ---------- Ticket card (parlay) ---------- */
-function product(arr) { return arr.reduce((a, x) => (Number.isFinite(x) ? a * x : a), 1); }
-function prettySelFor(b, title) {
-  if (b?.sel_pretty) return b.sel_pretty;
-  const m = String(title || b?.market || "").toUpperCase();
-  const s = String(b?.sel || "").toLowerCase();
-
-  if (m === "BTTS") {
-    if (/\byes\b/.test(s) || /\bgg\b/.test(s)) return "Yes";
-    if (/\bno\b/.test(s) || /\bng\b/.test(s)) return "No";
-    return "—";
-  }
-  if (m === "O/U 2.5") {
-    if (/over/.test(s)) return "Over 2.5";
-    if (/under/.test(s)) return "Under 2.5";
-    return "—";
-  }
-  if (m === "HT-FT") {
-    const hay = [b?.sel, b?.selection_label, b?.pick, b?.label].filter(Boolean).join(" ");
-    const fromHay = htftPrettyFrom(hay, b?.pick_code || b?.selection_code || b?.code);
-    return fromHay || (s ? s[0].toUpperCase()+s.slice(1) : "—");
-  }
-  return b?.sel || "—";
+/* ---------- Ticket group card (BTTS / O/U 2.5 / HT-FT) ---------- */
+function computeTotalOdds(list) {
+  const nums = list.map((x) => Number(x.odds)).filter((v) => Number.isFinite(v) && v > 1);
+  if (!nums.length) return null;
+  const prod = nums.reduce((a, b) => a * b, 1);
+  return prod;
 }
-function TicketCard({ title, legs }) {
-  const legsWithOdds = Array.isArray(legs) ? legs.filter((l) => Number(l?.odds)) : [];
-  const total = legsWithOdds.length ? product(legsWithOdds.map((l) => Number(l.odds))) : null;
+function TicketGroupCard({ title, items, sortBy = "ko" }) {
+  const sorted = useMemo(() => {
+    const arr = [...(items || [])];
+    if (sortBy === "conf") arr.sort((a, b) => (b.conf || 0) - (a.conf || 0));
+    else arr.sort((a, b) => (a.date?.getTime?.() || 9e15) - (b.date?.getTime?.() || 9e15));
+    return arr;
+  }, [items, sortBy]);
+
+  const total = computeTotalOdds(sorted);
 
   return (
-    <div className="p-4 rounded-xl bg-[#1a1e33] border border-white/5">
+    <div className="p-4 rounded-xl bg-[#1f2339]">
       <div className="flex items-center justify-between">
         <div className="text-slate-200 font-semibold">{title}</div>
-        <MarketBadge market={title} />
+        {typeof total === "number" ? (
+          <div className="text-slate-200 font-semibold">
+            Total: {total.toFixed(2)}
+          </div>
+        ) : null}
       </div>
 
-      {!legs?.length ? (
-        <div className="text-slate-400 text-sm mt-2">Nema parova u ovom slotu.</div>
-      ) : (
-        <>
-          <ul className="text-sm text-slate-300 mt-2 space-y-1.5">
-            {legs.map((l) => (
-              <li key={l.id} className="flex items-start justify-between gap-3">
-                <span className="min-w-0">
-                  <span className="font-medium">{l.home}</span>{" "}
-                  <span className="text-slate-400">vs</span>{" "}
-                  <span className="font-medium">{l.away}</span>{" "}
-                  <span className="text-slate-400">({prettySelFor(l, title)})</span>
-                </span>
-                <span className="shrink-0 text-slate-200">
-                  {Number(l?.odds) ? Number(l.odds).toFixed(2) : "—"}
-                </span>
-              </li>
-            ))}
-          </ul>
-
-          {/* separator iste “boje kao timovi” (svetlo siva/škriljac) */}
-          <div className="mt-3 border-t border-slate-300/30"></div>
-
-          <div className="pt-3 flex items-center justify-between text-sm">
-            <span className="text-slate-400">Ukupno ({legsWithOdds.length} para)</span>
-            <span className="text-slate-100 font-semibold">
-              {total ? total.toFixed(2) : "—"}
-            </span>
+      <div className="mt-3 space-y-3">
+        {sorted.map((b) => (
+          <div key={b.id} className="rounded-lg border border-slate-700/40 p-3">
+            <div className="text-xs text-slate-400 flex items-center justify-between">
+              <span>{b.league}</span>
+              <span>{fmtLocal(b.date)}</span>
+            </div>
+            <div className="font-semibold mt-0.5">
+              {b.home} <span className="text-slate-400">vs</span> {b.away}
+            </div>
+            <div className="text-sm text-slate-200 mt-0.5">
+              <MarketBadge market={b.market} />{" "}
+              <span className="font-semibold">{b.sel}</span>
+              {b.odds ? <span className="text-slate-300"> ({Number(b.odds).toFixed(2)})</span> : <span className="text-slate-500"> (—)</span>}
+            </div>
+            <div className="text-[11px] text-slate-400 mt-0.5">Conf: {Math.round(b.conf || 0)}%</div>
           </div>
-        </>
+        ))}
+      </div>
+
+      {/* separator line same tone as team names area */}
+      <div className="h-px bg-slate-600 my-3" />
+
+      {typeof total === "number" ? (
+        <div className="text-right text-slate-200 font-semibold">Ukupna kvota: {total.toFixed(2)}</div>
+      ) : (
+        <div className="text-right text-slate-500 text-sm">Ukupna kvota: —</div>
       )}
     </div>
   );
 }
 
 /* ===================== data hooks ===================== */
-function useFootballFeed() {
-  const [list, setList] = useState([]); const [err, setErr] = useState(null); const [loading, setLoading] = useState(true);
+function useValueBetsFeed() {
+  const [state, setState] = useState({
+    items: [], // 1X2 normalized
+    tickets: { btts: [], ou25: [], htft: [] }, // normalized
+    err: null,
+    loading: true,
+  });
+
   async function load() {
     try {
-      setLoading(true); setErr(null);
-      const slot = currentSlot(TZ); const n = desiredCountForSlot(slot, TZ);
+      setState((s) => ({ ...s, loading: true, err: null }));
+      const slot = currentSlot(TZ);
+      const n = desiredCountForSlot(slot, TZ);
       const j = await safeJson(`/api/value-bets-locked?slot=${slot}&n=${n}`);
-      const arr = Array.isArray(j?.items) ? j.items : Array.isArray(j?.football) ? j.football : Array.isArray(j) ? j : [];
-      setList(arr.map(normalizeBet));
-    } catch (e) { setErr(String(e?.message || e)); setList([]); } finally { setLoading(false); }
+      const srcItems = Array.isArray(j?.items) ? j.items : Array.isArray(j?.football) ? j.football : Array.isArray(j) ? j : [];
+      const items = srcItems.map((it) => normalizeBet(it)); // may include mixed markets, we’ll filter later
+
+      const tb = j?.tickets || {};
+      const bttsRaw = Array.isArray(tb.btts) ? tb.btts : [];
+      const ou25Raw = Array.isArray(tb.ou25) ? tb.ou25 : [];
+      const htftRaw = Array.isArray(tb.htft) ? tb.htft : [];
+
+      const btts = bttsRaw.map((it) => normalizeBet(it, "BTTS"));
+      const ou25 = ou25Raw.map((it) => normalizeBet(it, "O/U 2.5"));
+      const htft = htftRaw.map((it) => normalizeBet(it, "HT-FT"));
+
+      setState({
+        items,
+        tickets: { btts, ou25, htft },
+        err: null,
+        loading: false,
+      });
+    } catch (e) {
+      setState({ items: [], tickets: { btts: [], ou25: [], htft: [] }, err: String(e?.message || e), loading: false });
+    }
   }
+
   useEffect(() => { load(); }, []);
-  return { list, err, loading, reload: load };
+  return { ...state, reload: load };
 }
 
-/** Zamrzni tikete po (ymd,slot) – čitamo iz value-bets-locked i držimo u localStorage */
-function useFrozenTickets() {
-  const [state, setState] = useState({ btts: [], ou25: [], htft: [] });
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState(null);
-
-  const slot = currentSlot(TZ);
-  const ymd = ymdInTZ(new Date(), TZ);
-  const LS_KEY = `tickets:v3:${ymd}:${slot}`;
-
+function useCryptoTop3() {
+  const [items, setItems] = useState([]); const [err, setErr] = useState(null); const [loading, setLoading] = useState(true);
   async function load() {
     try {
       setLoading(true); setErr(null);
-
-      const j = await safeJson(`/api/value-bets-locked?slot=${slot}&slim=1`);
-      const t = j && typeof j === "object" && j.tickets && typeof j.tickets === "object" ? j.tickets : null;
-
-      const norm = (raw) => ({
-        btts: (raw?.btts || []).map(normalizeBet),
-        ou25: (raw?.ou25 || []).map(normalizeBet),
-        htft: (raw?.htft || []).map(normalizeBet),
-      });
-
-      if (t && (t.btts?.length || t.ou25?.length || t.htft?.length)) {
-        const payload = { ...norm(t), meta: { ymd: j?.ymd || ymd, slot: j?.slot || slot } };
-        try { localStorage.setItem(LS_KEY, JSON.stringify(payload)); } catch {}
-        setState(payload);
-      } else {
-        const s = typeof window !== "undefined" ? localStorage.getItem(LS_KEY) : null;
-        if (s) {
-          try {
-            const parsed = JSON.parse(s);
-            setState({
-              btts: (parsed?.btts || []).map(normalizeBet),
-              ou25: (parsed?.ou25 || []).map(normalizeBet),
-              htft: (parsed?.htft || []).map(normalizeBet),
-            });
-          } catch { setState({ btts: [], ou25: [], htft: [] }); }
-        } else {
-          setState({ btts: [], ou25: [], htft: [] });
-        }
-      }
-    } catch (e) {
-      setErr(String(e?.message || e)); setState({ btts: [], ou25: [], htft: [] });
-    } finally { setLoading(false); }
+      const j = await safeJson(`/api/crypto`);
+      const arr = Array.isArray(j?.items) ? j.items
+        : Array.isArray(j?.predictions) ? j.predictions
+        : Array.isArray(j?.data) ? j.data
+        : Array.isArray(j?.list) ? j.list
+        : Array.isArray(j?.results) ? j.results
+        : Array.isArray(j?.signals) ? j.signals
+        : Array.isArray(j?.crypto) ? j.crypto
+        : Array.isArray(j) ? j : [];
+      setItems(arr.slice(0, 3));
+    } catch (e) { setErr(String(e?.message || e)); setItems([]); } finally { setLoading(false); }
   }
-
-  useEffect(() => { load(); }, [slot, ymd]);
-  return { tickets: state, loading, err, reload: load };
+  useEffect(() => { load(); }, []);
+  return { items, err, loading };
 }
 
 /* ===================== Football tab ===================== */
 function FootballBody({ list, tickets }) {
   const [tab, setTab] = useState("ko"); // ko | conf | hist
 
+  // Only 1X2 on left (as requested)
   const oneX2All = useMemo(() => list.filter(x => String(x.market).toUpperCase() === "1X2"), [list]);
+
+  // Specials come exclusively from tickets object (not from items)
+  const ticketsBTTS = tickets?.btts || [];
+  const ticketsOU25 = tickets?.ou25 || [];
+  const ticketsHTFT = tickets?.htft || [];
 
   const koLeft = useMemo(
     () => [...oneX2All].sort((a, b) => (a.date?.getTime?.() || 9e15) - (b.date?.getTime?.() || 9e15)),
@@ -425,14 +410,12 @@ function FootballBody({ list, tickets }) {
   );
   const confLeft = useMemo(() => [...oneX2All].sort((a, b) => b.conf - a.conf), [oneX2All]);
 
-  const left = tab === "ko" ? koLeft : confLeft;
-
-  const btts = tickets?.btts || [];
-  const ou25 = tickets?.ou25 || [];
-  const htft = tickets?.htft || [];
+  // for right column we pass the sort mode to TicketGroupCard
+  const rightSort = tab === "conf" ? "conf" : "ko";
 
   return (
     <div className="space-y-4">
+      {/* Inner tabs */}
       <div className="flex items-center gap-2">
         <button className={`px-3 py-1.5 rounded-lg text-sm ${tab === "ko" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"}`} onClick={() => setTab("ko")} type="button">Kick-Off</button>
         <button className={`px-3 py-1.5 rounded-lg text-sm ${tab === "conf" ? "bg-[#202542] text-white" : "bg-[#171a2b] text-slate-300"}`} onClick={() => setTab("conf")} type="button">Confidence</button>
@@ -445,27 +428,32 @@ function FootballBody({ list, tickets }) {
         <div className="rounded-2xl bg-[#15182a] p-4">
           <div className="text-base font-semibold text-white mb-3">{tab === "ko" ? "Kick-Off" : "Confidence"}</div>
 
+          {/* 55/45 layout on md+ */}
           <div className="flex flex-col md:flex-row md:gap-4 gap-4">
             {/* 1X2 (55%) */}
             <section className="md:basis-[55%] md:min-w-0">
               <div className="text-slate-200 font-semibold mb-2">Match Odds (1X2)</div>
-              {!left.length ? (
+              {! (tab === "ko" ? koLeft : confLeft).length ? (
                 <div className="text-slate-400 text-sm">Nema 1X2 ponuda.</div>
               ) : (
                 <div className="grid grid-cols-1 gap-3">
-                  {left.map((b) => (<FootballCard key={b.id} bet={b} />))}
+                  {(tab === "ko" ? koLeft : confLeft).map((b) => (<FootballCard key={b.id} bet={b} />))}
                 </div>
               )}
             </section>
 
-            {/* Specials (45%) – iz zamrznutih tiketa */}
+            {/* Tickets (45%) */}
             <section className="md:basis-[45%] md:min-w-0">
-              <div className="text-slate-200 font-semibold mb-2">Specials — BTTS / HT-FT / O/U 2.5</div>
-              <div className="grid grid-cols-1 gap-3">
-                <TicketCard title="BTTS"   legs={btts} />
-                <TicketCard title="O/U 2.5" legs={ou25} />
-                <TicketCard title="HT-FT"  legs={htft} />
-              </div>
+              <div className="text-slate-200 font-semibold mb-2">Tickets — BTTS / O/U 2.5 / HT-FT</div>
+              {!ticketsBTTS.length && !ticketsOU25.length && !ticketsHTFT.length ? (
+                <div className="text-slate-400 text-sm">Nema specijalnih tiketa.</div>
+              ) : (
+                <div className="grid grid-cols-1 gap-3">
+                  {ticketsBTTS.length ? <TicketGroupCard title="BTTS Ticket" items={ticketsBTTS} sortBy={rightSort} /> : null}
+                  {ticketsOU25.length ? <TicketGroupCard title="O/U 2.5 Ticket" items={ticketsOU25} sortBy={rightSort} /> : null}
+                  {ticketsHTFT.length ? <TicketGroupCard title="HT-FT Ticket" items={ticketsHTFT} sortBy={rightSort} /> : null}
+                </div>
+              )}
             </section>
           </div>
         </div>
@@ -474,7 +462,7 @@ function FootballBody({ list, tickets }) {
   );
 }
 
-/* ===================== Combined & Crypto ===================== */
+/* ===================== Crypto sekcija (ostaje) ===================== */
 function CombinedBody({ footballTop3, cryptoTop3 }) {
   return (
     <div className="space-y-4">
@@ -520,17 +508,11 @@ function CryptoBody({ list }) {
 /* ===================== main ===================== */
 export default function CombinedBets() {
   const [tab, setTab] = useState("Combined");
-
-  const fb = useFootballFeed();
-  const { tickets, loading: tLoading, err: tErr } = useFrozenTickets();
-
-  // Combined prikazuje SAMO 1X2 top3
+  const fb = useValueBetsFeed();
+  const crypto = useCryptoTop3();
   const top3Football = useMemo(
-    () => [...fb.list]
-      .filter((x) => String(x.market).toUpperCase() === "1X2")
-      .sort((a, b) => b.conf - a.conf)
-      .slice(0, 3),
-    [fb.list]
+    () => [...fb.items.filter(x => x.market === "1X2")].sort((a, b) => b.conf - a.conf).slice(0, 3),
+    [fb.items]
   );
 
   return (
@@ -543,9 +525,9 @@ export default function CombinedBets() {
         ))}
       </div>
 
-      {tab === "Combined" && (fb.loading ? <div className="text-slate-400 text-sm">Učitavam…</div> : fb.err ? <div className="text-red-400 text-sm">Greška: {fb.err}</div> : <CombinedBody footballTop3={top3Football} cryptoTop3={[]} />)}
-      {tab === "Football" && (fb.loading || tLoading ? <div className="text-slate-400 text-sm">Učitavam…</div> : fb.err ? <div className="text-red-400 text-sm">Greška: {fb.err}</div> : tErr ? <div className="text-red-400 text-sm">Greška (tickets): {tErr}</div> : <FootballBody list={fb.list} tickets={tickets} />)}
-      {tab === "Crypto" && <CryptoBody list={[]} />}
+      {tab === "Combined" && (fb.loading ? <div className="text-slate-400 text-sm">Učitavam…</div> : fb.err ? <div className="text-red-400 text-sm">Greška: {fb.err}</div> : <CombinedBody footballTop3={top3Football} cryptoTop3={crypto.items} />)}
+      {tab === "Football" && (fb.loading ? <div className="text-slate-400 text-sm">Učitavam…</div> : fb.err ? <div className="text-red-400 text-sm">Greška: {fb.err}</div> : <FootballBody list={fb.items} tickets={fb.tickets} />)}
+      {tab === "Crypto" && (crypto.loading ? <div className="text-slate-400 text-sm">Učitavam…</div> : crypto.err ? <div className="text-red-400 text-sm">Greška: {crypto.err}</div> : <CryptoBody list={crypto.items} />)}
     </div>
   );
 }
