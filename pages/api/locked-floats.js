@@ -1,129 +1,187 @@
 // pages/api/locked-floats.js
 export const config = { api: { bodyParser: false } };
 
-/* KV (Vercel KV) */
-const KV_URL = process.env.KV_REST_API_URL;
-const KV_TOK = process.env.KV_REST_API_TOKEN;
-async function kvGet(key){ if(!KV_URL||!KV_TOK)return null; const r=await fetch(`${KV_URL.replace(/\/+$/,"")}/get/${encodeURIComponent(key)}`,{headers:{Authorization:`Bearer ${KV_TOK}`},cache:"no-store"}); if(!r.ok)return null; const j=await r.json().catch(()=>null); return typeof j?.result==="string"?j.result:null; }
-async function kvSet(key,val){ if(!KV_URL||!KV_TOK)return false; const r=await fetch(`${KV_URL.replace(/\/+$/,"")}/set/${encodeURIComponent(key)}`,{method:"POST",headers:{Authorization:`Bearer ${KV_TOK}`,"Content-Type":"application/json"},body: (typeof val==="string")?val:JSON.stringify(val)}); return r.ok; }
-
-/* TZ */
+/* ---------- TZ ---------- */
 function pickTZ(){ const raw=(process.env.TZ_DISPLAY||"Europe/Belgrade").trim(); try{ new Intl.DateTimeFormat("en-GB",{timeZone:raw}); return raw; }catch{ return "Europe/Belgrade"; } }
 const TZ = pickTZ();
 const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
 
-/* helpers */
+/* ---------- KV ---------- */
+const KV_URL = process.env.KV_REST_API_URL?.replace(/\/+$/,"");
+const KV_TOK = process.env.KV_REST_API_TOKEN;
+const okKV   = !!(KV_URL && KV_TOK);
 const J = s=>{ try{ return JSON.parse(String(s||"")); }catch{ return null; } };
-const kickoffTs = x => { const k=x?.fixture?.date||x?.fixture_date||x?.kickoff||x?.kickoff_utc||x?.ts; const d=k?new Date(k):null; return Number.isFinite(d?.getTime?.())?d.getTime():0; };
-const conf = x => Number.isFinite(x?.confidence_pct)?x.confidence_pct:(Number(x?.confidence)||0);
 
-/* API-Football odds (15 safe poziva max) */
-const AF_BASE = "https://v3.football.api-sports.io";
-const AF_KEY  = process.env.API_FOOTBALL_KEY;
-async function afOddsByFixture(fixtureId){
-  if(!AF_KEY) return null;
-  const url = `${AF_BASE}/odds?fixture=${fixtureId}`;
-  const r = await fetch(url, { headers:{ "x-apisports-key": AF_KEY }, cache:"no-store" });
-  if(!r.ok) return null;
-  const j = await r.json().catch(()=>null);
-  return j?.response?.[0]?.bookmakers || [];
+async function kvGet(key){
+  if(!okKV) return null;
+  const r=await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`,{headers:{Authorization:`Bearer ${KV_TOK}`},cache:"no-store"});
+  if(!r.ok) return null; const j=await r.json().catch(()=>null);
+  return typeof j?.result==="string" ? j.result : null;
+}
+async function kvSet(key,val){
+  if(!okKV) return false;
+  const r=await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`,{
+    method:"POST",headers:{Authorization:`Bearer ${KV_TOK}`,"Content-Type":"application/json"},
+    body: (typeof val==="string")?val:JSON.stringify(val)
+  });
+  return r.ok;
 }
 
-/* dnevni specijali: BTTS, O/U 2.5, HT/FT → tickets:<ymd> */
-async function buildDailyTickets(ymd) {
-  const raw = await kvGet(`vb:day:${ymd}:last`) || await kvGet(`vb:day:${ymd}:union`);
-  const base = J(raw) || [];
-  if (!base.length) return null;
+/* ---------- API-FOOTBALL ---------- */
+const AF_BASE = "https://v3.football.api-sports.io";
+const AF_KEY  = process.env.API_FOOTBALL_KEY;
+async function af(path){
+  if(!AF_KEY) return null;
+  const r=await fetch(`${AF_BASE}${path}`,{headers:{"x-apisports-key":AF_KEY}, cache:"no-store"});
+  if(!r.ok) return null;
+  const j=await r.json().catch(()=>null);
+  return j?.response || null;
+}
 
-  const take = base.slice(0, 12); // ≤12 AF poziva
+function mapFixtureToBase(fx){
+  // Dovoljno meta da refresh/rebuild mogu da rade; pick/conf/odds će se dodati posle.
+  return {
+    fixture_id: fx?.fixture?.id,
+    fixture: {
+      id: fx?.fixture?.id,
+      date: fx?.fixture?.date,
+      timezone: fx?.fixture?.timezone || TZ,
+    },
+    league: {
+      id: fx?.league?.id,
+      name: fx?.league?.name,
+      country: fx?.league?.country,
+      season: fx?.league?.season,
+      round: fx?.league?.round,
+    },
+    teams: {
+      home: { id: fx?.teams?.home?.id, name: fx?.teams?.home?.name, logo: fx?.teams?.home?.logo, winner: fx?.teams?.home?.winner ?? null },
+      away: { id: fx?.teams?.away?.id, name: fx?.teams?.away?.name, logo: fx?.teams?.away?.logo, winner: fx?.teams?.away?.winner ?? null },
+    },
+    kickoff_utc: fx?.fixture?.date,
+    market: "1X2",
+    market_label: "1X2",
+    // polja koja UI voli, ostavljena prazna da ih popuni refresh-odds/insights kasnije:
+    selection_label: null,
+    odds: { price: null, books_count: 0 },
+    confidence_pct: 50
+  };
+}
+
+/* ---------- Specijali (BTTS / O/U 2.5 / HT-FT) – skromno, ≤ 12 AF poziva ---------- */
+const conf = x => Number.isFinite(x?.confidence_pct)?x.confidence_pct:(Number(x?.confidence)||0);
+const kts = x => { const k=x?.fixture?.date||x?.kickoff||x?.kickoff_utc||x?.ts; const d=k?new Date(k):null; return Number.isFinite(d?.getTime?.())?d.getTime():0; };
+
+async function buildDailyTicketsFromAF(fixtures){
+  // Uzimamo najviše 12 prvih utakmica (da ostanemo daleko ispod 6000/dan)
+  const take = fixtures.slice(0, 12);
   const btts=[], ou25=[], htft=[];
 
-  function push(arr, it, confBoost){ arr.push({ ...it, confidence_pct: Math.min(95, Math.max(conf(it), 40) + confBoost) }); }
-
   for (const f of take) {
-    const fid = f?.fixture_id || f?.fixture?.id || f?.id; if (!fid) continue;
-    const books = await afOddsByFixture(fid); if (!books) continue;
-
+    const fid = f?.fixture?.id || f?.fixture_id; if(!fid) continue;
+    const oddsResp = await af(`/odds?fixture=${fid}`);
+    const books = oddsResp?.[0]?.bookmakers || [];
     // BTTS
     {
       let yes=[], no=[];
       for (const b of books) for (const bet of (b?.bets||[])) {
-        const nm = String(bet?.name||"").toLowerCase();
-        if (nm.includes("both teams to score")) {
+        const nm=String(bet?.name||"").toLowerCase();
+        if (nm.includes("both teams to score")){
           for (const v of (bet?.values||[])) {
             const lbl=String(v?.value||"").toLowerCase(), odd=Number(v?.odd);
-            if (!Number.isFinite(odd)) continue;
+            if(!Number.isFinite(odd)) continue;
             if (lbl.includes("yes")) yes.push(odd); else if (lbl.includes("no")) no.push(odd);
           }
         }
       }
       const pick = yes.length && (!no.length || Math.min(...yes) <= Math.min(...no)) ? {sel:"YES", price: Math.min(...yes)} :
                    no.length  ? {sel:"NO",  price: Math.min(...no)}  : null;
-      if (pick) push(btts, { ...f, market:"BTTS", market_label:"BTTS", selection_label: pick.sel, selection: pick.sel, market_odds: pick.price }, 5);
+      if (pick) btts.push({ ...mapFixtureToBase(f), market:"BTTS", market_label:"BTTS", selection_label: pick.sel, selection: pick.sel, market_odds: pick.price, confidence_pct: Math.max(55, conf(f)) });
     }
-
     // O/U 2.5
     {
       let over=[], under=[];
       for (const b of books) for (const bet of (b?.bets||[])) {
-        const nm = String(bet?.name||"").toLowerCase();
-        if (nm.includes("over/under") || nm.includes("totals")) {
+        const nm=String(bet?.name||"").toLowerCase();
+        if (nm.includes("over/under") || nm.includes("totals")){
           for (const v of (bet?.values||[])) {
             const lbl=String(v?.value||"").toLowerCase(), odd=Number(v?.odd);
-            if (!Number.isFinite(odd)) continue;
+            if(!Number.isFinite(odd)) continue;
             if (lbl.includes("over 2.5")) over.push(odd);
             if (lbl.includes("under 2.5")) under.push(odd);
           }
         }
       }
       const pick = over.length && (!under.length || Math.min(...over) <= Math.min(...under)) ? {sel:"OVER 2.5", price: Math.min(...over)} :
-                   under.length ? {sel:"UNDER 2.5",price: Math.min(...under)} : null;
-      if (pick) push(ou25, { ...f, market:"O/U 2.5", market_label:"O/U 2.5", selection_label: pick.sel, selection: pick.sel, market_odds: pick.price }, 5);
+                   under.length ? {sel:"UNDER 2.5", price: Math.min(...under)} : null;
+      if (pick) ou25.push({ ...mapFixtureToBase(f), market:"O/U 2.5", market_label:"O/U 2.5", selection_label: pick.sel, selection: pick.sel, market_odds: pick.price, confidence_pct: Math.max(55, conf(f)) });
     }
-
     // HT/FT
     {
       const map = {};
       for (const b of books) for (const bet of (b?.bets||[])) {
-        const nm = String(bet?.name||"").toLowerCase();
-        if (nm.includes("ht/ft") || nm.includes("half time/full time")) {
+        const nm=String(bet?.name||"").toLowerCase();
+        if (nm.includes("ht/ft") || nm.includes("half time/full time")){
           for (const v of (bet?.values||[])) {
-            const lbl = String(v?.value||"").toUpperCase().replace(/\s+/g,"");
-            const odd = Number(v?.odd); if (!Number.isFinite(odd)) continue;
-            const norm = lbl.replace(/(^|\/)1/g,"$1HOME").replace(/(^|\/)X/g,"$1DRAW").replace(/(^|\/)2/g,"$1AWAY");
+            const lbl=String(v?.value||"").toUpperCase().replace(/\s+/g,"");
+            const odd=Number(v?.odd); if(!Number.isFinite(odd)) continue;
+            const norm=lbl.replace(/(^|\/)1/g,"$1HOME").replace(/(^|\/)X/g,"$1DRAW").replace(/(^|\/)2/g,"$1AWAY");
             (map[norm] ||= []).push(odd);
           }
         }
       }
       const best = Object.entries(map).map(([k,arr])=>[k, arr && arr.length ? Math.min(...arr) : Infinity]).sort((a,b)=>a[1]-b[1])[0];
-      if (best && isFinite(best[1])) push(htft, { ...f, market:"HT-FT", market_label:"HT-FT", selection_label: best[0], selection: best[0], market_odds: best[1] }, 8);
+      if (best && isFinite(best[1])) htft.push({ ...mapFixtureToBase(f), market:"HT-FT", market_label:"HT-FT", selection_label: best[0], selection: best[0], market_odds: best[1], confidence_pct: Math.max(60, conf(f)) });
     }
   }
 
-  const sortT = (a,b)=> (conf(b)-conf(a)) || (kickoffTs(a)-kickoffTs(b));
+  const sortT = (a,b)=> (conf(b)-conf(a)) || (kts(a)-kts(b));
   btts.sort(sortT); ou25.sort(sortT); htft.sort(sortT);
-  await kvSet(`tickets:${ymd}`, { btts, ou25, htft });
-  return { btts: btts.length, ou25: ou25.length, htft: htft.length };
+  return { btts, ou25, htft };
 }
 
-export default async function handler(req, res) {
-  try {
-    const now = new Date();
-    const ymd = ymdInTZ(now, TZ);
+/* ---------- handler ---------- */
+export default async function handler(req, res){
+  try{
+    const today = ymdInTZ(new Date(), TZ);
 
-    // warm=1 → samo dnevni specijali (ako ne postoje)
-    if (String(req.query.warm||"") === "1") {
-      const raw = await kvGet(`tickets:${ymd}`);
-      if (!raw) {
-        const r = await buildDailyTickets(ymd);
-        return res.status(200).json({ ok:true, warm: r || { btts:0, ou25:0, htft:0 } });
+    // WARM: napravi bazu i (ako treba) dnevne tikete
+    if(String(req.query.warm||"") === "1"){
+      let baseCount = 0, madeBase = false, ticketsInfo = null;
+
+      // 1) BASE SNAPSHOT: ako ne postoji, povuci fixtures za današnji datum i upiši vb:day:<YMD>:(last|union)
+      const lastRaw = await kvGet(`vb:day:${today}:last`);
+      if (!J(lastRaw)?.length){
+        const fixtures = await af(`/fixtures?date=${today}&timezone=${encodeURIComponent(TZ)}`) || [];
+        const base = fixtures.map(mapFixtureToBase).filter(x=>x.fixture_id);
+        if (base.length){
+          await kvSet(`vb:day:${today}:last`, base);
+          await kvSet(`vb:day:${today}:union`, base);
+          madeBase = true;
+          baseCount = base.length;
+        }
+      }else{
+        baseCount = (J(lastRaw)||[]).length;
       }
-      return res.status(200).json({ ok:true, warm: { created:false, already:true } });
+
+      // 2) DAILY TICKETS: ako ne postoji tickets:<YMD>, napravi ga iz AF odds (≤12 poziva)
+      const tRaw = await kvGet(`tickets:${today}`);
+      if(!J(tRaw)){
+        const fixtures = J(await kvGet(`vb:day:${today}:last`)) || [];
+        const { btts, ou25, htft } = await buildDailyTicketsFromAF(fixtures);
+        await kvSet(`tickets:${today}`, { btts, ou25, htft });
+        ticketsInfo = { btts: btts.length, ou25: ou25.length, htft: htft.length };
+      }else{
+        const t = J(tRaw); ticketsInfo = { btts: (t?.btts||[]).length, ou25: (t?.ou25||[]).length, htft:(t?.htft||[]).length };
+      }
+
+      return res.status(200).json({ ok:true, warm:{ base_created:madeBase, base_count:baseCount, tickets:ticketsInfo } });
     }
 
-    // (ostali tvoji “floats/scout” koraci ostaju kakvi jesu ili ih dodaš po potrebi)
+    // Bez warm-a ne radimo ništa teško (ovaj endpoint se zove iz crona da popuni bazu)
     return res.status(200).json({ ok:true, note:"locked-floats alive" });
-  } catch (e) {
+
+  }catch(e){
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
 }
