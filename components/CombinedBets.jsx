@@ -165,7 +165,7 @@ function MarketBadge({ market }) {
   return <span className={`px-2 py-0.5 rounded-md text-[11px] border ${cls}`}>{m}</span>;
 }
 
-/* ---------- Football card (ikonica pored % + 55/45 layout kasnije) ---------- */
+/* ---------- Football card ---------- */
 function FootballCard({ bet }) {
   const confPct = Math.round(Number(bet.conf || 0));
   const icon = confIcon(confPct);
@@ -192,7 +192,6 @@ function FootballCard({ bet }) {
         )}
       </div>
 
-      {/* Confidence bar + ikonica pored % */}
       <div className="mt-3">
         <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
           <span>Confidence</span>
@@ -216,9 +215,37 @@ function useFootballFeed() {
       setLoading(true); setErr(null);
       const slot = currentSlot(TZ); const n = desiredCountForSlot(slot, TZ);
       const j = await safeJson(`/api/value-bets-locked?slot=${slot}&n=${n}`);
-      const arr = Array.isArray(j?.items) ? j.items : Array.isArray(j?.football) ? j.football : Array.isArray(j) ? j : [];
-      setList(arr.map(normalizeBet));
-    } catch (e) { setErr(String(e?.message || e)); setList([]); } finally { setLoading(false); }
+
+      // items (1X2)
+      const items = Array.isArray(j?.items) ? j.items
+        : Array.isArray(j?.football) ? j.football
+        : Array.isArray(j) ? j : [];
+
+      // tickets (BTTS / OU2.5 / HT-FT) – UI ranije nije čitao ovo!
+      const t = j?.tickets || {};
+      const tickets = [
+        ...(Array.isArray(t.btts) ? t.btts : []),
+        ...(Array.isArray(t.ou25) ? t.ou25 : []),
+        ...(Array.isArray(t.htft) ? t.htft : []),
+      ];
+
+      // Normalizacija + deduplikacija (id|market|sel)
+      const normAll = [...items, ...tickets].map(normalizeBet);
+      const seen = new Set(); const merged = [];
+      for (const b of normAll) {
+        const k = `${b.id}|${b.market}|${b.sel}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        merged.push(b);
+      }
+
+      setList(merged);
+    } catch (e) {
+      setErr(String(e?.message || e));
+      setList([]);
+    } finally {
+      setLoading(false);
+    }
   }
   useEffect(() => { load(); }, []);
   return { list, err, loading, reload: load };
