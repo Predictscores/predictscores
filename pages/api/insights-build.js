@@ -5,9 +5,9 @@ export const config = { api: { bodyParser: false } };
 
 /* ───────── TZ guard (Vercel: TZ je rezervisan; koristimo TZ_DISPLAY i sanitizujemo) ───────── */
 function pickTZ() {
-  const raw = (process.env.TZ || process.env.TZ_DISPLAY || "UTC").trim();
+  const raw = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
   const s = raw.replace(/^:+/, "");
-  try { new Intl.DateTimeFormat("en-GB", { timeZone: s }); return s; } catch { return "UTC"; }
+  try { new Intl.DateTimeFormat("en-GB", { timeZone: s }); return s; } catch { return "Europe/Belgrade"; }
 }
 const TZ = pickTZ();
 
@@ -24,22 +24,24 @@ async function kvGETraw(key, traceArr) {
   for (const b of kvBackends()) {
     try {
       const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`, {
-        headers: { Authorization: `Bearer ${b.tok}` }, cache: "no-store",
+        headers: { Authorization: `Bearer ${b.tok}` },
+        cache: "no-store",
       });
-      const ok = r.ok;
-      const j = ok ? await r.json().catch(()=>null) : null;
-      const val = (typeof j?.result === "string" && j.result) ? j.result : null;
-      traceArr && traceArr.push({ key, flavor:b.flavor, status: ok ? (val?"hit":"miss") : `http-${r.status}` });
-      if (val) return { raw: val, flavor: b.flavor };
+      const j = await r.json().catch(()=>null);
+      const raw = typeof j?.result === "string" ? j.result : null;
+      traceArr && traceArr.push({ get:key, ok:r.ok, flavor:b.flavor, hit: !!raw });
+      if (!r.ok) continue;
+      return { raw, flavor:b.flavor };
     } catch (e) {
-      traceArr && traceArr.push({ key, flavor:b.flavor, status:`err:${String(e?.message||e)}` });
+      traceArr && traceArr.push({ get:key, ok:false, flavor:b.flavor, err:String(e?.message||e) });
     }
   }
-  return { raw: null, flavor: null };
+  return { raw:null, flavor:null };
 }
-async function kvSET(key, valueString, traceArr) {
+async function kvSET(key, value, traceArr) {
   const saved = [];
-  for (const b of kvBackends().filter(x=>x.flavor==="vercel-kv")) {
+  const valueString = typeof value === "string" ? value : JSON.stringify(value);
+  for (const b of kvBackends()) {
     try {
       const r = await fetch(`${b.url}/set/${encodeURIComponent(key)}`, {
         method: "POST",
@@ -58,80 +60,30 @@ async function kvSET(key, valueString, traceArr) {
 
 /* ---------------- utils ---------------- */
 const J = s=>{ try{ return JSON.parse(String(s||"")); }catch{ return null; } };
-function arrFromAny(x){
-  if (!x) return null;
+function arrFromAny(x) {
   if (Array.isArray(x)) return x;
-  if (typeof x==="object"){
-    if (Array.isArray(x.value)) return x.value;
-    if (typeof x.value==="string"){ const v=J(x.value); if (Array.isArray(v)) return v; if (v&&typeof v==="object") return arrFromAny(v); }
-    if (Array.isArray(x.items)) return x.items;
-    if (Array.isArray(x.data))  return x.data;
-    if (Array.isArray(x.list))  return x.list;
-  }
-  if (typeof x==="string"){ const v=J(x); if (Array.isArray(v)) return v; if (v&&typeof v==="object") return arrFromAny(v); }
-  return null;
+  if (x && typeof x === "object" && Array.isArray(x.items)) return x.items;
+  if (x && typeof x === "object" && Array.isArray(x.football)) return x.football;
+  if (x && typeof x === "object" && Array.isArray(x.list)) return x.list;
+  return [];
 }
-function ymdInTZ(d=new Date(), tz=TZ){
-  const fmt = new Intl.DateTimeFormat("en-CA",{ timeZone:tz, year:"numeric", month:"2-digit", day:"2-digit" });
-  const p = fmt.formatToParts(d).reduce((a,x)=>(a[x.type]=x.value,a),{});
-  return `${p.year}-${p.month}-${p.day}`;
-}
-function hourInTZ(d=new Date(), tz=TZ){
-  const fmt = new Intl.DateTimeFormat("en-GB",{ timeZone:tz, hour:"2-digit", hour12:false });
-  return parseInt(fmt.format(d),10);
-}
-function deriveSlot(h){ if (h<10) return "late"; if (h<15) return "am"; return "pm"; }
-function confidence(it){
-  if (Number.isFinite(it?.confidence_pct)) return Number(it.confidence_pct);
-  if (Number.isFinite(it?.model_prob)) return Math.round(100*Number(it.model_prob));
-  return 0;
-}
-function normMarket(raw){
-  const s = String(raw||"").toLowerCase();
-  if (s.includes("btts") || s.includes("both teams to score")) return "BTTS";
-  if (s.includes("ht/ft") || s.includes("ht-ft") || s.includes("half time/full time")) return "HT-FT";
-  if (s.includes("over 2.5") || s.includes("under 2.5") || s.includes("ou2.5") || s.includes("o/u 2.5") || s.includes("totals")) return "O/U 2.5";
-  if (s === "1x2" || s.includes("match result") || s.includes("full time result")) return "1X2";
-  return (s||"").trim() ? s.toUpperCase() : "1X2";
-}
-function kickoffFromMeta(it){
-  const s =
-    it?.kickoff_utc ||
-    it?.kickoff ||
-    it?.datetime_local?.starting_at?.date_time ||
-    it?.fixture?.date || null;
-  const d = s ? new Date(s) : null;
-  return d && !isNaN(d.getTime()) ? d : null;
-}
+const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
+const hourInTZ = (d, tz) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour12:false, hour:"2-digit" }).format(d));
 
-/* ---------------- core: build tickets from locked/union ---------------- */
-function splitMarkets(list){
-  const out = { btts:[], ou25:[], htft:[] };
-  for (const it of list||[]){
-    const m = normMarket(it?.market_label || it?.market);
-    if (m==="BTTS") out.btts.push(it);
-    else if (m==="O/U 2.5") out.ou25.push(it);
-    else if (m==="HT-FT") out.htft.push(it);
-  }
-  const sortT = (a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0));
-  out.btts.sort(sortT); out.ou25.sort(sortT); out.htft.sort(sortT);
-  return out;
-}
-
+/* ---------------- main ---------------- */
 export default async function handler(req, res) {
   try {
-    res.setHeader("Cache-Control","no-store");
+    const trace = [];
+    const wantDebug = String(req.query.debug||"") === "1";
 
-    const q = req.query || {};
     const now = new Date();
-    const ymd = String(q.ymd||"").trim() || ymdInTZ(now, TZ);
-    const qsSlot = String(q.slot||"").trim().toLowerCase();
-    const slot = /^(am|pm|late)$/.test(qsSlot) ? qsSlot : deriveSlot(hourInTZ(now, TZ));
-    const wantDebug = String(q.debug||"") === "1" || String(q.debug||"").toLowerCase() === "true";
-    const trace = wantDebug ? [] : null;
+    const ymd = ymdInTZ(now, TZ);
+    const h = hourInTZ(now, TZ);
+    const slot = h < 10 ? "late" : h < 15 ? "am" : "pm";
 
-    // 1) pokušaј locked → vb:day:slot → union
+    // 1) pokušaj da učitaš per-slot locked feed (vbl_full) ili dnevne izvore
     const triedKeys = [
+      `tickets:${ymd}:${slot}`,
       `vbl_full:${ymd}:${slot}`,
       `vbl:${ymd}:${slot}`,
       `vb:day:${ymd}:${slot}`,
@@ -149,13 +101,37 @@ export default async function handler(req, res) {
       // nema ništa za izgradnju — očisti slot tikete da ne ostanu stari
       const key = `tickets:${ymd}:${slot}`;
       await kvSET(key, JSON.stringify({ btts:[], ou25:[], htft:[] }), trace);
-      return res.status(200).json({ ok:true, ymd, slot, source: null, tickets_key: key, counts:{ btts:0, ou25:0, htft:0 }, note:"no-source-items" });
+      return res.status(200).json({ ok:true, ymd, slot, source: src, counts:{ btts:0, ou25:0, htft:0 }, note:"no-source-items" });
     }
 
-    // 2) podeli i sortiraj
-    const groups = splitMarkets(baseArr);
+    // 2) grupisanje specijala
+    const groups = { btts:[], ou25:[], htft:[] };
+    for (const it of baseArr) {
+      const label = String(it?.market_label || it?.market || "").toUpperCase();
+      if (label.includes("BTTS")) groups.btts.push(it);
+      else if (label.includes("O/U 2.5") || label.includes("OVER 2.5") || label.includes("UNDER 2.5")) groups.ou25.push(it);
+      else if (label.includes("HT-FT") || label.includes("HT/FT")) groups.htft.push(it);
+    }
 
-    // 3) set u per-slot ključ + (opcionalno) daily alias
+    // prioritizuj po confidence pa kickoff (ako postoji)
+    const conf = x => Number.isFinite(x?.confidence_pct) ? x.confidence_pct : (Number(x?.confidence)||0);
+    const kstart = x => {
+      const k = x?.fixture?.date || x?.fixture_date || x?.kickoff || x?.kickoff_utc || x?.ts;
+      const d = k ? new Date(k) : null;
+      return Number.isFinite(d?.getTime?.()) ? d.getTime() : 0;
+    };
+    const sorter = (a,b)=> (conf(b)-conf(a)) || (kstart(a)-kstart(b));
+
+    groups.btts.sort(sorter);
+    groups.ou25.sort(sorter);
+    groups.htft.sort(sorter);
+
+    // 3) ograniči na max 4 po grupi (slot freeze logika je u rebuild/value-bets-locked)
+    groups.btts = groups.btts.slice(0, 4);
+    groups.ou25 = groups.ou25.slice(0, 4);
+    groups.htft = groups.htft.slice(0, 4);
+
+    // 4) upiši per-slot tikete
     const keySlot = `tickets:${ymd}:${slot}`;
     await kvSET(keySlot, JSON.stringify(groups), trace);
 
