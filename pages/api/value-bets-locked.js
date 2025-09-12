@@ -69,39 +69,33 @@ function kickoffFromMeta(it){
 function confidence(it){
   if (Number.isFinite(it?.confidence_pct)) return Number(it.confidence_pct);
   if (Number.isFinite(it?.model_prob)) return Math.round(100*Number(it.model_prob));
-  if (Number.isFinite(it?.implied_prob)) return Math.round(100*Number(it.implied_prob));
   return 0;
 }
-
-/* --------------- caps (weekday/weekend) --------------- */
-const CAP_LATE   = Math.max(1, Number(process.env.CAP_LATE   || 6)  || 6);
-const CAP_AM_WD  = Math.max(1, Number(process.env.CAP_AM_WD  || 15) || 15);
-const CAP_PM_WD  = Math.max(1, Number(process.env.CAP_PM_WD  || 15) || 15);
-const CAP_AM_WE  = Math.max(1, Number(process.env.CAP_AM_WE  || 20) || 20);
-const CAP_PM_WE  = Math.max(1, Number(process.env.CAP_PM_WE  || 20) || 20);
-
-function isWeekendInTZ(d=new Date(), tz=TZ){
-  const fmt = new Intl.DateTimeFormat("en-GB",{ timeZone:tz, weekday:"short" });
-  const w = fmt.format(d).toLowerCase();
-  return w.startsWith("sat") || w.startsWith("sun");
+function isWeekendDate(ymd){
+  // ymd: YYYY-MM-DD u Europe/Belgrade
+  const [y,m,d] = ymd.split("-").map(n=>parseInt(n,10));
+  const dt = new Date(Date.UTC(y, m-1, d));
+  const dow = dt.getUTCDay(); // 0=ned,6=sub
+  return dow === 0 || dow === 6;
 }
+
+/* ---------------- CAP po slotu (ENV) ---------------- */
+// CAP_LATE (default 6)
+// CAP_AM_WD, CAP_PM_WD (default 15)
+// CAP_AM_WE, CAP_PM_WE (default 20)
+function intEnv(name, def){ const v = Number(process.env[name]); return Number.isFinite(v) && v>0 ? Math.floor(v) : def; }
 function slotCapFor(ymd, slot){
-  const d = new Date(`${ymd}T12:00:00Z`); // neutral
-  const weekend = isWeekendInTZ(d, TZ);
-  if (slot==="late") return CAP_LATE;
-  if (slot==="am")   return weekend ? CAP_AM_WE : CAP_AM_WD;
-  return weekend ? CAP_PM_WE : CAP_PM_WD; // pm
+  const isWE = isWeekendDate(ymd);
+  if (slot === "late") return intEnv("CAP_LATE", 6);
+  if (slot === "am")   return isWE ? intEnv("CAP_AM_WE", 20) : intEnv("CAP_AM_WD", 15);
+  /* pm */              return isWE ? intEnv("CAP_PM_WE", 20) : intEnv("CAP_PM_WD", 15);
 }
 
 /* ---------------- items (1X2) reader ---------------- */
 async function readItems(ymd, slot, trace){
-  const policyCap = 15; // UI policy cap; real cap će biti min(slotCap, policyCap)
+  const cap = slotCapFor(ymd, slot);
 
-  function inSlot(d){
-    const h = hourInTZ(d, TZ);
-    return (slot==="late"? h<10 : slot==="am"? (h>=10 && h<15) : h>=15);
-  }
-
+  // 1) probaj striktne slot ključeve
   const strictKeys = [
     `vbl_full:${ymd}:${slot}`,
     `vbl:${ymd}:${slot}`,
@@ -111,33 +105,32 @@ async function readItems(ymd, slot, trace){
     const { raw } = await kvGETraw(k, trace);
     const arr = arrFromAny(J(raw));
     if (Array.isArray(arr) && arr.length) {
-      // dodatni filter po slotu — iako je feed "locked"
       const only = arr.filter(it => {
-        const d = kickoffFromMeta(it); return d ? inSlot(d) : true;
+        const d = kickoffFromMeta(it); if (!d) return false;
+        const h = hourInTZ(d, TZ);
+        return (slot==="late"? h<10 : slot==="am"? (h>=10 && h<15) : h>=15);
       });
-      const slotCap = slotCapFor(ymd, slot);
-      const cut = [...only]
-        .sort((a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0)))
-        .slice(0, Math.min(policyCap, slotCap));
-      return { items: cut, source: k, before: arr.length, after: cut.length, slotCap, policyCap };
+      if (only.length) {
+        only.sort((a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0)));
+        const sliced = only.slice(0, cap);
+        return { items: sliced, source: k, before: arr.length, after: sliced.length, slot_cap: cap };
+      }
     }
   }
 
-  // fallback: UNION/LAST (bez slot filtera), pa opet sečemo na slotCap
+  // 2) fallback: UNION/LAST **bez slot filtera** (da UI nikad nije prazan)
   const fallbackKeys = [`vb:day:${ymd}:union`, `vb:day:${ymd}:last`];
   for (const k of fallbackKeys) {
     const { raw } = await kvGETraw(k, trace);
     const arr = arrFromAny(J(raw));
     if (Array.isArray(arr) && arr.length) {
-      const slotCap = slotCapFor(ymd, slot);
       const list = [...arr]
         .sort((a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0)))
-        .slice(0, Math.min(policyCap, slotCap));
-      return { items: list, source: k, before: arr.length, after: list.length, slotCap, policyCap };
+        .slice(0, cap);
+      return { items: list, source: k, before: arr.length, after: list.length, slot_cap: cap };
     }
   }
-  const slotCap = slotCapFor(ymd, slot);
-  return { items: [], source: null, before: 0, after: 0, slotCap, policyCap };
+  return { items: [], source: null, before: 0, after: 0, slot_cap: cap };
 }
 
 /* ---------------- tickets reader ---------------- */
@@ -148,8 +141,8 @@ async function readTickets(ymd, slot, trace){
     const t = kickoffFromMeta(x)?.getTime() || 0;
     return t > now; // samo mečevi koji još nisu počeli
   };
-  const sortT = (a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0));
 
+  // prioritet: per-slot → dnevni
   const slotKey = `tickets:${ymd}:${slot}`;
   const { raw:rawSlot } = await kvGETraw(slotKey, tried);
   let obj = J(rawSlot);
@@ -163,6 +156,7 @@ async function readTickets(ymd, slot, trace){
   }
   if (!obj) return { tickets:{ btts:[], ou25:[], htft:[] }, source: src, tried };
 
+  const sortT = (a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0));
   return {
     tickets: {
       btts: (obj.btts||[]).filter(keep).sort(sortT),
@@ -181,11 +175,15 @@ export default async function handler(req,res){
     const q = req.query || {};
     const now = new Date();
     const ymd = String(q.ymd||"").trim() || ymdInTZ(now, TZ);
-    const slot = (String(q.slot||"").trim().toLowerCase() || deriveSlot(hourInTZ(now, TZ)));
+
+    // *** FIX: validacija slot-a ***
+    const rawSlot = String(q.slot||"").trim().toLowerCase();
+    const slot = /^(am|pm|late)$/.test(rawSlot) ? rawSlot : deriveSlot(hourInTZ(now, TZ));
+
     const wantDebug = String(q.debug||"") === "1" || String(q.debug||"").toLowerCase() === "true";
     const trace = wantDebug ? [] : null;
 
-    const { items, source, before, after, slotCap, policyCap } = await readItems(ymd, slot, trace);
+    const { items, source, before, after, slot_cap } = await readItems(ymd, slot, trace);
     const { tickets, source:tsrc, tried:ttried } = await readTickets(ymd, slot, trace);
 
     const payload = {
@@ -198,8 +196,8 @@ export default async function handler(req,res){
       tickets,
       source,
       tickets_source: tsrc,
-      policy_cap: policyCap,
-      slot_cap: slotCap,
+      policy_cap: 15,
+      slot_cap,
       ...(wantDebug ? { debug:{ trace, before, after, tickets_tried:ttried } } : {})
     };
     return res.status(200).json(payload);
