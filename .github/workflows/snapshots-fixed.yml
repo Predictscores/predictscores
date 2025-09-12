@@ -2,7 +2,7 @@ name: Snapshots (AM/PM/LATE)
 
 on:
   schedule:
-    # AM 10:00 Europe/Belgrade -> 08:00 UTC (CEST) i 09:00 UTC (CET)  | airbag -2/0/+2
+    # AM 10:00 Europe/Belgrade -> 08:00/09:00 UTC (airbag -2/0/+2)
     - cron: "58 7 * * *"
     - cron: "0 8 * * *"
     - cron: "2 8 * * *"
@@ -10,7 +10,7 @@ on:
     - cron: "0 9 * * *"
     - cron: "2 9 * * *"
 
-    # PM 15:00 Europe/Belgrade -> 13:00 UTC (CEST) i 14:00 UTC (CET)  | airbag -2/0/+2
+    # PM 15:00 Europe/Belgrade -> 13:00/14:00 UTC (airbag -2/0/+2)
     - cron: "58 12 * * *"
     - cron: "0 13 * * *"
     - cron: "2 13 * * *"
@@ -18,13 +18,14 @@ on:
     - cron: "0 14 * * *"
     - cron: "2 14 * * *"
 
-    # LATE 00:00 Europe/Belgrade -> 22:00 UTC (CEST, prethodni dan) i 23:00 UTC (CET) | airbag -2/0/+2
+    # LATE 00:00 Europe/Belgrade -> 22:00/23:00 UTC (prethodni dan) (airbag -2/0/+2)
     - cron: "58 21 * * *"
     - cron: "0 22 * * *"
     - cron: "2 22 * * *"
     - cron: "58 22 * * *"
     - cron: "0 23 * * *"
     - cron: "2 23 * * *"
+
   workflow_dispatch:
     inputs:
       slot:
@@ -32,7 +33,7 @@ on:
         required: false
         default: "auto"
       base:
-        description: "Base URL (override)"
+        description: "Base URL override (optional)"
         required: false
         default: ""
 
@@ -44,6 +45,12 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
+    env:
+      # Vremenska zona isključivo preko TZ_DISPLAY (TZ je zauzet na Vercel-u)
+      TZ_DISPLAY: Europe/Belgrade
+      # Fallback domen ako ne proslediš inputs.base
+      FALLBACK_BASE: https://predictscores.vercel.app
+
     steps:
       - name: Ensure jq is available
         shell: bash
@@ -51,13 +58,13 @@ jobs:
           set -euo pipefail
           command -v jq >/dev/null 2>&1 || { sudo apt-get update -y && sudo apt-get install -y jq; }
 
-      - name: Resolve BASE, SLOT, and YMD (with guard & precheck)
+      - name: Resolve BASE, SLOT, YMD and guard window
         id: ctx
         env:
-          FALLBACK_BASE: https://predictscores.vercel.app
-          INP_SLOT: ${{ inputs.slot }}
           INP_BASE: ${{ inputs.base }}
+          INP_SLOT: ${{ inputs.slot }}
           SCH: ${{ github.event.schedule }}
+          TZD: ${{ env.TZ_DISPLAY }}
         shell: bash
         run: |
           set -euo pipefail
@@ -65,7 +72,7 @@ jobs:
           BASE="${INP_BASE:-}"
           if [ -z "$BASE" ]; then BASE="${FALLBACK_BASE:-}"; fi
 
-          # Slot (auto vs schedule)
+          # Slot iz schedule-a ili fallback po satu u TZ_DISPLAY
           if [ "${INP_SLOT:-auto}" != "auto" ]; then
             SLOT="${INP_SLOT}"
           else
@@ -73,22 +80,22 @@ jobs:
               "58 7 * * *"|"0 8 * * *"|"2 8 * * *"|"58 8 * * *"|"0 9 * * *"|"2 9 * * *") SLOT="am" ;;
               "58 12 * * *"|"0 13 * * *"|"2 13 * * *"|"58 13 * * *"|"0 14 * * *"|"2 14 * * *") SLOT="pm" ;;
               "58 21 * * *"|"0 22 * * *"|"2 22 * * *"|"58 22 * * *"|"0 23 * * *"|"2 23 * * *") SLOT="late" ;;
-              *)  # fallback po lokalnom satu u Europe/Belgrade
-                  H=$(TZ="Europe/Belgrade" date +%H)
-                  if [ "$H" -lt 10 ]; then SLOT="late";
-                  elif [ "$H" -lt 15 ]; then SLOT="am";
-                  else SLOT="pm"; fi
+              *)  # fallback po lokalnom satu
+                  H=$(TZ="${TZD:-Europe/Belgrade}" date +%H)
+                  if   [ "$H" -lt 10 ]; then SLOT="late"
+                  elif [ "$H" -lt 15 ]; then SLOT="am"
+                  else                        SLOT="pm"
+                  fi
                   ;;
             esac
           fi
 
-          YMD=$(TZ="Europe/Belgrade" date +%F)
+          YMD=$(TZ="${TZD:-Europe/Belgrade}" date +%F)
 
-          # Guard prozor: koristimo FREEZE_MINUTES ako postoji, max 10
+          # Guard prozor (FREEZE_MINUTES ako postoji u Actions env-u, inače 10)
           FM=${FREEZE_MINUTES:-10}
-          if [ "$FM" -gt 10 ]; then FM=10; fi
 
-          now_hm=$(TZ="Europe/Belgrade" date +%H:%M)
+          now_hm=$(TZ="${TZD:-Europe/Belgrade}" date +%H:%M)
           H=${now_hm%%:*}; M=${now_hm##*:}
           m=$((10#$H*60 + 10#$M))
           mod=1440
@@ -102,9 +109,9 @@ jobs:
             if (( d < e )); then echo "$d"; else echo "$e"; fi
           }
 
-          t_late=0
-          t_am=$((10*60))
-          t_pm=$((15*60))
+          t_late=0         # 00:00
+          t_am=$((10*60))  # 10:00
+          t_pm=$((15*60))  # 15:00
           d_late=$(circ_dist "$m" "$t_late")
           d_am=$(circ_dist "$m" "$t_am")
           d_pm=$(circ_dist "$m" "$t_pm")
@@ -123,8 +130,8 @@ jobs:
             echo "ymd=$YMD"
           } >> "$GITHUB_OUTPUT"
 
-      # 0) Warm (ensures base snapshot exists so UI never sees empty feed)
-      - name: Warm locked-floats (ensure base snapshot)
+      # 0) Warm — popuni dnevne specijale i base snapshot pre rebuild-a
+      - name: Warm locked-floats (daily tickets & base snapshot)
         if: steps.ctx.outputs.run == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
@@ -134,7 +141,7 @@ jobs:
           set -euo pipefail
           curl -fsSL "$BASE/api/locked-floats?warm=1&slot=$SLOT" || true
 
-      # 1) Rebuild (first pass)
+      # 1) Rebuild (pass 1)
       - name: Rebuild snapshot (pass 1)
         if: steps.ctx.outputs.run == 'true'
         env:
@@ -146,7 +153,7 @@ jobs:
           curl -fsSL "$BASE/api/cron/rebuild?slot=$SLOT&debug=1" | tee /tmp/rebuild-1.json
           sleep 2
 
-      # 2) Refresh odds (batch, force) – kratko, u 2 batch-a
+      # 2) Refresh odds (kratko, batch ×2)
       - name: Refresh odds (batch, force)
         if: steps.ctx.outputs.run == 'true'
         env:
@@ -172,7 +179,7 @@ jobs:
           curl -fsSL "$BASE/api/cron/rebuild?slot=$SLOT&debug=1" | tee /tmp/rebuild-2.json
           sleep 2
 
-      # 4) Insights (tickets)
+      # 4) Insights (grupiše specijale i zamrzava po slotu)
       - name: Build insights (tickets)
         if: steps.ctx.outputs.run == 'true'
         env:
@@ -194,7 +201,7 @@ jobs:
           set -euo pipefail
           curl -fsSL "$BASE/api/cron/apply-learning?slot=$SLOT" | tee /tmp/learn.json
 
-      # 6) Sanity check (uvek OK, ne pravi dodatne AF pozive)
+      # 6) Sanity check (ne troši spoljne API limite)
       - name: Sanity check (locked feed)
         env:
           BASE: ${{ steps.ctx.outputs.base }}
