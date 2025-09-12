@@ -87,6 +87,45 @@ function normMarket(raw) {
   return (s || "").trim() ? s.toUpperCase() : "1X2";
 }
 
+/* ---------- HT-FT pretty helper ---------- */
+const MAP_T = { "1":"Home", "2":"Away", "x":"Draw", "d":"Draw", "h":"Home", "a":"Away" };
+function htftPrettyFrom(hay, code) {
+  const s = String(hay || "").toLowerCase();
+
+  // explicit code like 1-1, 1/x, h/a ...
+  const codeStr = String(code || "").toLowerCase();
+  let m = codeStr.match(/([12xdh])\s*[-/]\s*([12xdh])/);
+  if (m) {
+    const A = MAP_T[m[1]] || (m[1]==="x"||m[1]==="d"?"Draw":null);
+    const B = MAP_T[m[2]] || (m[2]==="x"||m[2]==="d"?"Draw":null);
+    if (A && B) return `${A}-${B}`;
+  }
+
+  // Home/Home, Away-Draw, H/H, A/D ...
+  m = s.match(/\b(home|away|draw|1|2|x|d|h|a)\s*[-/]\s*(home|away|draw|1|2|x|d|h|a)\b/);
+  if (m) {
+    const A = MAP_T[m[1]] || (m[1]==="x"||m[1]==="d"?"Draw":null) || (m[1]==="home"?"Home":m[1]==="away"?"Away":"Draw");
+    const B = MAP_T[m[2]] || (m[2]==="x"||m[2]==="d"?"Draw":null) || (m[2]==="home"?"Home":m[2]==="away"?"Away":"Draw");
+    return `${A}-${B}`;
+  }
+
+  // compact hh/ha/ad ...
+  m = s.match(/\b(hh|ha|hd|ah|aa|ad|dh|da|dd)\b/);
+  if (m) {
+    const pair = m[1];
+    const A = MAP_T[pair[0]];
+    const B = MAP_T[pair[1]] || (pair[1]==="d"?"Draw":null);
+    if (A && B) return `${A}-${B}`;
+  }
+
+  // text like "home home" / "away draw"
+  m = s.match(/\b(home|away|draw)\s+(home|away|draw)\b/);
+  if (m) return `${m[1][0].toUpperCase()+m[1].slice(1)}-${m[2][0].toUpperCase()+m[2].slice(1)}`;
+
+  // nothing reliable
+  return null;
+}
+
 /* ---------- bet normalizer (sa pretty selekcijama za BTTS/OU25/HTFT) ---------- */
 function normalizeBet(it) {
   const league =
@@ -132,14 +171,9 @@ function normalizeBet(it) {
     if (/\bover\b/.test(hay)) selPretty = "Over 2.5";
     else if (/\bunder\b/.test(hay)) selPretty = "Under 2.5";
   } else if (market === "HT-FT") {
-    const map = { "1":"Home", "2":"Away", "x":"Draw", "d":"Draw", "home":"Home", "away":"Away", "draw":"Draw" };
-    let m = hay.match(/(home|away|draw|1|2|x|d)\s*[-/]\s*(home|away|draw|1|2|x|d)/);
-    if (!m) m = hay.match(/\b(ht\/?ft)\s*(home|away|draw|1|2|x|d)\s*(home|away|draw|1|2|x|d)/);
-    if (m) {
-      const a = map[(m[2] || m[1]).toLowerCase()] || map[(m[1] || "").toLowerCase()];
-      const b = map[(m[3] || "").toLowerCase()];
-      if (a && b) selPretty = `${a}-${b}`;
-    }
+    selPretty =
+      htftPrettyFrom(hay, it?.pick_code || it?.selection_code || it?.code) ||
+      selPretty;
   }
 
   return {
@@ -245,9 +279,7 @@ function FootballCard({ bet }) {
 /* ---------- Ticket card (parlay) ---------- */
 function product(arr) { return arr.reduce((a, x) => (Number.isFinite(x) ? a * x : a), 1); }
 function prettySelFor(b, title) {
-  // koristimo ono što je normalizeBet već pripremio
   if (b?.sel_pretty) return b.sel_pretty;
-
   const m = String(title || b?.market || "").toUpperCase();
   const s = String(b?.sel || "").toLowerCase();
 
@@ -262,10 +294,9 @@ function prettySelFor(b, title) {
     return "—";
   }
   if (m === "HT-FT") {
-    const map = { "1":"Home", "2":"Away", "x":"Draw", "d":"Draw", "home":"Home", "away":"Away", "draw":"Draw" };
-    const mm = s.match(/(home|away|draw|1|2|x|d)\s*[-/]\s*(home|away|draw|1|2|x|d)/);
-    if (mm) return `${map[mm[1]]}-${map[mm[2]]}`;
-    return "—";
+    const hay = [b?.sel, b?.selection_label, b?.pick, b?.label].filter(Boolean).join(" ");
+    const fromHay = htftPrettyFrom(hay, b?.pick_code || b?.selection_code || b?.code);
+    return fromHay || (s ? s[0].toUpperCase()+s.slice(1) : "—");
   }
   return b?.sel || "—";
 }
@@ -300,7 +331,10 @@ function TicketCard({ title, legs }) {
             ))}
           </ul>
 
-          <div className="mt-3 pt-3 border-t border-white/5 flex items-center justify-between text-sm">
+          {/* separator iste “boje kao timovi” (svetlo siva/škriljac) */}
+          <div className="mt-3 border-t border-slate-300/30"></div>
+
+          <div className="pt-3 flex items-center justify-between text-sm">
             <span className="text-slate-400">Ukupno ({legsWithOdds.length} para)</span>
             <span className="text-slate-100 font-semibold">
               {total ? total.toFixed(2) : "—"}
@@ -383,7 +417,6 @@ function useFrozenTickets() {
 function FootballBody({ list, tickets }) {
   const [tab, setTab] = useState("ko"); // ko | conf | hist
 
-  // 1X2 samo
   const oneX2All = useMemo(() => list.filter(x => String(x.market).toUpperCase() === "1X2"), [list]);
 
   const koLeft = useMemo(
@@ -394,7 +427,6 @@ function FootballBody({ list, tickets }) {
 
   const left = tab === "ko" ? koLeft : confLeft;
 
-  // specials – iz zamrznutih tiketa
   const btts = tickets?.btts || [];
   const ou25 = tickets?.ou25 || [];
   const htft = tickets?.htft || [];
@@ -414,6 +446,7 @@ function FootballBody({ list, tickets }) {
           <div className="text-base font-semibold text-white mb-3">{tab === "ko" ? "Kick-Off" : "Confidence"}</div>
 
           <div className="flex flex-col md:flex-row md:gap-4 gap-4">
+            {/* 1X2 (55%) */}
             <section className="md:basis-[55%] md:min-w-0">
               <div className="text-slate-200 font-semibold mb-2">Match Odds (1X2)</div>
               {!left.length ? (
@@ -425,6 +458,7 @@ function FootballBody({ list, tickets }) {
               )}
             </section>
 
+            {/* Specials (45%) – iz zamrznutih tiketa */}
             <section className="md:basis-[45%] md:min-w-0">
               <div className="text-slate-200 font-semibold mb-2">Specials — BTTS / HT-FT / O/U 2.5</div>
               <div className="grid grid-cols-1 gap-3">
