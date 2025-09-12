@@ -43,8 +43,6 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      TZ: Europe/Belgrade
 
     steps:
       - name: Ensure jq is available
@@ -64,7 +62,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Base URL
           BASE="${INP_BASE:-}"
           if [ -z "$BASE" ]; then BASE="${FALLBACK_BASE:-}"; fi
 
@@ -73,14 +70,11 @@ jobs:
             SLOT="${INP_SLOT}"
           else
             case "${SCH:-}" in
-              # AM (CEST i CET)
               "58 7 * * *"|"0 8 * * *"|"2 8 * * *"|"58 8 * * *"|"0 9 * * *"|"2 9 * * *") SLOT="am" ;;
-              # PM (CEST i CET)
               "58 12 * * *"|"0 13 * * *"|"2 13 * * *"|"58 13 * * *"|"0 14 * * *"|"2 14 * * *") SLOT="pm" ;;
-              # LATE (CEST i CET; prethodni dan UTC)
               "58 21 * * *"|"0 22 * * *"|"2 22 * * *"|"58 22 * * *"|"0 23 * * *"|"2 23 * * *") SLOT="late" ;;
-              *)  # fallback po lokalnom satu
-                  H=$(TZ="${TZ:-Europe/Belgrade}" date +%H)
+              *)  # fallback po lokalnom satu u Europe/Belgrade
+                  H=$(TZ="Europe/Belgrade" date +%H)
                   if [ "$H" -lt 10 ]; then SLOT="late";
                   elif [ "$H" -lt 15 ]; then SLOT="am";
                   else SLOT="pm"; fi
@@ -88,10 +82,13 @@ jobs:
             esac
           fi
 
-          YMD=$(TZ="${TZ:-Europe/Belgrade}" date +%F)
+          YMD=$(TZ="Europe/Belgrade" date +%F)
 
-          # Minute-window guard (±10 min) oko 00:00 / 10:00 / 15:00
-          now_hm=$(TZ="${TZ:-Europe/Belgrade}" date +%H:%M)
+          # Guard prozor: koristimo FREEZE_MINUTES ako postoji, max 10
+          FM=${FREEZE_MINUTES:-10}
+          if [ "$FM" -gt 10 ]; then FM=10; fi
+
+          now_hm=$(TZ="Europe/Belgrade" date +%H:%M)
           H=${now_hm%%:*}; M=${now_hm##*:}
           m=$((10#$H*60 + 10#$M))
           mod=1440
@@ -114,47 +111,30 @@ jobs:
 
           run_guard=false
           case "$SLOT" in
-            late) (( d_late <= 10 )) && run_guard=true ;;
-            am)   (( d_am   <= 10 )) && run_guard=true ;;
-            pm)   (( d_pm   <= 10 )) && run_guard=true ;;
+            late) (( d_late <= FM )) && run_guard=true ;;
+            am)   (( d_am   <= FM )) && run_guard=true ;;
+            pm)   (( d_pm   <= FM )) && run_guard=true ;;
           esac
 
-          echo "BASE=$BASE"
-          echo "SLOT=$SLOT"
-          echo "YMD=$YMD"
-          echo "now=$now_hm ${TZ:-}"
-          echo "dist(late/am/pm)=$d_late/$d_am/$d_pm | guard=$run_guard"
-
-          if [ "$run_guard" != "true" ]; then
-            {
-              echo "run=false"
-              echo "base=$BASE"
-              echo "slot=$SLOT"
-              echo "ymd=$YMD"
-            } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Precheck: ako locked feed već postoji za taj slot, preskoči teške korake
-          resp="$(curl -fsS "$BASE/api/value-bets-locked?slot=$SLOT&slim=1" || echo "[]")"
-          count="$( (echo "$resp" | jq -r 'if type=="array" then length elif has("items") then (.items|length) elif has("value") then (try (.value|length) // 0) else 0 end') 2>/dev/null || echo 0 )"
-
-          if [ "${count:-0}" -gt 0 ]; then
-            echo "Locked feed already present for $SLOT ($count items). Skipping heavy calls."
-            run_value=false
-          else
-            echo "No locked feed for $SLOT yet → will run."
-            run_value=true
-          fi
-
           {
-            echo "run=$run_value"
+            echo "run=$run_guard"
             echo "base=$BASE"
             echo "slot=$SLOT"
             echo "ymd=$YMD"
           } >> "$GITHUB_OUTPUT"
 
-      # 1) Rebuild (prvi prolaz)
+      # 0) Warm (ensures base snapshot exists so UI never sees empty feed)
+      - name: Warm locked-floats (ensure base snapshot)
+        if: steps.ctx.outputs.run == 'true'
+        env:
+          BASE: ${{ steps.ctx.outputs.base }}
+          SLOT: ${{ steps.ctx.outputs.slot }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "$BASE/api/locked-floats?warm=1&slot=$SLOT" || true
+
+      # 1) Rebuild (first pass)
       - name: Rebuild snapshot (pass 1)
         if: steps.ctx.outputs.run == 'true'
         env:
@@ -163,9 +143,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::group::rebuild-1"
           curl -fsSL "$BASE/api/cron/rebuild?slot=$SLOT&debug=1" | tee /tmp/rebuild-1.json
-          echo "::endgroup::"
           sleep 2
 
       # 2) Refresh odds (batch, force) – kratko, u 2 batch-a
@@ -178,9 +156,7 @@ jobs:
         run: |
           set -euo pipefail
           for i in 1 2; do
-            echo "::group::refresh-odds [$i]"
             curl -fsSL "$BASE/api/cron/refresh-odds?slot=$SLOT&force=1" | tee "/tmp/refresh-$i.json"
-            echo "::endgroup::"
             sleep 3
           done
 
@@ -193,13 +169,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::group::rebuild-2"
           curl -fsSL "$BASE/api/cron/rebuild?slot=$SLOT&debug=1" | tee /tmp/rebuild-2.json
-          echo "::endgroup::"
           sleep 2
 
-      # 4) Insights
-      - name: Build insights
+      # 4) Insights (tickets)
+      - name: Build insights (tickets)
         if: steps.ctx.outputs.run == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
@@ -207,9 +181,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::group::insights-build"
           curl -fsSL "$BASE/api/insights-build?slot=$SLOT" | tee /tmp/insights.json
-          echo "::endgroup::"
 
       # 5) Apply learning
       - name: Apply learning
@@ -220,9 +192,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::group::apply-learning"
           curl -fsSL "$BASE/api/cron/apply-learning?slot=$SLOT" | tee /tmp/learn.json
-          echo "::endgroup::"
 
       # 6) Sanity check (uvek OK, ne pravi dodatne AF pozive)
       - name: Sanity check (locked feed)
@@ -232,6 +202,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::group::value-bets-locked"
           curl -fsSL "$BASE/api/value-bets-locked?slot=$SLOT&slim=1" | tee /tmp/locked.json
-          echo "::endgroup::"
