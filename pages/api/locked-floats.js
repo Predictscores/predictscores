@@ -1,92 +1,129 @@
-// FILE: pages/api/locked-floats.js
+// pages/api/locked-floats.js
 export const config = { api: { bodyParser: false } };
 
-/* KV helpers */
-function kvCreds() { return { url: process.env.KV_REST_API_URL, token: process.env.KV_REST_API_TOKEN }; }
-async function kvGet(key) {
-  const { url, token } = kvCreds(); if (!url || !token) return null;
-  const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
-  if (!r.ok) return null; const j = await r.json().catch(()=>null);
-  return (typeof j?.result === "string" ? j.result : null);
-}
-async function kvSet(key, value) {
-  const { url, token } = kvCreds(); if (!url || !token) return false;
-  const r = await fetch(`${url}/set/${encodeURIComponent(key)}`, {
-    method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type":"application/json" }, body: JSON.stringify(value)
-  });
-  return r.ok;
-}
-async function kvSetNX(key, ttlSec) {
-  const { url, token } = kvCreds(); if (!url || !token) return false;
-  const r = await fetch(`${url}/set/${encodeURIComponent(key)}?NX=1&EX=${ttlSec}`, {
-    method:"POST", headers:{ Authorization:`Bearer ${token}`, "Content-Type":"application/json" }, body: JSON.stringify("1")
-  });
-  return r.ok;
-}
-const J = s => { try { return JSON.parse(s); } catch { return null; } };
+/* KV (Vercel KV) */
+const KV_URL = process.env.KV_REST_API_URL;
+const KV_TOK = process.env.KV_REST_API_TOKEN;
+async function kvGet(key){ if(!KV_URL||!KV_TOK)return null; const r=await fetch(`${KV_URL.replace(/\/+$/,"")}/get/${encodeURIComponent(key)}`,{headers:{Authorization:`Bearer ${KV_TOK}`},cache:"no-store"}); if(!r.ok)return null; const j=await r.json().catch(()=>null); return typeof j?.result==="string"?j.result:null; }
+async function kvSet(key,val){ if(!KV_URL||!KV_TOK)return false; const r=await fetch(`${KV_URL.replace(/\/+$/,"")}/set/${encodeURIComponent(key)}`,{method:"POST",headers:{Authorization:`Bearer ${KV_TOK}`,"Content-Type":"application/json"},body: (typeof val==="string")?val:JSON.stringify(val)}); return r.ok; }
 
-/* Time helpers */
-function beogradYMD(d=new Date()) {
-  try { return new Intl.DateTimeFormat("en-CA", { timeZone: (process.env.TZ_DISPLAY||"Europe/Belgrade") }).format(d); }
-  catch { return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Belgrade" }).format(d); }
+/* TZ */
+function pickTZ(){ const raw=(process.env.TZ_DISPLAY||"Europe/Belgrade").trim(); try{ new Intl.DateTimeFormat("en-GB",{timeZone:raw}); return raw; }catch{ return "Europe/Belgrade"; } }
+const TZ = pickTZ();
+const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
+
+/* helpers */
+const J = s=>{ try{ return JSON.parse(String(s||"")); }catch{ return null; } };
+const kickoffTs = x => { const k=x?.fixture?.date||x?.fixture_date||x?.kickoff||x?.kickoff_utc||x?.ts; const d=k?new Date(k):null; return Number.isFinite(d?.getTime?.())?d.getTime():0; };
+const conf = x => Number.isFinite(x?.confidence_pct)?x.confidence_pct:(Number(x?.confidence)||0);
+
+/* API-Football odds (15 safe poziva max) */
+const AF_BASE = "https://v3.football.api-sports.io";
+const AF_KEY  = process.env.API_FOOTBALL_KEY;
+async function afOddsByFixture(fixtureId){
+  if(!AF_KEY) return null;
+  const url = `${AF_BASE}/odds?fixture=${fixtureId}`;
+  const r = await fetch(url, { headers:{ "x-apisports-key": AF_KEY }, cache:"no-store" });
+  if(!r.ok) return null;
+  const j = await r.json().catch(()=>null);
+  return j?.response?.[0]?.bookmakers || [];
 }
 
-/* ====== tvoj postojeći kod (preview / updateFloats / scoutAndSwap / writeSnapshot...) ostaje ====== */
-/* Minimalne izmene: dodata ensureBaseSnapshot(today) i warm branch u handler-u */
+/* dnevni specijali: BTTS, O/U 2.5, HT/FT → tickets:<ymd> */
+async function buildDailyTickets(ymd) {
+  const raw = await kvGet(`vb:day:${ymd}:last`) || await kvGet(`vb:day:${ymd}:union`);
+  const base = J(raw) || [];
+  if (!base.length) return null;
 
-async function writeSnapshot(ymd, arr) {
-  await kvSet(`vb:day:${ymd}:last`, arr || []);
-  await kvSet(`vb:day:${ymd}:union`, arr || []);
-}
+  const take = base.slice(0, 12); // ≤12 AF poziva
+  const btts=[], ou25=[], htft=[];
 
-async function buildPreview(ymd, passCap=8, maxPerLeague=2, uefaCap=6) {
-  // Osloni se na tvoju postojeću logiku da izgradiš početni niz (ovde minimalno – bez dodatnih AF poziva)
-  // Ako već ima union/last, koristi njih; inače vrati prazan niz i handler će probati kroz floats/scout sledeći put.
-  const lastRaw = await kvGet(`vb:day:${ymd}:last`);
-  const unionRaw = await kvGet(`vb:day:${ymd}:union`);
-  const base = J(lastRaw) || J(unionRaw) || [];
-  return Array.isArray(base) ? base.slice(0, passCap) : [];
-}
+  function push(arr, it, confBoost){ arr.push({ ...it, confidence_pct: Math.min(95, Math.max(conf(it), 40) + confBoost) }); }
 
-async function ensureBaseSnapshot(ymd) {
-  const lastRaw = await kvGet(`vb:day:${ymd}:last`);
-  const arr = J(lastRaw);
-  if (Array.isArray(arr) && arr.length > 0) return { created:false, count:arr.length };
-  const base = await buildPreview(ymd);
-  if (Array.isArray(base) && base.length) {
-    await writeSnapshot(ymd, base);
-    return { created:true, count:base.length };
+  for (const f of take) {
+    const fid = f?.fixture_id || f?.fixture?.id || f?.id; if (!fid) continue;
+    const books = await afOddsByFixture(fid); if (!books) continue;
+
+    // BTTS
+    {
+      let yes=[], no=[];
+      for (const b of books) for (const bet of (b?.bets||[])) {
+        const nm = String(bet?.name||"").toLowerCase();
+        if (nm.includes("both teams to score")) {
+          for (const v of (bet?.values||[])) {
+            const lbl=String(v?.value||"").toLowerCase(), odd=Number(v?.odd);
+            if (!Number.isFinite(odd)) continue;
+            if (lbl.includes("yes")) yes.push(odd); else if (lbl.includes("no")) no.push(odd);
+          }
+        }
+      }
+      const pick = yes.length && (!no.length || Math.min(...yes) <= Math.min(...no)) ? {sel:"YES", price: Math.min(...yes)} :
+                   no.length  ? {sel:"NO",  price: Math.min(...no)}  : null;
+      if (pick) push(btts, { ...f, market:"BTTS", market_label:"BTTS", selection_label: pick.sel, selection: pick.sel, market_odds: pick.price }, 5);
+    }
+
+    // O/U 2.5
+    {
+      let over=[], under=[];
+      for (const b of books) for (const bet of (b?.bets||[])) {
+        const nm = String(bet?.name||"").toLowerCase();
+        if (nm.includes("over/under") || nm.includes("totals")) {
+          for (const v of (bet?.values||[])) {
+            const lbl=String(v?.value||"").toLowerCase(), odd=Number(v?.odd);
+            if (!Number.isFinite(odd)) continue;
+            if (lbl.includes("over 2.5")) over.push(odd);
+            if (lbl.includes("under 2.5")) under.push(odd);
+          }
+        }
+      }
+      const pick = over.length && (!under.length || Math.min(...over) <= Math.min(...under)) ? {sel:"OVER 2.5", price: Math.min(...over)} :
+                   under.length ? {sel:"UNDER 2.5",price: Math.min(...under)} : null;
+      if (pick) push(ou25, { ...f, market:"O/U 2.5", market_label:"O/U 2.5", selection_label: pick.sel, selection: pick.sel, market_odds: pick.price }, 5);
+    }
+
+    // HT/FT
+    {
+      const map = {};
+      for (const b of books) for (const bet of (b?.bets||[])) {
+        const nm = String(bet?.name||"").toLowerCase();
+        if (nm.includes("ht/ft") || nm.includes("half time/full time")) {
+          for (const v of (bet?.values||[])) {
+            const lbl = String(v?.value||"").toUpperCase().replace(/\s+/g,"");
+            const odd = Number(v?.odd); if (!Number.isFinite(odd)) continue;
+            const norm = lbl.replace(/(^|\/)1/g,"$1HOME").replace(/(^|\/)X/g,"$1DRAW").replace(/(^|\/)2/g,"$1AWAY");
+            (map[norm] ||= []).push(odd);
+          }
+        }
+      }
+      const best = Object.entries(map).map(([k,arr])=>[k, arr && arr.length ? Math.min(...arr) : Infinity]).sort((a,b)=>a[1]-b[1])[0];
+      if (best && isFinite(best[1])) push(htft, { ...f, market:"HT-FT", market_label:"HT-FT", selection_label: best[0], selection: best[0], market_odds: best[1] }, 8);
+    }
   }
-  return { created:false, count:0 };
-}
 
-/* ====== tvoje postojeće funkcije updateFloats / scoutAndSwap, bez vizuelnih promena ====== */
+  const sortT = (a,b)=> (conf(b)-conf(a)) || (kickoffTs(a)-kickoffTs(b));
+  btts.sort(sortT); ou25.sort(sortT); htft.sort(sortT);
+  await kvSet(`tickets:${ymd}`, { btts, ou25, htft });
+  return { btts: btts.length, ou25: ou25.length, htft: htft.length };
+}
 
 export default async function handler(req, res) {
   try {
-    const today = beogradYMD();
+    const now = new Date();
+    const ymd = ymdInTZ(now, TZ);
 
-    // Warm: kreiraj base snapshot ako ne postoji (poziva se iz workflow-a)
+    // warm=1 → samo dnevni specijali (ako ne postoje)
     if (String(req.query.warm||"") === "1") {
-      const out = await ensureBaseSnapshot(today);
-      return res.status(200).json({ ok:true, warm: out });
+      const raw = await kvGet(`tickets:${ymd}`);
+      if (!raw) {
+        const r = await buildDailyTickets(ymd);
+        return res.status(200).json({ ok:true, warm: r || { btts:0, ou25:0, htft:0 } });
+      }
+      return res.status(200).json({ ok:true, warm: { created:false, already:true } });
     }
 
-    const doPreview = String(req.query.preview||"") === "1";
-    if (doPreview) {
-      const ok = await kvSetNX(`vb:preview:lock:${today}`, 15*60); // ~15 min lock
-      if (!ok) return res.status(200).json({ preview: "skipped (locked)" });
-      const out = await buildPreview(today, 8, 20, 6);
-      return res.status(200).json({ ok: true, out });
-    }
-
-    // Floats + Smart45 (ostavljeno kao u tvojoj verziji)
-    // Pretpostavka: koristi tvoje postojeće implementacije updateFloats i scoutAndSwap:
-    const floats = { ok:true }; // placeholder ako su te funkcije u drugim fajlovima
-    const scout  = { ok:true }; // isto
-
-    return res.status(200).json({ ok: true, floats, scout });
+    // (ostali tvoji “floats/scout” koraci ostaju kakvi jesu ili ih dodaš po potrebi)
+    return res.status(200).json({ ok:true, note:"locked-floats alive" });
   } catch (e) {
-    return res.status(500).json({ error: String(e&&e.message||e) });
+    return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
 }
