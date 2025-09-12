@@ -1,5 +1,5 @@
 // pages/api/value-bets-locked.js
-import { } from 'url'; // placeholder da zadrži ES module sintaksu
+import { } from 'url'; // zadržava ES module sintaksu u Next okruženju
 
 export const config = { api: { bodyParser: false } };
 
@@ -20,7 +20,7 @@ function kvBackends() {
   if (bU && bT) out.push({ flavor: "upstash-redis", url: bU.replace(/\/+$/,""), tok: bT });
   return out;
 }
-async function kvGETraw(key, traceArr) {
+async function kvGETraw(key, trace) {
   for (const b of kvBackends()) {
     try {
       const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`, {
@@ -29,10 +29,10 @@ async function kvGETraw(key, traceArr) {
       const ok = r.ok;
       const j = ok ? await r.json().catch(()=>null) : null;
       const val = (typeof j?.result === "string" && j.result) ? j.result : null;
-      traceArr && traceArr.push({ key, flavor:b.flavor, status: ok ? (val?"hit":"miss") : `http-${r.status}` });
+      trace && trace.push({ key, flavor:b.flavor, status: ok ? (val?"hit":"miss") : `http-${r.status}` });
       if (val) return { raw: val, flavor: b.flavor };
     } catch (e) {
-      traceArr && traceArr.push({ key, flavor:b.flavor, status:`err:${String(e?.message||e)}` });
+      trace && trace.push({ key, flavor:b.flavor, status:`err:${String(e?.message||e)}` });
     }
   }
   return { raw: null, flavor: null };
@@ -92,18 +92,10 @@ function slotCap(slot, tz=TZ){
   if (slot==="am")   return we ? capAmWe : capAmWd;
   return we ? capPmWe : capPmWd;
 }
-function normMarket(raw){
-  const s = String(raw||"").toLowerCase();
-  if (s.includes("btts") || s.includes("both teams to score")) return "BTTS";
-  if (s.includes("ht/ft") || s.includes("ht-ft") || s.includes("half time/full time")) return "HT-FT";
-  if (s.includes("over 2.5") || s.includes("under 2.5") || s.includes("ou2.5") || s.includes("o/u 2.5") || s.includes("totals")) return "O/U 2.5";
-  if (s === "1x2" || s.includes("match result") || s.includes("full time result")) return "1X2";
-  return (s||"").trim() ? s.toUpperCase() : "1X2";
-}
 
 /* ---------------- items (1X2) reader ---------------- */
 async function readItems(ymd, slot, trace, capOverride){
-  // 0) uzmi “locked” ako postoji
+  // 0) Ako postoji "zaključani" per-slot feed od rebuild-a, uzmi njega 1:1
   const lockedKeys = [
     `vbl_full:${ymd}:${slot}`,
     `vbl:${ymd}:${slot}`,
@@ -112,13 +104,15 @@ async function readItems(ymd, slot, trace, capOverride){
     const { raw } = await kvGETraw(k, trace);
     const arr = arrFromAny(J(raw));
     if (Array.isArray(arr) && arr.length) {
-      const limited = capOverride ? arr.slice(0, capOverride) : arr;
+      const limited = Array.isArray(arr) ? (capOverride ? arr.slice(0, capOverride) : arr) : [];
       return { items: limited, source: k, before: arr.length, after: limited.length };
     }
   }
 
-  // 1) per-slot “vb:day”
-  const strictKeys = [ `vb:day:${ymd}:${slot}` ];
+  // 1) probaj per-slot VB day ključeve (možda nisu “locked”, pa filter po satu)
+  const strictKeys = [
+    `vb:day:${ymd}:${slot}`,
+  ];
   for (const k of strictKeys) {
     const { raw } = await kvGETraw(k, trace);
     const arr = arrFromAny(J(raw));
@@ -136,7 +130,7 @@ async function readItems(ymd, slot, trace, capOverride){
     }
   }
 
-  // 2) fallback UNION/LAST bez slot filtera
+  // 2) fallback: UNION/LAST **bez slot filtera** (da UI nikad nije prazan)
   const fallbackKeys = [`vb:day:${ymd}:union`, `vb:day:${ymd}:last`];
   for (const k of fallbackKeys) {
     const { raw } = await kvGETraw(k, trace);
@@ -151,44 +145,39 @@ async function readItems(ymd, slot, trace, capOverride){
   return { items: [], source: null, before: 0, after: 0 };
 }
 
-/* ---------------- tickets reader (zamrznuti, bez future filtera) ---------------- */
-function splitMarkets(list){
-  const out = { btts:[], ou25:[], htft:[] };
-  for (const it of list||[]){
-    const m = normMarket(it?.market_label || it?.market);
-    if (m==="BTTS") out.btts.push(it);
-    else if (m==="O/U 2.5") out.ou25.push(it);
-    else if (m==="HT-FT") out.htft.push(it);
-  }
-  const sortT = (a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0));
-  out.btts.sort(sortT); out.ou25.sort(sortT); out.htft.sort(sortT);
-  return out;
-}
+/* ---------------- tickets reader ---------------- */
 async function readTickets(ymd, slot, trace){
   const tried = [];
+  const now = Date.now();
+  const keep = (x)=> {
+    const t = kickoffFromMeta(x)?.getTime() || 0;
+    return t > now; // samo mečevi koji još nisu počeli
+  };
 
-  // prioritet: per-slot → “mm” alias → dnevni
-  const keys = [
-    `tickets:${ymd}:${slot}`,
-    `tickets:${ymd}:mm`,
-    `tickets:${ymd}`,
-  ];
-  for (const k of keys){
-    const { raw } = await kvGETraw(k, tried);
-    const obj = J(raw);
-    if (obj && typeof obj === "object") {
-      const btts = Array.isArray(obj.btts) ? obj.btts.slice() : [];
-      const ou25 = Array.isArray(obj.ou25) ? obj.ou25.slice() : [];
-      const htft = Array.isArray(obj.htft) ? obj.htft.slice() : [];
-      const any = (btts.length + ou25.length + htft.length) > 0;
-      if (any){
-        const sorted = splitMarkets([...btts, ...ou25, ...htft]);
-        return { tickets: sorted, source: k, tried };
-      }
-    }
+  // prioritet: per-slot → dnevni
+  const slotKey = `tickets:${ymd}:${slot}`;
+  const { raw:rawSlot } = await kvGETraw(slotKey, tried);
+  let obj = J(rawSlot);
+  let src = obj ? slotKey : null;
+
+  if (!obj || typeof obj !== "object") {
+    const dayKey = `tickets:${ymd}`;
+    const { raw:rawDay } = await kvGETraw(dayKey, tried);
+    obj = J(rawDay);
+    if (obj) src = dayKey;
   }
-  // nema u KV → deriviraj iz items (caller prosleđuje items)
-  return { tickets:null, source:null, tried };
+  if (!obj) return { tickets:{ btts:[], ou25:[], htft:[] }, source: src, tried };
+
+  const sortT = (a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0));
+  return {
+    tickets: {
+      btts: (obj.btts||[]).filter(keep).sort(sortT),
+      ou25: (obj.ou25||[]).filter(keep).sort(sortT),
+      htft: (obj.htft||[]).filter(keep).sort(sortT),
+    },
+    source: src,
+    tried
+  };
 }
 
 /* ---------------- handler ---------------- */
@@ -201,33 +190,15 @@ export default async function handler(req,res){
     const qsSlot = String(q.slot||"").trim().toLowerCase();
     const slot = /^(am|pm|late)$/.test(qsSlot) ? qsSlot : deriveSlot(hourInTZ(now, TZ));
 
-    // ?n= ograničenje za 1X2 listu; ne utiče na tikete
+    // podrži ?n= za eksplicitni cap (npr. Combined tab top N)
     const n = Math.max(1, Math.min(50, Number(q.n || q.cap || 0) || 0)) || null;
     const wantDebug = String(q.debug||"") === "1" || String(q.debug||"").toLowerCase() === "true";
     const trace = wantDebug ? [] : null;
 
     const cap = n || slotCap(slot, TZ);
 
-    // 1) items (1X2)
     const { items, source, before, after } = await readItems(ymd, slot, trace, cap);
-
-    // 2) tickets (KV → fallback derivation)
-    const t0 = await readTickets(ymd, slot, trace);
-    let tickets = t0.tickets;
-    let tsrc = t0.source;
-
-    if (!tickets) {
-      // deriviramo iz union ili iz već učitanih items (što god imamo)
-      // pokušaj union/lasta bez re-sortiranja KV trace-a po drugi put
-      let baseArr = items && items.length ? items : [];
-      if (!baseArr.length) {
-        const { raw } = await kvGETraw(`vb:day:${ymd}:union`, trace);
-        const arr = arrFromAny(J(raw));
-        if (Array.isArray(arr) && arr.length) baseArr = arr;
-      }
-      tickets = splitMarkets(baseArr);
-      tsrc = "derived-from-items";
-    }
+    const { tickets, source:tsrc, tried:ttried } = await readTickets(ymd, slot, trace);
 
     const payload = {
       ok: true,
@@ -241,7 +212,7 @@ export default async function handler(req,res){
       tickets_source: tsrc,
       policy_cap: Number(process.env.VB_LIMIT || 25) || 25,
       slot_cap: cap,
-      ...(wantDebug ? { debug:{ trace, before, after, tickets_tried: t0.tried } } : {})
+      ...(wantDebug ? { debug:{ trace, before, after, tickets_tried:ttried } } : {})
     };
     return res.status(200).json(payload);
   }catch(e){
