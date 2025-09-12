@@ -1,16 +1,15 @@
 // pages/api/value-bets-locked.js
-import { } from 'url';
+import { } from 'url'; // zadržava ES module sintaksu u Next okruženju
 
 export const config = { api: { bodyParser: false } };
 
-const TZ = "Europe/Belgrade";
-
-/* ---------------- CAP env ---------------- */
-const CAP_LATE   = Number(process.env.CAP_LATE   ?? 6);
-const CAP_AM_WD  = Number(process.env.CAP_AM_WD  ?? 15);
-const CAP_PM_WD  = Number(process.env.CAP_PM_WD  ?? 15);
-const CAP_AM_WE  = Number(process.env.CAP_AM_WE  ?? 20);
-const CAP_PM_WE  = Number(process.env.CAP_PM_WE  ?? 20);
+/* ───────── TZ guard (Vercel: TZ je rezervisan; koristimo TZ_DISPLAY i sanitizujemo) ───────── */
+function pickTZ() {
+  const raw = (process.env.TZ || process.env.TZ_DISPLAY || "UTC").trim();
+  const s = raw.replace(/^:+/, ""); // npr. ":UTC" -> "UTC"
+  try { new Intl.DateTimeFormat("en-GB", { timeZone: s }); return s; } catch { return "UTC"; }
+}
+const TZ = pickTZ();
 
 /* ---------------- KV (REST) ---------------- */
 function kvBackends() {
@@ -78,23 +77,40 @@ function confidence(it){
   if (Number.isFinite(it?.model_prob)) return Math.round(100*Number(it.model_prob));
   return 0;
 }
-function slotCapFor(ymd, slot){
-  // WD/WE po lokalnom danu
-  const wd = new Date(`${ymd}T12:00:00`).toLocaleString('en-GB',{ timeZone:TZ, weekday:'short' });
-  const isWE = /Sat|Sun/.test(String(wd));
-  if (slot === "late") return CAP_LATE;
-  if (slot === "am")   return isWE ? CAP_AM_WE : CAP_AM_WD;
-  return isWE ? CAP_PM_WE : CAP_PM_WD;
+function isWeekend(tz=TZ){
+  const wd = new Intl.DateTimeFormat("en-GB",{ timeZone:tz, weekday:"short" }).format(new Date());
+  return wd==="Sat" || wd==="Sun";
+}
+function slotCap(slot, tz=TZ){
+  const we = isWeekend(tz);
+  const capLate = Number(process.env.CAP_LATE || 6) || 6;
+  const capAmWd  = Number(process.env.CAP_AM_WD || 15) || 15;
+  const capPmWd  = Number(process.env.CAP_PM_WD || 15) || 15;
+  const capAmWe  = Number(process.env.CAP_AM_WE || 20) || 20;
+  const capPmWe  = Number(process.env.CAP_PM_WE || 20) || 20;
+  if (slot==="late") return capLate;
+  if (slot==="am")   return we ? capAmWe : capAmWd;
+  return we ? capPmWe : capPmWd;
 }
 
 /* ---------------- items (1X2) reader ---------------- */
-async function readItems(ymd, slot, trace){
-  const cap = slotCapFor(ymd, slot);
-
-  // 1) striktni slot ključevi
-  const strictKeys = [
+async function readItems(ymd, slot, trace, capOverride){
+  // 0) Ako postoji "zaključani" per-slot feed od rebuild-a, uzmi njega 1:1
+  const lockedKeys = [
     `vbl_full:${ymd}:${slot}`,
     `vbl:${ymd}:${slot}`,
+  ];
+  for (const k of lockedKeys) {
+    const { raw } = await kvGETraw(k, trace);
+    const arr = arrFromAny(J(raw));
+    if (Array.isArray(arr) && arr.length) {
+      const limited = Array.isArray(arr) ? (capOverride ? arr.slice(0, capOverride) : arr) : [];
+      return { items: limited, source: k, before: arr.length, after: limited.length };
+    }
+  }
+
+  // 1) probaj per-slot VB day ključeve (možda nisu “locked”, pa filter po satu)
+  const strictKeys = [
     `vb:day:${ymd}:${slot}`,
   ];
   for (const k of strictKeys) {
@@ -108,25 +124,25 @@ async function readItems(ymd, slot, trace){
       });
       if (only.length) {
         only.sort((a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0)));
-        const sliced = only.slice(0, cap);
-        return { items: sliced, source: k, before: only.length, after: sliced.length, cap };
+        const limited = capOverride ? only.slice(0, capOverride) : only;
+        return { items: limited, source: k, before: arr.length, after: limited.length };
       }
     }
   }
 
-  // 2) fallback: UNION/LAST (uvek ograniči na cap)
+  // 2) fallback: UNION/LAST **bez slot filtera** (da UI nikad nije prazan)
   const fallbackKeys = [`vb:day:${ymd}:union`, `vb:day:${ymd}:last`];
   for (const k of fallbackKeys) {
     const { raw } = await kvGETraw(k, trace);
     const arr = arrFromAny(J(raw));
     if (Array.isArray(arr) && arr.length) {
-      const list = [...arr]
-        .sort((a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0)))
-        .slice(0, cap);
-      return { items: list, source: k, before: arr.length, after: list.length, cap };
+      const list = [...arr].sort((a,b)=> (confidence(b)-confidence(a)) || ((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0)));
+      const cap = capOverride || slotCap(slot, TZ);
+      const cut = list.slice(0, cap);
+      return { items: cut, source: k, before: arr.length, after: cut.length };
     }
   }
-  return { items: [], source: null, before: 0, after: 0, cap };
+  return { items: [], source: null, before: 0, after: 0 };
 }
 
 /* ---------------- tickets reader ---------------- */
@@ -171,14 +187,19 @@ export default async function handler(req,res){
     const q = req.query || {};
     const now = new Date();
     const ymd = String(q.ymd||"").trim() || ymdInTZ(now, TZ);
-    const slot = (String(q.slot||"").trim().toLowerCase() || deriveSlot(hourInTZ(now, TZ)));
+    const qsSlot = String(q.slot||"").trim().toLowerCase();
+    const slot = /^(am|pm|late)$/.test(qsSlot) ? qsSlot : deriveSlot(hourInTZ(now, TZ));
+
+    // podrži ?n= za eksplicitni cap (npr. Combined tab top N)
+    const n = Math.max(1, Math.min(50, Number(q.n || q.cap || 0) || 0)) || null;
     const wantDebug = String(q.debug||"") === "1" || String(q.debug||"").toLowerCase() === "true";
     const trace = wantDebug ? [] : null;
 
-    const { items, source, before, after, cap } = await readItems(ymd, slot, trace);
+    const cap = n || slotCap(slot, TZ);
+
+    const { items, source, before, after } = await readItems(ymd, slot, trace, cap);
     const { tickets, source:tsrc, tried:ttried } = await readTickets(ymd, slot, trace);
 
-    // SPLJOŠTENE kopije za UI koji očekuje ravne ključeve:
     const payload = {
       ok: true,
       slot,
@@ -186,18 +207,11 @@ export default async function handler(req,res){
       items,
       football: items,
       top3: items.slice(0,3),
-
-      // tiketi (nested)
       tickets,
-      // tiketi (flat za UI)
-      btts: tickets.btts,
-      ou25: tickets.ou25,
-      htft: tickets.htft,
-
       source,
       tickets_source: tsrc,
-      policy_cap: cap,     // koliko vraćamo
-      slot_cap: cap,       // eksplicitno da workflow može da pročita
+      policy_cap: Number(process.env.VB_LIMIT || 25) || 25,
+      slot_cap: cap,
       ...(wantDebug ? { debug:{ trace, before, after, tickets_tried:ttried } } : {})
     };
     return res.status(200).json(payload);
