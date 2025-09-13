@@ -21,7 +21,8 @@ const kickoffFromMeta=it=>{ const k=it?.fixture?.date||it?.fixture_date||it?.kic
 const byConfKick=(a,b)=>(confidence(b)-confidence(a))||((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0));
 
 function isYouthLeague(name,country){
-  const n=String(name||""); if(/\bU(?:\s|-)?(?:15|16|17|18|19|20|21|22|23)\b/i.test(n)) return true;
+  const n=String(name||"");
+  if(/\bU(?:\s|-)?(?:15|16|17|18|19|20|21|22|23)\b/i.test(n)) return true;
   if(/\bYouth|Reserves?|Primavera|U-\d{2}\b/i.test(n)) return true;
   if(/U\d\d/.test(n)) return true;
   return false;
@@ -49,12 +50,12 @@ export default async function handler(req,res){
     const now=new Date(); const qSlot=canonicalSlot(req.query.slot); const slot=qSlot==="auto"?autoSlot(now,TZ):qSlot; const ymd=ymdInTZ(now,TZ);
     const weekend=isWeekendYmd(ymd,TZ); const cap=capsFor(slot,weekend);
 
-    // baza za dan
+    // baza za dan (union prefer)
     const tried=[];
     async function firstHit(keys){ for(const k of keys){ const r=await kvGETraw(k); tried.push({key:k,hit:!!r.raw}); const arr=J(r.raw)||(J(J(r.raw)?.value||"")||[]); if(Array.isArray(arr)&&arr.length) return {key:k,arr}; } return {key:null,arr:[]}; }
     const {key:srcKey,arr:base}=await firstHit([`vb:day:${ymd}:${slot}`,`vb:day:${ymd}:union`,`vb:day:${ymd}:last`]);
 
-    // filter: slot prozor + ukloni youth/rezervne; max 2 po ligi (UEFA do 6)
+    // slot filter + odbaci youth/rezervne
     const only=base.filter(it=>{
       const lg=it?.league||{}; if(isYouthLeague(lg.name,lg.country)) return false;
       const kd=kickoffFromMeta(it); if(!kd) return false;
@@ -63,18 +64,24 @@ export default async function handler(req,res){
       return slot==="late"?(h<10):slot==="am"?(h>=10&&h<15):(h>=15);
     }).sort(byConfKick);
 
-    const perLeague=new Map(); const kept=[];
+    // primeni MAX per liga, ali BEZ cap-a → ovo ide u vbl_full
+    const perLeagueAll=new Map(); const limited=[];
     for(const it of only){
       const lg=it?.league||{}; const key=String(lg.id||lg.name||"?");
       const limit=isUefa(lg.name,lg.country)?6:2;
-      const cur=perLeague.get(key)||0; if(cur>=limit) continue;
-      perLeague.set(key,cur+1); kept.push(it);
-      if(kept.length>=cap) break;
+      const cur=perLeagueAll.get(key)||0; if(cur>=limit) continue;
+      perLeagueAll.set(key,cur+1); limited.push(it);
     }
 
-    const saves=[]; saves.push(...await kvSET(`vbl:${ymd}:${slot}`,kept)); saves.push(...await kvSET(`vbl_full:${ymd}:${slot}`,kept));
+    // cap samo za vbl (za potrošače kojima treba), zadrži isto sortiranje
+    const kept = limited.slice(0,cap);
 
-    // zamrzni tikete — **ne prepisuj slot praznim!**
+    // snimi: vbl_full = LIMITED (bez cap), vbl = KEPT (sa cap)
+    const saves=[];
+    saves.push(...await kvSET(`vbl_full:${ymd}:${slot}`,limited));
+    saves.push(...await kvSET(`vbl:${ymd}:${slot}`,kept));
+
+    // tiketi — ne prepisuj postojeće slot tikete
     const slotKey = `tickets:${ymd}:${slot}`;
     const slotNow = J((await kvGETraw(slotKey)).raw);
     let ticketAction = "noop";
@@ -93,7 +100,7 @@ export default async function handler(req,res){
 
     return res.status(200).json({
       ok:true, ymd, slot,
-      counts:{ base: base.length, after_filters: only.length, kept: kept.length },
+      counts:{ base: base.length, after_filters: only.length, kept: kept.length, full: limited.length },
       source: srcKey,
       diag:{ reads: tried, writes: { saves }, tickets: { action: ticketAction } }
     });
