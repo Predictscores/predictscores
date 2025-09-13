@@ -1,213 +1,274 @@
 // pages/api/cron/refresh-odds.js
-// Median kvote (trusted) + BTTS/OU2.5 iz The Odds API.
-// Piše u vbl_full:<YMD>:<slot> i u vb:day:<YMD>:union.
-// Radi i kada je union plain-array ili {items}.
-// 1 OA poziv po slotu; dnevni limit 15 (KV: oa:budget:<ymd>).
-
 export const config = { api: { bodyParser: false } };
 
-const KV_URL = process.env.KV_REST_API_URL;
-const KV_TOKEN = process.env.KV_REST_API_TOKEN;
-const OA_KEY = process.env.ODDS_API_KEY;
-const TZ = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
+/* ---------- TZ (samo TZ_DISPLAY) ---------- */
+function pickTZ() {
+  const raw = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
+  try { new Intl.DateTimeFormat("en-GB", { timeZone: raw }); return raw; } catch { return "Europe/Belgrade"; }
+}
+const TZ = pickTZ();
 
-/* ---------- KV ---------- */
-async function kvGet(key) {
-  const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${KV_TOKEN}` },
-    cache: "no-store",
-  });
-  if (!r.ok) return null;
-  const j = await r.json().catch(() => null);
-  try { return j && j.result ? JSON.parse(j.result) : null; } catch { return null; }
-}
-async function kvSet(key, val) {
-  const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ value: JSON.stringify(val) }),
-  });
-  return r.ok;
-}
-
-/* ---------- TZ-safe ---------- */
-function tzNowParts() {
-  const fmt = new Intl.DateTimeFormat("en-GB", {
-    timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
-  });
-  const parts = fmt.formatToParts(new Date());
-  const get = t => Number(parts.find(p => p.type === t)?.value);
-  return { y: get("year"), m: get("month"), d: get("day"), H: get("hour") };
-}
-function ymdFromParts(p) { return `${p.y}-${String(p.m).padStart(2,"0")}-${String(p.d).padStart(2,"0")}`; }
-function slotFromQuery(q) {
-  const s = (q.slot || "").toString().trim().toLowerCase();
-  if (s === "am" || s === "pm" || s === "late") return s;
-  const { H } = tzNowParts();
-  if (H < 10) return "late";
-  if (H < 15) return "am";
-  return "pm";
-}
-
-/* ---------- Odds helpers ---------- */
-const TRUSTED = new Set([
-  "pinnacle","bet365","unibet","bwin","williamhill",
-  "marathonbet","skybet","betfair","888sport","sbobet",
-]);
-function normalizeName(s){
-  return (s||"").toLowerCase().replace(/club|fc|cf|sc|ac|afc|bc|[.\-']/g," ").replace(/\s+/g," ").trim();
-}
-function median(vals){ const a=vals.filter(Number.isFinite).sort((x,y)=>x-y); if(!a.length) return null; const i=Math.floor(a.length/2); return a.length%2?a[i]:(a[i-1]+a[i])/2; }
-function pickMedian(offers, proj){
-  const all=[], tr=[];
-  for(const b of offers||[]){
-    const v = proj(b);
-    if(Number.isFinite(v)){ all.push(v); if(TRUSTED.has((b.title||b.name||"").toLowerCase())) tr.push(v); }
-  }
-  const base = tr.length ? tr : all;
-  return { price: median(base), books_count: base.length };
-}
-function indexOA(list){
-  const m=new Map();
-  for(const ev of list||[]){
-    const h=normalizeName(ev.home_team), a=normalizeName(ev.away_team);
-    if(!h||!a) continue;
-    m.set(`${h}|${a}`, ev);
-  }
-  return m;
-}
-function extractMarkets(ev){
-  const out={ h2h:null, totals25:{over:null,under:null}, btts:{Y:null,N:null} };
-  if(!ev||!Array.isArray(ev.bookmakers)) return out;
-  const h2h=[], totals=[], btts=[];
-  for(const bk of ev.bookmakers){
-    for(const mk of bk.markets||[]){
-      if(mk.key==="h2h" && Array.isArray(mk.outcomes)){
-        const g=n=>mk.outcomes.find(o=>(o.name||o.title)===n)?.price;
-        h2h.push({ title:bk.title||bk.key||"", h:g("Home"), d:g("Draw"), a:g("Away") });
-      }
-      if(mk.key==="totals" && Array.isArray(mk.outcomes)){
-        for(const o of mk.outcomes){
-          if(Number(o.point)===2.5){
-            totals.push({ title:bk.title||bk.key||"", o:o.name==="Over"?o.price:undefined, u:o.name==="Under"?o.price:undefined });
-          }
-        }
-      }
-      if((mk.key==="btts"||mk.key==="both_teams_to_score") && Array.isArray(mk.outcomes)){
-        const g=n=>mk.outcomes.find(o=>(o.name||o.title)===n)?.price;
-        btts.push({ title:bk.title||bk.key||"", y:g("Yes"), n:g("No") });
-      }
-    }
-  }
-  if(h2h.length){
-    out.h2h = { home: pickMedian(h2h,b=>Number(b.h)), draw: pickMedian(h2h,b=>Number(b.d)), away: pickMedian(h2h,b=>Number(b.a)) };
-  }
-  if(totals.length){
-    out.totals25 = { over: pickMedian(totals,b=>Number(b.o)), under: pickMedian(totals,b=>Number(b.u)) };
-  }
-  if(btts.length){
-    out.btts = { Y: pickMedian(btts,b=>Number(b.y)), N: pickMedian(btts,b=>Number(b.n)) };
-  }
+/* ---------- KV backends (Vercel KV / Upstash) ---------- */
+function kvBackends() {
+  const out = [];
+  const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
+  const bU = process.env.UPSTASH_REDIS_REST_URL, bT = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (aU && aT) out.push({ flavor:"vercel-kv", url:aU.replace(/\/+$/,""), tok:aT });
+  if (bU && bT) out.push({ flavor:"upstash-redis", url:bU.replace(/\/+$/,""), tok:bT });
   return out;
 }
-async function callOAOnce(ymdStr){
-  if(!OA_KEY) return { called:false, used_before:0, used_after:0, events:0, data:[] };
-  const keyBudget=`oa:budget:${ymdStr}`;
-  const b=(await kvGet(keyBudget))||{used:0};
-  const used_before=Number(b.used||0);
-  if(used_before>=15) return { called:false, used_before, used_after:used_before, events:0, data:[] };
-
-  const url=`https://api.the-odds-api.com/v4/sports/upcoming/odds?regions=eu&markets=h2h,totals,btts&oddsFormat=decimal&dateFormat=iso&apiKey=${encodeURIComponent(OA_KEY)}`;
-  let data=[];
-  try{ const r=await fetch(url,{cache:"no-store"}); if(r.ok) data=await r.json(); }catch{}
-  await kvSet(keyBudget,{used:used_before+1});
-  return { called:true, used_before, used_after:used_before+1, events:Array.isArray(data)?data.length:0, data:Array.isArray(data)?data:[] };
-}
-
-/* ---------- shape helpers ---------- */
-function normalizeFeedShape(x){
-  if(!x) return null;
-  if(Array.isArray(x)) return { items: x, _wasArray:true };
-  if(Array.isArray(x.items)) return { items: x.items, _wasArray:false, _obj:x };
-  return null;
-}
-function applyMarketsToList(list, idx){
-  let touched=0;
-  for(const it of list||[]){
-    try{
-      const h=normalizeName(it?.teams?.home?.name||it?.home?.name);
-      const a=normalizeName(it?.teams?.away?.name||it?.away?.name);
-      if(!h||!a) continue;
-      const ev = idx.get(`${h}|${a}`);
-      if(!ev) continue;
-      const m = extractMarkets(ev);
-      it.markets = it.markets || {};
-      if(m.h2h)      it.markets.h2h  = m.h2h;
-      if(m.totals25) it.markets.ou25 = { over:m.totals25.over, under:m.totals25.under };
-      if(m.btts)     it.markets.btts = m.btts;
-      touched++;
-    }catch{}
-  }
-  return touched;
-}
-
-/* ---------- Handler ---------- */
-export default async function handler(req,res){
-  const p = tzNowParts();
-  const day = ymdFromParts(p);
-  const slot = slotFromQuery(req.query);
-
-  const keyFull  = `vbl_full:${day}:${slot}`;
-  const keyUnion = `vb:day:${day}:union`;
-
-  let fullRaw  = await kvGet(keyFull);
-  let unionRaw = await kvGet(keyUnion);
-
-  let full  = normalizeFeedShape(fullRaw);
-  let union = normalizeFeedShape(unionRaw);
-
-  // Fallback – ako nema full, koristi union kao osnovu
-  let source = "full";
-  if(!full){
-    if(!union){
-      return res.status(200).json({ ok:true, ymd:day, slot, msg:"no vbl_full nor union", saves:false, oa:{called:false,used_before:0,used_after:0,events:0} });
+async function kvGETraw(key, trace) {
+  for (const b of kvBackends()) {
+    try {
+      const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`,{ headers:{ Authorization:`Bearer ${b.tok}` }, cache:"no-store" });
+      const j = await r.json().catch(()=>null);
+      const raw = typeof j?.result === "string" ? j.result : null;
+      trace && trace.push({ get:key, ok:r.ok, flavor:b.flavor, hit:!!raw });
+      if (!r.ok) continue;
+      return { raw, flavor:b.flavor };
+    } catch (e) {
+      trace && trace.push({ get:key, ok:false, err:String(e?.message||e) });
     }
-    full = { items: (union.items||[]).map(x=>x) }; // plitka kopija
-    source = "union-fallback";
   }
+  return { raw:null, flavor:null };
+}
+async function kvSET(key, value, trace) {
+  const saved = [];
+  const body = (typeof value === "string") ? value : JSON.stringify(value);
+  for (const b of kvBackends()) {
+    try {
+      const r = await fetch(`${b.url}/set/${encodeURIComponent(key)}`,{
+        method:"POST", headers:{ Authorization:`Bearer ${b.tok}`, "Content-Type":"application/json" }, cache:"no-store", body
+      });
+      saved.push({ flavor:b.flavor, ok:r.ok });
+    } catch (e) { saved.push({ flavor:b.flavor, ok:false, err:String(e?.message||e) }); }
+  }
+  trace && trace.push({ set:key, saved }); return saved;
+}
 
-  const oa = await callOAOnce(day);
-  const idx = indexOA(oa.data);
+/* ---------- utils ---------- */
+const J = s=>{ try{ return JSON.parse(String(s||"")); }catch{ return null; } };
+const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
+const hourInTZ = (d, tz) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour12:false, hour:"2-digit" }).format(d));
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate()+n); return x; };
+const arrFromAny = x => Array.isArray(x) ? x
+  : (x && typeof x==="object" && Array.isArray(x.items)) ? x.items
+  : (x && typeof x==="object" && Array.isArray(x.football)) ? x.football
+  : (x && typeof x==="object" && Array.isArray(x.list)) ? x.list
+  : [];
+const canonicalSlot = x=>{ x=String(x||"auto").toLowerCase(); return (x==="late"||x==="am"||x==="pm")?x:"auto"; };
+const autoSlot = (d,tz)=>{ const h=hourInTZ(d,tz); return h<10?"late":(h<15?"am":"pm"); };
+const targetYmdForSlot = (now,slot,tz)=>{ const h=hourInTZ(now,tz);
+  if (slot==="late") return ymdInTZ(h<10?now:addDays(now,1), tz);
+  if (slot==="am")   return ymdInTZ(h<15?now:addDays(now,1), tz);
+  if (slot==="pm")   return ymdInTZ(h<15?now:addDays(now,1), tz);
+  return ymdInTZ(now, tz);
+};
 
-  // 1) upiši u full
-  const touched_full = applyMarketsToList(full.items, idx);
-  await kvSet(keyFull, full._wasArray ? full.items : (full._obj || full));
+/* ---------- name/median helpers ---------- */
+const strip = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"").replace(/[\W_]+/g,"").toLowerCase();
+const keyTeams = (home,away)=> `${strip(home)}__${strip(away)}`;
+const median = arr => {
+  const a = (arr||[]).filter(n=>Number.isFinite(n)).sort((x,y)=>x-y);
+  if (!a.length) return null;
+  const m = Math.floor(a.length/2);
+  return a.length%2 ? a[m] : (a[m-1]+a[m])/2;
+};
+const TRUSTED = new Set(["bet365","pinnacle","williamhill","marathonbet","unibet","888sport","skybet","betfair","betway","ladbrokes","coral","bwin","leon","parimatch","10bet"].map(strip));
 
-  // 2) propagiraj u union (ako postoji)
-  let touched_union = 0;
-  if(union){
-    // map po fixture_id iz full-a
-    const byId = new Map();
-    for(const it of full.items||[]) if(it.fixture_id!=null) byId.set(it.fixture_id, it);
-    for(const u of union.items||[]){
-      const m = byId.get(u.fixture_id);
-      if(m && m.markets){
-        u.markets = u.markets || {};
-        if(m.markets.h2h)   u.markets.h2h = m.markets.h2h;
-        if(m.markets.ou25)  u.markets.ou25 = m.markets.ou25;
-        if(m.markets.btts)  u.markets.btts = m.markets.btts;
-        touched_union++;
+/* ---------- OA ---------- */
+function slotWindowUTC(now, slot, tz) {
+  // grubi prozori za OA (minimizujemo listu)
+  const d = new Date(now);
+  const dayYmd = targetYmdForSlot(now, slot, tz);
+  const [Y,M,D] = dayYmd.split("-").map(Number);
+  // lokalan početak dana u TZ
+  const startLocal = new Date(Date.UTC(Y, M-1, D, 0, 0, 0));
+  const base = new Date(startLocal); // kao UTC nosilac
+  const addH = (h)=> new Date(base.getTime() + h*3600*1000);
+  let fromH=0, toH=24;
+  if (slot==="late") { fromH=0; toH=10; }
+  if (slot==="am")   { fromH=10; toH=15; }
+  if (slot==="pm")   { fromH=15; toH=24; }
+  return { from:new Date(addH(fromH)), to:new Date(addH(toH)) };
+}
+
+async function fetchOA({ from, to }, trace) {
+  const key = process.env.ODDS_API_KEY;
+  if (!key) return { events:[], called:false, url:null, ok:false };
+  const qs = new URLSearchParams({
+    apiKey: key,
+    regions: "eu,uk",
+    markets: "h2h,totals,both_teams_to_score,half_time_full_time",
+    oddsFormat: "decimal",
+    dateFormat: "iso",
+    commenceTimeFrom: from.toISOString(),
+    commenceTimeTo: to.toISOString()
+  });
+  const url = `https://api.the-odds-api.com/v4/sports/soccer/odds?${qs.toString()}`;
+  try {
+    const r = await fetch(url, { cache:"no-store" });
+    const data = await r.json().catch(()=>[]);
+    const events = Array.isArray(data) ? data : [];
+    trace && trace.push({ oa_url:url, oa_ok:r.ok, events:events.length });
+    return { events, called:true, url, ok:r.ok };
+  } catch(e) {
+    trace && trace.push({ oa_err:String(e?.message||e) });
+    return { events:[], called:true, url, ok:false };
+  }
+}
+
+function normalizeBookName(name){ return strip(String(name||"")); }
+
+function pullPriceFromBookmakers(bookmakers, marketKey, pickPredicate) {
+  const prices = [];
+  for (const bm of (bookmakers||[])) {
+    const bn = normalizeBookName(bm?.title);
+    if (!TRUSTED.has(bn)) continue;
+    for (const mk of (bm?.markets||[])) {
+      const mtype = String(mk?.key||"");
+      if (mtype !== marketKey) continue;
+      for (const out of (mk?.outcomes||[])) {
+        if (pickPredicate(out)) {
+          const p = Number(out?.price);
+          if (Number.isFinite(p)) prices.push(p);
+        }
       }
     }
-    await kvSet(keyUnion, union._wasArray ? union.items : (union._obj || union));
   }
+  return median(prices);
+}
 
-  return res.status(200).json({
-    ok:true, ymd:day, slot, source,
-    inspected_full: full.items?.length||0, touched_full,
-    touched_union,
-    saves:[{ flavor:"vercel-kv", ok:true }],
-    oa
-  });
+function mapOAbyTeams(events){
+  const map = new Map();
+  for (const ev of (events||[])) {
+    const h = ev?.home_team, a = ev?.away_team;
+    if (!h || !a) continue;
+    const k = keyTeams(h, a);
+    (map.get(k) || map.set(k, []).get(k)).push(ev);
+  }
+  return map;
+}
+
+function closestByTime(cands, kickoffISO){
+  if (!Array.isArray(cands) || !cands.length) return null;
+  if (!kickoffISO) return cands[0];
+  const kt = new Date(kickoffISO).getTime();
+  let best=cands[0], bestAbs=Infinity;
+  for (const ev of cands){
+    const t = new Date(ev?.commence_time).getTime();
+    const diff = Math.abs((t||0) - kt);
+    if (diff < bestAbs) { best = ev; bestAbs = diff; }
+  }
+  return best;
+}
+
+/* ---------- handler ---------- */
+export default async function handler(req, res) {
+  try {
+    const trace = [];
+    const now = new Date();
+
+    const qSlot = canonicalSlot(req.query.slot);
+    const slot  = qSlot==="auto" ? autoSlot(now, TZ) : qSlot;
+    const ymd   = targetYmdForSlot(now, slot, TZ);
+
+    // izvori
+    const tried = [
+      `vbl_full:${ymd}:${slot}`,
+      `vb:day:${ymd}:${slot}`,
+      `vb:day:${ymd}:union`,
+      `vbl:${ymd}:${slot}`
+    ];
+    let src=null, baseArr=null;
+    for (const k of tried) {
+      const { raw } = await kvGETraw(k, trace);
+      const arr = arrFromAny(J(raw));
+      if (arr.length){ src=k; baseArr=arr; break; }
+    }
+    if (!baseArr) {
+      return res.status(200).json({ ok:true, ymd, slot, msg:"no vbl_full nor union", saves:false, oa:{ called:false, used_before:0, used_after:0, events:0 } });
+    }
+
+    // OA fetch u slot prozoru
+    const windowUTC = slotWindowUTC(now, slot, TZ);
+    const oa = await fetchOA(windowUTC, trace);
+    const events = oa.events || [];
+    const byTeams = mapOAbyTeams(events);
+
+    let inspected = 0, touched_full = 0, touched_union = 0;
+
+    // helper za zapis nazad (čuvamo kao {items:[...]})
+    async function saveBack(key, arr) {
+      return kvSET(key, { items: arr }, trace);
+    }
+
+    // obradimo samo onoliko koliko imamo u baseArr
+    for (const it of baseArr) {
+      inspected++;
+      const home = it?.teams?.home?.name || it?.home?.name;
+      const away = it?.teams?.away?.name || it?.away?.name;
+      if (!home || !away) continue;
+
+      const k = keyTeams(home, away);
+      const cands = byTeams.get(k) || byTeams.get(keyTeams(away, home)) || [];
+      if (!cands.length) continue;
+      const match = closestByTime(cands, it?.kickoff_utc || it?.fixture?.date || it?.kickoff);
+
+      if (!match) continue;
+
+      const books = match?.bookmakers || [];
+
+      // 1X2 (h2h)
+      const h2hHome = pullPriceFromBookmakers(books, "h2h", o=>String(o?.name).toLowerCase()==="home");
+      const h2hDraw = pullPriceFromBookmakers(books, "h2h", o=>String(o?.name).toLowerCase()==="draw");
+      const h2hAway = pullPriceFromBookmakers(books, "h2h", o=>String(o?.name).toLowerCase()==="away");
+
+      // O/U 2.5 (totals, point=2.5, Over)
+      const ouOver = pullPriceFromBookmakers(books, "totals", o=> (Number(o?.point)===2.5) && String(o?.name).toLowerCase()==="over");
+      const ouUnder = pullPriceFromBookmakers(books, "totals", o=> (Number(o?.point)===2.5) && String(o?.name).toLowerCase()==="under");
+
+      // BTTS yes
+      const bttsYes = pullPriceFromBookmakers(books, "both_teams_to_score", o=>String(o?.name).toLowerCase().includes("yes"));
+
+      // HT-FT (Home/Home & Away/Away kao reprezentativni)
+      const htftHH = pullPriceFromBookmakers(books, "half_time_full_time", o=>String(o?.name).toLowerCase().includes("home/home"));
+      const htftAA = pullPriceFromBookmakers(books, "half_time_full_time", o=>String(o?.name).toLowerCase().includes("away/away"));
+
+      it.markets = it.markets || {};
+      it.markets.h2h  = { home:h2hHome, draw:h2hDraw, away:h2hAway };
+      it.markets.ou25 = { over:ouOver, under:ouUnder };
+      it.markets.btts = { yes:bttsYes };
+      it.markets.htft = { hh:htftHH, aa:htftAA };
+
+      touched_full++;
+    }
+
+    // snimimo nazad u vbl_full:<ymd>:<slot>
+    const saves = await saveBack(`vbl_full:${ymd}:${slot}`, baseArr);
+
+    // ako postoji union, pokušaj propagaciju (po fixture_id match-u)
+    const { raw:rawUnion } = await kvGETraw(`vb:day:${ymd}:union`, trace);
+    const unionArr = arrFromAny(J(rawUnion));
+    if (unionArr.length) {
+      const byFix = new Map();
+      for (const it of baseArr) if (it?.fixture_id) byFix.set(String(it.fixture_id), it);
+      for (const u of unionArr) {
+        const fix = u?.fixture_id && byFix.get(String(u.fixture_id));
+        if (fix?.markets) { u.markets = { ...u.markets, ...fix.markets }; touched_union++; }
+      }
+      await saveBack(`vb:day:${ymd}:union`, unionArr);
+    }
+
+    return res.status(200).json({
+      ok:true, ymd, slot,
+      source: (src||"full").includes("vbl_full") ? "full" : (src||"union"),
+      inspected_full: inspected,
+      touched_full, touched_union,
+      saves, oa: { called: oa.called, events: events.length }
+    });
+
+  } catch (e) {
+    return res.status(200).json({ ok:false, error:String(e?.message||e) });
+  }
 }
