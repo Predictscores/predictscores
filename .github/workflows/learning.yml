@@ -3,7 +3,7 @@ name: snapshots
 on:
   workflow_dispatch: {}
   schedule:
-    # 00:00 Europe/Belgrade  ≈ 22:00 UTC (dok je CEST)
+    # 00:00 Europe/Belgrade  ≈ 22:00 UTC (tokom CEST)
     - cron: '0 22 * * *'
     # 10:00 Europe/Belgrade ≈ 08:00 UTC
     - cron: '0 8 * * *'
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       BASE_URL: https://predictscores.vercel.app
     steps:
@@ -34,8 +34,11 @@ jobs:
       - name: Rebuild snapshot
         run: curl -fsSL "$BASE_URL/api/cron/rebuild?slot=${{ steps.slot.outputs.slot }}&debug=1"
 
-      - name: Refresh odds (OA→AF)
+      - name: Refresh odds (OA→AF, median & consensus)
         run: curl -fsSL "$BASE_URL/api/cron/refresh-odds?slot=${{ steps.slot.outputs.slot }}"
+
+      - name: Apply learning (history settle/calibration hook)
+        run: curl -fsSL "$BASE_URL/api/cron/apply-learning?debug=1"
 
       - name: Build insights / freeze tickets
         run: curl -fsSL "$BASE_URL/api/insights-build?slot=${{ steps.slot.outputs.slot }}&debug=1"
