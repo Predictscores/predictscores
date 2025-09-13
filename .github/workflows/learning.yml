@@ -2,6 +2,9 @@ name: snapshots
 
 on:
   workflow_dispatch: {}
+  push:
+    branches:
+      - main
   schedule:
     # 00:00 Europe/Belgrade  ≈ 22:00 UTC (tokom CEST)
     - cron: '0 22 * * *'
