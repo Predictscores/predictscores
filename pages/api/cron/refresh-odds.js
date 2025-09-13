@@ -58,13 +58,11 @@ const AF_KEY  = process.env.API_FOOTBALL_KEY;
 /* ── The Odds API (ODDS_API) ── */
 const OA_BASE = "https://api.the-odds-api.com/v4";
 const OA_KEY  = process.env.ODDS_API_KEY;
-// čvrsti dnevni limit bez ikakvog dodatnog ENV-a
 const OA_DAILY_LIMIT = 15;
 const TRUSTED = new Set([
   "Pinnacle","bet365","Bet365","William Hill","WilliamHill","Bwin","Unibet","Marathon","Marathonbet",
   "10Bet","10bet","Betfair","Betway","888sport","Betano","DraftKings","FanDuel"
 ]);
-// The Odds API koristi "bookmakers" slugove (mala slova, bez razmaka)
 const OA_BOOKMAKER_SLUGS = [
   "pinnacle","bet365","williamhill","bwin","unibet","marathonbet","10bet","betfair","betway","888sport","betano","draftkings","fanduel"
 ].join(",");
@@ -80,7 +78,6 @@ function teamKey(h,a){ return `${norm(h)}|${norm(a)}`; }
 function similarTeams(h1,a1,h2,a2) {
   const t1 = [norm(h1), norm(a1)];
   const t2 = [norm(h2), norm(a2)];
-  // pokušaj direktno i obrnuto
   return (t1[0]===t2[0] && t1[1]===t2[1]) || (t1[0]===t2[1] && t1[1]===t2[0]) ||
          (t2[0].includes(t1[0]) && t2[1].includes(t1[1])) ||
          (t2[1].includes(t1[0]) && t2[0].includes(t1[1]));
@@ -127,7 +124,7 @@ async function oaMarkUsed(ymd, inc=1){
   return used + inc;
 }
 
-/* Jedan ODDS_API upit: upcoming soccer H2H za EU/UK/US, samo trusted */
+/* Jedan ODDS_API upit: upcoming soccer H2H */
 async function oaUpcomingH2H() {
   if (!OA_KEY) return null;
   const url = `${OA_BASE}/sports/upcoming/odds?apiKey=${encodeURIComponent(OA_KEY)}&regions=eu,uk,us&markets=h2h&bookmakers=${encodeURIComponent(OA_BOOKMAKER_SLUGS)}&oddsFormat=decimal&dateFormat=iso`;
@@ -136,7 +133,6 @@ async function oaUpcomingH2H() {
   const arr = await r.json().catch(()=>null);
   if (!Array.isArray(arr)) return null;
 
-  // izgradi mapu: "home|away" -> agregisane najbolje kvote (H/D/A) + broj trusted bookova
   const map = new Map();
   for (const ev of arr) {
     const home = ev?.home_team, away = ev?.away_team;
@@ -183,7 +179,6 @@ export default async function handler(req, res){
     const slot  = qSlot==="auto" ? autoSlot(now, TZ) : qSlot;
     const ymd   = ymdInTZ(now, TZ);
 
-    // čitaj vbl_full za slot
     const { raw } = await kvGETraw(`vbl_full:${ymd}:${slot}`);
     const list = J(raw) || [];
     if (!list.length) {
@@ -219,14 +214,13 @@ export default async function handler(req, res){
       targeted++;
 
       // 1) Probaj ODDS_API (ako je mapa popunjena)
-      let price = null, booksCount = 0, usedOA = false;
+      let price = null, booksCount = 0;
       if (oaMap && home && away) {
         const key = teamKey(home, away);
         let hit = oaMap.get(key);
         if (!hit) {
-          // probaj fuzzy: prođi kroz 50 kandidata max
           let tries = 0;
-          for (const [k, v] of oaMap.entries()) {
+          for (const [, v] of oaMap.entries()) {
             if (++tries > 50) break;
             if (similarTeams(home, away, v.home, v.away)) { hit = v; break; }
           }
@@ -234,17 +228,14 @@ export default async function handler(req, res){
         if (hit) {
           const best = hit.best;
           const withSel = withPick(it, best);
-          if (withSel?.selection_label) {
-            if (/^home/i.test(withSel.selection_label)) price = best.H;
-            else if (/^draw/i.test(withSel.selection_label)) price = best.D;
-            else if (/^away/i.test(withSel.selection_label)) price = best.A;
-          }
+          if (/^home/i.test(withSel?.selection_label||"")) price = best.H;
+          else if (/^draw/i.test(withSel?.selection_label||"")) price = best.D;
+          else if (/^away/i.test(withSel?.selection_label||"")) price = best.A;
           if (Number.isFinite(price) && price>1) {
             updated.push({ ...withSel, odds: { price, books_count: hit.booksCount } });
-            touched++; usedOA = true;
-            continue; // gotovo za ovaj fixture
+            touched++;
+            continue;
           } else {
-            // zadrži makar books_count iz OA
             booksCount = hit.booksCount || 0;
           }
         }
@@ -255,12 +246,10 @@ export default async function handler(req, res){
       const { best, booksCount:afBooks } = best1x2FromAF(books);
       const withSel = withPick(it, best);
 
-      if (!Number.isFinite(price)) { // ako OA nije dao cenu
-        if (withSel?.selection_label) {
-          if (/^home/i.test(withSel.selection_label)) price = best.H;
-          else if (/^draw/i.test(withSel.selection_label)) price = best.D;
-          else if (/^away/i.test(withSel.selection_label)) price = best.A;
-        }
+      if (!Number.isFinite(price)) {
+        if (/^home/i.test(withSel?.selection_label||"")) price = best.H;
+        else if (/^draw/i.test(withSel?.selection_label||"")) price = best.D;
+        else if (/^away/i.test(withSel?.selection_label||"")) price = best.A;
         booksCount = Math.max(booksCount, afBooks||0);
       }
 
@@ -272,7 +261,6 @@ export default async function handler(req, res){
       }
     }
 
-    // snimi nazad (vbl_full i vbl)
     const saves = [];
     saves.push(...await kvSET(`vbl_full:${ymd}:${slot}`, updated));
     saves.push(...await kvSET(`vbl:${ymd}:${slot}`, updated));
