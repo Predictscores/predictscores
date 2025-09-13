@@ -15,135 +15,114 @@ async function kvGet(key) {
 
 // ---- Eval market outcome from FT/HT score
 function evalPick(p, sc) {
-  if (!sc || sc.ftH == null || sc.ftA == null) return null;
-  const ftH = Number(sc.ftH), ftA = Number(sc.ftA);
-  const total = ftH + ftA;
-  const market = String(p.market || "").toLowerCase();
-  const selection = String(p.selection || "").toLowerCase();
-
-  // BTTS
-  if (market.includes("btts")) {
-    const yes = selection.includes("yes");
-    const hit = yes ? (ftH>0 && ftA>0) : !(ftH>0 && ftA>0);
-    return hit ? "won" : "lost";
+  if (!p || !sc || !sc.ft) return null;
+  const { ft, ht } = sc;
+  if (p.market === "1X2") {
+    const diff = (ft.home ?? 0) - (ft.away ?? 0);
+    if (p.pick_code === "1") return diff > 0 ? 1 : 0;
+    if (p.pick_code === "X") return diff === 0 ? 1 : 0;
+    if (p.pick_code === "2") return diff < 0 ? 1 : 0;
   }
-  // OU (extract line like 2.5)
-  if (market.includes("over") || market.includes("under") || market.includes("ou")) {
-    const m = String(p.market).match(/([0-9]+(?:\.[0-9]+)?)/);
-    const line = m ? Number(m[1]) : 2.5;
-    if (selection.includes("over")) {
-      if (total === line) return null;
-      return total > line ? "won" : "lost";
-    }
-    if (selection.includes("under")) {
-      if (total === line) return null;
-      return total < line ? "won" : "lost";
-    }
+  if (p.market === "OU2.5") {
+    const goals = (ft.home ?? 0) + (ft.away ?? 0);
+    if (p.pick_code === "O") return goals > 2 ? 1 : 0;
+    if (p.pick_code === "U") return goals < 3 ? 1 : 0;
   }
-  // 1X2
-  if (market.includes("1x2") || market === "1x2" || market.includes("match winner")) {
-    if (selection === "1" || selection.includes("home")) return ftH > ftA ? "won" : (ftH === ftA ? null : "lost");
-    if (selection === "2" || selection.includes("away")) return ftA > ftH ? "won" : (ftH === ftA ? null : "lost");
-    if (selection === "x" || selection.includes("draw")) return ftH === ftA ? "won" : "lost";
+  if (p.market === "BTTS") {
+    const yes = (ft.home ?? 0) > 0 && (ft.away ?? 0) > 0;
+    if (p.pick_code === "Y") return yes ? 1 : 0;
+    if (p.pick_code === "N") return !yes ? 1 : 0;
   }
-  // HT-FT
-  if (market.includes("ht-ft") || market.includes("ht/ft")) {
-    const ht = (sc.htH!=null && sc.htA!=null) ? (sc.htH>sc.htA?"1":(sc.htH<sc.htA?"2":"X")) : null;
-    const ft = ftH>ftA?"1":(ftH<ftA?"2":"X");
-    const norm = selection.replace(/\s+/g,"").replace("ht","").replace("ft","").replace(/draw/gi,"X").replace(/home/gi,"1").replace(/away/gi,"2");
-    const m = norm.match(/([12X])[/\-]([12X])/i) || norm.match(/^([12x])([12x])$/i);
-    if (!ht || !m) return null;
-    const wantHT = m[1].toUpperCase(), wantFT = m[2].toUpperCase();
-    return (ht===wantHT && ft===wantFT) ? "won" : "lost";
+  if (p.market === "HT-FT" && sc.ht) {
+    const dft = (ft.home ?? 0) - (ft.away ?? 0);
+    const dht = (sc.ht.home ?? 0) - (sc.ht.away ?? 0);
+    const code = (x) => (x > 0 ? "H" : x < 0 ? "A" : "D");
+    return `${code(dht)}-${code(dft)}` === p.pick_code ? 1 : 0;
   }
   return null;
 }
 
-// ---- Smoothing helpers
-function laplaceRate(wins, total, alpha=1, beta=1) {
-  return (wins + alpha) / (total + alpha + beta);
-}
-function toPP(x) { return Math.round(x * 1000) / 10; } // one decimal pp
-
 export default async function handler(req, res) {
   try {
-    const days = Math.max(7, Math.min(60, Number(req.query.days || 30)));
+    const days = Math.max(1, Math.min(90, Number(req.query.days || "30")));
     const now = new Date();
+    const tz = process.env.TZ_DISPLAY || "Europe/Belgrade";
+    const base = new Date(now.toLocaleString("en-GB", { timeZone: tz }));
 
-    const rows = []; // flattened resolved picks with status + conf
+    const ymds = [];
     for (let i = 0; i < days; i++) {
-      const d = new Date(now); d.setDate(d.getDate() - i);
-      const ymd = d.toISOString().slice(0,10);
-      const snap = await kvGet(`vb:day:${ymd}:last`);
-      if (!Array.isArray(snap)) continue;
+      const d = new Date(base);
+      d.setDate(d.getDate() - i);
+      const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, "0"), dd = String(d.getDate()).padStart(2, "0");
+      ymds.push(`${y}-${m}-${dd}`);
+    }
 
-      for (const p of snap) {
-        const sc = await kvGet(`vb:score:${p.fixture_id}`);
-        const status = evalPick(p, sc);
-        if (!status) continue;
+    const rows = [];
+
+    for (const ymd of ymds) {
+      // ★ Promena: čitamo dnevni snapshot sa :union
+      const snap = await kvGet(`vb:day:${ymd}:union`);
+      if (!snap || !snap.items) continue;
+
+      for (const it of snap.items) {
+        const pick = it && it.market ? { market: it.market, pick_code: it.pick_code } : null;
+        const scoreRaw = await kvGet(`vb:score:${it.fixture_id}`);
+        if (!scoreRaw) continue;
+        const sc = typeof scoreRaw === "string" ? JSON.parse(scoreRaw) : scoreRaw;
+        const won = evalPick(pick, sc);
+        if (won == null) continue;
+
         rows.push({
-          market: p.market || "",
-          league: p.league_name || "",
-          conf: Number.isFinite(p.conf) ? Number(p.conf) : null,
-          status
+          ymd,
+          league: it.league?.id ?? "unknown",
+          market: pick.market,
+          pick_code: pick.pick_code,
+          price: it?.odds?.price ?? null,
+          implied: it?.odds?.price ? 1 / Number(it.odds.price) : null,
+          won
         });
       }
     }
 
-    // Aggregate per market (global) and per (market, league)
-    const aggMarket = new Map();
-    const aggLeague = new Map(); // key: market||league
+    const marketReport = {};
+    const leagueAdjust = [];
 
     for (const r of rows) {
-      const kM = r.market.toLowerCase();
-      const kL = `${kM}||${(r.league||"").toLowerCase()}`;
-
-      // market
-      let aM = aggMarket.get(kM);
-      if (!aM) { aM = { market: r.market, n:0, w:0, confSum:0, confN:0 }; aggMarket.set(kM, aM); }
-      aM.n += 1; if (r.status === "won") aM.w += 1;
-      if (Number.isFinite(r.conf)) { aM.confSum += r.conf; aM.confN += 1; }
-
-      // league
-      let aL = aggLeague.get(kL);
-      if (!aL) { aL = { market: r.market, league: r.league, n:0, w:0 }; aggLeague.set(kL, aL); }
-      aL.n += 1; if (r.status === "won") aL.w += 1;
+      if (!marketReport[r.market]) marketReport[r.market] = { total: 0, won: 0, implied: [] };
+      marketReport[r.market].total++;
+      marketReport[r.market].won += r.won;
+      if (r.implied != null) marketReport[r.market].implied.push(r.implied);
     }
 
-    // Build report
-    const marketReport = [];
-    for (const [, a] of aggMarket) {
-      const actual = laplaceRate(a.w, a.n);
-      const pred = a.confN ? (a.confSum / a.confN) / 100 : null;
-      const delta = (pred!=null) ? (actual - pred) : null;
-      marketReport.push({
-        market: a.market,
-        samples: a.n,
-        win_rate: toPP(actual),           // %
-        avg_conf_shown: pred!=null ? toPP(pred) : null, // %
-        calibration_delta_pp: delta!=null ? toPP(delta) : null // +pp = podcenili smo, -pp = precenili smo
+    for (const [m, v] of Object.entries(marketReport)) {
+      const wr = v.total ? v.won / v.total : 0;
+      const imp = v.implied.length ? v.implied.reduce((a,b)=>a+b,0) / v.implied.length : null;
+      marketReport[m] = {
+        samples: v.total,
+        win_rate_pct: Math.round(wr * 1000) / 10,
+        mean_implied_pct: imp != null ? Math.round(imp * 1000) / 10 : null,
+        delta_vs_market_pp: imp != null ? Math.round((wr - imp) * 1000) / 10 : null
+      };
+    }
+
+    // liga-level (ograničeno na 200 izlaza radi bezbednosti)
+    const byLeague = {};
+    for (const r of rows) {
+      if (!byLeague[r.league]) byLeague[r.league] = { total: 0, won: 0, implied: [] };
+      byLeague[r.league].total++;
+      byLeague[r.league].won += r.won;
+      if (r.implied != null) byLeague[r.league].implied.push(r.implied);
+    }
+    for (const [lg, v] of Object.entries(byLeague)) {
+      const wr = v.total ? v.won / v.total : 0;
+      const imp = v.implied.length ? v.implied.reduce((a,b)=>a+b,0)/v.implied.length : null;
+      leagueAdjust.push({
+        league: lg,
+        samples: v.total,
+        win_rate_pct: Math.round(wr * 1000) / 10,
+        mean_implied_pct: imp != null ? Math.round(imp * 1000) / 10 : null,
+        delta_vs_market_pp: imp != null ? Math.round((wr - imp) * 1000) / 10 : null
       });
-    }
-    marketReport.sort((x,y)=> y.samples - x.samples);
-
-    const leagueAdjust = [];
-    for (const [, a] of aggLeague) {
-      const mKey = a.market.toLowerCase();
-      const m = aggMarket.get(mKey);
-      if (!m || a.n < 25) continue; // treba malo uzorka
-      const actL = laplaceRate(a.w, a.n);
-      const actM = laplaceRate(m.w, m.n);
-      const diff = actL - actM;
-      const abs = Math.abs(diff);
-      if (abs >= 0.05) { // bar 5pp razlike
-        leagueAdjust.push({
-          market: a.market,
-          league: a.league,
-          samples: a.n,
-          delta_vs_market_pp: toPP(diff), // +pp bonus, -pp malus kandidat
-          suggestion: diff > 0 ? "bonus" : "malus"
-        });
-      }
     }
     leagueAdjust.sort((x,y)=> Math.abs(y.delta_vs_market_pp) - Math.abs(x.delta_vs_market_pp));
 
