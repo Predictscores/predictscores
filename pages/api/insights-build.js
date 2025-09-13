@@ -1,14 +1,14 @@
 // pages/api/insights-build.js
 export const config = { api: { bodyParser: false } };
 
-/* TZ (samo TZ_DISPLAY) */
+/* TZ */
 function pickTZ() {
   const raw = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
   try { new Intl.DateTimeFormat("en-GB", { timeZone: raw }); return raw; } catch { return "Europe/Belgrade"; }
 }
 const TZ = pickTZ();
 
-/* KV (Vercel KV / Upstash) */
+/* KV */
 function kvBackends() {
   const out = [];
   const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
@@ -26,9 +26,7 @@ async function kvGETraw(key, trace) {
       trace && trace.push({ get:key, ok:r.ok, flavor:b.flavor, hit:!!raw });
       if (!r.ok) continue;
       return { raw, flavor:b.flavor };
-    } catch (e) {
-      trace && trace.push({ get:key, ok:false, err:String(e?.message||e) });
-    }
+    } catch (e) { trace && trace.push({ get:key, ok:false, err:String(e?.message||e) }); }
   }
   return { raw:null, flavor:null };
 }
@@ -50,21 +48,62 @@ async function kvSET(key, value, trace) {
 const J = s=>{ try{ return JSON.parse(String(s||"")); }catch{ return null; } };
 const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
 const hourInTZ = (d, tz) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour12:false, hour:"2-digit" }).format(d));
-const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate()+n); return x; };
-const arrFromAny = x => Array.isArray(x) ? x
-  : (x && typeof x==="object" && Array.isArray(x.items)) ? x.items
-  : (x && typeof x==="object" && Array.isArray(x.football)) ? x.football
-  : (x && typeof x==="object" && Array.isArray(x.list)) ? x.list : [];
-
-/* slot helpers */
 function canonicalSlot(x){ x=String(x||"auto").toLowerCase(); return x==="late"||x==="am"||x==="pm"?x:"auto"; }
 function autoSlot(d,tz){ const h=hourInTZ(d,tz); return h<10?"late":(h<15?"am":"pm"); }
-function targetYmdForSlot(now, slot, tz){
-  const h=hourInTZ(now,tz);
-  if (slot==="late") return ymdInTZ(h<10?now:addDays(now,1), tz);
-  if (slot==="am")   return ymdInTZ(h<15?now:addDays(now,1), tz);
-  if (slot==="pm")   return ymdInTZ(h<15?now:addDays(now,1), tz);
-  return ymdInTZ(now, tz);
+
+const AF_BASE = "https://v3.football.api-sports.io";
+const AF_KEY  = process.env.API_FOOTBALL_KEY;
+async function afOddsByFixture(fid){
+  if(!AF_KEY) return null;
+  const r = await fetch(`${AF_BASE}/odds?fixture=${fid}`, { headers:{ "x-apisports-key": AF_KEY }, cache:"no-store" });
+  if(!r.ok) return null; const j = await r.json().catch(()=>null);
+  return j?.response?.[0]?.bookmakers || [];
+}
+const conf = x => Number.isFinite(x?.confidence_pct)?x.confidence_pct:(Number(x?.confidence)||0);
+const kstart = x => { const k=x?.fixture?.date||x?.fixture_date||x?.kickoff||x?.kickoff_utc||x?.ts; const d=k?new Date(k):null; return Number.isFinite(d?.getTime?.())?d.getTime():0; };
+const sorter = (a,b)=> (conf(b)-conf(a)) || (kstart(a)-kstart(b));
+
+function pickFromBooks(bookmakers, kind){
+  // kind: "BTTS" | "OU25" | "HTFT"
+  let map = {};
+  for (const b of (bookmakers||[])) for (const bet of (b?.bets||[])) {
+    const nm = String(bet?.name||"").toLowerCase();
+
+    if (kind==="BTTS" && nm.includes("both teams to score")) {
+      for (const v of (bet?.values||[])) {
+        const lbl = String(v?.value||"").toUpperCase(); const odd = Number(v?.odd);
+        if (!Number.isFinite(odd)) continue;
+        const key = /YES/.test(lbl) ? "YES" : (/NO/.test(lbl) ? "NO" : null);
+        if (!key) continue;
+        (map[key] ||= []).push(odd);
+      }
+    }
+
+    if (kind==="OU25" && (nm.includes("over/under") || nm.includes("totals"))) {
+      for (const v of (bet?.values||[])) {
+        const lbl = String(v?.value||"").toUpperCase(); const odd = Number(v?.odd);
+        if (!Number.isFinite(odd)) continue;
+        let key = null;
+        if (lbl.includes("OVER 2.5")) key="OVER 2.5";
+        else if (lbl.includes("UNDER 2.5")) key="UNDER 2.5";
+        if (!key) continue;
+        (map[key] ||= []).push(odd);
+      }
+    }
+
+    if (kind==="HTFT" && (nm.includes("ht/ft") || nm.includes("half time/full time"))) {
+      for (const v of (bet?.values||[])) {
+        const lbl = String(v?.value||"").toUpperCase().replace(/\s+/g,"");
+        const odd = Number(v?.odd); if (!Number.isFinite(odd)) continue;
+        const norm=lbl.replace(/(^|\/)1/g,"$1HOME").replace(/(^|\/)X/g,"$1DRAW").replace(/(^|\/)2/g,"$1AWAY");
+        (map[norm] ||= []).push(odd);
+      }
+    }
+  }
+  // najbolja (najniža) kvota za izbor
+  const best = Object.entries(map).map(([k,arr])=>[k, arr && arr.length ? Math.min(...arr) : Infinity]).sort((a,b)=>a[1]-b[1])[0];
+  if (!best || !isFinite(best[1])) return null;
+  return { pick: best[0], price: best[1] };
 }
 
 export default async function handler(req, res) {
@@ -74,55 +113,60 @@ export default async function handler(req, res) {
 
     const qSlot = canonicalSlot(req.query.slot);
     const slot  = qSlot==="auto" ? autoSlot(now, TZ) : qSlot;
-    const ymd   = targetYmdForSlot(now, slot, TZ);
-
-    // prioritet: tickets:<ymd>:<slot> → vbl_full:<ymd>:<slot> → vbl → vb:day:<ymd>:<slot>|union
-    const tried = [
-      `tickets:${ymd}:${slot}`,
-      `vbl_full:${ymd}:${slot}`,
-      `vbl:${ymd}:${slot}`,
-      `vb:day:${ymd}:${slot}`,
-      `vb:day:${ymd}:union`
-    ];
-    let baseArr=null, src=null;
-    for (const k of tried) {
-      const { raw } = await kvGETraw(k, trace);
-      const arr = arrFromAny(J(raw));
-      if (arr.length){ baseArr=arr; src=k; break; }
-    }
-
-    if (!baseArr) {
-      const key = `tickets:${ymd}:${slot}`;
-      await kvSET(key, { btts:[], ou25:[], htft:[] }, trace);
-      return res.status(200).json({ ok:true, ymd, slot, source:src, counts:{btts:0,ou25:0,htft:0}, note:"no-source-items" });
-    }
-
-    const conf = x => Number.isFinite(x?.confidence_pct)?x.confidence_pct:(Number(x?.confidence)||0);
-    const kstart = x => { const k=x?.fixture?.date||x?.fixture_date||x?.kickoff||x?.kickoff_utc||x?.ts; const d=k?new Date(k):null; return Number.isFinite(d?.getTime?.())?d.getTime():0; };
-    const sorter = (a,b)=> (conf(b)-conf(a)) || (kstart(a)-kstart(b));
-
-    const groups = { btts:[], ou25:[], htft:[] };
-    for (const it of baseArr) {
-      const L = String(it?.market_label||it?.market||"").toUpperCase();
-      if (L.includes("BTTS")) groups.btts.push(it);
-      else if (L.includes("O/U 2.5") || L.includes("OVER 2.5") || L.includes("UNDER 2.5")) groups.ou25.push(it);
-      else if (L.includes("HT-FT") || L.includes("HT/FT")) groups.htft.push(it);
-    }
-    groups.btts.sort(sorter); groups.ou25.sort(sorter); groups.htft.sort(sorter);
-    groups.btts = groups.btts.slice(0,4);
-    groups.ou25 = groups.ou25.slice(0,4);
-    groups.htft = groups.htft.slice(0,4);
+    const ymd   = ymdInTZ(now, TZ);
 
     const keySlot = `tickets:${ymd}:${slot}`;
-    await kvSET(keySlot, groups, trace);
+    const existing = J((await kvGETraw(keySlot, trace)).raw);
+    if (existing && (
+      (Array.isArray(existing.btts)&&existing.btts.length) ||
+      (Array.isArray(existing.ou25)&&existing.ou25.length) ||
+      (Array.isArray(existing.htft)&&existing.htft.length)
+    )) {
+      const counts = { btts: existing.btts?.length||0, ou25: existing.ou25?.length||0, htft: existing.htft?.length||0 };
+      return res.status(200).json({ ok:true, ymd, slot, source:keySlot, tickets_key:keySlot, counts, debug:{ trace } });
+    }
 
-    const { raw:rawDay } = await kvGETraw(`tickets:${ymd}`, trace);
-    const jDay = J(rawDay);
-    const hasDay = jDay && (Array.isArray(jDay.btts)||Array.isArray(jDay.ou25)||Array.isArray(jDay.htft));
-    if (!hasDay) await kvSET(`tickets:${ymd}`, groups, trace);
+    // dnevni
+    const keyDay = `tickets:${ymd}`;
+    const day = J((await kvGETraw(keyDay, trace)).raw);
+    if (day && (
+      (Array.isArray(day.btts)&&day.btts.length) ||
+      (Array.isArray(day.ou25)&&day.ou25.length) ||
+      (Array.isArray(day.htft)&&day.htft.length)
+    )) {
+      await kvSET(keySlot, day, trace);
+      const counts = { btts: day.btts?.length||0, ou25: day.ou25?.length||0, htft: day.htft?.length||0 };
+      return res.status(200).json({ ok:true, ymd, slot, source:keyDay, tickets_key:keySlot, counts, debug:{ trace } });
+    }
+
+    // Fallback: napravi tikete iz vbl_full slot stavki (max 6 AF poziva)
+    const { raw } = await kvGETraw(`vbl_full:${ymd}:${slot}`, trace);
+    const base = J(raw) || [];
+    const pool = base.slice(0, 6); // max
+
+    const btts=[], ou25=[], htft=[];
+    for (const it of pool) {
+      const fid = it?.fixture_id || it?.fixture?.id || it?.id;
+      if (!fid) continue;
+      const books = await afOddsByFixture(fid) || [];
+      const p1 = pickFromBooks(books, "BTTS");
+      const p2 = pickFromBooks(books, "OU25");
+      const p3 = pickFromBooks(books, "HTFT");
+      if (p1) btts.push({ ...it, market:"BTTS", market_label:"BTTS", selection_label:p1.pick, market_odds:p1.price, confidence_pct: Math.max(55, conf(it)) });
+      if (p2) ou25.push({ ...it, market:"O/U 2.5", market_label:"O/U 2.5", selection_label:p2.pick, market_odds:p2.price, confidence_pct: Math.max(55, conf(it)) });
+      if (p3) htft.push({ ...it, market:"HT-FT", market_label:"HT-FT", selection_label:p3.pick, market_odds:p3.price, confidence_pct: Math.max(60, conf(it)) });
+    }
+
+    btts.sort(sorter); ou25.sort(sorter); htft.sort(sorter);
+    const groups = { btts: btts.slice(0,4), ou25: ou25.slice(0,4), htft: htft.slice(0,4) };
+
+    await kvSET(keySlot, groups, trace);
+    // zapiši i dnevne ako ih nema
+    const dayRaw = (await kvGETraw(keyDay, trace)).raw;
+    if (!J(dayRaw)) await kvSET(keyDay, groups, trace);
 
     const counts = { btts: groups.btts.length, ou25: groups.ou25.length, htft: groups.htft.length };
-    return res.status(200).json({ ok:true, ymd, slot, source:src, tickets_key:keySlot, counts, debug:{ trace } });
+    return res.status(200).json({ ok:true, ymd, slot, source:`vbl_full:${ymd}:${slot}`, tickets_key:keySlot, counts, debug:{ trace } });
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
