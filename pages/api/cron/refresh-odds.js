@@ -1,6 +1,7 @@
 // pages/api/cron/refresh-odds.js
-// Enrich: median kvote (trusted) + BTTS/OU2.5 iz The Odds API.
-// Piše u vbl_full:<YMD>:<slot> I u vb:day:<YMD>:union (po fixture_id).
+// Median kvote (trusted) + BTTS/OU2.5 iz The Odds API.
+// Piše u vbl_full:<YMD>:<slot> i u vb:day:<YMD>:union.
+// Radi i kada je union plain-array ili {items}.
 // 1 OA poziv po slotu; dnevni limit 15 (KV: oa:budget:<ymd>).
 
 export const config = { api: { bodyParser: false } };
@@ -124,7 +125,13 @@ async function callOAOnce(ymdStr){
   return { called:true, used_before, used_after:used_before+1, events:Array.isArray(data)?data.length:0, data:Array.isArray(data)?data:[] };
 }
 
-/* ---------- Apply markets to a list (in place) ---------- */
+/* ---------- shape helpers ---------- */
+function normalizeFeedShape(x){
+  if(!x) return null;
+  if(Array.isArray(x)) return { items: x, _wasArray:true };
+  if(Array.isArray(x.items)) return { items: x.items, _wasArray:false, _obj:x };
+  return null;
+}
 function applyMarketsToList(list, idx){
   let touched=0;
   for(const it of list||[]){
@@ -151,35 +158,39 @@ export default async function handler(req,res){
   const day = ymdFromParts(p);
   const slot = slotFromQuery(req.query);
 
-  const keyFull   = `vbl_full:${day}:${slot}`;
-  const keyUnion  = `vb:day:${day}:union`;
+  const keyFull  = `vbl_full:${day}:${slot}`;
+  const keyUnion = `vb:day:${day}:union`;
 
-  let full = await kvGet(keyFull);
-  const union = await kvGet(keyUnion);
+  let fullRaw  = await kvGet(keyFull);
+  let unionRaw = await kvGet(keyUnion);
 
-  // Fallback: ako nema vbl_full, radi nad union i kreiraj ga iz union-a
+  let full  = normalizeFeedShape(fullRaw);
+  let union = normalizeFeedShape(unionRaw);
+
+  // Fallback – ako nema full, koristi union kao osnovu
   let source = "full";
-  if(!full || !Array.isArray(full.items)){
-    if(!union || !Array.isArray(union.items)){
+  if(!full){
+    if(!union){
       return res.status(200).json({ ok:true, ymd:day, slot, msg:"no vbl_full nor union", saves:false, oa:{called:false,used_before:0,used_after:0,events:0} });
     }
-    full = { ...union }; // plitka kopija; dovoljno je za upis markets
+    full = { items: (union.items||[]).map(x=>x) }; // plitka kopija
     source = "union-fallback";
   }
 
   const oa = await callOAOnce(day);
   const idx = indexOA(oa.data);
 
-  // 1) upiši u vbl_full
+  // 1) upiši u full
   const touched_full = applyMarketsToList(full.items, idx);
-  await kvSet(keyFull, full);
+  await kvSet(keyFull, full._wasArray ? full.items : (full._obj || full));
 
-  // 2) propagiraj u union po fixture_id (ako postoji)
+  // 2) propagiraj u union (ako postoji)
   let touched_union = 0;
-  if(union && Array.isArray(union.items)){
+  if(union){
+    // map po fixture_id iz full-a
     const byId = new Map();
     for(const it of full.items||[]) if(it.fixture_id!=null) byId.set(it.fixture_id, it);
-    for(const u of union.items){
+    for(const u of union.items||[]){
       const m = byId.get(u.fixture_id);
       if(m && m.markets){
         u.markets = u.markets || {};
@@ -189,14 +200,12 @@ export default async function handler(req,res){
         touched_union++;
       }
     }
-    await kvSet(keyUnion, union);
+    await kvSet(keyUnion, union._wasArray ? union.items : (union._obj || union));
   }
 
   return res.status(200).json({
-    ok:true, ymd:day, slot,
-    source,
-    inspected_full: full.items?.length||0,
-    touched_full,
+    ok:true, ymd:day, slot, source,
+    inspected_full: full.items?.length||0, touched_full,
     touched_union,
     saves:[{ flavor:"vercel-kv", ok:true }],
     oa
