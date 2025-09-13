@@ -1,68 +1,41 @@
-- name: Settle TODAY (vb:day -> vb:cal)
-  shell: bash
-  env:
-    TZ_DISPLAY: Europe/Belgrade
-    KV_REST_API_URL: ${{ secrets.KV_REST_API_URL }}
-    KV_REST_API_TOKEN: ${{ secrets.KV_REST_API_TOKEN }}
-  run: |
-    node <<'NODE'
-    // --- TZ / YMD ---
-    const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-    const today = new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(new Date());
+name: snapshots
 
-    // --- KV helpers (REST) ---
-    const baseURL = (process.env.KV_REST_API_URL || "").replace(/\/+$/,"");
-    const token   = process.env.KV_REST_API_TOKEN || "";
-    async function kvGet(key){
-      if(!baseURL || !token) return null;
-      const r = await fetch(`${baseURL}/get/${encodeURIComponent(key)}`, {
-        headers: { Authorization: `Bearer ${token}` }, cache: "no-store"
-      });
-      if(!r.ok) return null;
-      const j = await r.json().catch(()=>null);
-      return typeof j?.result === "string" ? j.result : null;
-    }
-    async function kvSet(key, value){
-      if(!baseURL || !token) return false;
-      const body = (typeof value === "string") ? value : JSON.stringify(value);
-      const r = await fetch(`${baseURL}/set/${encodeURIComponent(key)}`, {
-        method:"POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type":"application/json" },
-        cache: "no-store",
-        body
-      });
-      return r.ok;
-    }
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 00:00 Europe/Belgrade  ≈ 22:00 UTC (dok je CEST)
+    - cron: '0 22 * * *'
+    # 10:00 Europe/Belgrade ≈ 08:00 UTC
+    - cron: '0 8 * * *'
+    # 15:00 Europe/Belgrade ≈ 13:00 UTC
+    - cron: '0 13 * * *'
 
-    // --- robustno parsiranje vrednosti iz KV (string ili {value: ...}) ---
-    const unpack = (raw) => {
-      if (raw == null) return null;
-      const s = (typeof raw === "string") ? raw : String(raw);
-      try {
-        const v = JSON.parse(s);
-        if (Array.isArray(v)) return v;
-        if (v && typeof v === "object" && Object.hasOwn(v, "value")) {
-          const w = v.value;
-          if (Array.isArray(w)) return w;
-          if (typeof w === "string") {
-            try {
-              const arr = JSON.parse(w);
-              if (Array.isArray(arr)) return arr;
-            } catch (e) {}
-          }
-        }
-      } catch (e) {}
-      return null;
-    };
+concurrency:
+  group: snapshots-${{ github.ref }}
+  cancel-in-progress: false
 
-    (async () => {
-      const srcKey = `vb:day:${today}:combined`;
-      const dstKey = `vb:cal:${today}`;
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BASE_URL: https://predictscores.vercel.app
+    steps:
+      - name: Compute slot (Europe/Belgrade)
+        id: slot
+        run: |
+          H=$(TZ='Europe/Belgrade' date +%H)
+          if [ "$H" -lt 10 ]; then SLOT=late;
+          elif [ "$H" -lt 15 ]; then SLOT=am;
+          else SLOT=pm; fi
+          echo "slot=$SLOT" >> $GITHUB_OUTPUT
+          echo "Belgrade hour: $H, slot: $SLOT"
 
-      const raw = await kvGet(srcKey);
-      const list = unpack(raw) || [];
+      - name: Rebuild snapshot
+        run: curl -fsSL "$BASE_URL/api/cron/rebuild?slot=${{ steps.slot.outputs.slot }}&debug=1"
 
-      await kvSet(dstKey, list);
-      console.log(JSON.stringify({ ok:true, today, from:srcKey, to:dstKey, count:list.length }));
-    })().catch(err => { console.error(err); process.exit(1); });
-    NODE
+      - name: Refresh odds (OA→AF)
+        run: curl -fsSL "$BASE_URL/api/cron/refresh-odds?slot=${{ steps.slot.outputs.slot }}"
+
+      - name: Build insights / freeze tickets
+        run: curl -fsSL "$BASE_URL/api/insights-build?slot=${{ steps.slot.outputs.slot }}&debug=1"
