@@ -1,6 +1,7 @@
 // pages/api/cron/refresh-odds.js
-// Enrich vbl_full:<YMD>:<slot> median kvotama (trusted) + BTTS/OU2.5 iz The Odds API.
-// • 1 OA poziv po slotu, ukupno max 15/dan (guard u KV: oa:budget:<ymd>)
+// Enrich: median kvote (trusted) + BTTS/OU2.5 iz The Odds API.
+// Piše u vbl_full:<YMD>:<slot> I u vb:day:<YMD>:union (po fixture_id).
+// 1 OA poziv po slotu; dnevni limit 15 (KV: oa:budget:<ymd>).
 
 export const config = { api: { bodyParser: false } };
 
@@ -9,11 +10,11 @@ const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const OA_KEY = process.env.ODDS_API_KEY;
 const TZ = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
 
-/* ---------- KV helpers ---------- */
+/* ---------- KV ---------- */
 async function kvGet(key) {
   const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
     headers: { Authorization: `Bearer ${KV_TOKEN}` },
-    cache: "no-store"
+    cache: "no-store",
   });
   if (!r.ok) return null;
   const j = await r.json().catch(() => null);
@@ -23,20 +24,20 @@ async function kvSet(key, val) {
   const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ value: JSON.stringify(val) })
+    body: JSON.stringify({ value: JSON.stringify(val) }),
   });
   return r.ok;
 }
 
-/* ---------- TZ-safe helpers (bez new Date nad locale stringom) ---------- */
+/* ---------- TZ-safe ---------- */
 function tzNowParts() {
   const fmt = new Intl.DateTimeFormat("en-GB", {
     timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
   });
   const parts = fmt.formatToParts(new Date());
   const get = t => Number(parts.find(p => p.type === t)?.value);
-  return { y: get("year"), m: get("month"), d: get("day"), H: get("hour"), M: get("minute"), S: get("second") };
+  return { y: get("year"), m: get("month"), d: get("day"), H: get("hour") };
 }
 function ymdFromParts(p) { return `${p.y}-${String(p.m).padStart(2,"0")}-${String(p.d).padStart(2,"0")}`; }
 function slotFromQuery(q) {
@@ -51,7 +52,7 @@ function slotFromQuery(q) {
 /* ---------- Odds helpers ---------- */
 const TRUSTED = new Set([
   "pinnacle","bet365","unibet","bwin","williamhill",
-  "marathonbet","skybet","betfair","888sport","sbobet"
+  "marathonbet","skybet","betfair","888sport","sbobet",
 ]);
 function normalizeName(s){
   return (s||"").toLowerCase().replace(/club|fc|cf|sc|ac|afc|bc|[.\-']/g," ").replace(/\s+/g," ").trim();
@@ -69,32 +70,32 @@ function pickMedian(offers, proj){
 function indexOA(list){
   const m=new Map();
   for(const ev of list||[]){
-    const k = `${normalizeName(ev.home_team)}|${normalizeName(ev.away_team)}`;
-    if(k.includes("undefined")) continue;
-    m.set(k, ev);
+    const h=normalizeName(ev.home_team), a=normalizeName(ev.away_team);
+    if(!h||!a) continue;
+    m.set(`${h}|${a}`, ev);
   }
   return m;
 }
 function extractMarkets(ev){
   const out={ h2h:null, totals25:{over:null,under:null}, btts:{Y:null,N:null} };
   if(!ev||!Array.isArray(ev.bookmakers)) return out;
-
   const h2h=[], totals=[], btts=[];
   for(const bk of ev.bookmakers){
     for(const mk of bk.markets||[]){
       if(mk.key==="h2h" && Array.isArray(mk.outcomes)){
-        const get=n=>mk.outcomes.find(o=>(o.name||o.title)===n)?.price;
-        h2h.push({ title:bk.title||bk.key||"", h:get("Home"), d:get("Draw"), a:get("Away") });
+        const g=n=>mk.outcomes.find(o=>(o.name||o.title)===n)?.price;
+        h2h.push({ title:bk.title||bk.key||"", h:g("Home"), d:g("Draw"), a:g("Away") });
       }
       if(mk.key==="totals" && Array.isArray(mk.outcomes)){
         for(const o of mk.outcomes){
-          const pt=Number(o.point);
-          if(pt===2.5) totals.push({ title:bk.title||bk.key||"", o:o.name==="Over"?o.price:undefined, u:o.name==="Under"?o.price:undefined });
+          if(Number(o.point)===2.5){
+            totals.push({ title:bk.title||bk.key||"", o:o.name==="Over"?o.price:undefined, u:o.name==="Under"?o.price:undefined });
+          }
         }
       }
       if((mk.key==="btts"||mk.key==="both_teams_to_score") && Array.isArray(mk.outcomes)){
-        const get=n=>mk.outcomes.find(o=>(o.name||o.title)===n)?.price;
-        btts.push({ title:bk.title||bk.key||"", y:get("Yes"), n:get("No") });
+        const g=n=>mk.outcomes.find(o=>(o.name||o.title)===n)?.price;
+        btts.push({ title:bk.title||bk.key||"", y:g("Yes"), n:g("No") });
       }
     }
   }
@@ -123,45 +124,81 @@ async function callOAOnce(ymdStr){
   return { called:true, used_before, used_after:used_before+1, events:Array.isArray(data)?data.length:0, data:Array.isArray(data)?data:[] };
 }
 
-/* ---------- Handler ---------- */
-export default async function handler(req,res){
-  const p = tzNowParts();
-  const day = ymdFromParts(p);
-  const slot = slotFromQuery(req.query);
-
-  const keyFull = `vbl_full:${day}:${slot}`;
-  const src = await kvGet(keyFull);
-  if(!src || !Array.isArray(src.items)){
-    return res.status(200).json({ ok:true, ymd:day, slot, msg:"no vbl_full", saves:false, oa:{called:false, used_before:0, used_after:0, events:0} });
-  }
-
-  const oa = await callOAOnce(day);
-  const idx = indexOA(oa.data);
-
+/* ---------- Apply markets to a list (in place) ---------- */
+function applyMarketsToList(list, idx){
   let touched=0;
-  for(const it of src.items){
+  for(const it of list||[]){
     try{
       const h=normalizeName(it?.teams?.home?.name||it?.home?.name);
       const a=normalizeName(it?.teams?.away?.name||it?.away?.name);
       if(!h||!a) continue;
       const ev = idx.get(`${h}|${a}`);
       if(!ev) continue;
-
       const m = extractMarkets(ev);
       it.markets = it.markets || {};
-      if(m.h2h)   it.markets.h2h  = m.h2h;
+      if(m.h2h)      it.markets.h2h  = m.h2h;
       if(m.totals25) it.markets.ou25 = { over:m.totals25.over, under:m.totals25.under };
-      if(m.btts)  it.markets.btts = m.btts;
+      if(m.btts)     it.markets.btts = m.btts;
       touched++;
     }catch{}
   }
+  return touched;
+}
 
-  await kvSet(keyFull, src);
+/* ---------- Handler ---------- */
+export default async function handler(req,res){
+  const p = tzNowParts();
+  const day = ymdFromParts(p);
+  const slot = slotFromQuery(req.query);
+
+  const keyFull   = `vbl_full:${day}:${slot}`;
+  const keyUnion  = `vb:day:${day}:union`;
+
+  let full = await kvGet(keyFull);
+  const union = await kvGet(keyUnion);
+
+  // Fallback: ako nema vbl_full, radi nad union i kreiraj ga iz union-a
+  let source = "full";
+  if(!full || !Array.isArray(full.items)){
+    if(!union || !Array.isArray(union.items)){
+      return res.status(200).json({ ok:true, ymd:day, slot, msg:"no vbl_full nor union", saves:false, oa:{called:false,used_before:0,used_after:0,events:0} });
+    }
+    full = { ...union }; // plitka kopija; dovoljno je za upis markets
+    source = "union-fallback";
+  }
+
+  const oa = await callOAOnce(day);
+  const idx = indexOA(oa.data);
+
+  // 1) upiši u vbl_full
+  const touched_full = applyMarketsToList(full.items, idx);
+  await kvSet(keyFull, full);
+
+  // 2) propagiraj u union po fixture_id (ako postoji)
+  let touched_union = 0;
+  if(union && Array.isArray(union.items)){
+    const byId = new Map();
+    for(const it of full.items||[]) if(it.fixture_id!=null) byId.set(it.fixture_id, it);
+    for(const u of union.items){
+      const m = byId.get(u.fixture_id);
+      if(m && m.markets){
+        u.markets = u.markets || {};
+        if(m.markets.h2h)   u.markets.h2h = m.markets.h2h;
+        if(m.markets.ou25)  u.markets.ou25 = m.markets.ou25;
+        if(m.markets.btts)  u.markets.btts = m.markets.btts;
+        touched_union++;
+      }
+    }
+    await kvSet(keyUnion, union);
+  }
 
   return res.status(200).json({
     ok:true, ymd:day, slot,
-    inspected: src.items.length, touched,
-    source: keyFull, saves:[{flavor:"vercel-kv",ok:true}],
+    source,
+    inspected_full: full.items?.length||0,
+    touched_full,
+    touched_union,
+    saves:[{ flavor:"vercel-kv", ok:true }],
     oa
   });
 }
