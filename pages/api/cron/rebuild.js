@@ -20,7 +20,7 @@ const confidence=it=>Number.isFinite(it?.confidence_pct)?it.confidence_pct:(Numb
 const kickoffFromMeta=it=>{ const k=it?.fixture?.date||it?.fixture_date||it?.kickoff||it?.kickoff_utc||it?.ts; const d=k?new Date(k):null; return Number.isFinite(d?.getTime?.())?d:null; };
 const byConfKick=(a,b)=>(confidence(b)-confidence(a))||((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0));
 
-function isYouthLeague(name,country){
+function isYouthLeague(name){
   const n=String(name||"");
   if(/\bU(?:\s|-)?(?:15|16|17|18|19|20|21|22|23)\b/i.test(n)) return true;
   if(/\bYouth|Reserves?|Primavera|U-\d{2}\b/i.test(n)) return true;
@@ -57,7 +57,7 @@ export default async function handler(req,res){
 
     // slot filter + odbaci youth/rezervne
     const only=base.filter(it=>{
-      const lg=it?.league||{}; if(isYouthLeague(lg.name,lg.country)) return false;
+      const lg=it?.league||{}; if(isYouthLeague(lg.name)) return false;
       const kd=kickoffFromMeta(it); if(!kd) return false;
       const ky=ymdInTZ(kd,TZ); if(ky!==ymd) return false;
       const h=hourInTZ(kd,TZ);
@@ -73,7 +73,7 @@ export default async function handler(req,res){
       perLeagueAll.set(key,cur+1); limited.push(it);
     }
 
-    // cap samo za vbl (za potrošače kojima treba), zadrži isto sortiranje
+    // cap samo za vbl (za druge potrošače), zadrži isto sortiranje
     const kept = limited.slice(0,cap);
 
     // snimi: vbl_full = LIMITED (bez cap), vbl = KEPT (sa cap)
