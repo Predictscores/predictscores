@@ -1,6 +1,6 @@
 // pages/api/insights-build.js
-// Tiketi se pune iz celodnevnog pool-a (vb:day:<YMD>:union), a zatim se "zamrzavaju" po slotu.
-// Uvek ciljamo **4** para po tržištu (ako ih ima), uz min kvotu 1.5 i max 2 meča po ligi.
+// Tiketi se pune iz celodnevnog pool-a (vb:day:<YMD>:union) ili iz slot feeda ako pool ne postoji.
+// Radi i kada je union plain-array ili {items}. Zadrži 4 po tiketu ako ih ima.
 
 export const config = { api: { bodyParser: false } };
 
@@ -48,12 +48,19 @@ function slotFromQuery(q){
   const {H}=tzNowParts(); if(H<10) return "late"; if(H<15) return "am"; return "pm";
 }
 
+/* ---------- shape ---------- */
+function getItems(feed){
+  if(!feed) return null;
+  if(Array.isArray(feed)) return feed;
+  if(Array.isArray(feed.items)) return feed.items;
+  return null;
+}
+
 /* ---------- utils ---------- */
 function safeConf(it){ const c=Number(it?.confidence_pct); return Number.isFinite(c)?c:50; }
 function leagueId(it){ return it?.league?.id ?? it?.league_id ?? "unknown"; }
 function priceFrom(o){ const p=Number(o?.price); return Number.isFinite(p)?p:null; }
 function passMin(p){ return p==null ? true : p>=MIN_ODDS; }
-
 function pickTop(items, want){
   const byLg=new Map(), out=[];
   for(const it of items){
@@ -65,7 +72,7 @@ function pickTop(items, want){
   return out;
 }
 
-/* ---- kandidati iz markets.* koje je upisao refresh-odds ---- */
+/* ---- kandidati ---- */
 function bttsCandidates(list){
   const a=[];
   for(const it of list){
@@ -125,19 +132,20 @@ export default async function handler(req,res){
     const p=tzNowParts(); const day=ymdFromParts(p);
     const slot=slotFromQuery(req.query);
 
-    const poolKey = `vb:day:${day}:union`;       // celodnevni pool
-    const fullKey = `vbl_full:${day}:${slot}`;   // slot feed (fallback)
-    const pool = await kvGet(poolKey) || await kvGet(fullKey);
+    const poolKey = `vb:day:${day}:union`;
+    const fullKey = `vbl_full:${day}:${slot}`;
 
-    if(!pool || !Array.isArray(pool.items)){
-      return res.status(200).json({ ok:true, ymd:day, slot, source:pool?poolKey:fullKey, counts:{btts:0,ou25:0,htft:0} });
+    const poolRaw = await kvGet(poolKey);
+    const fullRaw = await kvGet(fullKey);
+
+    const items = getItems(poolRaw) || getItems(fullRaw);
+    if(!Array.isArray(items) || !items.length){
+      return res.status(200).json({ ok:true, ymd:day, slot, source: items ? poolKey : fullKey, counts:{btts:0,ou25:0,htft:0} });
     }
 
-    const base = pool.items || [];
-
-    const cBTTS = bttsCandidates(base);
-    const cOU25 = ou25Candidates(base);
-    const cHTFT = htftCandidates(base);
+    const cBTTS = bttsCandidates(items);
+    const cOU25 = ou25Candidates(items);
+    const cHTFT = htftCandidates(items);
 
     const picksBTTS = pickTop(cBTTS, TARGET_PER_TICKET);
     const picksOU25 = pickTop(cOU25, TARGET_PER_TICKET);
@@ -148,7 +156,7 @@ export default async function handler(req,res){
     await kvSet(tkKey, tickets);
 
     return res.status(200).json({
-      ok:true, ymd:day, slot, source: poolKey, tickets_key: tkKey,
+      ok:true, ymd:day, slot, source: Array.isArray(poolRaw)?poolKey: (poolRaw&&poolKey)||fullKey,
       counts:{ btts:picksBTTS.length, ou25:picksOU25.length, htft:picksHTFT.length }
     });
   }catch(e){
