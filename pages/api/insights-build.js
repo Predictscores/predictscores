@@ -8,7 +8,7 @@ function pickTZ() {
 }
 const TZ = pickTZ();
 
-/* ---------- KV ---------- */
+/* ---------- KV (Vercel KV / Upstash) ---------- */
 function kvBackends() {
   const out = [];
   const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
@@ -26,7 +26,9 @@ async function kvGETraw(key, trace) {
       trace && trace.push({ get:key, ok:r.ok, flavor:b.flavor, hit:!!raw });
       if (!r.ok) continue;
       return { raw, flavor:b.flavor };
-    } catch (e) { trace && trace.push({ get:key, ok:false, err:String(e?.message||e) }); }
+    } catch (e) {
+      trace && trace.push({ get:key, ok:false, err:String(e?.message||e) });
+    }
   }
   return { raw:null, flavor:null };
 }
@@ -64,6 +66,31 @@ function targetYmdForSlot(now, slot, tz){
   return ymdInTZ(now, tz);
 }
 
+/* ---------- selection helpers ---------- */
+const num = v => Number.isFinite(v) ? v : Number(v);
+const MIN_ODDS = (()=>{ const v=Number(process.env.MIN_ODDS); return Number.isFinite(v)&&v>1 ? v : 1.5; })();
+const pickPrice = (v)=>{ const n=num(v); return Number.isFinite(n) ? n : null; };
+const kickoffISO = (it)=> it?.fixture?.date || it?.fixture_date || it?.kickoff || it?.kickoff_utc || it?.ts || null;
+const confPct = (it)=> Number.isFinite(it?.confidence_pct) ? it.confidence_pct : (Number(it?.confidence)||0);
+const byStrength = (a,b)=> (confPct(b)-confPct(a)) || (new Date(kickoffISO(a)).getTime() - new Date(kickoffISO(b)).getTime());
+
+/* ---------- tickets snapshot record ---------- */
+function snapshotItem(it, market_key, price, books_count, pick, extra={}){
+  const fx = it?.fixture?.id || it?.fixture_id || it?.id || null;
+  return {
+    fixture_id: fx,
+    league: it?.league || it?.fixture?.league || null,
+    teams: it?.teams || it?.fixture?.teams || null,
+    kickoff: kickoffISO(it),
+    market_key, pick,
+    price_snapshot: price ?? null,
+    books_count_snapshot: Number(books_count)||0,
+    frozen: true,
+    snapshot_at: new Date().toISOString(),
+    ...extra
+  };
+}
+
 export default async function handler(req, res) {
   try {
     const trace = [];
@@ -73,64 +100,91 @@ export default async function handler(req, res) {
     const slot  = qSlot==="auto" ? autoSlot(now, TZ) : qSlot;
     const ymd   = targetYmdForSlot(now, slot, TZ);
 
-    // prioritet: vbl_full:<ymd>:<slot> → vb:day:<ymd>:union → vb:day:<ymd>:<slot>
+    /* kandidati: prefer vbl_full → vbl → vb:day:<slot> → vb:day:union */
     const tried = [
       `vbl_full:${ymd}:${slot}`,
-      `vb:day:${ymd}:union`,
-      `vb:day:${ymd}:${slot}`
+      `vbl:${ymd}:${slot}`,
+      `vb:day:${ymd}:${slot}`,
+      `vb:day:${ymd}:union`
     ];
-    let baseArr = null, src = null;
+    let baseArr=null, source=null;
     for (const k of tried) {
       const { raw } = await kvGETraw(k, trace);
       const arr = arrFromAny(J(raw));
-      if (arr.length) { baseArr=arr; src=k; break; }
+      if (arr.length){ baseArr=arr; source=k; break; }
     }
 
-    // ako baš nemamo ništa, zamrzni prazno
     if (!baseArr) {
-      const key = `tickets:${ymd}:${slot}`;
-      await kvSET(key, { btts:[], ou25:[], htft:[] }, trace);
-      return res.status(200).json({ ok:true, ymd, slot, source:src, counts:{btts:0,ou25:0,htft:0} });
+      // no-clobber: ne pišemo prazno preko postojećih
+      return res.status(200).json({ ok:true, ymd, slot, source:null, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, note:"no-source-items" });
     }
 
-    const conf = x => Number.isFinite(x?.confidence_pct)?x.confidence_pct:(Number(x?.confidence)||0);
-    const kstart = x => { const k=x?.fixture?.date||x?.fixture_date||x?.kickoff||x?.kickoff_utc||x?.ts; const d=k?new Date(k):null; return Number.isFinite(d?.getTime?.())?d.getTime():0; };
-    const sorter = (a,b)=> (conf(b)-conf(a)) || (kstart(a)-kstart(b));
-
-    const groups = { btts:[], ou25:[], htft:[] };
+    const groups = { btts:[], ou25:[], htft:[], fh_ou15:[] };
 
     for (const it of baseArr) {
       const m = it?.markets || {};
-      // BTTS
-      if (m?.btts && (Number.isFinite(m.btts.yes) || Number.isFinite(m.btts.no))) {
-        groups.btts.push(it);
+      // BTTS (Yes)
+      if (m?.btts) {
+        const p = pickPrice(m.btts.yes);
+        if (p && p >= MIN_ODDS) groups.btts.push({ it, price:p, books:m?.btts?.books_count, pick:"yes" });
       }
-      // OU 2.5
-      if (m?.ou25 && (Number.isFinite(m.ou25.over) || Number.isFinite(m.ou25.under))) {
-        groups.ou25.push(it);
+      // OU 2.5 (Over)
+      if (m?.ou25) {
+        const p = pickPrice(m.ou25.over);
+        if (p && p >= MIN_ODDS) groups.ou25.push({ it, price:p, books:m?.ou25?.books_count, pick:"over" });
       }
-      // HT-FT
-      if (m?.htft && (Number.isFinite(m.htft.hh) || Number.isFinite(m.htft.aa))) {
-        groups.htft.push(it);
+      // HT-FT (HH/AA kao reprezentativne kombinacije)
+      if (m?.htft) {
+        // uzmi bolju (niža implied prob => viša kvota nije nužno "bolja"; ali oba su daleko iznad 1.5)
+        const hh = pickPrice(m.htft.hh);
+        const aa = pickPrice(m.htft.aa);
+        const chosen = (hh && aa) ? (hh >= aa ? {p:hh, code:"hh"} : {p:aa, code:"aa"}) : (hh ? {p:hh, code:"hh"} : (aa ? {p:aa, code:"aa"} : null));
+        if (chosen && chosen.p >= MIN_ODDS) groups.htft.push({ it, price:chosen.p, books:m?.htft?.books_count, pick:chosen.code });
+      }
+      // FH Over 1.5 (first-half OU 1.5)
+      if (m?.fh_ou15) {
+        const p = pickPrice(m.fh_ou15.over);
+        if (p && p >= MIN_ODDS) groups.fh_ou15.push({ it, price:p, books:m?.fh_ou15?.books_count, pick:"over" });
       }
     }
 
-    groups.btts.sort(sorter); groups.ou25.sort(sorter); groups.htft.sort(sorter);
-    groups.btts = groups.btts.slice(0,4);
-    groups.ou25 = groups.ou25.slice(0,4);
-    groups.htft = groups.htft.slice(0,4);
+    // sortiraj po "snazi"
+    for (const k of Object.keys(groups)) groups[k].sort((a,b)=> byStrength(a.it,b.it));
 
+    // uzmi tačno 4 po grupi (ako fali, uzmi koliko ima — ne prepisuj stare nulu preko postojećih)
+    const top = {
+      btts: groups.btts.slice(0,4),
+      ou25: groups.ou25.slice(0,4),
+      htft: groups.htft.slice(0,4),
+      fh_ou15: groups.fh_ou15.slice(0,4)
+    };
+
+    const totalNew = top.btts.length + top.ou25.length + top.htft.length + top.fh_ou15.length;
+
+    // no-clobber: ako nemamo ništa validno, ne diramo postojeće tikete
     const keySlot = `tickets:${ymd}:${slot}`;
-    await kvSET(keySlot, groups, trace);
+    if (totalNew === 0) {
+      trace.push({ note:"no-clobber (no-valid-candidates)" });
+      return res.status(200).json({ ok:true, ymd, slot, source, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, debug:{ trace } });
+    }
 
-    // dnevni fallback ako ne postoji
+    // snapshot (strogo zamrzavanje: selekcije + cene)
+    const snap = { btts:[], ou25:[], htft:[], fh_ou15:[] };
+    for (const row of top.btts)   snap.btts.push(snapshotItem(row.it,   "btts",     row.price, row.books, row.pick));
+    for (const row of top.ou25)   snap.ou25.push(snapshotItem(row.it,   "ou25",     row.price, row.books, row.pick));
+    for (const row of top.htft)   snap.htft.push(snapshotItem(row.it,   "htft",     row.price, row.books, row.pick));
+    for (const row of top.fh_ou15) snap.fh_ou15.push(snapshotItem(row.it,"fh_ou15", row.price, row.books, row.pick));
+
+    await kvSET(keySlot, snap, trace);
+
+    // upiši dnevni fallback (ako ne postoji)
     const { raw:rawDay } = await kvGETraw(`tickets:${ymd}`, trace);
     const jDay = J(rawDay);
-    const hasDay = jDay && (Array.isArray(jDay.btts)||Array.isArray(jDay.ou25)||Array.isArray(jDay.htft));
-    if (!hasDay) await kvSET(`tickets:${ymd}`, groups, trace);
+    const hasDay = jDay && (Array.isArray(jDay.btts)||Array.isArray(jDay.ou25)||Array.isArray(jDay.htft)||Array.isArray(jDay.fh_ou15));
+    if (!hasDay) await kvSET(`tickets:${ymd}`, snap, trace);
 
-    const counts = { btts: groups.btts.length, ou25: groups.ou25.length, htft: groups.htft.length };
-    return res.status(200).json({ ok:true, ymd, slot, source:src, tickets_key:keySlot, counts });
+    const counts = { btts: snap.btts.length, ou25: snap.ou25.length, htft: snap.htft.length, fh_ou15: snap.fh_ou15.length };
+    return res.status(200).json({ ok:true, ymd, slot, source, tickets_key:keySlot, counts, min_odds:MIN_ODDS, debug:{ trace } });
 
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
