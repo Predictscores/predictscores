@@ -26,9 +26,7 @@ async function kvGETraw(key, trace) {
       trace && trace.push({ get:key, ok:r.ok, flavor:b.flavor, hit:!!raw });
       if (!r.ok) continue;
       return { raw, flavor:b.flavor };
-    } catch (e) {
-      trace && trace.push({ get:key, ok:false, err:String(e?.message||e) });
-    }
+    } catch (e) { trace && trace.push({ get:key, ok:false, err:String(e?.message||e) }); }
   }
   return { raw:null, flavor:null };
 }
@@ -46,6 +44,22 @@ function targetYmdForSlot(now, slot, tz){
   return ymdInTZ(now, tz);
 }
 
+/* ---------- caps ---------- */
+function dowShort(d, tz){ return new Intl.DateTimeFormat("en-GB",{ timeZone: tz, weekday:"short" }).format(d); }
+function slotCap(now, slot){
+  const wd = dowShort(now, TZ); // 'Sat' / 'Sun' → vikend
+  const weekend = (wd === 'Sat' || wd === 'Sun');
+  const CAP_LATE = Number(process.env.CAP_LATE)||6;
+  const CAP_AM_WD = Number(process.env.CAP_AM_WD)||15;
+  const CAP_PM_WD = Number(process.env.CAP_PM_WD)||15;
+  const CAP_AM_WE = Number(process.env.CAP_AM_WE)||20;
+  const CAP_PM_WE = Number(process.env.CAP_PM_WE)||20;
+  if (slot==="late") return CAP_LATE;
+  if (slot==="am")   return weekend ? CAP_AM_WE : CAP_AM_WD;
+  if (slot==="pm")   return weekend ? CAP_PM_WE : CAP_PM_WD;
+  return 20;
+}
+
 export default async function handler(req, res) {
   try {
     const trace = [];
@@ -55,13 +69,12 @@ export default async function handler(req, res) {
     const slot  = qSlot==="auto" ? autoSlot(now, TZ) : qSlot;
     const ymd   = targetYmdForSlot(now, slot, TZ);
 
-    // Football list (za kartice)
-    // prioritet: vbl_full → vbl → vb:day:<slot> → vb:day:union
+    // Football list (za kartice) – prefer capovani pool
     const poolKeys = [
-      `vbl_full:${ymd}:${slot}`,
       `vbl:${ymd}:${slot}`,
       `vb:day:${ymd}:${slot}`,
-      `vb:day:${ymd}:union`
+      `vb:day:${ymd}:union`,
+      `vbl_full:${ymd}:${slot}`
     ];
     let items=null, source=null;
     for (const k of poolKeys) {
@@ -71,16 +84,22 @@ export default async function handler(req, res) {
       if (arr.length){ items=arr; source=k; break; }
     }
 
+    // primeni cap ako je izvor "uncapped"
+    const cap = slotCap(now, slot);
+    if (Array.isArray(items) && items.length > cap && /vbl_full|vb:day:.*:union/.test(String(source||""))) {
+      items = items.slice(0, cap);
+      trace.push({ capping:true, cap, source });
+    }
+
     // Tiketi (strogo zamrznuti)
     const { raw:rawT } = await kvGETraw(`tickets:${ymd}:${slot}`, trace);
     const tickets = J(rawT) || null;
 
-    // Ne pokušavamo gradnju tiketa ovde (insights-build to radi i zamrzava)
     return res.status(200).json({
       ok:true, ymd, slot,
       source, items: Array.isArray(items)? items : [],
       tickets: tickets || { btts:[], ou25:[], htft:[], fh_ou15:[] },
-      debug: { trace }
+      debug: { trace, cap }
     });
 
   } catch (e) {
