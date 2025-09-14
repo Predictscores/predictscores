@@ -6,7 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 /**
  * HistoryPanel (always two columns)
  * - Left: Football history (unchanged behavior; list for last N days)
- * - Right: Crypto history for a specific day (ymd) or today's date
+ * - Right: Crypto summary (14d ROI) + Crypto history for a specific day (ymd) or today's date
  *
  * Props:
  *   - days: number (default 14)   -> football lookback
@@ -106,7 +106,9 @@ export default function HistoryPanel({ days = 14, ymd }) {
   // --- Crypto (right column) ---
   const dayYmd = useMemo(() => (isValidYmd(ymd) ? ymd : ymdInTZ(new Date())), [ymd]);
   const [cryptoData, setCryptoData] = useState(null);
+  const [cryptoStats, setCryptoStats] = useState(null); // 14d ROI summary
 
+  // Daily items for the chosen day
   useEffect(() => {
     const ac = new AbortController();
     (async () => {
@@ -120,6 +122,21 @@ export default function HistoryPanel({ days = 14, ymd }) {
     })();
     return () => ac.abort();
   }, [dayYmd]);
+
+  // 14-day summary (ROI/winrate) — computed on read
+  useEffect(() => {
+    const ac = new AbortController();
+    (async () => {
+      try {
+        const r = await fetch(`/api/crypto-stats?days=14`, { cache: "no-store", signal: ac.signal });
+        const j = await r.json().catch(() => null);
+        setCryptoStats(j || { ok: false });
+      } catch {
+        setCryptoStats({ ok: false });
+      }
+    })();
+    return () => ac.abort();
+  }, []);
 
   // --- Render helpers ---
   const FootballList = (
@@ -175,6 +192,20 @@ export default function HistoryPanel({ days = 14, ymd }) {
       <div className="min-w-0">
         <section>
           <h3 className="font-semibold">Crypto — {dayYmd}</h3>
+
+          {/* 14d ROI summary */}
+          {cryptoStats?.ok ? (
+            <div className="text-sm opacity-80 mb-3">
+              14d decided: {cryptoStats.decided ?? 0}
+              {" · "}win-rate: {cryptoStats.win_rate_pct ?? "—"}%
+              {" · "}avg RR: {typeof cryptoStats.avg_rr === "number" ? cryptoStats.avg_rr.toFixed(3) : "—"}
+              {" · "}median RR: {cryptoStats.median_rr ?? "—"}
+            </div>
+          ) : (
+            <div className="text-sm opacity-60 mb-3">—</div>
+          )}
+
+          {/* Per-day items */}
           {cryptoData?.ok && Array.isArray(cryptoData.items) && cryptoData.items.length > 0 ? (
             <>
               <div className="text-sm opacity-80 mb-2">
