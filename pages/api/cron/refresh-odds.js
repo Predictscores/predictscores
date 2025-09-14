@@ -26,7 +26,9 @@ async function kvGETraw(key, trace) {
       trace && trace.push({ get:key, ok:r.ok, flavor:b.flavor, hit:!!raw });
       if (!r.ok) continue;
       return { raw, flavor:b.flavor };
-    } catch (e) { trace && trace.push({ get:key, ok:false, err:String(e?.message||e) }); }
+    } catch (e) {
+      trace && trace.push({ get:key, ok:false, err:String(e?.message||e) });
+    }
   }
   return { raw:null, flavor:null };
 }
@@ -196,7 +198,7 @@ async function fetchAFOddsByFixture(fixtureId, trace){
     const j = await r.json();
     trace && trace.push({ af_url:url, af_ok:r.ok, resp:Array.isArray(j?.response)? j.response.length : 0 });
     if (!r.ok || !Array.isArray(j?.response) || !j.response.length) return null;
-    return j.response[0]; // {bookmakers:[{name,bets:[{name,values:[{value,odd}]}]}], update,...}
+    return j.response[0];
   } catch(e) {
     trace && trace.push({ af_err:String(e?.message||e) });
     return null;
@@ -222,28 +224,23 @@ function pickFromAF(afResp){
         const odd = Number(v?.odd);
         if (!Number.isFinite(odd)) continue;
 
-        // 1X2
         if (/1x2|match\s*winn?er/.test(name)) {
           if (/home/.test(valTxt)) collect.h2h.home.push(odd);
           else if (/draw|tie/.test(valTxt)) collect.h2h.draw.push(odd);
           else if (/away/.test(valTxt)) collect.h2h.away.push(odd);
         }
-        // BTTS
         if (/both\s*teams\s*to\s*score/.test(name)) {
           if (/yes/.test(valTxt)) collect.btts.yes.push(odd);
           if (/no/.test(valTxt))  collect.btts.no.push(odd);
         }
-        // OU full-time (2.5)
         if (/over\/under|goals\s*over\/under/.test(name) && !/1st|first\s*half/.test(name)) {
           if (/over\s*2\.?5/.test(valTxt))  collect.ou25.over.push(odd);
           if (/under\s*2\.?5/.test(valTxt)) collect.ou25.under.push(odd);
         }
-        // HT/FT
         if (/ht\/ft|half\s*time\s*\/\s*full\s*time/.test(name)) {
           if (/home\/home/.test(valTxt)) collect.htft.hh.push(odd);
           if (/away\/away/.test(valTxt)) collect.htft.aa.push(odd);
         }
-        // FH over 1.5
         if ((/over\/under|goals\s*over\/under/.test(name) && /1st|first\s*half/.test(name)) ||
             (/first\s*half.*over\/under/.test(name))) {
           if (/over\s*1\.?5/.test(valTxt)) collect.fh_ou15.over.push(odd);
@@ -251,37 +248,35 @@ function pickFromAF(afResp){
       }
     }
   }
-  // trim median + sanity
   const med = (arr)=> trimMedian(arr);
-  const buildIf = (cond, o) => cond ? o : null;
 
-  // h2h
   const H = med(collect.h2h.home), D = med(collect.h2h.draw), A = med(collect.h2h.away);
-  if ([H,D,A].some(Number.isFinite) && impliedSumOk([H,D,A]) && inRange(H??1.5,1.15,20) && inRange(D??3,1.15,20) && inRange(A??1.5,1.15,20))
+  if ([H,D,A].some(Number.isFinite) && impliedSumOk([H,D,A]) && inRange(H??1.5,1.15,20) && inRange(A??1.5,1.15,20))
     out.h2h = { home:H??null, draw:D??null, away:A??null };
 
-  // btts
   const Y = med(collect.btts.yes), N = med(collect.btts.no);
   if ([Y,N].some(Number.isFinite) && impliedSumOk([Y,N]) && inRange(Y??1.8,1.25,5.0))
     out.btts = { yes:Y??null, no:N??null };
 
-  // ou25
   const O = med(collect.ou25.over), U = med(collect.ou25.under);
   if ([O,U].some(Number.isFinite) && impliedSumOk([O,U]) && inRange(O??1.6,1.2,5.5) && inRange(U??2.2,1.2,5.5))
     out.ou25 = { over:O??null, under:U??null };
 
-  // htft
   const HH = med(collect.htft.hh), AA = med(collect.htft.aa);
   if ([HH,AA].some(Number.isFinite) && (inRange(HH??3,3,40) || inRange(AA??3,3,40)))
     out.htft = { hh:HH??null, aa:AA??null };
 
-  // fh_ou15
   const FH = med(collect.fh_ou15.over);
   if (Number.isFinite(FH) && inRange(FH,1.2,5.0))
     out.fh_ou15 = { over: FH };
 
   return out;
 }
+
+/* ---------- confidence / kickoff helpers ---------- */
+function confPct(it){ return Number.isFinite(it?.confidence_pct) ? it.confidence_pct : (Number(it?.confidence)||0); }
+function kickoffISO(it){ return it?.kickoff_utc || it?.fixture?.date || it?.kickoff || it?.fixture_date || it?.ts || null; }
+function kickoffTime(it){ const d = kickoffISO(it) ? new Date(kickoffISO(it)).getTime() : 0; return Number.isFinite(d) ? d : 0; }
 
 export default async function handler(req, res) {
   try {
@@ -292,32 +287,67 @@ export default async function handler(req, res) {
     const slot  = qSlot==="auto" ? autoSlot(now, TZ) : qSlot;
     const ymd   = targetYmdForSlot(now, slot, TZ);
 
-    // Prefer capovani izvori za refresh targete
-    const tried = [
+    // ---- skupi izvore: capovani + union + full → set bez duplikata (fixture_id) ----
+    const srcKeys = [
       `vbl:${ymd}:${slot}`,
       `vb:day:${ymd}:${slot}`,
       `vb:day:${ymd}:union`,
       `vbl_full:${ymd}:${slot}`
     ];
-    let baseArr=null, src=null;
-    for (const k of tried) {
+    const seen = new Map(); // fixture_id -> item
+    let firstSrc=null;
+    for (const k of srcKeys) {
       const { raw } = await kvGETraw(k, trace);
       const arr = arrFromAny(J(raw));
-      if (arr.length){ src=k; baseArr=arr; break; }
+      if (!arr.length) continue;
+      if (!firstSrc) firstSrc = k;
+      for (const it of arr) {
+        const fix = it?.fixture_id || it?.fixture?.id || it?.id;
+        const key = String(fix||"");
+        if (!key) continue;
+        if (!seen.has(key)) seen.set(key, it);
+      }
     }
-    if (!baseArr) return res.status(200).json({ ok:true, ymd, slot, msg:"no source", updated:0 });
+    const items = Array.from(seen.values());
+    if (!items.length) {
+      return res.status(200).json({ ok:true, ymd, slot, msg:"no source", updated:0 });
+    }
 
-    // -------- AF primarno: za prvih ~40 targeta (ili gde fale marketi) --------
-    // prioritet: oni bez kvota u ključnim marketima
-    const needers = [];
-    for (const it of baseArr) {
+    // Koliko trenutno imamo FH1.5?
+    const hasFH = items.filter(it => Number.isFinite(it?.markets?.fh_ou15?.over)).length;
+
+    // Needers – fali bar jedan ključni market
+    const needersAll = items.filter(it => {
       const m = it?.markets||{};
-      const need = (!m?.btts?.yes) || (!m?.ou25?.over) || (!m?.htft?.hh && !m?.htft?.aa) || (!m?.fh_ou15?.over) || (!m?.h2h?.home);
-      if (need) needers.push(it);
-      if (needers.length>=40) break; // lokalni cap bez ENV-a
-    }
+      return (!Number.isFinite(m?.btts?.yes)) ||
+             (!Number.isFinite(m?.ou25?.over)) ||
+             (!Number.isFinite(m?.h2h?.home))  ||
+             (!Number.isFinite(m?.htft?.hh) && !Number.isFinite(m?.htft?.aa)) ||
+             (!Number.isFinite(m?.fh_ou15?.over));
+    });
+
+    // Rangiraj needers: cap-pool > union/full, pa confidence desc, pa kickoff asc
+    const srcScore = (it)=>{
+      // gruba preferencija: daj +2 ako je u vbl, +1 ako je u vb:day:* / union
+      // (ne radimo skupo pretraživanje; heuristika po ligama/ids nije potrebna)
+      return 0; // jednostavno ostavimo 0 da ne uvodimo trošak; conf/kickoff će uraditi posao
+    };
+    needersAll.sort((a,b)=>{
+      const dc = (confPct(b) - confPct(a));
+      if (dc) return dc;
+      const ma = a?.markets, mb = b?.markets;
+      const ha = !!(ma && (ma.h2h||ma.ou25||ma.btts||ma.htft||ma.fh_ou15));
+      const hb = !!(mb && (mb.h2h||mb.ou25||mb.btts||mb.htft||mb.fh_ou15));
+      if (ha !== hb) return hb ? 1 : -1; // one bez markets pre
+      const dk = kickoffTime(a) - kickoffTime(b);
+      if (dk) return dk;
+      return (srcScore(b) - srcScore(a));
+    });
+
+    // ---- AF pass #1: široko punjenje (do ~60 needers) ----
+    const PASS1_LIMIT = 60;
     let afUpdated=0;
-    for (const it of needers) {
+    for (const it of needersAll.slice(0, PASS1_LIMIT)) {
       const fix = it?.fixture_id || it?.fixture?.id;
       const af = await fetchAFOddsByFixture(fix, trace);
       if (!af) continue;
@@ -328,60 +358,68 @@ export default async function handler(req, res) {
       }
     }
 
-    // -------- OA fallback (≤5 po slotu, ≤15/dan): samo ako i dalje fali --------
+    // Ponovo prebroj FH posle pass #1
+    const hasFHafter1 = items.filter(it => Number.isFinite(it?.markets?.fh_ou15?.over)).length;
+
+    // ---- AF pass #2 (ako treba): fokus samo FH1.5, do ~80 needers bez FH ----
+    let afUpdatedFH=0;
+    if (hasFHafter1 < 4) {
+      const fhNeeders = items
+        .filter(it => !Number.isFinite(it?.markets?.fh_ou15?.over))
+        .sort((a,b)=> {
+          const dc = (confPct(b) - confPct(a)); if (dc) return dc;
+          return kickoffTime(a) - kickoffTime(b);
+        });
+      const PASS2_LIMIT = 80;
+      for (const it of fhNeeders.slice(0, PASS2_LIMIT)) {
+        const fix = it?.fixture_id || it?.fixture?.id;
+        const af = await fetchAFOddsByFixture(fix, trace);
+        if (!af) continue;
+        const parsed = pickFromAF(af);
+        if (parsed?.fh_ou15) {
+          it.markets = { ...(it.markets||{}), fh_ou15: parsed.fh_ou15, h2h: parsed.h2h || it.markets?.h2h, btts: parsed.btts || it.markets?.btts, ou25: parsed.ou25 || it.markets?.ou25, htft: parsed.htft || it.markets?.htft };
+          afUpdatedFH++;
+        }
+        if ((items.filter(x=>Number.isFinite(x?.markets?.fh_ou15?.over)).length) >= 4) break;
+      }
+    }
+
+    // ---- OA fallback ≤5 po slotu (≤15/dan) za preostale rupe ----
     const { remaining } = await oaRemaining(ymd, trace);
     const maxTargets = Math.min(5, remaining);
     let oaUsed=0, oaUpdated=0;
     if (maxTargets>0) {
       const window = slotWindowUTC(now, slot, TZ);
-      // povuci OA evente za prozor
-      const regions = String(process.env.ODDS_API_REGION||"eu").trim() || "eu";
-      const qs = new URLSearchParams({
-        apiKey: process.env.ODDS_API_KEY || "",
-        regions: /\beu\b/i.test(regions) ? "eu,uk" : regions,
-        markets: OA_MARKETS,
-        oddsFormat: "decimal",
-        dateFormat: "iso",
-        commenceTimeFrom: window.from.toISOString(),
-        commenceTimeTo: window.to.toISOString()
-      });
-      const url = `https://api.the-odds-api.com/v4/sports/soccer/odds?${qs.toString()}`;
-      let events=[];
-      try {
-        const r = await fetch(url, { cache:"no-store" });
-        const data = await r.json().catch(()=>[]);
-        events = Array.isArray(data)? data : [];
-        trace.push({ oa_url:url, events:events.length, ok:true });
-      } catch(e) {
-        trace.push({ oa_err:String(e?.message||e) });
-      }
-      const byTeams = mapOAbyTeams(events);
+      const oa = await fetchOA(window, trace);
+      const byTeams = mapOAbyTeams(oa.events||[]);
 
-      const candidates = [];
-      for (const it of baseArr) {
+      // odaberi do maxTargets kandidata koji i dalje fale (prefer sa skorim kickoffom)
+      const stillNeed = items.filter(it => {
         const m = it?.markets||{};
-        const needBtts = !Number.isFinite(m?.btts?.yes);
-        const needOU25 = !Number.isFinite(m?.ou25?.over);
-        const needHTFT = !Number.isFinite(m?.htft?.hh) && !Number.isFinite(m?.htft?.aa);
-        const needFH   = !Number.isFinite(m?.fh_ou15?.over);
-        if (needBtts || needOU25 || needHTFT || needFH) candidates.push(it);
-        if (candidates.length>=maxTargets) break;
-      }
+        return (!Number.isFinite(m?.btts?.yes)) ||
+               (!Number.isFinite(m?.ou25?.over)) ||
+               (!Number.isFinite(m?.h2h?.home))  ||
+               (!Number.isFinite(m?.htft?.hh) && !Number.isFinite(m?.htft?.aa)) ||
+               (!Number.isFinite(m?.fh_ou15?.over));
+      }).sort((a,b)=>{
+        const dk = kickoffTime(a) - kickoffTime(b);
+        if (dk) return dk;
+        return (confPct(b) - confPct(a));
+      }).slice(0, maxTargets);
 
-      for (const it of candidates) {
+      for (const it of stillNeed) {
         const home = it?.teams?.home?.name || it?.home?.name;
         const away = it?.teams?.away?.name || it?.away?.name;
         if (!home || !away) continue;
         const k = keyTeams(home, away);
         const cands = byTeams.get(k) || byTeams.get(keyTeams(away, home)) || [];
         if (!cands.length) continue;
-        const match = closestByTime(cands, it?.kickoff_utc || it?.fixture?.date || it?.kickoff);
+        const match = closestByTime(cands, kickoffISO(it));
         if (!match) continue;
 
         const books = match?.bookmakers || [];
         const markets = it.markets || (it.markets = {});
 
-        // H2H
         const h   = pullPriceOA(books, "h2h", o=>String(o?.name).toLowerCase()==="home");
         const d   = pullPriceOA(books, "h2h", o=>String(o?.name).toLowerCase()==="draw");
         const a   = pullPriceOA(books, "h2h", o=>String(o?.name).toLowerCase()==="away");
@@ -390,7 +428,6 @@ export default async function handler(req, res) {
           oaUpdated++;
         }
 
-        // OU 2.5
         const ouO = pullPriceOA(books, "totals", o=> (Number(o?.point)===2.5) && String(o?.name).toLowerCase()==="over", desc=>/1st|first\s*half/i.test(desc)===false);
         const ouU = pullPriceOA(books, "totals", o=> (Number(o?.point)===2.5) && String(o?.name).toLowerCase()==="under", desc=>/1st|first\s*half/i.test(desc)===false);
         if ([ouO,ouU].some(Number.isFinite) && impliedSumOk([ouO,ouU]) && inRange(ouO??1.6,1.2,5.5) && inRange(ouU??2.2,1.2,5.5)) {
@@ -398,7 +435,6 @@ export default async function handler(req, res) {
           oaUpdated++;
         }
 
-        // BTTS
         const bttsY = pullPriceOA(books, "both_teams_to_score", o=>/yes/i.test(String(o?.name)));
         const bttsN = pullPriceOA(books, "both_teams_to_score", o=>/no/i.test(String(o?.name)));
         if ([bttsY,bttsN].some(Number.isFinite) && impliedSumOk([bttsY,bttsN]) && inRange(bttsY??1.8,1.25,5.0)) {
@@ -406,7 +442,6 @@ export default async function handler(req, res) {
           oaUpdated++;
         }
 
-        // HT-FT
         const htftHH = pullPriceOA(books, "half_time_full_time", o=>/home\/home/i.test(String(o?.name)));
         const htftAA = pullPriceOA(books, "half_time_full_time", o=>/away\/away/i.test(String(o?.name)));
         if ((Number.isFinite(htftHH) && inRange(htftHH,3,40)) || (Number.isFinite(htftAA) && inRange(htftAA,3,40))) {
@@ -414,7 +449,6 @@ export default async function handler(req, res) {
           oaUpdated++;
         }
 
-        // FH over 1.5 (1st half)
         const fhO = pullPriceOA(books, "totals", o=> (Number(o?.point)===1.5) && String(o?.name).toLowerCase()==="over", desc=>/1st|first\s*half/i.test(desc));
         if (Number.isFinite(fhO) && inRange(fhO,1.2,5.0)) {
           markets.fh_ou15 = { over: fhO };
@@ -428,13 +462,13 @@ export default async function handler(req, res) {
     }
 
     // Snimi nazad (vbl_full i union, ako ima promene)
-    if (afUpdated>0 || oaUpdated>0) {
-      await kvSET(`vbl_full:${ymd}:${slot}`, { items: baseArr }, trace);
+    if (afUpdated>0 || afUpdatedFH>0 || oaUsed>0) {
+      await kvSET(`vbl_full:${ymd}:${slot}`, { items }, trace);
       const { raw:rawUnion } = await kvGETraw(`vb:day:${ymd}:union`, trace);
       const unionArr = arrFromAny(J(rawUnion));
       if (unionArr.length) {
         const byFix = new Map();
-        for (const it of baseArr) if (it?.fixture_id || it?.fixture?.id) byFix.set(String(it.fixture_id||it?.fixture?.id), it);
+        for (const it of items) if (it?.fixture_id || it?.fixture?.id) byFix.set(String(it.fixture_id||it?.fixture?.id), it);
         let touched_union=0;
         for (const u of unionArr) {
           const fix = u?.fixture_id && byFix.get(String(u.fixture_id));
@@ -445,9 +479,10 @@ export default async function handler(req, res) {
     }
 
     return res.status(200).json({
-      ok:true, ymd, slot, source:src,
-      af_updated: afUpdated, oa_used: oaUsed, oa_updated: oaUpdated,
-      debug:{ trace }
+      ok:true, ymd, slot, source:firstSrc,
+      af_updated: afUpdated, af_updated_fh: afUpdatedFH,
+      oa_used: oaUsed,
+      debug:{ trace, fh_count_before: hasFH, fh_count_after: items.filter(it => Number.isFinite(it?.markets?.fh_ou15?.over)).length }
     });
 
   } catch (e) {
