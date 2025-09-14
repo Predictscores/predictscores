@@ -1,7 +1,7 @@
 // pages/api/crypto-history-day.js
 export const config = { api: { bodyParser: false } };
 
-// ---- KV helpers (isti stil kao ostale rute) ----
+// ---- KV helpers ----
 function kvBackends() {
   const out = [];
   const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
@@ -22,8 +22,11 @@ async function kvGETraw(key) {
   }
   return null;
 }
+
 const J = s=>{ try{ return JSON.parse(String(s||"")); }catch{ return null; } };
 const isValidYmd = (s)=> /^\d{4}-\d{2}-\d{2}$/.test(String(s||""));
+
+// TZ helpers
 function pickTZ() {
   const raw = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
   try { new Intl.DateTimeFormat("en-GB",{ timeZone:raw }); return raw; } catch { return "Europe/Belgrade"; }
@@ -31,7 +34,32 @@ function pickTZ() {
 const TZ = pickTZ();
 const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
 
-// ---- core ----
+// ---- normalize timestamps: seconds / ms / microseconds / ISO ----
+function toDateFlexible(ts) {
+  if (ts == null) return null;
+
+  // If ISO string
+  if (typeof ts === "string" && /\D/.test(ts)) {
+    const d = new Date(ts);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  // Numeric-like
+  const n0 = Number(ts);
+  if (!Number.isFinite(n0)) return null;
+
+  let n = n0;
+
+  // If clearly in seconds (10 digits or too small), scale up
+  if (n < 1e11) n = n * 1000;
+
+  // If clearly too large (microseconds / *10 etc.), scale down by 10 until < ~year 2100
+  while (n > 4e12) n = Math.floor(n / 10);
+
+  const d = new Date(n);
+  return isNaN(d.getTime()) ? null : d;
+}
+
 export default async function handler(req, res) {
   try {
     const qYmd = String(req.query.ymd||"").trim();
@@ -39,21 +67,29 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok:false, error:"Provide ymd=YYYY-MM-DD" });
     }
 
-    // Učitaj index i uzmi poslednjih N id-eva (dovoljno za jedan dan)
+    // Učitaj skorašnje ID-eve (dovoljno za jedan dan)
     const idxRaw = await kvGETraw("crypto:history:index");
-    const ids = (J(idxRaw)||[]).slice(-600).reverse(); // recent → old
+    const ids = (J(idxRaw)||[]).slice(-800).reverse(); // recent → old
 
     const items = [];
     for (const id of ids) {
       const raw = await kvGETraw(`crypto:history:item:${id}`);
       const it = J(raw);
-      if (!it || !it.ts) continue;
-      // Poredi po danu u zadatom TZ
-      const y = ymdInTZ(new Date(Number(it.ts)), TZ);
+      if (!it) continue;
+
+      // probaj redom: ts (created), evaluated_ts, valid_until
+      const d =
+        toDateFlexible(it.ts) ||
+        toDateFlexible(it.evaluated_ts) ||
+        toDateFlexible(it.valid_until);
+
+      if (!d) continue;
+
+      const y = ymdInTZ(d, TZ);
       if (y === qYmd) {
         items.push({
-          id: id,
-          ts: it.ts,
+          id,
+          ts: it.ts ?? null,
           symbol: it.symbol || it.symbol1 || it.ticker,
           name: it.name || null,
           exchange: it.exchange || null,
@@ -65,20 +101,20 @@ export default async function handler(req, res) {
           rr: it.rr ?? null,
           confidence_pct: it.confidence_pct ?? null,
           valid_until: it.valid_until ?? null,
-          outcome: it.outcome || null,     // "tp" | "sl" | "expired"
+          outcome: it.outcome || null,   // "tp" | "sl" | "expired" | null
           win: (typeof it.win!=="undefined" ? it.win : (typeof it.won!=="undefined"?it.won:null)),
           exit_price: it.exit_price ?? null,
           realized_rr: it.realized_rr ?? null,
           evaluated_ts: it.evaluated_ts ?? null
         });
       } else if (items.length && y !== qYmd) {
-        // čim smo prošli kroz dan i već imamo neke — prekini radi performansi
+        // čim prođemo granicu dana, prekini radi performansi
         break;
       }
     }
 
-    // Rezime (računa se nad odlučenim; expired ne ulazi u win-rate)
-    const decided = items.filter(i => (i.outcome==="tp"||i.outcome==="sl"));
+    // Rezime nad odlučenim (tp/sl). expired ne ulazi u win-rate.
+    const decided = items.filter(i => i.outcome==="tp" || i.outcome==="sl");
     const wins = decided.filter(i => i.outcome==="tp").length;
     const avgRR = decided.length ? decided.reduce((s,i)=> s + (Number(i.realized_rr)||0), 0)/decided.length : null;
     const medianRR = decided.length
