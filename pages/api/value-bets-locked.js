@@ -26,7 +26,9 @@ async function kvGETraw(key, trace) {
       trace && trace.push({ get:key, ok:r.ok, flavor:b.flavor, hit:!!raw });
       if (!r.ok) continue;
       return { raw, flavor:b.flavor };
-    } catch (e) { trace && trace.push({ get:key, ok:false, err:String(e?.message||e) }); }
+    } catch (e) {
+      trace && trace.push({ get:key, ok:false, err:String(e?.message||e) });
+    }
   }
   return { raw:null, flavor:null };
 }
@@ -60,6 +62,16 @@ function slotCap(now, slot){
   return 20;
 }
 
+/* ---------- sort helpers ---------- */
+function confPct(it){ return Number.isFinite(it?.confidence_pct) ? it.confidence_pct : (Number(it?.confidence)||0); }
+function kickoffISO(it){ return it?.kickoff_utc || it?.fixture?.date || it?.kickoff || it?.fixture_date || it?.ts || null; }
+function kickoffTime(it){ const d = kickoffISO(it) ? new Date(kickoffISO(it)).getTime() : 0; return Number.isFinite(d) ? d : 0; }
+function hasMarkets(it){
+  const m = it?.markets || {};
+  return Number.isFinite(m?.h2h?.home) || Number.isFinite(m?.btts?.yes) || Number.isFinite(m?.ou25?.over) ||
+         Number.isFinite(m?.htft?.hh)  || Number.isFinite(m?.htft?.aa)  || Number.isFinite(m?.fh_ou15?.over);
+}
+
 export default async function handler(req, res) {
   try {
     const trace = [];
@@ -69,7 +81,7 @@ export default async function handler(req, res) {
     const slot  = qSlot==="auto" ? autoSlot(now, TZ) : qSlot;
     const ymd   = targetYmdForSlot(now, slot, TZ);
 
-    // Football list (za kartice) – prefer capovani pool
+    // Football list – prefer capovani pool
     const poolKeys = [
       `vbl:${ymd}:${slot}`,
       `vb:day:${ymd}:${slot}`,
@@ -81,7 +93,17 @@ export default async function handler(req, res) {
       const { raw } = await kvGETraw(k, trace);
       const j = J(raw);
       const arr = Array.isArray(j) ? j : (Array.isArray(j?.items)? j.items : []);
-      if (arr.length){ items=arr; source=k; break; }
+      if (arr.length){ items=arr.slice(); source=k; break; }
+    }
+
+    // sort: primary confidence desc, then hasMarkets(true first), then kickoff asc
+    if (Array.isArray(items)) {
+      items.sort((a,b)=>{
+        const dc = (confPct(b) - confPct(a)); if (dc) return dc;
+        const hm = (hasMarkets(b) === hasMarkets(a)) ? 0 : (hasMarkets(b) ? 1 : -1);
+        if (hm) return -hm; // true pre false
+        return kickoffTime(a) - kickoffTime(b);
+      });
     }
 
     // primeni cap ako je izvor "uncapped"
@@ -89,9 +111,13 @@ export default async function handler(req, res) {
     if (Array.isArray(items) && items.length > cap && /vbl_full|vb:day:.*:union/.test(String(source||""))) {
       items = items.slice(0, cap);
       trace.push({ capping:true, cap, source });
+    } else if (Array.isArray(items) && items.length > cap && /vbl:/.test(String(source||""))) {
+      // vbl je već capovan upstream, ali ako se promeni redosled, osigurajmo se
+      items = items.slice(0, cap);
+      trace.push({ capping:true, cap, source:"vbl (extra-guard)" });
     }
 
-    // Tiketi (strogo zamrznuti)
+    // Tiketi (strogo zamrznuti; ne pravimo ih ovde)
     const { raw:rawT } = await kvGETraw(`tickets:${ymd}:${slot}`, trace);
     const tickets = J(rawT) || null;
 
