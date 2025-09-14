@@ -46,9 +46,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Vremenska zona isključivo preko TZ_DISPLAY (TZ je zauzet na Vercel-u)
       TZ_DISPLAY: Europe/Belgrade
-      # Fallback domen ako ne proslediš inputs.base
       FALLBACK_BASE: https://predictscores.vercel.app
 
     steps:
@@ -72,7 +70,6 @@ jobs:
           BASE="${INP_BASE:-}"
           if [ -z "$BASE" ]; then BASE="${FALLBACK_BASE:-}"; fi
 
-          # Slot iz schedule-a ili fallback po satu u TZ_DISPLAY
           if [ "${INP_SLOT:-auto}" != "auto" ]; then
             SLOT="${INP_SLOT}"
           else
@@ -80,21 +77,19 @@ jobs:
               "58 7 * * *"|"0 8 * * *"|"2 8 * * *"|"58 8 * * *"|"0 9 * * *"|"2 9 * * *") SLOT="am" ;;
               "58 12 * * *"|"0 13 * * *"|"2 13 * * *"|"58 13 * * *"|"0 14 * * *"|"2 14 * * *") SLOT="pm" ;;
               "58 21 * * *"|"0 22 * * *"|"2 22 * * *"|"58 22 * * *"|"0 23 * * *"|"2 23 * * *") SLOT="late" ;;
-              *)  # fallback po lokalnom satu
-                  H=$(TZ="${TZD:-Europe/Belgrade}" date +%H)
-                  if   [ "$H" -lt 10 ]; then SLOT="late"
-                  elif [ "$H" -lt 15 ]; then SLOT="am"
-                  else                        SLOT="pm"
-                  fi
-                  ;;
+              *)
+                H=$(TZ="${TZD:-Europe/Belgrade}" date +%H)
+                if   [ "$H" -lt 10 ]; then SLOT="late"
+                elif [ "$H" -lt 15 ]; then SLOT="am"
+                else                        SLOT="pm"
+                fi
+                ;;
             esac
           fi
 
           YMD=$(TZ="${TZD:-Europe/Belgrade}" date +%F)
 
-          # Guard prozor (FREEZE_MINUTES ako postoji u Actions env-u, inače 10)
           FM=${FREEZE_MINUTES:-10}
-
           now_hm=$(TZ="${TZD:-Europe/Belgrade}" date +%H:%M)
           H=${now_hm%%:*}; M=${now_hm##*:}
           m=$((10#$H*60 + 10#$M))
@@ -109,9 +104,9 @@ jobs:
             if (( d < e )); then echo "$d"; else echo "$e"; fi
           }
 
-          t_late=0         # 00:00
-          t_am=$((10*60))  # 10:00
-          t_pm=$((15*60))  # 15:00
+          t_late=0
+          t_am=$((10*60))
+          t_pm=$((15*60))
           d_late=$(circ_dist "$m" "$t_late")
           d_am=$(circ_dist "$m" "$t_am")
           d_pm=$(circ_dist "$m" "$t_pm")
@@ -130,16 +125,17 @@ jobs:
             echo "ymd=$YMD"
           } >> "$GITHUB_OUTPUT"
 
-      # 0) Warm — popuni dnevne specijale i base snapshot pre rebuild-a
+      # 0) Warm — ostaje, ali sada sa ymd da ne piše „sutra“
       - name: Warm locked-floats (daily tickets & base snapshot)
         if: steps.ctx.outputs.run == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
+          YMD:  ${{ steps.ctx.outputs.ymd }}
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "$BASE/api/locked-floats?warm=1&slot=$SLOT" || true
+          curl -fsSL "$BASE/api/locked-floats?warm=1&slot=$SLOT&ymd=$YMD" || true
 
       # 1) Rebuild (pass 1)
       - name: Rebuild snapshot (pass 1)
@@ -147,10 +143,11 @@ jobs:
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
+          YMD:  ${{ steps.ctx.outputs.ymd }}
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "$BASE/api/cron/rebuild?slot=$SLOT&debug=1" | tee /tmp/rebuild-1.json
+          curl -fsSL "$BASE/api/cron/rebuild?slot=$SLOT&ymd=$YMD&debug=1" | tee /tmp/rebuild-1.json
           sleep 2
 
       # 2) Refresh odds (kratko, batch ×2)
@@ -159,11 +156,12 @@ jobs:
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
+          YMD:  ${{ steps.ctx.outputs.ymd }}
         shell: bash
         run: |
           set -euo pipefail
           for i in 1 2; do
-            curl -fsSL "$BASE/api/cron/refresh-odds?slot=$SLOT&force=1" | tee "/tmp/refresh-$i.json"
+            curl -fsSL "$BASE/api/cron/refresh-odds?slot=$SLOT&ymd=$YMD&force=1" | tee "/tmp/refresh-$i.json"
             sleep 3
           done
 
@@ -173,10 +171,11 @@ jobs:
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
+          YMD:  ${{ steps.ctx.outputs.ymd }}
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "$BASE/api/cron/rebuild?slot=$SLOT&debug=1" | tee /tmp/rebuild-2.json
+          curl -fsSL "$BASE/api/cron/rebuild?slot=$SLOT&ymd=$YMD&debug=1" | tee /tmp/rebuild-2.json
           sleep 2
 
       # 4) Insights (grupiše specijale i zamrzava po slotu)
@@ -185,10 +184,11 @@ jobs:
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
+          YMD:  ${{ steps.ctx.outputs.ymd }}
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "$BASE/api/insights-build?slot=$SLOT" | tee /tmp/insights.json
+          curl -fsSL "$BASE/api/insights-build?slot=$SLOT&ymd=$YMD" | tee /tmp/insights.json
 
       # 5) Apply learning
       - name: Apply learning
@@ -196,17 +196,19 @@ jobs:
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
+          YMD:  ${{ steps.ctx.outputs.ymd }}
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "$BASE/api/cron/apply-learning?slot=$SLOT" | tee /tmp/learn.json
+          curl -fsSL "$BASE/api/cron/apply-learning?slot=$SLOT&ymd=$YMD" | tee /tmp/learn.json
 
-      # 6) Sanity check (ne troši spoljne API limite)
+      # 6) Sanity check
       - name: Sanity check (locked feed)
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
+          YMD:  ${{ steps.ctx.outputs.ymd }}
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "$BASE/api/value-bets-locked?slot=$SLOT&slim=1" | tee /tmp/locked.json
+          curl -fsSL "$BASE/api/value-bets-locked?slot=$SLOT&ymd=$YMD&slim=1" | tee /tmp/locked.json
