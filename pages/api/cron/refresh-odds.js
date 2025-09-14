@@ -57,12 +57,11 @@ const arrFromAny = x => Array.isArray(x) ? x
   : (x && typeof x==="object" && Array.isArray(x.list)) ? x.list : [];
 const canonicalSlot = x=>{ x=String(x||"auto").toLowerCase(); return (x==="late"||x==="am"||x==="pm")?x:"auto"; };
 const autoSlot = (d,tz)=>{ const h=hourInTZ(d,tz); return h<10?"late":(h<15?"am":"pm"); };
-const targetYmdForSlot = (now,slot,tz)=>{ const h=hourInTZ(now,tz);
-  if (slot==="late") return ymdInTZ(h<10?now:addDays(now,1), tz);
-  if (slot==="am")   return ymdInTZ(h<15?now:addDays(now,1), tz);
-  if (slot==="pm")   return ymdInTZ(h<15?now:addDays(now,1), tz);
-  return ymdInTZ(now, tz);
-};
+
+// FIX: am/pm/late -> uvek "danas" (oslanjamo se na eksplicitni ?ymd= kada ga workflow prosledi)
+const targetYmdForSlot = (now,slot,tz)=> ymdInTZ(now, tz);
+
+const isValidYmd = (s)=> /^\d{4}-\d{2}-\d{2}$/.test(String(s||""));
 
 /* ---------- trusted / helpers ---------- */
 const strip = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"").replace(/[\W_]+/g,"").toLowerCase();
@@ -71,6 +70,7 @@ const TRUSTED = (() => {
   const def = ["bet365","pinnacle","williamhill","marathonbet","unibet","888sport","skybet","betfair","betway","ladbrokes","coral","bwin","leon","parimatch","10bet"].map(strip);
   return new Set((env.length?env:def).filter(Boolean));
 })();
+
 const median = arr => {
   const a = (arr||[]).filter(n=>Number.isFinite(n)).sort((x,y)=>x-y);
   if (!a.length) return null;
@@ -102,9 +102,10 @@ async function oaConsume(ymd, n, trace){
   const { used, key } = await oaRemaining(ymd, trace);
   await kvSET(key, String(used+n), trace);
 }
-function slotWindowUTC(now, slot, tz) {
-  const dayYmd = targetYmdForSlot(now, slot, tz);
-  const [Y,M,D] = dayYmd.split("-").map(Number);
+
+// FIX: prozor računamo iz IZABRANOG ymd (ne iz "now")
+function slotWindowUTC(dayYmd, slot, tz) {
+  const [Y,M,D] = String(dayYmd).split("-").map(Number);
   const base = new Date(Date.UTC(Y, M-1, D, 0, 0, 0));
   const addH = (h)=> new Date(base.getTime() + h*3600*1000);
   let fromH=0, toH=24;
@@ -162,7 +163,7 @@ function closestByTime(cands, kickoffISO){
   }
   return best;
 }
-async function fetchOA({ from, to }, trace) {
+async function fetchOA(window, trace) {
   const key = process.env.ODDS_API_KEY;
   if (!key) return { events:[], called:false, ok:false };
   const regions = String(process.env.ODDS_API_REGION||"eu").trim() || "eu";
@@ -172,8 +173,8 @@ async function fetchOA({ from, to }, trace) {
     markets: OA_MARKETS,
     oddsFormat: "decimal",
     dateFormat: "iso",
-    commenceTimeFrom: from.toISOString(),
-    commenceTimeTo: to.toISOString()
+    commenceTimeFrom: window.from.toISOString(),
+    commenceTimeTo: window.to.toISOString()
   });
   const url = `https://api.the-odds-api.com/v4/sports/soccer/odds?${qs.toString()}`;
   try {
@@ -285,16 +286,19 @@ export default async function handler(req, res) {
 
     const qSlot = canonicalSlot(req.query.slot);
     const slot  = qSlot==="auto" ? autoSlot(now, TZ) : qSlot;
-    const ymd   = targetYmdForSlot(now, slot, TZ);
 
-    // ---- skupi izvore: capovani + union + full → set bez duplikata (fixture_id) ----
+    // NEW: ymd override iz query-ja (prioritet)
+    const qYmd = String(req.query.ymd||"").trim();
+    const ymd  = isValidYmd(qYmd) ? qYmd : targetYmdForSlot(now, slot, TZ);
+
+    // ---- skupi izvore ----
     const srcKeys = [
       `vbl:${ymd}:${slot}`,
       `vb:day:${ymd}:${slot}`,
       `vb:day:${ymd}:union`,
       `vbl_full:${ymd}:${slot}`
     ];
-    const seen = new Map(); // fixture_id -> item
+    const seen = new Map();
     let firstSrc=null;
     for (const k of srcKeys) {
       const { raw } = await kvGETraw(k, trace);
@@ -313,10 +317,8 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok:true, ymd, slot, msg:"no source", updated:0 });
     }
 
-    // Koliko trenutno imamo FH1.5?
     const hasFH = items.filter(it => Number.isFinite(it?.markets?.fh_ou15?.over)).length;
 
-    // Needers – fali bar jedan ključni market
     const needersAll = items.filter(it => {
       const m = it?.markets||{};
       return (!Number.isFinite(m?.btts?.yes)) ||
@@ -326,25 +328,18 @@ export default async function handler(req, res) {
              (!Number.isFinite(m?.fh_ou15?.over));
     });
 
-    // Rangiraj needers: cap-pool > union/full, pa confidence desc, pa kickoff asc
-    const srcScore = (it)=>{
-      // gruba preferencija: daj +2 ako je u vbl, +1 ako je u vb:day:* / union
-      // (ne radimo skupo pretraživanje; heuristika po ligama/ids nije potrebna)
-      return 0; // jednostavno ostavimo 0 da ne uvodimo trošak; conf/kickoff će uraditi posao
-    };
     needersAll.sort((a,b)=>{
       const dc = (confPct(b) - confPct(a));
       if (dc) return dc;
       const ma = a?.markets, mb = b?.markets;
       const ha = !!(ma && (ma.h2h||ma.ou25||ma.btts||ma.htft||ma.fh_ou15));
       const hb = !!(mb && (mb.h2h||mb.ou25||mb.btts||mb.htft||mb.fh_ou15));
-      if (ha !== hb) return hb ? 1 : -1; // one bez markets pre
+      if (ha !== hb) return hb ? 1 : -1;
       const dk = kickoffTime(a) - kickoffTime(b);
       if (dk) return dk;
-      return (srcScore(b) - srcScore(a));
+      return 0;
     });
 
-    // ---- AF pass #1: široko punjenje (do ~60 needers) ----
     const PASS1_LIMIT = 60;
     let afUpdated=0;
     for (const it of needersAll.slice(0, PASS1_LIMIT)) {
@@ -358,10 +353,8 @@ export default async function handler(req, res) {
       }
     }
 
-    // Ponovo prebroj FH posle pass #1
     const hasFHafter1 = items.filter(it => Number.isFinite(it?.markets?.fh_ou15?.over)).length;
 
-    // ---- AF pass #2 (ako treba): fokus samo FH1.5, do ~80 needers bez FH ----
     let afUpdatedFH=0;
     if (hasFHafter1 < 4) {
       const fhNeeders = items
@@ -384,16 +377,15 @@ export default async function handler(req, res) {
       }
     }
 
-    // ---- OA fallback ≤5 po slotu (≤15/dan) za preostale rupe ----
+    // OA fallback iz prozora za upravo taj ymd+slot
     const { remaining } = await oaRemaining(ymd, trace);
     const maxTargets = Math.min(5, remaining);
     let oaUsed=0, oaUpdated=0;
     if (maxTargets>0) {
-      const window = slotWindowUTC(now, slot, TZ);
+      const window = slotWindowUTC(ymd, slot, TZ);
       const oa = await fetchOA(window, trace);
       const byTeams = mapOAbyTeams(oa.events||[]);
 
-      // odaberi do maxTargets kandidata koji i dalje fale (prefer sa skorim kickoffom)
       const stillNeed = items.filter(it => {
         const m = it?.markets||{};
         return (!Number.isFinite(m?.btts?.yes)) ||
@@ -461,7 +453,6 @@ export default async function handler(req, res) {
       if (oaUsed>0) await oaConsume(ymd, oaUsed, trace);
     }
 
-    // Snimi nazad (vbl_full i union, ako ima promene)
     if (afUpdated>0 || afUpdatedFH>0 || oaUsed>0) {
       await kvSET(`vbl_full:${ymd}:${slot}`, { items }, trace);
       const { raw:rawUnion } = await kvGETraw(`vb:day:${ymd}:union`, trace);
