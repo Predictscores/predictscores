@@ -56,13 +56,9 @@ const arrFromAny = x => Array.isArray(x) ? x
 
 function canonicalSlot(x){ x=String(x||"auto").toLowerCase(); return x==="late"||x==="am"||x==="pm"?x:"auto"; }
 function autoSlot(d,tz){ const h=hourInTZ(d,tz); return h<10?"late":(h<15?"am":"pm"); }
-function targetYmdForSlot(now, slot, tz){
-  const h=hourInTZ(now,tz);
-  if (slot==="late") return ymdInTZ(h<10?now:addDays(now,1), tz);
-  if (slot==="am")   return ymdInTZ(h<15?now:addDays(now,1), tz);
-  if (slot==="pm")   return ymdInTZ(h<15?now:addDays(now,1), tz);
-  return ymdInTZ(now, tz);
-}
+// FIX: uvek "danas" (workflow prosleđuje ymd kada treba drugi dan)
+function targetYmdForSlot(now, slot, tz){ return ymdInTZ(now, tz); }
+const isValidYmd = (s)=> /^\d{4}-\d{2}-\d{2}$/.test(String(s||""));
 
 /* ---------- selection helpers ---------- */
 const num = v => Number.isFinite(v) ? v : Number(v);
@@ -96,7 +92,10 @@ export default async function handler(req, res) {
 
     const qSlot = canonicalSlot(req.query.slot);
     const slot  = qSlot==="auto" ? autoSlot(now, TZ) : qSlot;
-    const ymd   = targetYmdForSlot(now, slot, TZ);
+
+    // NEW: ymd override iz query-ja
+    const qYmd = String(req.query.ymd||"").trim();
+    const ymd  = isValidYmd(qYmd) ? qYmd : targetYmdForSlot(now, slot, TZ);
 
     /* kandidati: prefer vbl_full → vbl → vb:day:<slot> → vb:day:union */
     const tried = [
@@ -113,7 +112,6 @@ export default async function handler(req, res) {
     }
 
     if (!baseArr) {
-      // no-clobber: ne pišemo prazno preko postojećih
       return res.status(200).json({ ok:true, ymd, slot, source:null, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, note:"no-source-items" });
     }
 
@@ -121,34 +119,28 @@ export default async function handler(req, res) {
 
     for (const it of baseArr) {
       const m = it?.markets || {};
-      // BTTS (Yes)
       if (m?.btts) {
         const p = pickPrice(m.btts.yes);
         if (p && p >= MIN_ODDS) groups.btts.push({ it, price:p, books:m?.btts?.books_count, pick:"yes" });
       }
-      // OU 2.5 (Over)
       if (m?.ou25) {
         const p = pickPrice(m.ou25.over);
         if (p && p >= MIN_ODDS) groups.ou25.push({ it, price:p, books:m?.ou25?.books_count, pick:"over" });
       }
-      // HT-FT (HH/AA)
       if (m?.htft) {
         const hh = pickPrice(m.htft.hh);
         const aa = pickPrice(m.htft.aa);
         const chosen = (hh && aa) ? (hh >= aa ? {p:hh, code:"hh"} : {p:aa, code:"aa"}) : (hh ? {p:hh, code:"hh"} : (aa ? {p:aa, code:"aa"} : null));
         if (chosen && chosen.p >= MIN_ODDS) groups.htft.push({ it, price:chosen.p, books:m?.htft?.books_count, pick:chosen.code });
       }
-      // FH Over 1.5 (first-half OU 1.5)
       if (m?.fh_ou15) {
         const p = pickPrice(m.fh_ou15.over);
         if (p && p >= MIN_ODDS) groups.fh_ou15.push({ it, price:p, books:m?.fh_ou15?.books_count, pick:"over" });
       }
     }
 
-    // sortiraj po "snazi"
     for (const k of Object.keys(groups)) groups[k].sort((a,b)=> byStrength(a.it,b.it));
 
-    // tačno 4 po grupi
     const top = {
       btts: groups.btts.slice(0,4),
       ou25: groups.ou25.slice(0,4),
@@ -164,7 +156,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok:true, ymd, slot, source, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, debug:{ trace } });
     }
 
-    // snapshot (strogo zamrzavanje: selekcije + cene)
     const snap = { btts:[], ou25:[], htft:[], fh_ou15:[] };
     for (const row of top.btts)    snap.btts.push(snapshotItem(row.it,   "btts",     row.price, row.books, row.pick));
     for (const row of top.ou25)    snap.ou25.push(snapshotItem(row.it,   "ou25",     row.price, row.books, row.pick));
@@ -173,7 +164,6 @@ export default async function handler(req, res) {
 
     await kvSET(keySlot, snap, trace);
 
-    // upiši dnevni fallback (ako ne postoji)
     const { raw:rawDay } = await kvGETraw(`tickets:${ymd}`, trace);
     const jDay = J(rawDay);
     const hasDay = jDay && (Array.isArray(jDay.btts)||Array.isArray(jDay.ou25)||Array.isArray(jDay.htft)||Array.isArray(jDay.fh_ou15));
