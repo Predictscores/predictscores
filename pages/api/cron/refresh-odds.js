@@ -26,9 +26,7 @@ async function kvGETraw(key, trace) {
       trace && trace.push({ get:key, ok:r.ok, flavor:b.flavor, hit:!!raw });
       if (!r.ok) continue;
       return { raw, flavor:b.flavor };
-    } catch (e) {
-      trace && trace.push({ get:key, ok:false, err:String(e?.message||e) });
-    }
+    } catch (e) { trace && trace.push({ get:key, ok:false, err:String(e?.message||e) }); }
   }
   return { raw:null, flavor:null };
 }
@@ -54,8 +52,7 @@ const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate()+n); ret
 const arrFromAny = x => Array.isArray(x) ? x
   : (x && typeof x==="object" && Array.isArray(x.items)) ? x.items
   : (x && typeof x==="object" && Array.isArray(x.football)) ? x.football
-  : (x && typeof x==="object" && Array.isArray(x.list)) ? x.list
-  : [];
+  : (x && typeof x==="object" && Array.isArray(x.list)) ? x.list : [];
 const canonicalSlot = x=>{ x=String(x||"auto").toLowerCase(); return (x==="late"||x==="am"||x==="pm")?x:"auto"; };
 const autoSlot = (d,tz)=>{ const h=hourInTZ(d,tz); return h<10?"late":(h<15?"am":"pm"); };
 const targetYmdForSlot = (now,slot,tz)=>{ const h=hourInTZ(now,tz);
@@ -65,9 +62,8 @@ const targetYmdForSlot = (now,slot,tz)=>{ const h=hourInTZ(now,tz);
   return ymdInTZ(now, tz);
 };
 
-/* ---------- trusted / stats ---------- */
+/* ---------- trusted / helpers ---------- */
 const strip = s => String(s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"").replace(/[\W_]+/g,"").toLowerCase();
-const keyTeams = (home,away)=> `${strip(home)}__${strip(away)}`;
 const TRUSTED = (() => {
   const env = String(process.env.TRUSTED_BOOKIES||"").split(",").map(s=>strip(s));
   const def = ["bet365","pinnacle","williamhill","marathonbet","unibet","888sport","skybet","betfair","betway","ladbrokes","coral","bwin","leon","parimatch","10bet"].map(strip);
@@ -85,10 +81,15 @@ function trimMedian(values){
   const cut=Math.max(1, Math.floor(a.length*0.2));
   return median(a.slice(cut, a.length-cut));
 }
+function inRange(p, lo, hi){ return Number.isFinite(p) && p>=lo && p<=hi; }
+function impliedSumOk(prices){
+  const inv = (p)=> (Number.isFinite(p)&&p>0)?(1/p):0;
+  const s = (prices||[]).map(inv).reduce((a,b)=>a+b,0);
+  return s>=0.8 && s<=1.3;
+}
 
 /* ---------- OA helpers (backup; ≤15/dan) ---------- */
 const OA_DAILY_CAP = Number.isFinite(Number(process.env.ODDS_API_DAILY_CAP)) ? Number(process.env.ODDS_API_DAILY_CAP) : 15;
-
 async function oaRemaining(ymd, trace){
   const key = `oa:used:${ymd}`;
   const { raw } = await kvGETraw(key, trace);
@@ -97,12 +98,9 @@ async function oaRemaining(ymd, trace){
 }
 async function oaConsume(ymd, n, trace){
   const { used, key } = await oaRemaining(ymd, trace);
-  const next = used + n;
-  await kvSET(key, String(next), trace);
-  return next;
+  await kvSET(key, String(used+n), trace);
 }
 function slotWindowUTC(now, slot, tz) {
-  const d = new Date(now);
   const dayYmd = targetYmdForSlot(now, slot, tz);
   const [Y,M,D] = dayYmd.split("-").map(Number);
   const base = new Date(Date.UTC(Y, M-1, D, 0, 0, 0));
@@ -111,11 +109,13 @@ function slotWindowUTC(now, slot, tz) {
   if (slot==="late") { fromH=0; toH=10; }
   if (slot==="am")   { fromH=10; toH=15; }
   if (slot==="pm")   { fromH=15; toH=24; }
-  return { from:new Date(addH(fromH)), to:new Date(addH(toH)) };
+  return { from:addH(fromH), to:addH(toH) };
 }
 
-function normalizeBookName(name){ return strip(String(name||"")); }
-function pullPrice(bookmakers, marketKey, pickPredicate, periodFilter=null) {
+/* ---------- OA pulling ---------- */
+const OA_MARKETS = "h2h,totals,both_teams_to_score,half_time_full_time";
+function normalizeBookName(n){ return strip(n); }
+function pullPriceOA(bookmakers, marketKey, pickPredicate, periodFilter=null) {
   const prices = [];
   for (const bm of (bookmakers||[])) {
     const bn = normalizeBookName(bm?.title);
@@ -123,7 +123,6 @@ function pullPrice(bookmakers, marketKey, pickPredicate, periodFilter=null) {
     for (const mk of (bm?.markets||[])) {
       const key = String(mk?.key||"");
       if (key !== marketKey) continue;
-      // pokušaj filtriranja perioda (FH) ako je definisano
       if (periodFilter) {
         const period = String(mk?.description||mk?.name||"").toLowerCase();
         if (!periodFilter(period)) continue;
@@ -138,7 +137,7 @@ function pullPrice(bookmakers, marketKey, pickPredicate, periodFilter=null) {
   }
   return trimMedian(prices);
 }
-
+function keyTeams(home,away){ return `${strip(home)}__${strip(away)}`; }
 function mapOAbyTeams(events){
   const map = new Map();
   for (const ev of (events||[])) {
@@ -161,15 +160,14 @@ function closestByTime(cands, kickoffISO){
   }
   return best;
 }
-
 async function fetchOA({ from, to }, trace) {
   const key = process.env.ODDS_API_KEY;
-  if (!key) return { events:[], called:false, url:null, ok:false };
+  if (!key) return { events:[], called:false, ok:false };
   const regions = String(process.env.ODDS_API_REGION||"eu").trim() || "eu";
   const qs = new URLSearchParams({
     apiKey: key,
-    regions: /\beu\b/i.test(regions) ? "eu,uk" : regions, // dodaj uk radi pokrivenosti
-    markets: "h2h,totals,both_teams_to_score,half_time_full_time",
+    regions: /\beu\b/i.test(regions) ? "eu,uk" : regions,
+    markets: OA_MARKETS,
     oddsFormat: "decimal",
     dateFormat: "iso",
     commenceTimeFrom: from.toISOString(),
@@ -188,13 +186,102 @@ async function fetchOA({ from, to }, trace) {
   }
 }
 
-/* ---------- sanity kvota ---------- */
-function impliedSumOk(prices){
-  const inv = (p)=> (Number.isFinite(p)&&p>0)?(1/p):0;
-  const s = (prices||[]).map(inv).reduce((a,b)=>a+b,0);
-  return s>=0.8 && s<=1.3;
+/* ---------- AF odds pulling (primarno) ---------- */
+async function fetchAFOddsByFixture(fixtureId, trace){
+  const key = process.env.API_FOOTBALL_KEY;
+  if (!key || !fixtureId) return null;
+  const url = `https://v3.football.api-sports.io/odds?fixture=${encodeURIComponent(String(fixtureId))}`;
+  try {
+    const r = await fetch(url, { headers:{ "x-apisports-key": key }, cache:"no-store" });
+    const j = await r.json();
+    trace && trace.push({ af_url:url, af_ok:r.ok, resp:Array.isArray(j?.response)? j.response.length : 0 });
+    if (!r.ok || !Array.isArray(j?.response) || !j.response.length) return null;
+    return j.response[0]; // {bookmakers:[{name,bets:[{name,values:[{value,odd}]}]}], update,...}
+  } catch(e) {
+    trace && trace.push({ af_err:String(e?.message||e) });
+    return null;
+  }
 }
-function inRange(p, lo, hi){ return Number.isFinite(p) && p>=lo && p<=hi; }
+function pickFromAF(afResp){
+  const out = {};
+  const bms = afResp?.bookmakers || [];
+  const collect = {
+    h2h:   { home:[], draw:[], away:[] },
+    btts:  { yes:[],  no:[] },
+    ou25:  { over:[], under:[] },
+    htft:  { hh:[],   aa:[] },
+    fh_ou15: { over:[] }
+  };
+  for (const bm of bms) {
+    const bn = strip(bm?.name);
+    if (!TRUSTED.has(bn)) continue;
+    for (const bet of (bm?.bets||[])) {
+      const name = String(bet?.name||"").toLowerCase();
+      for (const v of (bet?.values||[])) {
+        const valTxt = String(v?.value||"").toLowerCase();
+        const odd = Number(v?.odd);
+        if (!Number.isFinite(odd)) continue;
+
+        // 1X2
+        if (/1x2|match\s*winn?er/.test(name)) {
+          if (/home/.test(valTxt)) collect.h2h.home.push(odd);
+          else if (/draw|tie/.test(valTxt)) collect.h2h.draw.push(odd);
+          else if (/away/.test(valTxt)) collect.h2h.away.push(odd);
+        }
+        // BTTS
+        if (/both\s*teams\s*to\s*score/.test(name)) {
+          if (/yes/.test(valTxt)) collect.btts.yes.push(odd);
+          if (/no/.test(valTxt))  collect.btts.no.push(odd);
+        }
+        // OU full-time (2.5)
+        if (/over\/under|goals\s*over\/under/.test(name) && !/1st|first\s*half/.test(name)) {
+          if (/over\s*2\.?5/.test(valTxt))  collect.ou25.over.push(odd);
+          if (/under\s*2\.?5/.test(valTxt)) collect.ou25.under.push(odd);
+        }
+        // HT/FT
+        if (/ht\/ft|half\s*time\s*\/\s*full\s*time/.test(name)) {
+          if (/home\/home/.test(valTxt)) collect.htft.hh.push(odd);
+          if (/away\/away/.test(valTxt)) collect.htft.aa.push(odd);
+        }
+        // FH over 1.5
+        if ((/over\/under|goals\s*over\/under/.test(name) && /1st|first\s*half/.test(name)) ||
+            (/first\s*half.*over\/under/.test(name))) {
+          if (/over\s*1\.?5/.test(valTxt)) collect.fh_ou15.over.push(odd);
+        }
+      }
+    }
+  }
+  // trim median + sanity
+  const med = (arr)=> trimMedian(arr);
+  const buildIf = (cond, o) => cond ? o : null;
+
+  // h2h
+  const H = med(collect.h2h.home), D = med(collect.h2h.draw), A = med(collect.h2h.away);
+  if ([H,D,A].some(Number.isFinite) && impliedSumOk([H,D,A]) && inRange(H??1.5,1.15,20) && inRange(D??3,1.15,20) && inRange(A??1.5,1.15,20))
+    out.h2h = { home:H??null, draw:D??null, away:A??null };
+
+  // btts
+  const Y = med(collect.btts.yes), N = med(collect.btts.no);
+  if ([Y,N].some(Number.isFinite) && impliedSumOk([Y,N]) && inRange(Y??1.8,1.25,5.0))
+    out.btts = { yes:Y??null, no:N??null };
+
+  // ou25
+  const O = med(collect.ou25.over), U = med(collect.ou25.under);
+  if ([O,U].some(Number.isFinite) && impliedSumOk([O,U]) && inRange(O??1.6,1.2,5.5) && inRange(U??2.2,1.2,5.5))
+    out.ou25 = { over:O??null, under:U??null };
+
+  // htft
+  const HH = med(collect.htft.hh), AA = med(collect.htft.aa);
+  if ([HH,AA].some(Number.isFinite) && (inRange(HH??3,3,40) || inRange(AA??3,3,40)))
+    out.htft = { hh:HH??null, aa:AA??null };
+
+  // fh_ou15
+  const FH = med(collect.fh_ou15.over);
+  if (Number.isFinite(FH) && inRange(FH,1.2,5.0))
+    out.fh_ou15 = { over: FH };
+
+  return out;
+}
 
 export default async function handler(req, res) {
   try {
@@ -205,12 +292,12 @@ export default async function handler(req, res) {
     const slot  = qSlot==="auto" ? autoSlot(now, TZ) : qSlot;
     const ymd   = targetYmdForSlot(now, slot, TZ);
 
-    // Učitaj bazni skup (prefer vbl_full → vb:day:union → vb:day:slot → vbl)
+    // Prefer capovani izvori za refresh targete
     const tried = [
-      `vbl_full:${ymd}:${slot}`,
-      `vb:day:${ymd}:union`,
+      `vbl:${ymd}:${slot}`,
       `vb:day:${ymd}:${slot}`,
-      `vbl:${ymd}:${slot}`
+      `vb:day:${ymd}:union`,
+      `vbl_full:${ymd}:${slot}`
     ];
     let baseArr=null, src=null;
     for (const k of tried) {
@@ -218,117 +305,149 @@ export default async function handler(req, res) {
       const arr = arrFromAny(J(raw));
       if (arr.length){ src=k; baseArr=arr; break; }
     }
-    if (!baseArr) return res.status(200).json({ ok:true, ymd, slot, msg:"no source", oa:{called:false,events:0}, touched_full:0, touched_union:0 });
+    if (!baseArr) return res.status(200).json({ ok:true, ymd, slot, msg:"no source", updated:0 });
 
-    // Slot prozor i OA cap
-    const windowUTC = slotWindowUTC(now, slot, TZ);
-    const { remaining, key:capKey } = await oaRemaining(ymd, trace);
-    const maxTargets = Math.min(5, remaining); // ≤5 po slotu
-
-    // Priprema mapiranja OA događaja (samo ako imamo cap)
-    let byTeams = new Map();
-    if (maxTargets>0) {
-      const oa = await fetchOA(windowUTC, trace);
-      byTeams = mapOAbyTeams(oa.events||[]);
-    }
-
-    // Izaberi targete: prioritet — oni koji imaju kandidaturu za tikete ili prazan market
-    // (ograniči na maxTargets; ostalima ne diramo markets)
-    const candidates = [];
+    // -------- AF primarno: za prvih ~40 targeta (ili gde fale marketi) --------
+    // prioritet: oni bez kvota u ključnim marketima
+    const needers = [];
     for (const it of baseArr) {
       const m = it?.markets||{};
-      const needBtts = !Number.isFinite(m?.btts?.yes);
-      const needOU25 = !Number.isFinite(m?.ou25?.over);
-      const needHTFT = !Number.isFinite(m?.htft?.hh) && !Number.isFinite(m?.htft?.aa);
-      const needFH   = !Number.isFinite(m?.fh_ou15?.over);
-      if (needBtts || needOU25 || needHTFT || needFH) candidates.push(it);
-      if (candidates.length>=maxTargets) break;
+      const need = (!m?.btts?.yes) || (!m?.ou25?.over) || (!m?.htft?.hh && !m?.htft?.aa) || (!m?.fh_ou15?.over) || (!m?.h2h?.home);
+      if (need) needers.push(it);
+      if (needers.length>=40) break; // lokalni cap bez ENV-a
+    }
+    let afUpdated=0;
+    for (const it of needers) {
+      const fix = it?.fixture_id || it?.fixture?.id;
+      const af = await fetchAFOddsByFixture(fix, trace);
+      if (!af) continue;
+      const parsed = pickFromAF(af);
+      if (parsed && Object.keys(parsed).length) {
+        it.markets = { ...(it.markets||{}), ...parsed };
+        afUpdated++;
+      }
     }
 
-    let touched_full=0, touched_union=0, usedOA=0, updated=0;
-    // Obradi targete kroz OA (backup)
-    for (const it of candidates) {
-      const home = it?.teams?.home?.name || it?.home?.name;
-      const away = it?.teams?.away?.name || it?.away?.name;
-      if (!home || !away) continue;
+    // -------- OA fallback (≤5 po slotu, ≤15/dan): samo ako i dalje fali --------
+    const { remaining } = await oaRemaining(ymd, trace);
+    const maxTargets = Math.min(5, remaining);
+    let oaUsed=0, oaUpdated=0;
+    if (maxTargets>0) {
+      const window = slotWindowUTC(now, slot, TZ);
+      // povuci OA evente za prozor
+      const regions = String(process.env.ODDS_API_REGION||"eu").trim() || "eu";
+      const qs = new URLSearchParams({
+        apiKey: process.env.ODDS_API_KEY || "",
+        regions: /\beu\b/i.test(regions) ? "eu,uk" : regions,
+        markets: OA_MARKETS,
+        oddsFormat: "decimal",
+        dateFormat: "iso",
+        commenceTimeFrom: window.from.toISOString(),
+        commenceTimeTo: window.to.toISOString()
+      });
+      const url = `https://api.the-odds-api.com/v4/sports/soccer/odds?${qs.toString()}`;
+      let events=[];
+      try {
+        const r = await fetch(url, { cache:"no-store" });
+        const data = await r.json().catch(()=>[]);
+        events = Array.isArray(data)? data : [];
+        trace.push({ oa_url:url, events:events.length, ok:true });
+      } catch(e) {
+        trace.push({ oa_err:String(e?.message||e) });
+      }
+      const byTeams = mapOAbyTeams(events);
 
-      const k = keyTeams(home, away);
-      const cands = byTeams.get(k) || byTeams.get(keyTeams(away, home)) || [];
-      if (!cands.length) continue;
-      const match = closestByTime(cands, it?.kickoff_utc || it?.fixture?.date || it?.kickoff);
-      if (!match) continue;
-
-      const books = match?.bookmakers || [];
-      const markets = it.markets || (it.markets = {});
-
-      // 1X2 (h2h)
-      const h   = pullPrice(books, "h2h", o=>String(o?.name).toLowerCase()==="home");
-      const d   = pullPrice(books, "h2h", o=>String(o?.name).toLowerCase()==="draw");
-      const a   = pullPrice(books, "h2h", o=>String(o?.name).toLowerCase()==="away");
-      if ([h,d,a].some(Number.isFinite) && impliedSumOk([h,d,a])) {
-        markets.h2h = { home:h??null, draw:d??null, away:a??null };
-        updated++;
+      const candidates = [];
+      for (const it of baseArr) {
+        const m = it?.markets||{};
+        const needBtts = !Number.isFinite(m?.btts?.yes);
+        const needOU25 = !Number.isFinite(m?.ou25?.over);
+        const needHTFT = !Number.isFinite(m?.htft?.hh) && !Number.isFinite(m?.htft?.aa);
+        const needFH   = !Number.isFinite(m?.fh_ou15?.over);
+        if (needBtts || needOU25 || needHTFT || needFH) candidates.push(it);
+        if (candidates.length>=maxTargets) break;
       }
 
-      // OU 2.5 (totals, Over/Under @2.5)
-      const ouO = pullPrice(books, "totals", o=> (Number(o?.point)===2.5) && String(o?.name).toLowerCase()==="over", desc=>/1st|first\s*half/i.test(desc)===false);
-      const ouU = pullPrice(books, "totals", o=> (Number(o?.point)===2.5) && String(o?.name).toLowerCase()==="under", desc=>/1st|first\s*half/i.test(desc)===false);
-      if ([ouO,ouU].some(Number.isFinite) && impliedSumOk([ouO,ouU]) && inRange(ouO,1.2,5.5) && inRange(ouU,1.2,5.5)) {
-        markets.ou25 = { over:ouO??null, under:ouU??null };
-        updated++;
-      }
+      for (const it of candidates) {
+        const home = it?.teams?.home?.name || it?.home?.name;
+        const away = it?.teams?.away?.name || it?.away?.name;
+        if (!home || !away) continue;
+        const k = keyTeams(home, away);
+        const cands = byTeams.get(k) || byTeams.get(keyTeams(away, home)) || [];
+        if (!cands.length) continue;
+        const match = closestByTime(cands, it?.kickoff_utc || it?.fixture?.date || it?.kickoff);
+        if (!match) continue;
 
-      // BTTS yes
-      const bttsY = pullPrice(books, "both_teams_to_score", o=>/yes/i.test(String(o?.name)));
-      const bttsN = pullPrice(books, "both_teams_to_score", o=>/no/i.test(String(o?.name)));
-      if ([bttsY,bttsN].some(Number.isFinite) && impliedSumOk([bttsY,bttsN]) && inRange(bttsY,1.25,5.0)) {
-        markets.btts = { yes:bttsY??null, no:bttsN??null };
-        updated++;
-      }
+        const books = match?.bookmakers || [];
+        const markets = it.markets || (it.markets = {});
 
-      // HT-FT (kao predstavnici HH/AA)
-      const htftHH = pullPrice(books, "half_time_full_time", o=>/home\/home/i.test(String(o?.name)));
-      const htftAA = pullPrice(books, "half_time_full_time", o=>/away\/away/i.test(String(o?.name)));
-      if ([htftHH,htftAA].some(Number.isFinite) && inRange(htftHH??3,3,40) || inRange(htftAA??3,3,40)) {
-        markets.htft = { hh:htftHH??null, aa:htftAA??null };
-        updated++;
-      }
+        // H2H
+        const h   = pullPriceOA(books, "h2h", o=>String(o?.name).toLowerCase()==="home");
+        const d   = pullPriceOA(books, "h2h", o=>String(o?.name).toLowerCase()==="draw");
+        const a   = pullPriceOA(books, "h2h", o=>String(o?.name).toLowerCase()==="away");
+        if ([h,d,a].some(Number.isFinite) && impliedSumOk([h,d,a]) && inRange(h??1.5,1.15,20) && inRange(a??1.5,1.15,20)) {
+          markets.h2h = { home:h??null, draw:d??null, away:a??null };
+          oaUpdated++;
+        }
 
-      // FH Over 1.5 (totals @1.5, ali samo za 1st half)
-      const fhO = pullPrice(books, "totals", o=> (Number(o?.point)===1.5) && String(o?.name).toLowerCase()==="over", desc=>/1st|first\s*half/i.test(desc));
-      if (Number.isFinite(fhO) && inRange(fhO,1.2,5.0)) {
-        markets.fh_ou15 = { over: fhO, books_count: (markets.fh_ou15?.books_count||0) };
-        updated++;
-      }
+        // OU 2.5
+        const ouO = pullPriceOA(books, "totals", o=> (Number(o?.point)===2.5) && String(o?.name).toLowerCase()==="over", desc=>/1st|first\s*half/i.test(desc)===false);
+        const ouU = pullPriceOA(books, "totals", o=> (Number(o?.point)===2.5) && String(o?.name).toLowerCase()==="under", desc=>/1st|first\s*half/i.test(desc)===false);
+        if ([ouO,ouU].some(Number.isFinite) && impliedSumOk([ouO,ouU]) && inRange(ouO??1.6,1.2,5.5) && inRange(ouU??2.2,1.2,5.5)) {
+          markets.ou25 = { over:ouO??null, under:ouU??null };
+          oaUpdated++;
+        }
 
-      touched_full++;
-      usedOA++;
-      if (usedOA >= maxTargets) break;
+        // BTTS
+        const bttsY = pullPriceOA(books, "both_teams_to_score", o=>/yes/i.test(String(o?.name)));
+        const bttsN = pullPriceOA(books, "both_teams_to_score", o=>/no/i.test(String(o?.name)));
+        if ([bttsY,bttsN].some(Number.isFinite) && impliedSumOk([bttsY,bttsN]) && inRange(bttsY??1.8,1.25,5.0)) {
+          markets.btts = { yes:bttsY??null, no:bttsN??null };
+          oaUpdated++;
+        }
+
+        // HT-FT
+        const htftHH = pullPriceOA(books, "half_time_full_time", o=>/home\/home/i.test(String(o?.name)));
+        const htftAA = pullPriceOA(books, "half_time_full_time", o=>/away\/away/i.test(String(o?.name)));
+        if ((Number.isFinite(htftHH) && inRange(htftHH,3,40)) || (Number.isFinite(htftAA) && inRange(htftAA,3,40))) {
+          markets.htft = { hh:htftHH??null, aa:htftAA??null };
+          oaUpdated++;
+        }
+
+        // FH over 1.5 (1st half)
+        const fhO = pullPriceOA(books, "totals", o=> (Number(o?.point)===1.5) && String(o?.name).toLowerCase()==="over", desc=>/1st|first\s*half/i.test(desc));
+        if (Number.isFinite(fhO) && inRange(fhO,1.2,5.0)) {
+          markets.fh_ou15 = { over: fhO };
+          oaUpdated++;
+        }
+
+        oaUsed++;
+        if (oaUsed>=maxTargets) break;
+      }
+      if (oaUsed>0) await oaConsume(ymd, oaUsed, trace);
     }
 
-    // Snimi nazad u vbl_full
-    if (updated>0) await kvSET(`vbl_full:${ymd}:${slot}`, { items: baseArr }, trace);
-
-    // Pokušaj propagacije u union (po fixture_id)
-    const { raw:rawUnion } = await kvGETraw(`vb:day:${ymd}:union`, trace);
-    const unionArr = arrFromAny(J(rawUnion));
-    if (updated>0 && unionArr.length) {
-      const byFix = new Map();
-      for (const it of baseArr) if (it?.fixture_id || it?.fixture?.id) byFix.set(String(it.fixture_id||it?.fixture?.id), it);
-      for (const u of unionArr) {
-        const fix = u?.fixture_id && byFix.get(String(u.fixture_id));
-        if (fix?.markets) { u.markets = { ...u.markets, ...fix.markets }; touched_union++; }
+    // Snimi nazad (vbl_full i union, ako ima promene)
+    if (afUpdated>0 || oaUpdated>0) {
+      await kvSET(`vbl_full:${ymd}:${slot}`, { items: baseArr }, trace);
+      const { raw:rawUnion } = await kvGETraw(`vb:day:${ymd}:union`, trace);
+      const unionArr = arrFromAny(J(rawUnion));
+      if (unionArr.length) {
+        const byFix = new Map();
+        for (const it of baseArr) if (it?.fixture_id || it?.fixture?.id) byFix.set(String(it.fixture_id||it?.fixture?.id), it);
+        let touched_union=0;
+        for (const u of unionArr) {
+          const fix = u?.fixture_id && byFix.get(String(u.fixture_id));
+          if (fix?.markets) { u.markets = { ...u.markets, ...fix.markets }; touched_union++; }
+        }
+        if (touched_union>0) await kvSET(`vb:day:${ymd}:union`, { items: unionArr }, trace);
       }
-      await kvSET(`vb:day:${ymd}:union`, { items: unionArr }, trace);
     }
-
-    // Upiši OA potrošnju samo ako smo stvarno koristili targete (ne brojimo prazne/greške)
-    if (usedOA>0) await oaConsume(ymd, usedOA, trace);
 
     return res.status(200).json({
       ok:true, ymd, slot, source:src,
-      touched_full, touched_union, updated, oa_used: usedOA, oa_cap_left: Math.max(0, OA_DAILY_CAP - (await oaRemaining(ymd, trace)).used),
-      debug: { trace }
+      af_updated: afUpdated, oa_used: oaUsed, oa_updated: oaUpdated,
+      debug:{ trace }
     });
 
   } catch (e) {
