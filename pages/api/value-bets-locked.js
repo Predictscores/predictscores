@@ -38,18 +38,14 @@ const hourInTZ = (d, tz) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: 
 const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate()+n); return x; };
 function canonicalSlot(x){ x=String(x||"auto").toLowerCase(); return x==="late"||x==="am"||x==="pm"?x:"auto"; }
 function autoSlot(d,tz){ const h=hourInTZ(d,tz); return h<10?"late":(h<15?"am":"pm"); }
-function targetYmdForSlot(now, slot, tz){
-  const h=hourInTZ(now,tz);
-  if (slot==="late") return ymdInTZ(h<10?now:addDays(now,1), tz);
-  if (slot==="am")   return ymdInTZ(h<15?now:addDays(now,1), tz);
-  if (slot==="pm")   return ymdInTZ(h<15?now:addDays(now,1), tz);
-  return ymdInTZ(now, tz);
-}
+// FIX: uvek "danas" kada nema ?ymd=
+function targetYmdForSlot(now, slot, tz){ return ymdInTZ(now, tz); }
+const isValidYmd = (s)=> /^\d{4}-\d{2}-\d{2}$/.test(String(s||""));
 
 /* ---------- caps ---------- */
 function dowShort(d, tz){ return new Intl.DateTimeFormat("en-GB",{ timeZone: tz, weekday:"short" }).format(d); }
 function slotCap(now, slot){
-  const wd = dowShort(now, TZ); // 'Sat' / 'Sun' → vikend
+  const wd = dowShort(now, TZ);
   const weekend = (wd === 'Sat' || wd === 'Sun');
   const CAP_LATE = Number(process.env.CAP_LATE)||6;
   const CAP_AM_WD = Number(process.env.CAP_AM_WD)||15;
@@ -79,7 +75,10 @@ export default async function handler(req, res) {
 
     const qSlot = canonicalSlot(req.query.slot);
     const slot  = qSlot==="auto" ? autoSlot(now, TZ) : qSlot;
-    const ymd   = targetYmdForSlot(now, slot, TZ);
+
+    // NEW: ymd override
+    const qYmd = String(req.query.ymd||"").trim();
+    const ymd  = isValidYmd(qYmd) ? qYmd : targetYmdForSlot(now, slot, TZ);
 
     // Football list – prefer capovani pool
     const poolKeys = [
@@ -96,28 +95,24 @@ export default async function handler(req, res) {
       if (arr.length){ items=arr.slice(); source=k; break; }
     }
 
-    // sort: primary confidence desc, then hasMarkets(true first), then kickoff asc
     if (Array.isArray(items)) {
       items.sort((a,b)=>{
         const dc = (confPct(b) - confPct(a)); if (dc) return dc;
         const hm = (hasMarkets(b) === hasMarkets(a)) ? 0 : (hasMarkets(b) ? 1 : -1);
-        if (hm) return -hm; // true pre false
+        if (hm) return -hm;
         return kickoffTime(a) - kickoffTime(b);
       });
     }
 
-    // primeni cap ako je izvor "uncapped"
     const cap = slotCap(now, slot);
     if (Array.isArray(items) && items.length > cap && /vbl_full|vb:day:.*:union/.test(String(source||""))) {
       items = items.slice(0, cap);
       trace.push({ capping:true, cap, source });
     } else if (Array.isArray(items) && items.length > cap && /vbl:/.test(String(source||""))) {
-      // vbl je već capovan upstream, ali ako se promeni redosled, osigurajmo se
       items = items.slice(0, cap);
       trace.push({ capping:true, cap, source:"vbl (extra-guard)" });
     }
 
-    // Tiketi (strogo zamrznuti; ne pravimo ih ovde)
     const { raw:rawT } = await kvGETraw(`tickets:${ymd}:${slot}`, trace);
     const tickets = J(rawT) || null;
 
