@@ -4,15 +4,15 @@
 import { useEffect, useMemo, useState } from "react";
 
 /**
- * HistoryPanel
- * - Left: Football history (unchanged behavior)
- * - Right: (optional) Crypto history for the same day, behind feature flag
+ * HistoryPanel (always two columns)
+ * - Left: Football history (unchanged behavior; list for last N days)
+ * - Right: Crypto history for a specific day (ymd) or today's date
  *
- * To enable the right column, set:
- *   NEXT_PUBLIC_FEATURE_CRYPTO_HISTORY=1
- * If the flag is not "1", this component renders exactly like before (single column).
+ * Props:
+ *   - days: number (default 14)   -> football lookback
+ *   - ymd:  string (YYYY-MM-DD)   -> crypto day; if omitted, uses today in TZ
  */
-const FEATURE_CRYPTO = process.env.NEXT_PUBLIC_FEATURE_CRYPTO_HISTORY === "1";
+
 const TZ = (process.env.NEXT_PUBLIC_TZ_DISPLAY || "Europe/Belgrade").trim() || "Europe/Belgrade";
 
 function ymdInTZ(date, tz = TZ) {
@@ -36,6 +36,8 @@ function coalesceArray(x) {
   }
   return [];
 }
+
+const isValidYmd = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 
 // --- Small helpers to format football items robustly (works with several shapes) ---
 function getFixtureId(it) {
@@ -68,7 +70,7 @@ function getResult(it) {
   return it?.result || (typeof it?.won !== "undefined" ? (it.won ? "win" : "loss") : null);
 }
 
-export default function HistoryPanel({ days = 14 }) {
+export default function HistoryPanel({ days = 14, ymd }) {
   const [items, setItems] = useState([]);
   const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -101,12 +103,11 @@ export default function HistoryPanel({ days = 14 }) {
     return () => ac.abort();
   }, [days]);
 
-  // --- Crypto (optional right column) ---
-  const dayYmd = useMemo(() => ymdInTZ(new Date()), []);
+  // --- Crypto (right column) ---
+  const dayYmd = useMemo(() => (isValidYmd(ymd) ? ymd : ymdInTZ(new Date())), [ymd]);
   const [cryptoData, setCryptoData] = useState(null);
 
   useEffect(() => {
-    if (!FEATURE_CRYPTO) return;
     const ac = new AbortController();
     (async () => {
       try {
@@ -145,13 +146,13 @@ export default function HistoryPanel({ days = 14 }) {
           const pick = getPick(it);
           const price = getPrice(it);
           const result = getResult(it);
-          const ymd = it?.ymd || (k ? ymdInTZ(k) : null);
+          const ymdItem = it?.ymd || (k ? ymdInTZ(k) : null);
 
           return (
             <div key={id} className="py-3">
               <div className="flex items-baseline justify-between">
                 <div className="font-medium">{title}</div>
-                <div className="text-xs opacity-70">{ymd || ""}</div>
+                <div className="text-xs opacity-70">{ymdItem || ""}</div>
               </div>
               <div className="text-slate-300">
                 {market}
@@ -167,12 +168,7 @@ export default function HistoryPanel({ days = 14 }) {
     </div>
   );
 
-  if (!FEATURE_CRYPTO) {
-    // Exact same single-column behavior as before
-    return FootballList;
-  }
-
-  // Two columns: left football, right crypto
+  // Always two columns: left football, right crypto
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       <div className="min-w-0">{FootballList}</div>
