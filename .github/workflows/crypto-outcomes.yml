@@ -1,0 +1,33 @@
+name: Crypto Outcomes (settle)
+
+on:
+  schedule:
+    - cron: "10 * * * *"   # na svakoj punoj uri u :10 (UTC)
+  workflow_dispatch: {}     # ručni trigger iz Actions taba
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate secrets
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          CRON_KEY: ${{ secrets.CRON_KEY }}
+        run: |
+          set -e
+          if [ -z "$BASE_URL" ]; then
+            echo "ERROR: BASE_URL secret is missing."; exit 1; fi
+          if [ -z "$CRON_KEY" ]; then
+            echo "ERROR: CRON_KEY secret is missing."; exit 1; fi
+          if ! echo "$BASE_URL" | grep -Eq '^https?://'; then
+            echo "ERROR: BASE_URL must include scheme (https://). Current: '$BASE_URL'"; exit 1; fi
+
+      - name: Settle crypto signals
+        env:
+          BASE_URL: ${{ secrets.BASE_URL }}
+          CRON_KEY: ${{ secrets.CRON_KEY }}
+        run: |
+          set -e
+          curl --fail --show-error --silent \
+            "$BASE_URL/api/cron/crypto-outcomes?key=$CRON_KEY" \
+            | tee /dev/stderr
