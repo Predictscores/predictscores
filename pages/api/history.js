@@ -1,128 +1,85 @@
 // pages/api/history.js
-// History prikazuje SAMO Combined (Top 3 po danu):
-// 1) čita hist:<YMD> (građeno iz combined u apply-learning)
-// 2) fallback: vb:day:<YMD>:combined (ako hist još ne postoji)
-// Vraća i `items` i `history` (isti niz), + `count`.
+export const config = { api: { bodyParser: false } };
 
-export const config = { runtime: "nodejs" };
-
-function kvEnv() {
-  const url =
-    process.env.KV_REST_API_URL ||
-    process.env.UPSTASH_REDIS_REST_URL ||
-    process.env.KV_URL ||
-    "";
-  const token =
-    process.env.KV_REST_API_TOKEN ||
-    process.env.UPSTASH_REDIS_REST_TOKEN ||
-    process.env.KV_REST_API_READ_ONLY_TOKEN ||
-    "";
-  return { url, token };
-}
-async function kvGetRaw(key) {
-  const { url, token } = kvEnv();
-  if (!url || !token) return null;
-  try {
-    const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
-      headers: { Authorization: `Bearer ${token}` },
-      cache: "no-store",
-    });
-    if (!r.ok) return null;
-    const j = await r.json().catch(() => null);
-    if (!j || typeof j.result === "undefined") return null;
-    return j.result;
-  } catch { return null; }
-}
-async function kvGetJSON(key) {
-  const raw = await kvGetRaw(key);
-  if (raw == null) return null;
-  if (typeof raw === "string") {
-    const s = raw.trim();
-    if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
-      try { return JSON.parse(s); } catch { return raw; }
-    }
-    return raw;
-  }
-  return raw;
-}
-
-function ymd(d = new Date()) { return d.toISOString().slice(0, 10); }
-function daysArray(n) {
-  const out = []; const today = new Date();
-  for (let i = 0; i < n; i++) { const d = new Date(today); d.setDate(d.getDate() - i); out.push(ymd(d)); }
+/* ---------- KV ---------- */
+function kvBackends() {
+  const out = [];
+  const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
+  const bU = process.env.UPSTASH_REDIS_REST_URL, bT = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (aU && aT) out.push({ flavor:"vercel-kv", url:aU.replace(/\/+$/,""), tok:aT });
+  if (bU && bT) out.push({ flavor:"upstash-redis", url:bU.replace(/\/+$/,""), tok:bT });
   return out;
 }
-
-function coercePick(it, d) {
-  const home = it.home || it?.teams?.home || "";
-  const away = it.away || it?.teams?.away || "";
-  const market = it.market || it.market_label || "";
-  const rawPick = it.pick ?? it.selection ?? it.selection_label ?? it.pick_code;
-  const pick =
-    typeof rawPick === "string" ? rawPick :
-    it?.pick_code === "1" ? "Home" :
-    it?.pick_code === "2" ? "Away" :
-    it?.pick_code === "X" ? "Draw" : String(rawPick || "");
-  const price = Number(it?.odds?.price);
-  const result = (it.outcome || it.result || "").toString().toUpperCase();
-  return {
-    ...it,
-    home, away, market,
-    pick, selection: pick,
-    odds: Number.isFinite(price) ? { price } : it.odds || {},
-    result,
-    _day: it._day || d,
-    _source: it._source || "combined",
-  };
+async function kvGETraw(key, trace) {
+  for (const b of kvBackends()) {
+    try {
+      const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`,{ headers:{ Authorization:`Bearer ${b.tok}` }, cache:"no-store" });
+      const j = await r.json().catch(()=>null);
+      const raw = typeof j?.result === "string" ? j.result : null;
+      trace && trace.push({ get:key, ok:r.ok, flavor:b.flavor, hit:!!raw });
+      if (!r.ok) continue;
+      return { raw, flavor:b.flavor };
+    } catch (e) { trace && trace.push({ get:key, ok:false, err:String(e?.message||e) }); }
+  }
+  return { raw:null, flavor:null };
 }
-function flattenHistObj(obj, d) {
-  if (!obj) return [];
-  if (Array.isArray(obj)) return obj.map((x) => coercePick(x, d));
-  if (Array.isArray(obj.items)) return obj.items.map((x) => coercePick(x, d));
-  return [];
+
+/* ---------- helpers ---------- */
+const J = s=>{ try{ return JSON.parse(String(s||"")); }catch{ return null; } };
+const isValidYmd = (s)=> /^\d{4}-\d{2}-\d{2}$/.test(String(s||""));
+const onlyMarketsCSV = (process.env.HISTORY_ALLOWED_MARKETS || "h2h").split(",").map(s=>s.trim().toLowerCase()).filter(Boolean);
+const allowSet = new Set(onlyMarketsCSV.length ? onlyMarketsCSV : ["h2h"]);
+const arrFromAny = x => Array.isArray(x) ? x
+  : (x && typeof x==="object" && Array.isArray(x.items)) ? x.items
+  : (x && typeof x==="object" && Array.isArray(x.history)) ? x.history
+  : (x && typeof x==="object" && Array.isArray(x.list)) ? x.list : [];
+const dedupKey = e => `${e?.fixture_id||e?.id||"?"}__${String(e?.market_key||"").toLowerCase()}__${String(e?.pick||"").toLowerCase()}`;
+
+/**
+ * Filtriraj na dozvoljene markete (default: samo h2h), zadrži osnovna polja.
+ */
+function filterAllowed(arr) {
+  const by = new Map();
+  for (const e of (arr||[])) {
+    const mkey = String(e?.market_key||"").toLowerCase();
+    if (!allowSet.has(mkey)) continue;
+    const k = dedupKey(e);
+    if (!by.has(k)) by.set(k, e);
+  }
+  return Array.from(by.values());
 }
 
 export default async function handler(req, res) {
   try {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Cache-Control", "no-store, max-age=0, must-revalidate");
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    const trace = [];
+    const qYmd = String(req.query.ymd||"").trim();
+    const ymd = isValidYmd(qYmd) ? qYmd : null;
 
-    const days = Math.max(1, Math.min(60, Number(req.query.days || 14)));
-    const ymds = daysArray(days);
+    if (!ymd) {
+      return res.status(200).json({ ok:false, error:"Provide ymd=YYYY-MM-DD" });
+    }
 
-    const flat = [];
+    // 1) Primarno: hist:<ymd>
+    const histKey = `hist:${ymd}`;
+    const { raw:rawHist } = await kvGETraw(histKey, trace);
+    const histArr = arrFromAny(J(rawHist));
+    let items = filterAllowed(histArr);
+    let source = items.length ? histKey : null;
 
-    for (const d of ymds) {
-      // 1) primarno hist:<YMD> (već settled iz combined)
-      let hist = await kvGetJSON(`hist:${d}`);
-      let items = flattenHistObj(hist, d);
-
-      // 2) fallback: vb:day:<YMD>:combined (ako hist još nije upisan)
-      if (!items.length) {
-        const combined = await kvGetJSON(`vb:day:${d}:combined`);
-        if (Array.isArray(combined) && combined.length) {
-          items = combined.map((x) => coercePick(x, d));
-        }
-      }
-
-      for (const it of items) flat.push(it);
+    // 2) Fallback: vb:day:<ymd>:combined (ali filtrirano na h2h)
+    if (!items.length) {
+      const combKey = `vb:day:${ymd}:combined`;
+      const { raw:rawComb } = await kvGETraw(combKey, trace);
+      const combArr = arrFromAny(J(rawComb));
+      items = filterAllowed(combArr);
+      source = items.length ? combKey : null;
     }
 
     return res.status(200).json({
-      ok: true,
-      days,
-      count: flat.length,
-      items: flat,
-      history: flat, // kompatibilnost sa UI koji čita .history
+      ok:true, ymd, count: items.length, source, history: items, debug:{ trace, allowed: Array.from(allowSet) }
     });
+
   } catch (e) {
-    return res.status(200).json({
-      ok: false,
-      error: String(e?.message || e),
-      items: [],
-      history: [],
-      count: 0,
-    });
+    return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
 }
