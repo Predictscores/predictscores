@@ -116,7 +116,9 @@ function slotWindowUTC(dayYmd, slot, tz) {
 }
 
 /* ---------- OA pulling ---------- */
-const OA_MARKETS = "h2h,totals,both_teams_to_score,half_time_full_time";
+// CHG: marketi iz ENV-a; default samo ono što Starter plan sigurno podržava
+const OA_MARKETS = process.env.ODDS_API_MARKETS || "h2h,totals";
+
 function normalizeBookName(n){ return strip(n); }
 function pullPriceOA(bookmakers, marketKey, pickPredicate, periodFilter=null) {
   const prices = [];
@@ -163,30 +165,44 @@ function closestByTime(cands, kickoffISO){
   }
   return best;
 }
+
+// CHG: fetchOA sa fallbackom na "h2h,totals" ako API vrati 400 (invalid market)
 async function fetchOA(window, trace) {
   const key = process.env.ODDS_API_KEY;
   if (!key) return { events:[], called:false, ok:false };
+
   const regions = String(process.env.ODDS_API_REGION||"eu").trim() || "eu";
-  const qs = new URLSearchParams({
+  const baseQs = {
     apiKey: key,
     regions: /\beu\b/i.test(regions) ? "eu,uk" : regions,
-    markets: OA_MARKETS,
     oddsFormat: "decimal",
     dateFormat: "iso",
     commenceTimeFrom: window.from.toISOString(),
     commenceTimeTo: window.to.toISOString()
-  });
-  const url = `https://api.the-odds-api.com/v4/sports/soccer/odds?${qs.toString()}`;
-  try {
-    const r = await fetch(url, { cache:"no-store" });
-    const data = await r.json().catch(()=>[]);
-    const events = Array.isArray(data) ? data : [];
-    trace && trace.push({ oa_url:url, oa_ok:r.ok, events:events.length });
-    return { events, called:true, ok:r.ok };
-  } catch(e) {
-    trace && trace.push({ oa_err:String(e?.message||e) });
-    return { events:[], called:true, ok:false };
+  };
+
+  const tryFetch = async (markets) => {
+    const qs = new URLSearchParams({ ...baseQs, markets });
+    const url = `https://api.the-odds-api.com/v4/sports/soccer/odds?${qs.toString()}`;
+    try {
+      const r = await fetch(url, { cache:"no-store" });
+      const data = await r.json().catch(()=>[]);
+      const events = Array.isArray(data) ? data : [];
+      trace && trace.push({ oa_url:url, oa_ok:r.ok, oa_status:r.status, events:events.length });
+      return { ok:r.ok, status:r.status, events };
+    } catch(e) {
+      trace && trace.push({ oa_err:String(e?.message||e) });
+      return { ok:false, status:0, events:[] };
+    }
+  };
+
+  // 1) pokušaj sa onim što je zadato / ENV
+  let res = await tryFetch(OA_MARKETS);
+  // 2) fallback ako je invalid market (400)
+  if (!res.ok && res.status === 400 && OA_MARKETS !== "h2h,totals") {
+    res = await tryFetch("h2h,totals");
   }
+  return { events: res.events, called:true, ok: res.ok };
 }
 
 /* ---------- AF odds pulling (primarno) ---------- */
@@ -427,6 +443,7 @@ export default async function handler(req, res) {
           oaUpdated++;
         }
 
+        // Ovo će ostati prazno na Starter planu (nema tih marketa), ali ne smeta:
         const bttsY = pullPriceOA(books, "both_teams_to_score", o=>/yes/i.test(String(o?.name)));
         const bttsN = pullPriceOA(books, "both_teams_to_score", o=>/no/i.test(String(o?.name)));
         if ([bttsY,bttsN].some(Number.isFinite) && impliedSumOk([bttsY,bttsN]) && inRange(bttsY??1.8,1.25,5.0)) {
