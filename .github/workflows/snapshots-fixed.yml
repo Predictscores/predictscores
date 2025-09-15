@@ -125,9 +125,9 @@ jobs:
             echo "ymd=$YMD"
           } >> "$GITHUB_OUTPUT"
 
-      # 0) Warm — ostaje, ali sada sa ymd da ne piše „sutra“
+      # 0) Warm — PRIVREMENO ISKLJUČEN da ne piše dnevni tickets:<ymd>
       - name: Warm locked-floats (daily tickets & base snapshot)
-        if: steps.ctx.outputs.run == 'true'
+        if: ${{ false }}   # <— jedina funkcionalna promena u fajlu
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
