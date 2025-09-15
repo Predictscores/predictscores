@@ -1,4 +1,4 @@
-// pages/api/cron/refresh-odds.js — per-slot SINGLE OA CALL (15/day safe), OA markets fixed, HT/FT from AF, FH1.5+ included
+// pages/api/cron/refresh-odds.js — FINAL per-slot OA (single call), AF primary, proper OA mapping, safe fallbacks
 export const config = { api: { bodyParser: false } };
 
 /* ---------- TZ (samo TZ_DISPLAY) ---------- */
@@ -8,7 +8,7 @@ function pickTZ() {
 }
 const TZ = pickTZ();
 
-/* ---------- KV helpers (Vercel KV + opcioni Upstash fallback) ---------- */
+/* ---------- KV ---------- */
 function kvBackends() {
   const out = [];
   const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
@@ -61,7 +61,6 @@ function ymdInTZ(d, tz){
   return `${y}-${m}-${da}`;
 }
 function slotWindowUTC(ymd, slot){
-  // Jednostavno: UTC granice datuma
   const base = new Date(`${ymd}T00:00:00Z`);
   const from = new Date(base); const to = new Date(base);
   if (slot==="late") { from.setUTCHours(0);  to.setUTCHours(10); }
@@ -70,28 +69,26 @@ function slotWindowUTC(ymd, slot){
   return { from, to };
 }
 
-/* ---------- Normalizacija imena ---------- */
+/* ---------- Name/market helpers ---------- */
 const strip = s => String(s||"")
   .normalize("NFD").replace(/\p{Diacritic}/gu,"")
   .replace(/[\u2019'`]/g,"")
   .replace(/[^a-z0-9]+/gi," ")
   .trim().toLowerCase();
 
-function normTeamName(name){
-  let n = strip(name)
-    .replace(/\b(fc|cf|sc|ac|fk|bk|sk|afc|bfk)\b/g, " ")
+function normTeamLoose(name){
+  return strip(name)
+    .replace(/\b(fc|cf|sc|ac|afc|bk|fk|sk)\b/g, " ")
     .replace(/\b(women|ladies)\b/g, " ")
     .replace(/\b(u\d{2})\b/g, " ")
-    .replace(/\b(ii|iii|iv)\b/g, " ")
-    .replace(/\b(\d)\b/g, " ")
+    .replace(/\b(ii|iii|iv|v)\b/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  return n;
 }
+function hoursDiff(a,b){ return Math.abs(new Date(a).getTime()-new Date(b).getTime())/36e5; }
+function isFirstHalf(o){ const s=`${o?.name||''} ${o?.description||''}`; return /1st|first/i.test(s); }
 
-function hoursDiff(a, b){ return Math.abs(new Date(a).getTime() - new Date(b).getTime())/36e5; }
-
-/* ---------- Trust i sanity ---------- */
+/* ---------- Trust & sanity ---------- */
 const TRUSTED = (() => {
   const env = String(process.env.TRUSTED_BOOKIES||"").split(",").map(s=>strip(s));
   const def = [
@@ -100,25 +97,10 @@ const TRUSTED = (() => {
   ].map(strip);
   return new Set((env.length?env:def).filter(Boolean));
 })();
-
-const median = arr => {
-  const a = ((arr)||[]).filter(n=>Number.isFinite(n)).sort((x,y)=>x-y);
-  if (!a.length) return null;
-  const m = Math.floor(a.length/2);
-  return a.length%2 ? a[m] : (a[m-1]+a[m])/2;
-};
-function trimMedian(values){
-  const a=(values||[]).filter(Number.isFinite).sort((x,y)=>x-y);
-  if (a.length<=2) return median(a);
-  const cut=Math.max(1, Math.floor(a.length*0.2));
-  return median(a.slice(cut, a.length-cut));
-}
-function impliedSumOk(prices){
-  const inv = (p)=> (Number.isFinite(p)&&p>0)?(1/p):0;
-  const s = (prices||[]).map(inv).reduce((a,b)=>a+b,0);
-  return s>0.9 && s<1.1;
-}
-function inRange(p, lo, hi){ return Number.isFinite(p) && p>=lo && p<=hi; }
+const median = arr => { const a=(arr||[]).filter(Number.isFinite).sort((x,y)=>x-y); if(!a.length) return null; const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; };
+function trimMedian(values){ const a=(values||[]).filter(Number.isFinite).sort((x,y)=>x-y); if(a.length<=2) return median(a); const cut=Math.max(1,Math.floor(a.length*0.2)); return median(a.slice(cut,a.length-cut)); }
+function impliedSumOk(prices){ const inv=p=> (Number.isFinite(p)&&p>0)?1/p:0; const s=(prices||[]).map(inv).reduce((a,b)=>a+b,0); return s>0.9 && s<1.1; }
+function inRange(p,lo,hi){ return Number.isFinite(p)&&p>=lo&&p<=hi; }
 
 /* ---------- API-Football (primarni) ---------- */
 async function fetchAFOddsByFixture(fixId, needFH=false, trace){
@@ -134,170 +116,121 @@ async function fetchAFOddsByFixture(fixId, needFH=false, trace){
 }
 
 /* ---------- The Odds API (backup) — SINGLE CALL PER SLOT ---------- */
-const OA_MARKETS_BASE = (process.env.ODDS_API_MARKETS || "h2h,totals,btts").trim(); // bez ht_ft — često 422
-
+const OA_MARKETS_BASE = (process.env.ODDS_API_MARKETS || "h2h,totals,btts").trim(); // bez ht_ft da izbegnemo 422
 async function fetchOAEvents(trace){
   const apiKey = process.env.ODDS_API_KEY || process.env.THEODDS_API_KEY;
-  if (!apiKey) return { called:false, ok:false, events:[], markets:"none", status:0 };
-  const sport = 'soccer';
+  if (!apiKey) return { called:false, ok:false, events:[], status:0, markets_used:"none" };
+  const sport='soccer';
   const regions = process.env.ODDS_API_REGIONS || 'eu,uk,us';
-
   const tryFetch = async (mk) => {
     const url = `https://api.the-odds-api.com/v4/sports/${sport}/odds?regions=${encodeURIComponent(regions)}&markets=${encodeURIComponent(mk)}&oddsFormat=decimal&dateFormat=iso&apiKey=${encodeURIComponent(apiKey)}`;
     const r = await fetch(url, { cache:'no-store' });
-    const ok = r.ok; const status = r.status; const data = ok ? await r.json() : [];
+    const ok=r.ok, status=r.status; const data = ok? await r.json() : [];
     trace && trace.push({ oa_fetch:{ ok, status, markets:mk, events:Array.isArray(data)?data.length:0 } });
-    return { ok, status, data, markets:mk };
+    return { ok, status, data, mk };
   };
-
-  // 1) probaj bazni skup
   let res = await tryFetch(OA_MARKETS_BASE);
-  // 2) fallback i na 400 i na 422
-  if (!res.ok && (res.status===400 || res.status===422) && OA_MARKETS_BASE!=="h2h,totals") {
-    res = await tryFetch("h2h,totals");
-  }
-  return { called:true, ok:res.ok, events:Array.isArray(res.data)?res.data:[], markets_used:res.markets, status:res.status };
+  if (!res.ok && (res.status===400 || res.status===422) && OA_MARKETS_BASE!=="h2h,totals") res = await tryFetch("h2h,totals");
+  return { called:true, ok:res.ok, events:Array.isArray(res.data)?res.data:[], status:res.status, markets_used:res.mk };
 }
 
-function maybeTrusted(bms){
-  const t = (bms||[]).filter(bm => TRUSTED.has(strip(bm?.title||bm?.key||bm?.name||"")));
-  return t.length ? t : (bms||[]); // ako nema trusted, uzmi sve pa će sanity da preseče
-}
-
-function pullPriceOA(bookmakers, marketKey, outcomePred){
-  const prices = [];
-  for (const bm of maybeTrusted(bookmakers)){
+function maybeTrusted(bms){ const t=(bms||[]).filter(bm=>TRUSTED.has(strip(bm?.title||bm?.key||bm?.name||""))); return t.length?t:(bms||[]); }
+function pullPriceOA(bookmakers, marketKey, pick){
+  const prices=[]; for (const bm of maybeTrusted(bookmakers)){
     for (const mk of (bm?.markets||[])){
       if (String(mk?.key)!==String(marketKey)) continue;
-      for (const o of (mk?.outcomes||[])){
-        if (!outcomePred(o, mk)) continue;
-        const price = Number(o?.price ?? o?.odds ?? o?.decimal ?? o?.value);
-        if (Number.isFinite(price)) prices.push(price);
-      }
+      for (const o of (mk?.outcomes||[])) if (pick(o,mk)) { const p=Number(o?.price ?? o?.odds ?? o?.decimal ?? o?.value); if (Number.isFinite(p)) prices.push(p); }
     }
   }
-  if (!prices.length) return null;
-  if (prices.length>4){ prices.sort((a,b)=>a-b); prices.shift(); prices.pop(); }
-  return trimMedian(prices);
+  if(!prices.length) return null; if(prices.length>4){ prices.sort((a,b)=>a-b); prices.shift(); prices.pop(); } return trimMedian(prices);
 }
-
-function isFirstHalf(o){ const s = `${o?.name||''} ${o?.description||''}`; return /1st|first/i.test(s); }
-
 function matchOAEvent(oaEvents, home, away, kickoffISO){
-  const H = normTeamName(home), A = normTeamName(away);
-  let best=null, bestScore=1e9;
+  const H=normTeamLoose(home), A=normTeamLoose(away); let best=null, bestScore=1e9;
   for (const ev of (oaEvents||[])){
-    const eh = normTeamName(ev?.home_team || ev?.homeTeam || ev?.teams?.home);
-    const ea = normTeamName(ev?.away_team || ev?.awayTeam || ev?.teams?.away);
-    if (!eh || !ea) continue;
-    const homeOk = eh.includes(H) || H.includes(eh);
-    const awayOk = ea.includes(A) || A.includes(ea);
-    if (!homeOk || !awayOk) continue;
-    const diff = hoursDiff(kickoffISO, ev?.commence_time);
-    if (diff <= 6 && diff < bestScore){ bestScore=diff; best=ev; }
+    const eh=normTeamLoose(ev?.home_team || ev?.homeTeam || ev?.teams?.home);
+    const ea=normTeamLoose(ev?.away_team || ev?.awayTeam || ev?.teams?.away);
+    if(!eh||!ea) continue; const homeOk=eh.includes(H)||H.includes(eh); const awayOk=ea.includes(A)||A.includes(ea); if(!homeOk||!awayOk) continue;
+    const diff=hoursDiff(kickoffISO, ev?.commence_time); if(diff<=6 && diff<bestScore){ bestScore=diff; best=ev; }
   }
   return best;
 }
-
 function enrichFromOA(event, markets){
   const books = event?.bookmakers || [];
-  // OU 2.5
-  const ouO = pullPriceOA(books, 'totals', o=>/(^|\b)over\s*2\.?5\b/i.test(String(o?.name||'')));
-  const ouU = pullPriceOA(books, 'totals', o=>/(^|\b)under\s*2\.?5\b/i.test(String(o?.name||'')));
+  const ouO = pullPriceOA(books, 'totals', o=>/(^|\b)over\s*2\.?5\b/i.test(String(o?.name||o?.description||'')));
+  const ouU = pullPriceOA(books, 'totals', o=>/(^|\b)under\s*2\.?5\b/i.test(String(o?.name||o?.description||'')));
   if ((Number.isFinite(ouO)||Number.isFinite(ouU)) && impliedSumOk([ouO,ouU])) markets.ou25 = { over:ouO??null, under:ouU??null };
-  // FH OU 1.5 (1st/First Half)
-  const fhO = pullPriceOA(books, 'totals', o=>isFirstHalf(o) && /(\bover\s*1\.?5\b)/i.test(String(o?.name||'')));
-  const fhU = pullPriceOA(books, 'totals', o=>isFirstHalf(o) && /(\bunder\s*1\.?5\b)/i.test(String(o?.name||'')));
+  const fhO = pullPriceOA(books, 'totals', o=>isFirstHalf(o) && /(\bover\s*1\.?5\b)/i.test(String(o?.name||o?.description||'')));
+  const fhU = pullPriceOA(books, 'totals', o=>isFirstHalf(o) && /(\bunder\s*1\.?5\b)/i.test(String(o?.name||o?.description||'')));
   if ((Number.isFinite(fhO)||Number.isFinite(fhU)) && impliedSumOk([fhO,fhU])) markets.fh_ou15 = { over:fhO??null, under:fhU??null };
-  // BTTS
-  const bttsY = pullPriceOA(books, 'btts', o=>/yes/i.test(String(o?.name||'')));
-  const bttsN = pullPriceOA(books, 'btts', o=>/no/i.test(String(o?.name||'')));
+  const bttsY = pullPriceOA(books, 'btts', o=>/yes/i.test(String(o?.name)));
+  const bttsN = pullPriceOA(books, 'btts', o=>/no/i.test(String(o?.name)));
   if ([bttsY,bttsN].some(Number.isFinite) && impliedSumOk([bttsY,bttsN])) markets.btts = { yes:bttsY??null, no:bttsN??null };
-  // HT/FT — OA često nema; AF je primarni izvor za htft
 }
-
-function mergeMarkets(orig, add){
-  const out = { ...(orig||{}) };
-  for (const k of Object.keys(add||{})) out[k] = { ...(orig?.[k]||{}), ...(add?.[k]||{}) };
-  return out;
-}
+function mergeMarkets(orig, add){ const out={...(orig||{})}; for(const k of Object.keys(add||{})) out[k]={...(orig?.[k]||{}), ...(add?.[k]||{})}; return out; }
 
 /* ---------- Handler ---------- */
 export default async function handler(req, res){
-  const t0 = Date.now();
-  const trace = [];
-  try {
-    const slot = String(req.query.slot||'pm').toLowerCase();
-    const today = ymdInTZ(new Date(), TZ);
-    const ymd = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.ymd||'')) ? String(req.query.ymd) : today;
+  const t0 = Date.now(); const trace=[];
+  try{
+    const slot=String(req.query.slot||'pm').toLowerCase();
+    const today=ymdInTZ(new Date(), TZ);
+    const ymd=/^\d{4}-\d{2}-\d{2}$/.test(String(req.query.ymd||''))? String(req.query.ymd) : today;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(String(req.query.ymd||''))) trace.push({ warn:'ymd_placeholder_or_missing', used:ymd });
 
-    const window = slotWindowUTC(ymd, slot);
+    const unionKey=`vb:day:${ymd}:${slot}`; const fullKey=`vbl_full:${ymd}:${slot}`;
+    const union=await kvGETjson(unionKey, trace)||{items:[]}; const full=await kvGETjson(fullKey, trace)||{items:[]};
+    const items = (Array.isArray(union?.items) && union.items.length>0) ? union.items : (Array.isArray(full?.items)? full.items : []);
+    trace.push({ items_len: items.length });
 
-    const unionKey = `vb:day:${ymd}:${slot}`;
-    const fullKey  = `vbl_full:${ymd}:${slot}`;
-
-    const union = await kvGETjson(unionKey, trace) || { items:[] };
-    const full  = await kvGETjson(fullKey,  trace) || { items:[] };
-
-    const items = (union?.items?.length ? union.items : full.items) || [];
-
-    // ---- SINGLE OA CALL for this slot ----
-    const oa = await fetchOAEvents(trace); // trace sadrži status i markets_used
+    // Jedan OA fetch za ceo slot
+    const oa = await fetchOAEvents(trace);
 
     let afUpdated=0, oaUpdated=0, miss=0;
 
     for (const it of items){
-      const fixture_id = it?.fixture_id || it?.id || it?.fixtureId;
+      const fixture_id = it?.fixture_id || it?.id || it?.fixtureId; if(!fixture_id){ miss++; continue; }
       const home = it?.home || it?.teams?.home || it?.team_home || it?.home_name;
       const away = it?.away || it?.teams?.away || it?.team_away || it?.away_name;
       const kickoffISO = it?.kickoff_utc || it?.kickoff || it?.datetime_utc || it?.date || null;
-      if (!fixture_id || !home || !away || !kickoffISO){ miss++; continue; }
+      if (!home || !away || !kickoffISO){ miss++; continue; }
 
       const markets = { ...(it?.markets||{}) };
 
-      // API-Football — primarni (uklj. HT/FT)
-      try {
+      // --- AF primarni ---
+      try{
         const af = await fetchAFOddsByFixture(fixture_id, true, trace);
         for (const p of (af?.payload||[])){
           for (const r of (p?.response||[])){
             for (const bk of (r?.bookmakers||[])){
-              const bmName = strip(bk?.name||bk?.title||bk?.key||'');
-              const allow = process.env.ODDS_TRUSTED_ONLY==='1' ? TRUSTED.has(bmName) : true;
-              if (!allow) continue;
+              const bkName = strip(bk?.name||bk?.title||bk?.key||'');
+              const allow = process.env.ODDS_TRUSTED_ONLY==='1' ? TRUSTED.has(bkName) : true; if(!allow) continue;
               for (const bet of (bk?.bets||[])){
-                const label = String(bet?.name||'').toLowerCase();
-                // 1X2
-                if (/match winner|1x2/.test(label)){
+                const label=String(bet?.name||'').toLowerCase();
+                if(/match winner|1x2/.test(label)){
                   const h = Number(bet?.values?.find(v=>/home|1/i.test(v?.value))?.odd);
                   const a = Number(bet?.values?.find(v=>/away|2/i.test(v?.value))?.odd);
-                  if ((Number.isFinite(h)||Number.isFinite(a)) && impliedSumOk([h,a]) && inRange(h??1.8,1.15,10) && inRange(a??1.8,1.15,10)){
-                    markets['1x2'] = { home:h??null, away:a??null }; afUpdated++;
-                  }
+                  if ((Number.isFinite(h)||Number.isFinite(a)) && impliedSumOk([h,a]) && inRange(h??1.8,1.15,10) && inRange(a??1.8,1.15,10)) { markets['1x2']={home:h??null, away:a??null}; afUpdated++; }
                 }
-                // BTTS
-                if (/both teams to score|btts/.test(label)){
+                if(/both teams to score|btts/.test(label)){
                   const yes = Number(bet?.values?.find(v=>/yes/i.test(v?.value))?.odd);
                   const no  = Number(bet?.values?.find(v=>/no/i.test(v?.value))?.odd);
-                  if ([yes,no].some(Number.isFinite) && impliedSumOk([yes,no])){ markets['btts'] = { yes:yes??null, no:no??null }; afUpdated++; }
+                  if ([yes,no].some(Number.isFinite) && impliedSumOk([yes,no])) { markets['btts']={ yes:yes??null, no:no??null }; afUpdated++; }
                 }
-                // OU (uklj. FH 1.5 ako je označeno kao 1st Half)
-                if (/totals|over\/under|goals/.test(label)){
-                  const over25 = Number(bet?.values?.find(v=>/(^|\s)over\s*2\.5/i.test(v?.value))?.odd);
-                  const under25= Number(bet?.values?.find(v=>/(^|\s)under\s*2\.5/i.test(v?.value))?.odd);
-                  if ((Number.isFinite(over25)||Number.isFinite(under25)) && impliedSumOk([over25,under25])){ markets['ou25'] = { over:over25??null, under:under25??null }; afUpdated++; }
-                  const isFH = /1st half|first half|fh/i.test(label);
+                if(/totals|over\/under|goals/.test(label)){
+                  const over25=Number(bet?.values?.find(v=>/(^|\s)over\s*2\.5/i.test(v?.value))?.odd);
+                  const under25=Number(bet?.values?.find(v=>/(^|\s)under\s*2\.5/i.test(v?.value))?.odd);
+                  if ((Number.isFinite(over25)||Number.isFinite(under25)) && impliedSumOk([over25,under25])) { markets['ou25']={ over:over25??null, under:under25??null }; afUpdated++; }
+                  const isFH=/1st half|first half|fh/i.test(label);
                   if (isFH){
-                    const ouO = Number(bet?.values?.find(v=>/(^|\s)over\s*1\.5/i.test(v?.value))?.odd);
-                    const ouU = Number(bet?.values?.find(v=>/(^|\s)under\s*1\.5/i.test(v?.value))?.odd);
-                    if ((Number.isFinite(ouO)||Number.isFinite(ouU)) && impliedSumOk([ouO,ouU])){ markets['fh_ou15'] = { over:ouO??null, under:ouU??null }; afUpdated++; }
+                    const ouO=Number(bet?.values?.find(v=>/(^|\s)over\s*1\.5/i.test(v?.value))?.odd);
+                    const ouU=Number(bet?.values?.find(v=>/(^|\s)under\s*1\.5/i.test(v?.value))?.odd);
+                    if ((Number.isFinite(ouO)||Number.isFinite(ouU)) && impliedSumOk([ouO,ouU])) { markets['fh_ou15']={ over:ouO??null, under:ouU??null }; afUpdated++; }
                   }
                 }
-                // HT/FT
-                if (/half time\/full time|ht\/ft|htft/.test(label)){
+                if(/half time\/full time|ht\/ft|htft/.test(label)){
                   const hh = Number(bet?.values?.find(v=>/home\/?home/i.test(v?.value))?.odd);
                   const aa = Number(bet?.values?.find(v=>/away\/?away/i.test(v?.value))?.odd);
-                  if ((Number.isFinite(hh)&&inRange(hh,3,40)) || (Number.isFinite(aa)&&inRange(aa,3,40))){ markets['htft'] = { hh:hh??null, aa:aa??null }; afUpdated++; }
+                  if ((Number.isFinite(hh)&&inRange(hh,3,40)) || (Number.isFinite(aa)&&inRange(aa,3,40))) { markets['htft']={ hh:hh??null, aa:aa??null }; afUpdated++; }
                 }
               }
             }
@@ -305,14 +238,14 @@ export default async function handler(req, res){
         }
       } catch(e){ trace.push({ af_parse_error:String(e?.message||e) }); }
 
-      // OA fallback — iskoristi već preuzete evente
-      try {
+      // --- OA fallback (koristi JEDAN payload, mapiraj event na fixture) ---
+      try{
         if (oa?.ok && Array.isArray(oa.events) && oa.events.length){
           const ev = matchOAEvent(oa.events, home, away, kickoffISO);
           if (ev){
             const before = JSON.stringify(markets);
             enrichFromOA(ev, markets);
-            const after = JSON.stringify(markets);
+            const after  = JSON.stringify(markets);
             if (before!==after) oaUpdated++;
           }
         }
@@ -321,16 +254,12 @@ export default async function handler(req, res){
       it.markets = mergeMarkets(it.markets, markets);
     }
 
-    // Sačuvaj nazad
-    const outFull = { ...(full||{}), items };
-    await kvSET(fullKey, outFull, trace);
-    const unionOut = { ...(union||{}), items };
-    await kvSET(unionKey, unionOut, trace);
+    const outFull = { ...(full||{}), items }; await kvSET(fullKey, outFull, trace);
+    const unionOut = { ...(union||{}), items }; await kvSET(unionKey, unionOut, trace);
 
     const took = Date.now()-t0;
-    return res.status(200).json({ ok:true, ymd, slot, af_updated:afUpdated, oa_updated:oaUpdated, took_ms:took, miss, oa_markets_used:oa?.markets_used, oa_status:oa?.status, trace });
+    return res.status(200).json({ ok:true, ymd, slot, af_updated:afUpdated, oa_updated:oaUpdated, took_ms:took, trace, oa_status:oa?.status, oa_markets_used:oa?.markets_used });
   } catch (e){
-    const took = Date.now()-t0;
-    return res.status(500).json({ ok:false, error:String(e?.message||e), took_ms:took });
+    const took = Date.now()-t0; return res.status(500).json({ ok:false, error:String(e?.message||e), took_ms:took });
   }
 }
