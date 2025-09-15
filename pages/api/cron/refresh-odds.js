@@ -93,7 +93,8 @@ const TRUSTED = (() => {
   const env = String(process.env.TRUSTED_BOOKIES||"").split(",").map(s=>strip(s));
   const def = [
     "bet365","pinnacle","williamhill","marathonbet","unibet","888sport","skybet","betfair","betway",
-    "ladbrokes","coral","bwin","leon","parimatch","10bet","1xbet","betano","stake","tipsport","efbet","parionsport","toto"
+    "ladbrokes","coral","bwin","leon","parimatch","10bet",
+    "1xbet","betano","stake","tipsport","efbet","parionsport","toto"
   ].map(strip);
   return new Set((env.length?env:def).filter(Boolean));
 })();
