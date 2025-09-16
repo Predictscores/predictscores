@@ -65,16 +65,15 @@ function consensusPrice(list){ const m=median(list); if (Number.isFinite(m)) ret
  *  ENV / time helpers
  * ========================= */
 const TZ = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
-const SLOT_CAP_LATE = Number(process.env.SLOT_ODDS_CAP_LATE || 1200);
-const SLOT_CAP_AM   = Number(process.env.SLOT_ODDS_CAP_AM   || 2400);
-const SLOT_CAP_PM   = Number(process.env.SLOT_ODDS_CAP_PM   || 2400);
+const SLOT_ODDS_CAP_LATE = Number(process.env.SLOT_ODDS_CAP_LATE || 1200);
+const SLOT_ODDS_CAP_AM   = Number(process.env.SLOT_ODDS_CAP_AM   || 2400);
+const SLOT_ODDS_CAP_PM   = Number(process.env.SLOT_ODDS_CAP_PM   || 2400);
 const BACKOFF_MINUTES_EMPTY = Number(process.env.ODDS_BACKOFF_MINUTES || 25);
-const MIN_ODDS = Number(process.env.MIN_ODDS || 1.50);
 
 const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
 const hourInTZ = (d, tz) => Number(new Intl.DateTimeFormat("en-GB",{ timeZone:tz, hour12:false, hour:"2-digit"}).format(d));
 function pickSlot(now) { const h=hourInTZ(now,TZ); return h<10?"late":h<15?"am":"pm"; }
-function capForSlot(slot){ if (slot==="late") return SLOT_CAP_LATE; if (slot==="am") return SLOT_CAP_AM; return SLOT_CAP_PM; }
+function capForSlot(slot){ if (slot==="late") return SLOT_ODDS_CAP_LATE; if (slot==="am") return SLOT_ODDS_CAP_AM; return SLOT_ODDS_CAP_PM; }
 function leagueTier(leagueName=""){ const s=String(leagueName).toLowerCase(); if(/uefa|champions|europa|conference/.test(s))return 1; if(/premier league|la liga|serie a|bundesliga|ligue 1|eredivisie|primeira|championship|mls/.test(s))return 2; return 3; }
 
 /* =========================
@@ -213,17 +212,26 @@ export default async function handler(req, res){
     let slot = String(req.query.slot||"auto").toLowerCase();
     if (!["late","am","pm"].includes(slot)) slot = pickSlot(now);
 
-    const apiKey = process.env.APIFOOTBALL_KEY;
-    if (!apiKey) return res.status(200).json({ ok:false, error:"APIFOOTBALL_KEY missing" });
+    // READ API KEY — supports your 'API_FOOTBALL_KEY'
+    const apiKey =
+      process.env.APIFOOTBALL_KEY ||
+      process.env.API_FOOTBALL_KEY ||
+      process.env.APISPORTS_KEY ||
+      process.env.APISPORTS_API_KEY ||
+      process.env.X_APISPORTS_KEY;
+    if (!apiKey) {
+      return res.status(200).json({
+        ok:false,
+        error:"API-Football key missing (tried: APIFOOTBALL_KEY, API_FOOTBALL_KEY, APISPORTS_KEY, APISPORTS_API_KEY, X_APISPORTS_KEY)"
+      });
+    }
 
     const unionKey = `vb:day:${ymd}:${slot}`;
     const fullKey  = `vbl_full:${ymd}:${slot}`;
     const union = kvToItems(await kvGET(unionKey, trace));
     const full  = kvToItems(await kvGET(fullKey,  trace));
 
-    const byId = new Map();
     const items = (full.items.length ? full.items : union.items).slice();
-    for (const f of items) byId.set(f.fixture_id || f.fixture?.id, f);
 
     // Prioritet: bez markets prvo, pa UEFA/top5
     items.sort((a,b)=>{
@@ -247,7 +255,7 @@ export default async function handler(req, res){
         skipped++; continue;
       }
 
-      // backoff kad AF vrati prazno
+      // backoff kada AF ranije vrati prazno
       const missKey = `af:miss:${id}`;
       const missRaw = await kvGET(missKey, trace);
       if (missRaw && typeof missRaw === "string") {
