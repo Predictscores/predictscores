@@ -1,108 +1,167 @@
 // pages/api/cron/rebuild.js
 export const config = { api: { bodyParser: false } };
 
-/* TZ */
-function pickTZ(){ const raw=(process.env.TZ_DISPLAY||"Europe/Belgrade").trim(); try{ new Intl.DateTimeFormat("en-GB",{timeZone:raw}); return raw; }catch{ return "Europe/Belgrade"; } }
+/* ---------- TZ helpers ---------- */
+function pickTZ() {
+  const raw = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
+  try { new Intl.DateTimeFormat("en-GB", { timeZone: raw }); return raw; } catch { return "Europe/Belgrade"; }
+}
 const TZ = pickTZ();
+const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
+const hourInTZ = (d, tz) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour12:false, hour:"2-digit" }).format(d));
 
-/* KV */
-function kvBackends(){ const out=[]; const aU=process.env.KV_REST_API_URL, aT=process.env.KV_REST_API_TOKEN; const bU=process.env.UPSTASH_REDIS_REST_URL, bT=process.env.UPSTASH_REDIS_REST_TOKEN; if(aU&&aT) out.push({flavor:"vercel-kv",url:aU.replace(/\/+$/,""),tok:aT}); if(bU&&bT) out.push({flavor:"upstash-redis",url:bU.replace(/\/+$/,""),tok:bT}); return out; }
-async function kvGETraw(key){ for(const b of kvBackends()){ try{ const r=await fetch(`${b.url}/get/${encodeURIComponent(key)}`,{headers:{Authorization:`Bearer ${b.tok}`},cache:"no-store"}); if(!r.ok) continue; const j=await r.json().catch(()=>null); const val=typeof j?.result==="string"?j.result:null; if(val) return {raw:val,flavor:b.flavor}; }catch{} } return {raw:null,flavor:null}; }
-async function kvSET(key,val){ const saves=[]; const body=(typeof val==="string")?val:JSON.stringify(val); for(const b of kvBackends()){ try{ const r=await fetch(`${b.url}/set/${encodeURIComponent(key)}`,{method:"POST",headers:{Authorization:`Bearer ${b.tok}`,"Content-Type":"application/json"},cache:"no-store",body}); saves.push({flavor:b.flavor,ok:r.ok}); }catch(e){ saves.push({flavor:b.flavor,ok:false,error:String(e?.message||e)}); } } return saves; }
+/* ---------- KV (Vercel KV or Upstash REST) ---------- */
+function kvBackends() {
+  const out = [];
+  const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
+  const bU = process.env.UPSTASH_REDIS_REST_URL, bT = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (aU && aT) out.push({ flavor:"vercel-kv", url:aU.replace(/\/+$/,""), tok:aT });
+  if (bU && bT) out.push({ flavor:"upstash-redis", url:bU.replace(/\/+$/,""), tok:bT });
+  return out;
+}
+async function kvGET(key, trace=[]) {
+  for (const b of kvBackends()) {
+    try {
+      const u = `${b.url}/get/${encodeURIComponent(key)}`;
+      const r = await fetch(u, { headers: { Authorization: `Bearer ${b.tok}` }, cache:"no-store" });
+      if (!r.ok) continue;
+      const j = await r.json().catch(()=>null);
+      const v = j?.result ?? j?.value ?? null;
+      if (v==null) continue;
+      const out = typeof v==="string" ? JSON.parse(v) : v;
+      trace.push({kv:"hit", key, flavor:b.flavor, size: (Array.isArray(out?.items)?out.items.length: (Array.isArray(out)?out.length:0))});
+      return out;
+    } catch {}
+  }
+  trace.push({kv:"miss", key});
+  return null;
+}
+async function kvSET(key, val, trace=[]) {
+  const saves = [];
+  for (const b of kvBackends()) {
+    try {
+      const body = typeof val==="string" ? val : JSON.stringify(val);
+      const u = `${b.url}/set/${encodeURIComponent(key)}`;
+      const r = await fetch(u, { method:"POST", headers:{ "Content-Type":"application/json", Authorization:`Bearer ${b.tok}` }, body: JSON.stringify({ value: body }) });
+      saves.push({ key, flavor:b.flavor, ok:r.ok });
+    } catch (e) {
+      saves.push({ key, flavor:b.flavor, ok:false, error:String(e?.message||e) });
+    }
+  }
+  trace.push({kv:"set", key, saves});
+  return saves;
+}
 
-const J=s=>{ try{ return JSON.parse(String(s||"")); }catch{ return null; } };
-const ymdInTZ=(d,tz)=>new Intl.DateTimeFormat("en-CA",{timeZone:tz}).format(d);
-const hourInTZ=(d,tz)=>Number(new Intl.DateTimeFormat("en-GB",{timeZone:tz,hour12:false,hour:"2-digit"}).format(d));
+/* ---------- API-Football thin wrapper (uses official header) ---------- */
+const { afFetch } = require("../../../lib/sources/apiFootball");
+
+/* ---------- utils ---------- */
 function canonicalSlot(x){ x=String(x||"auto").toLowerCase(); return x==="late"||x==="am"||x==="pm"?x:"auto"; }
-function autoSlot(d,tz){ const h=hourInTZ(d,tz); return h<10?"late":(h<15?"am":"pm"); }
+function isYouthLeague(name=""){ name=String(name||"").toLowerCase(); return /(u-?\d{2}|youth|reserve|women|futsal)/.test(name); }
+function kickoffISOFromAF(fix){ return fix?.fixture?.date || null; }
+function leagueFromAF(fix){ return { id: fix?.league?.id, name: fix?.league?.name, country: fix?.league?.country, season: fix?.league?.season }; }
+function teamsFromAF(fix){ return { home: fix?.teams?.home?.name, away: fix?.teams?.away?.name, home_id: fix?.teams?.home?.id, away_id: fix?.teams?.away?.id }; }
 
-const confidence=it=>Number.isFinite(it?.confidence_pct)?it.confidence_pct:(Number(it?.confidence)||0);
-const kickoffFromMeta=it=>{ const k=it?.fixture?.date||it?.fixture_date||it?.kickoff||it?.kickoff_utc||it?.ts; const d=k?new Date(k):null; return Number.isFinite(d?.getTime?.())?d:null; };
-const byConfKick=(a,b)=>(confidence(b)-confidence(a))||((kickoffFromMeta(a)?.getTime()||0)-(kickoffFromMeta(b)?.getTime()||0));
-
-function isYouthLeague(name){
-  const n=String(name||"");
-  if(/\bU(?:\s|-)?(?:15|16|17|18|19|20|21|22|23)\b/i.test(n)) return true;
-  if(/\bYouth|Reserves?|Primavera|U-\d{2}\b/i.test(n)) return true;
-  if(/U\d\d/.test(n)) return true;
-  return false;
+function slotFilter(dateISO, slot){
+  if(!dateISO) return false;
+  const d = new Date(dateISO);
+  const h = hourInTZ(d, TZ);
+  if (slot==="late") return h < 10;
+  if (slot==="am")   return h >= 10 && h < 15;
+  if (slot==="pm")   return h >= 15;
+  return true;
 }
-function isUefa(name,country){
-  const n=String(name||""); const c=String(country||"");
-  return /UEFA|Champions League|Europa League|Conference League|European Championship|Euro Qual/i.test(n) || /Europe/i.test(c);
+function perLeagueCap(slot, isWeekend){
+  const CAP_LATE = Number(process.env.CAP_LATE)||6;
+  const CAP_AM_WD = Number(process.env.CAP_AM_WD)||15;
+  const CAP_PM_WD = Number(process.env.CAP_PM_WD)||15;
+  const CAP_AM_WE = Number(process.env.CAP_AM_WE)||20;
+  const CAP_PM_WE = Number(process.env.CAP_PM_WE)||20;
+  if (slot==="late") return CAP_LATE;
+  if (!isWeekend) return slot==="am" ? CAP_AM_WD : CAP_PM_WD;
+  return slot==="am" ? CAP_AM_WE : CAP_PM_WE;
 }
-function isWeekendYmd(ymd,tz){ const [y,m,d]=ymd.split("-").map(Number); const dt=new Date(Date.UTC(y,m-1,d)); const wd=new Intl.DateTimeFormat("en-US",{timeZone:tz,weekday:"short"}).format(dt); return wd==="Sat"||wd==="Sun"; }
-function capsFor(slot,weekend){
-  const capLate=Number(process.env.CAP_LATE||6);
-  const capAmWd=Number(process.env.CAP_AM_WD||15);
-  const capPmWd=Number(process.env.CAP_PM_WD||15);
-  const capAmWe=Number(process.env.CAP_AM_WE||20);
-  const capPmWe=Number(process.env.CAP_PM_WE||20);
-  if(slot==="late") return capLate;
-  if(!weekend) return slot==="am"?capAmWd:capPmWd;
-  return slot==="am"?capAmWe:capPmWe;
+function isWeekendYmd(ymd, tz){
+  const [y,m,d]=ymd.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m-1, d, 12, 0, 0));
+  const w = new Intl.DateTimeFormat("en-GB",{ timeZone:tz, weekday:"short"}).format(dt).toLowerCase();
+  return w==="sat"||w==="sun";
 }
 
-const hasAnyTickets = obj => !!(obj && ((obj.btts?.length||0)+(obj.ou25?.length||0)+(obj.htft?.length||0)>0));
-
-export default async function handler(req,res){
+/* ---------- main ---------- */
+export default async function handler(req, res){
+  const trace = [];
   try{
-    const now=new Date(); const qSlot=canonicalSlot(req.query.slot); const slot=qSlot==="auto"?autoSlot(now,TZ):qSlot; const ymd=ymdInTZ(now,TZ);
-    const weekend=isWeekendYmd(ymd,TZ); const cap=capsFor(slot,weekend);
-
-    // baza za dan (union prefer)
-    const tried=[];
-    async function firstHit(keys){ for(const k of keys){ const r=await kvGETraw(k); tried.push({key:k,hit:!!r.raw}); const arr=J(r.raw)||(J(J(r.raw)?.value||"")||[]); if(Array.isArray(arr)&&arr.length) return {key:k,arr}; } return {key:null,arr:[]}; }
-    const {key:srcKey,arr:base}=await firstHit([`vb:day:${ymd}:${slot}`,`vb:day:${ymd}:union`,`vb:day:${ymd}:last`]);
-
-    // slot filter + odbaci youth/rezervne
-    const only=base.filter(it=>{
-      const lg=it?.league||{}; if(isYouthLeague(lg.name)) return false;
-      const kd=kickoffFromMeta(it); if(!kd) return false;
-      const ky=ymdInTZ(kd,TZ); if(ky!==ymd) return false;
-      const h=hourInTZ(kd,TZ);
-      return slot==="late"?(h<10):slot==="am"?(h>=10&&h<15):(h>=15);
-    }).sort(byConfKick);
-
-    // primeni MAX per liga, ali BEZ cap-a → ovo ide u vbl_full
-    const perLeagueAll=new Map(); const limited=[];
-    for(const it of only){
-      const lg=it?.league||{}; const key=String(lg.id||lg.name||"?");
-      const limit=isUefa(lg.name,lg.country)?6:2;
-      const cur=perLeagueAll.get(key)||0; if(cur>=limit) continue;
-      perLeagueAll.set(key,cur+1); limited.push(it);
+    const now = new Date();
+    const ymd = ymdInTZ(now, TZ);
+    let slot = canonicalSlot(req.query.slot);
+    if (slot==="auto") {
+      const h = hourInTZ(now, TZ);
+      slot = (h<10) ? "late" : (h<15) ? "am" : "pm";
     }
+    const weekend = isWeekendYmd(ymd, TZ);
+    const capPerLeague = perLeagueCap(slot, weekend);
 
-    // cap samo za vbl (za druge potrošače), zadrži isto sortiranje
-    const kept = limited.slice(0,cap);
+    // 1) try existing KV
+    const unionKey = `vb:day:${ymd}:${slot}`;
+    const fullKey  = `vbl_full:${ymd}:${slot}`;
+    let base = await kvGET(unionKey, trace);
+    let full  = await kvGET(fullKey,  trace);
+    const baseItems = Array.isArray(base?.items) ? base.items : (Array.isArray(base)?base:[]);
+    const fullItems = Array.isArray(full?.items) ? full.items : (Array.isArray(full)?full:[]);
 
-    // snimi: vbl_full = LIMITED (bez cap), vbl = KEPT (sa cap)
-    const saves=[];
-    saves.push(...await kvSET(`vbl_full:${ymd}:${slot}`,limited));
-    saves.push(...await kvSET(`vbl:${ymd}:${slot}`,kept));
+    let items = fullItems.length ? fullItems : baseItems;
 
-    // tiketi — ne prepisuj postojeće slot tikete
-    const slotKey = `tickets:${ymd}:${slot}`;
-    const slotNow = J((await kvGETraw(slotKey)).raw);
-    let ticketAction = "noop";
-    if (!hasAnyTickets(slotNow)) {
-      const dayKey = `tickets:${ymd}`;
-      const dayObj = J((await kvGETraw(dayKey)).raw);
-      if (hasAnyTickets(dayObj)) {
-        await kvSET(slotKey, dayObj);
-        ticketAction = "copied-day-to-slot";
-      } else {
-        ticketAction = "no-day-tickets";
+    // 2) If base empty, fetch fixtures for the day and seed KV
+    if (!items.length){
+      const af = await afFetch("/fixtures", { date: ymd });
+      const list = Array.isArray(af?.response) ? af.response : [];
+      const mapped = list
+        .filter(f => !isYouthLeague(f?.league?.name))
+        .filter(f => slotFilter(kickoffISOFromAF(f), slot))
+        .map(f => {
+          const dateISO = kickoffISOFromAF(f);
+          return {
+            fixture_id: f?.fixture?.id,
+            fixture: { id: f?.fixture?.id, date: dateISO, timezone: f?.fixture?.timezone },
+            kickoff: dateISO,
+            kickoff_utc: dateISO,
+            league: leagueFromAF(f),
+            league_name: f?.league?.name,
+            league_country: f?.league?.country,
+            teams: teamsFromAF(f),
+            home: f?.teams?.home?.name,
+            away: f?.teams?.away?.name,
+            markets: {} // to be filled by refresh-odds
+          };
+        });
+
+      // per-league cap for slim list; full list keeps all (by slot)
+      const perLeagueCounter = new Map();
+      const slim = [];
+      for (const it of mapped){
+        const key = String(it?.league?.id || it?.league?.name || "?");
+        const cur = perLeagueCounter.get(key)||0;
+        if (cur < capPerLeague){ slim.push(it); perLeagueCounter.set(key, cur+1); }
       }
-    } else {
-      ticketAction = "kept-existing-slot";
+
+      await kvSET(fullKey,  { items: mapped }, trace);
+      await kvSET(unionKey, { items: slim   }, trace);
+      await kvSET(`vb:day:${ymd}:last`,  { items: slim }, trace);
+      await kvSET(`vb:day:${ymd}:union`, { items: slim }, trace);
+
+      items = mapped;
     }
 
+    // Response diagnostic
     return res.status(200).json({
-      ok:true, ymd, slot,
-      counts:{ base: base.length, after_filters: only.length, kept: kept.length, full: limited.length },
-      source: srcKey,
-      diag:{ reads: tried, writes: { saves }, tickets: { action: ticketAction } }
+      ok:true,
+      ymd, slot,
+      counts: { full: items.length },
+      source: items.length ? "af:seed-or-kv" : "empty",
+      trace
     });
-  }catch(e){ return res.status(200).json({ok:false,error:String(e?.message||e)}); }
+  }catch(e){
+    return res.status(200).json({ ok:false, error: String(e?.message||e) });
+  }
 }
