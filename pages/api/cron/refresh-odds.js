@@ -55,14 +55,13 @@ async function kvSET(key, val, trace=[]) {
 /* ---------- API-Football ---------- */
 const { afFetch } = require("../../../lib/sources/apiFootball");
 
-/* ---------- Odds helpers ---------- */
-const TRUSTED = (() => {
-  const env = String(process.env.TRUSTED_BOOKIES||"").split(",").map(s=>String(s||"").trim().toLowerCase());
-  const def = ["bet365","pinnacle","williamhill","marathonbet","unibet","888sport","skybet","betfair","betway","ladbrokes","coral","bwin","1xbet","betano","stake","tipsport","efbet","parionsport","toto"];
-  return new Set((env.length?env:def).filter(Boolean));
-})();
-function strip(x){ return String(x||"").trim().toLowerCase(); }
-function mergeMarkets(orig, add){ const out={...(orig||{})}; for(const k of Object.keys(add||{})) out[k]={...(orig?.[k]||{}), ...(add?.[k]||{})}; return out; }
+/* ---------- Helpers ---------- */
+const SLOT_ODDS_CAP = Number(process.env.SLOT_ODDS_CAP || 2000); // ~6000/dan budžet = 3×2000
+const ODDS_PER_FIXTURE_CAP = Number(process.env.ODDS_PER_FIXTURE_CAP || 15);
+function pickSlotAuto(now) {
+  const h = hourInTZ(now, TZ);
+  return (h<10) ? "late" : (h<15) ? "am" : "pm";
+}
 function slotFilter(dateISO, slot){
   if(!dateISO) return false;
   const d = new Date(dateISO);
@@ -72,6 +71,8 @@ function slotFilter(dateISO, slot){
   if (slot==="pm")   return h >= 15;
   return true;
 }
+function strip(x){ return String(x||"").trim().toLowerCase(); }
+function mergeMarkets(orig, add){ const out={...(orig||{})}; for(const k of Object.keys(add||{})) out[k]={...(orig?.[k]||{}), ...(add?.[k]||{})}; return out; }
 
 /* ---------- main ---------- */
 export default async function handler(req, res){
@@ -80,20 +81,16 @@ export default async function handler(req, res){
     const now = new Date();
     const ymd = ymdInTZ(now, TZ);
     let slot = String(req.query.slot||"auto").toLowerCase();
-    if (!["late","am","pm"].includes(slot)) {
-      const h = hourInTZ(now, TZ);
-      slot = (h<10) ? "late" : (h<15) ? "am" : "pm";
-    }
+    if (!["late","am","pm"].includes(slot)) slot = pickSlotAuto(now);
 
     const unionKey = `vb:day:${ymd}:${slot}`;
     const fullKey  = `vbl_full:${ymd}:${slot}`;
 
     let union = await kvGET(unionKey, trace) || { items:[] };
     let full  = await kvGET(fullKey,  trace) || { items:[] };
-
     let items = Array.isArray(full?.items) && full.items.length ? full.items : (Array.isArray(union?.items)?union.items:[]);
 
-    // ---- Lazy seed if empty (fetch daily fixtures for slot) ----
+    // Seed ako je prazno
     if (!items.length){
       const af = await afFetch("/fixtures", { date: ymd });
       const list = Array.isArray(af?.response) ? af.response : [];
@@ -111,38 +108,51 @@ export default async function handler(req, res){
         }));
       await kvSET(fullKey,  { items }, trace);
       await kvSET(unionKey, { items }, trace);
-      await kvSET(`vb:day:${ymd}:last`, { items }, trace);
+      await kvSET(`vb:day:${ymd}:last`,  { items }, trace);
       await kvSET(`vb:day:${ymd}:union`, { items }, trace);
     }
 
-    // ---- AF odds for each fixture (with simple per-run cap) ----
-    const DAILY_CAP = 6000;
-    const RUN_CAP   = 1800;
+    // Odds update sa cap + "skip if markets exist"
     let updated = 0, skipped = 0;
+    const trustList = String(process.env.TRUSTED_BOOKIES||"")
+      .split(",").map(s=>s.trim().toLowerCase()).filter(Boolean);
+    const TRUSTED = new Set(trustList.length ? trustList : [
+      "bet365","pinnacle","williamhill","marathonbet","unibet","888sport","skybet","betfair",
+      "betway","ladbrokes","coral","bwin","1xbet","betano","stake","tipsport","efbet","parionsport","toto"
+    ]);
+    const trustedOnly = process.env.ODDS_TRUSTED_ONLY === "1";
 
     for (const it of items){
-      if (updated >= RUN_CAP) break;
+      if (updated >= SLOT_ODDS_CAP) break;
       const fid = it?.fixture_id || it?.fixture?.id;
       if (!fid) continue;
 
+      // Skip ako već imamo makar jedan ključ tržišta
+      const hasAnyMarket = it?.markets && (it.markets['1x2'] || it.markets['btts'] || it.markets['ou25'] || it.markets['fh_ou15'] || it.markets['htft']);
+      if (hasAnyMarket) { skipped++; continue; }
+
       const data = await afFetch("/odds", { fixture: String(fid) });
       const books = Array.isArray(data?.response?.[0]?.bookmakers) ? data.response[0].bookmakers : [];
-
       let mk = it.markets || {};
+      let perFixture = 0;
+
       for (const bk of books){
+        if (perFixture >= ODDS_PER_FIXTURE_CAP) break;
         const name = strip(bk?.name||bk?.title||bk?.key);
-        if (process.env.ODDS_TRUSTED_ONLY === "1" && !TRUSTED.has(name)) continue;
+        if (trustedOnly && !TRUSTED.has(name)) continue;
 
         for (const bet of (bk?.bets||[])){
+          if (perFixture >= ODDS_PER_FIXTURE_CAP) break;
           const label = String(bet?.name||"").toLowerCase();
 
           // 1X2 / Match Winner
           if(/match winner|1x2/.test(label)){
-            const h = Number(bet?.values?.find(v=>/home|1/i.test(v?.value))?.odd);
-            const d = Number(bet?.values?.find(v=>/draw|x/i.test(v?.value))?.odd);
-            const a = Number(bet?.values?.find(v=>/away|2/i.test(v?.value))?.odd);
+            const h = Number(bet?.values?.find(v=>/home|1\b/i.test(v?.value))?.odd);
+            const d = Number(bet?.values?.find(v=>/draw|x\b/i.test(v?.value))?.odd);
+            const a = Number(bet?.values?.find(v=>/away|2\b/i.test(v?.value))?.odd);
             if (Number.isFinite(h)||Number.isFinite(d)||Number.isFinite(a)){
               mk['1x2'] = { ...(mk['1x2']||{}), home: h??mk['1x2']?.home??null, draw:d??mk['1x2']?.draw??null, away:a??mk['1x2']?.away??null };
+              perFixture++;
             }
           }
           // BTTS
@@ -151,6 +161,7 @@ export default async function handler(req, res){
             const no  = Number(bet?.values?.find(v=>/no/i.test(v?.value))?.odd);
             if (Number.isFinite(yes)||Number.isFinite(no)){
               mk['btts'] = { ...(mk['btts']||{}), yes: yes??mk['btts']?.yes??null, no: no??mk['btts']?.no??null };
+              perFixture++;
             }
           }
           // OU 2.5
@@ -160,6 +171,7 @@ export default async function handler(req, res){
             const over = Number(vOver?.odd), under = Number(vUnder?.odd);
             if (Number.isFinite(over)||Number.isFinite(under)){
               mk['ou25'] = { ...(mk['ou25']||{}), over: over??mk['ou25']?.over??null, under: under??mk['ou25']?.under??null };
+              perFixture++;
             }
           }
           // FH OU 1.5
@@ -169,36 +181,31 @@ export default async function handler(req, res){
             const over = Number(vOver?.odd), under = Number(vUnder?.odd);
             if (Number.isFinite(over)||Number.isFinite(under)){
               mk['fh_ou15'] = { ...(mk['fh_ou15']||{}), over: over??mk['fh_ou15']?.over??null, under: under??mk['fh_ou15']?.under??null };
+              perFixture++;
             }
           }
-          // HT/FT (halftime/fulltime)
+          // HT/FT
           if(/half time\/full time|ht\/ft|double result/i.test(label)){
-            const hh = Number(bet?.values?.find(v=>/home\/home|hh/i.test(v?.value))?.odd);
-            const hd = Number(bet?.values?.find(v=>/home\/draw|hd/i.test(v?.value))?.odd);
-            const ha = Number(bet?.values?.find(v=>/home\/away|ha/i.test(v?.value))?.odd);
-            const dh = Number(bet?.values?.find(v=>/draw\/home|dh/i.test(v?.value))?.odd);
-            const dd = Number(bet?.values?.find(v=>/draw\/draw|dd/i.test(v?.value))?.odd);
-            const da = Number(bet?.values?.find(v=>/draw\/away|da/i.test(v?.value))?.odd);
-            const ah = Number(bet?.values?.find(v=>/away\/home|ah/i.test(v?.value))?.odd);
-            const ad = Number(bet?.values?.find(v=>/away\/draw|ad/i.test(v?.value))?.odd);
-            const aa = Number(bet?.values?.find(v=>/away\/away|aa/i.test(v?.value))?.odd);
+            const vv = code => Number(bet?.values?.find(v=>new RegExp(code,'i').test(v?.value))?.odd);
+            const hh=vv('home\\/home|^hh$'), hd=vv('home\\/draw|^hd$'), ha=vv('home\\/away|^ha$');
+            const dh=vv('draw\\/home|^dh$'), dd=vv('draw\\/draw|^dd$'), da=vv('draw\\/away|^da$');
+            const ah=vv('away\\/home|^ah$'), ad=vv('away\\/draw|^ad$'), aa=vv('away\\/away|^aa$');
             if ([hh,hd,ha,dh,dd,da,ah,ad,aa].some(Number.isFinite)){
-              mk['htft'] = { ...(mk['htft']||{}), hh: hh??mk['htft']?.hh??null, hd: hd??mk['htft']?.hd??null, ha: ha??mk['htft']?.ha??null,
-                                                  dh: dh??mk['htft']?.dh??null, dd: dd??mk['htft']?.dd??null, da: da??mk['htft']?.da??null,
-                                                  ah: ah??mk['htft']?.ah??null, ad: ad??mk['htft']?.ad??null, aa: aa??mk['htft']?.aa??null };
+              mk['htft'] = { ...(mk['htft']||{}), hh, hd, ha, dh, dd, da, ah, ad, aa };
+              perFixture++;
             }
           }
         }
       }
+
       it.markets = mergeMarkets(it.markets||{}, mk);
       updated++;
 
-      // persist back to KV (full only)
-      full = { items };
-      await kvSET(fullKey, full, trace);
+      // persist back (full only)
+      await kvSET(fullKey, { items }, trace);
     }
 
-    return res.status(200).json({ ok:true, ymd, slot, updated, items_len: items.length, trace });
+    return res.status(200).json({ ok:true, ymd, slot, updated, skipped, items_len: items.length, trace });
   }catch(e){
     return res.status(200).json({ ok:false, error: String(e?.message||e) });
   }
