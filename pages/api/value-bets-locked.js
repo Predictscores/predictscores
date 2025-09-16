@@ -1,7 +1,7 @@
 // pages/api/value-bets-locked.js
 export const config = { api: { bodyParser: false } };
 
-/* ---------- TZ ---------- */
+/* ---------- TZ helpers ---------- */
 function pickTZ() {
   const raw = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
   try { new Intl.DateTimeFormat("en-GB", { timeZone: raw }); return raw; } catch { return "Europe/Belgrade"; }
@@ -14,7 +14,7 @@ function pickSlotAuto(now) {
   return (h<10) ? "late" : (h<15) ? "am" : "pm";
 }
 
-/* ---------- KV ---------- */
+/* ---------- KV (Vercel KV / Upstash REST) ---------- */
 function kvBackends() {
   const out = [];
   const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
@@ -29,29 +29,57 @@ async function kvGET(key, trace=[]) {
       const u = `${b.url}/get/${encodeURIComponent(key)}`;
       const r = await fetch(u, { headers: { Authorization: `Bearer ${b.tok}` }, cache:"no-store" });
       if (!r.ok) continue;
-      const j = await r.json().catch(()=>null);
-      const v = j?.result ?? j?.value ?? null;
+      const j = await r.json().catch(()=>null); // Upstash/Vercel REST shape: { result | value }
+      const v = (j && ("result" in j ? j.result : j.value)) ?? null;
       if (v==null) continue;
-      const out = typeof v==="string" ? JSON.parse(v) : v;
-      trace.push({get:key, ok:true, flavor:b.flavor, hit:true});
-      return out;
+      trace.push({ get:key, ok:true, flavor:b.flavor, hit:true });
+      return v; // može biti string (JSON), ili već objekat
     } catch {}
   }
-  trace.push({get:key, ok:true, hit:false});
+  trace.push({ get:key, ok:true, hit:false });
   return null;
 }
 
-/* ---------- Build helpers ---------- */
+/* ---------- Safe deserialization (bezbedna) ---------- */
+function kvToItems(doc) {
+  // 1) null/undefined
+  if (doc == null) return { items: [] };
+
+  let v = doc;
+
+  // 2) Ako je ceo dokument STRING -> pokušaj JSON.parse
+  if (typeof v === "string") {
+    try { v = JSON.parse(v); } catch { return { items: [] }; }
+  }
+
+  // 3) Ako je { value: "<json-string>" } (REST) -> parse value
+  if (v && typeof v === "object" && typeof v.value === "string") {
+    try { v = JSON.parse(v.value); } catch { return { items: [] }; }
+  }
+
+  // 4) Ako je rezultat direktno niz -> standardizuj
+  if (Array.isArray(v)) return { items: v };
+
+  // 5) Ako već ima items niz -> OK
+  if (v && Array.isArray(v.items)) return v;
+
+  // 6) Bilo šta drugo -> prazan standardni oblik
+  return { items: [] };
+}
+
+/* ---------- VB params ---------- */
 const VB_LIMIT = Number(process.env.VB_LIMIT || 25);
 const VB_MAX_PER_LEAGUE = Number(process.env.VB_MAX_PER_LEAGUE || 2);
 const MIN_ODDS = Number(process.env.MIN_ODDS || 1.5);
+const MAX_ODDS = Number(process.env.MAX_ODDS || 5.5); // opciono: čuva kvalitet selekcija
 
+/* ---------- Builders ---------- */
 function toCandidateFromMarkets(fix){
   const out = [];
   const { markets = {} } = fix || {};
 
   // 1) BTTS Yes
-  if (markets.btts?.yes && markets.btts.yes >= MIN_ODDS) {
+  if (markets.btts?.yes && markets.btts.yes >= MIN_ODDS && markets.btts.yes <= MAX_ODDS) {
     out.push({
       fixture_id: fix.fixture_id || fix.fixture?.id,
       market: "BTTS",
@@ -62,7 +90,7 @@ function toCandidateFromMarkets(fix){
     });
   }
   // 2) OU 2.5 Over
-  if (markets.ou25?.over && markets.ou25.over >= MIN_ODDS) {
+  if (markets.ou25?.over && markets.ou25.over >= MIN_ODDS && markets.ou25.over <= MAX_ODDS) {
     out.push({
       fixture_id: fix.fixture_id || fix.fixture?.id,
       market: "OU2.5",
@@ -73,7 +101,7 @@ function toCandidateFromMarkets(fix){
     });
   }
   // 3) FH OU 1.5 Over
-  if (markets.fh_ou15?.over && markets.fh_ou15.over >= MIN_ODDS) {
+  if (markets.fh_ou15?.over && markets.fh_ou15.over >= MIN_ODDS && markets.fh_ou15.over <= MAX_ODDS) {
     out.push({
       fixture_id: fix.fixture_id || fix.fixture?.id,
       market: "FH_OU1.5",
@@ -83,12 +111,12 @@ function toCandidateFromMarkets(fix){
       odds: { price: Number(markets.fh_ou15.over) },
     });
   }
-  // 4) HT/FT — uzmi 2-3 najrazumnija (HH, DD, AA) ako postoje
+  // 4) HT/FT — uzmi razumnije prvo (HH, DD, AA ...)
   const htft = fix.markets?.htft || {};
   const HTFT_ORDER = ["hh","dd","aa","hd","dh","ha","ah","da","ad"];
   for (const code of HTFT_ORDER) {
     const price = Number(htft[code]);
-    if (Number.isFinite(price) && price >= MIN_ODDS) {
+    if (Number.isFinite(price) && price >= MIN_ODDS && price <= Math.max(MAX_ODDS, 10)) {
       out.push({
         fixture_id: fix.fixture_id || fix.fixture?.id,
         market: "HTFT",
@@ -97,12 +125,11 @@ function toCandidateFromMarkets(fix){
         selection_label: `HT/FT ${code.toUpperCase()}`,
         odds: { price },
       });
-      // ne gomilati previše iz jedne utakmice
-      if (out.length >= 4) break;
+      if (out.length >= 4) break; // ne gomilati previše iz jedne utakmice
     }
   }
 
-  // dodaj zajedničke meta podatke
+  // meta
   for (const c of out) {
     c.league = fix.league;
     c.league_name = fix.league?.name;
@@ -112,9 +139,8 @@ function toCandidateFromMarkets(fix){
     c.away = fix.away;
     c.kickoff = fix.kickoff;
     c.kickoff_utc = fix.kickoff_utc || fix.kickoff;
-    // "confidence" = neutralno 60 dok ne ukrstimo sa modelom
     c.model_prob = null;
-    c.confidence_pct = 60;
+    c.confidence_pct = 60; // neutralno dok ne dodamo model
   }
   return out;
 }
@@ -141,7 +167,6 @@ function groupTickets(items){
     else if (it.market === "FH_OU1.5") t.fh_ou15.push(it);
     else if (it.market === "HTFT") t.htft.push(it);
   }
-  // ograniči 3–5 po tiketu
   const clamp = arr => arr.slice(0, Math.max(3, Math.min(5, arr.length)));
   t.btts   = clamp(t.btts);
   t.ou25   = clamp(t.ou25);
@@ -163,32 +188,53 @@ export default async function handler(req, res){
     const fullKey  = `vbl_full:${ymd}:${slot}`;
     const ticketsKey = `tickets:${ymd}:${slot}`;
 
-    const union = await kvGET(unionKey, trace);
-    const full  = await kvGET(fullKey,  trace);
+    // 1) Učitaj KV i bezbedno deserializuj
+    let union = await kvGET(unionKey, trace);
+    let full  = await kvGET(fullKey,  trace);
+    union = kvToItems(union);
+    full  = kvToItems(full);
 
-    const base = Array.isArray(full?.items) && full.items.length ? full.items
-               : Array.isArray(union?.items) ? union.items : [];
+    // 2) Odaberi bazu (preferiraj full jer ima markets)
+    const base = full.items.length ? full.items : union.items;
 
     if (!base.length){
-      return res.status(200).json({ ok:true, ymd, slot, source:null, items:[], tickets:{ btts:[], ou25:[], htft:[], fh_ou15:[] }, debug:{ trace } });
+      return res.status(200).json({
+        ok:true, ymd, slot, source:null,
+        items:[], tickets:{ btts:[], ou25:[], htft:[], fh_ou15:[] },
+        debug:{ trace }
+      });
     }
 
-    // kandidati iz markets
+    // 3) Generiši kandidate iz markets
     const expanded = [];
     for (const f of base) {
       const adds = toCandidateFromMarkets(f);
       if (adds.length) expanded.push(...adds);
     }
 
-    // cap po ligi i globalni limit
-    const capped = capPerLeague(expanded);
+    // 4) Guard: minimalna kompletiranost (≥2 tržišta po meču) – za kvalitet
+    const byFixture = new Map();
+    for (const c of expanded) {
+      const fid = c.fixture_id;
+      const arr = byFixture.get(fid) || [];
+      arr.push(c.market);
+      byFixture.set(fid, arr);
+    }
+    const goodFixture = new Set(
+      [...byFixture.entries()].filter(([_, arr]) => new Set(arr).size >= 2).map(([fid]) => fid)
+    );
+    const filtered = expanded.filter(c => goodFixture.has(c.fixture_id));
 
-    // grupiši u 4 tiketa
+    // 5) Cap po ligi i globalni limit
+    const capped = capPerLeague(filtered);
+
+    // 6) Grupacija u tikete
     const tickets = groupTickets(capped);
 
+    // 7) Odgovor
     return res.status(200).json({
       ok:true, ymd, slot,
-      source: "vbl_full",
+      source: full.items.length ? "vbl_full" : "vb:day",
       items: capped,
       tickets,
       debug: { trace }
