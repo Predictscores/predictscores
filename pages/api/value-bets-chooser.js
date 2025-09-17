@@ -36,6 +36,25 @@ function ymdBelgrade(d = new Date()) {
   return d.toLocaleString("sv-SE", { timeZone: "Europe/Belgrade" }).slice(0, 10);
 }
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+const clamp01 = (n) => (Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : null);
+const probabilityFromOdds = (price) => {
+  const p = Number(price);
+  if (!Number.isFinite(p) || p <= 1) return null;
+  return 1 / p;
+};
+function baseProbability(it, impliedProb) {
+  const modelProb = clamp01(Number(it?.model_prob));
+  if (modelProb != null) return modelProb;
+
+  const confRaw = Number(it?.confidence_pct);
+  if (Number.isFinite(confRaw) && confRaw > 0) {
+    const fromConf = clamp01(confRaw / 100);
+    if (fromConf != null) return fromConf;
+  }
+
+  if (impliedProb != null) return impliedProb;
+  return 0;
+}
 
 // ista mikro-korekcija kao u value-bets-meta (injuries + H2H%)
 // ograničeno na ±3 p.p., konzervativno
@@ -134,10 +153,10 @@ export default async function handler(req, res) {
         confAdj = clamp(confAdj + adjPP, 30, 85);
       }
 
-      // EV iz p_eff (koristimo model_prob kao osnovu; ovo je lokalni p_eff)
-      const p_model = Number(it?.model_prob) || 0;
-      const p_eff = clamp(p_model + (adjPP / 100), 0, 1); // p.p. → apsolutno
       const price = Number(it?.odds?.price) || NaN;
+      const impliedProb = probabilityFromOdds(price);
+      const p_base = baseProbability(it, impliedProb);
+      const p_eff = clamp(p_base + (adjPP / 100), 0, 1);
       const books = Number(it?.odds?.books_count) || 0;
 
       enriched.push({
@@ -145,7 +164,9 @@ export default async function handler(req, res) {
         _meta: meta || null,
         _confidence_adj_pp: adjPP,
         _confidence_pct_adj: confAdj,
+        _p_base: p_base,
         _p_eff: p_eff,
+        _implied_prob: impliedProb,
         _ev_eff: Number.isFinite(price) ? (price * p_eff - 1) : -Infinity,
         _books_ok: books >= 2,                // <<< prag spušten: 2 (pre je bilo 3)
         _price_ok: priceCapOK(String(it.market).toUpperCase(), price),

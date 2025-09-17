@@ -71,51 +71,245 @@ function isWeekend(ymd){
   return wd==="sat"||wd==="sun";
 }
 function isUEFA(league){ const n=String(league?.name||"").toLowerCase(); return /uefa|champions|europa|conference|ucl|uel|uecl/.test(n); }
-function confFromOdds(odds){ if(!Number.isFinite(odds)||odds<=1) return 0; return Math.round(Math.max(0,Math.min(100,(1/odds)*100))); }
+
+/* =========================
+ *  Model helpers
+ * ========================= */
+function toProbability(value){
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  if (num > 1) {
+    if (num <= 100) return Math.max(0, Math.min(1, num / 100));
+    return null;
+  }
+  if (num < 0) return 0;
+  return Math.max(0, Math.min(1, num));
+}
+function pluck(obj, path){
+  let cur = obj;
+  for (const key of path) {
+    if (cur == null) return undefined;
+    cur = cur[key];
+  }
+  return cur;
+}
+function probabilityFromPaths(obj, paths){
+  for (const path of paths) {
+    const val = pluck(obj, path);
+    const prob = toProbability(val);
+    if (prob != null) return prob;
+  }
+  return null;
+}
+function probabilityValue(src, keys){
+  if (!src || typeof src !== "object") return null;
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(src, key)) {
+      const prob = toProbability(src[key]);
+      if (prob != null) return prob;
+    }
+  }
+  return null;
+}
+function normalizedModelProbs(fix){
+  const candidates = [fix?.model_probs, fix?.model?.probs, fix?.model?.probabilities, fix?.models?.probs, fix?.models?.probabilities];
+  for (const src of candidates) {
+    if (!src || typeof src !== "object") continue;
+    const home = probabilityValue(src, ["home","Home","HOME","1","H","home_win","homeWin","p1","prob_home","prob1"]);
+    const draw = probabilityValue(src, ["draw","Draw","DRAW","X","D","drawn","pX","prob_draw","probx"]);
+    const away = probabilityValue(src, ["away","Away","AWAY","2","A","away_win","awayWin","p2","prob_away","prob2"]);
+    if (home == null && draw == null && away == null) continue;
+    const out = {};
+    if (home != null) { out.home = home; out["1"] = home; }
+    if (draw != null) { out.draw = draw; out["X"] = draw; }
+    if (away != null) { out.away = away; out["2"] = away; }
+    return out;
+  }
+  return null;
+}
+function buildModelContext(fix){
+  return {
+    oneXtwo: normalizedModelProbs(fix),
+    btts: probabilityFromPaths(fix, [
+      ["btts_probability"],
+      ["model_probs","btts_yes"],
+      ["model_probs","btts","yes"],
+      ["model","btts_probability"],
+      ["model","btts","yes"],
+      ["models","btts","yes"],
+    ]),
+    ou25: probabilityFromPaths(fix, [
+      ["over25_probability"],
+      ["ou25_probability"],
+      ["model_probs","over25"],
+      ["model_probs","ou25_over"],
+      ["model","over25_probability"],
+      ["model","ou25","over"],
+      ["models","ou25","over"],
+    ]),
+    fh_ou15: probabilityFromPaths(fix, [
+      ["fh_over15_probability"],
+      ["model_probs","fh_over15"],
+      ["model_probs","fh_ou15_over"],
+      ["model","fh_ou15","over"],
+      ["models","fh_ou15","over"],
+    ]),
+  };
+}
+function impliedFromPrice(price){
+  const p = Number(price);
+  if (!Number.isFinite(p) || p <= 1) return null;
+  return 1 / p;
+}
+function normalizePickCode(rawCode, rawPick, rawLabel){
+  const candidates = [rawCode, rawPick, rawLabel];
+  for (const cand of candidates) {
+    if (!cand) continue;
+    const str = String(cand).trim();
+    if (!str) continue;
+    const up = str.toUpperCase();
+    if (up.includes(":")) {
+      const parts = up.split(":");
+      const last = parts[parts.length - 1];
+      if (last) return last;
+    }
+    return up;
+  }
+  return "";
+}
+function modelProbabilityFor(ctx, marketRaw, pickCodeRaw, pickRaw, labelRaw){
+  const market = String(marketRaw || "").toUpperCase();
+  const code = normalizePickCode(pickCodeRaw, pickRaw, labelRaw);
+  if (!code) return null;
+
+  if (market === "BTTS") {
+    const yes = ctx?.btts;
+    if (yes == null) return null;
+    if (code === "Y" || code === "YES") return yes;
+    if (code === "N" || code === "NO") return 1 - yes;
+    return null;
+  }
+
+  if (market === "OU2.5" || market === "O/U 2.5" || market === "OU25") {
+    const over = ctx?.ou25;
+    if (over == null) return null;
+    if (code.startsWith("O")) return over;
+    if (code.startsWith("U")) return 1 - over;
+    return null;
+  }
+
+  if (market === "FH_OU1.5" || market === "FH OU1.5" || market === "FH-OU1.5") {
+    const over = ctx?.fh_ou15;
+    if (over == null) return null;
+    if (code.includes("O")) return over;
+    if (code.includes("U")) return 1 - over;
+    return null;
+  }
+
+  if (market === "1X2" || market === "1X-2") {
+    const map = ctx?.oneXtwo;
+    if (!map) return null;
+    if (code === "1" || code === "HOME") return map["1"] ?? map.home ?? null;
+    if (code === "X" || code === "DRAW") return map["X"] ?? map.draw ?? null;
+    if (code === "2" || code === "AWAY") return map["2"] ?? map.away ?? null;
+    return null;
+  }
+
+  return null;
+}
+function confidenceFromModel(prob, implied){
+  const hasProb = Number.isFinite(prob);
+  const hasImplied = Number.isFinite(implied);
+  if (!hasProb && !hasImplied) return 0;
+
+  if (hasProb) {
+    const p = Math.max(0, Math.min(1, prob));
+    const base = p * 100;
+    if (hasImplied) {
+      const edge = (p - implied) * 100;
+      const boosted = base + edge * 0.65;
+      return Math.round(Math.max(20, Math.min(88, boosted)));
+    }
+    return Math.round(Math.max(20, Math.min(88, base)));
+  }
+
+  const ip = Math.max(0, Math.min(1, implied));
+  return Math.round(Math.max(20, Math.min(88, ip * 100)));
+}
+function applyModelFields(candidate, ctx){
+  const prob = modelProbabilityFor(ctx, candidate.market, candidate.pick_code, candidate.pick, candidate.selection_label);
+  const implied = impliedFromPrice(candidate?.odds?.price);
+  candidate.model_prob = prob != null ? prob : null;
+  candidate.implied_prob = implied != null ? implied : null;
+  if ((candidate.market || "").toUpperCase() === "1X2" && ctx?.oneXtwo) {
+    candidate.model_probs = ctx.oneXtwo;
+  }
+  candidate.confidence_pct = confidenceFromModel(prob, implied);
+  return candidate;
+}
 function oneXtwoCapForSlot(slot, we){ if(slot==="late") return CAP_LATE; if(!we) return slot==="am"?CAP_AM_WD:CAP_PM_WD; return slot==="am"?CAP_AM_WE:CAP_PM_WE; }
 
 /* =========================
  *  Candidate builders
  * ========================= */
 function fromMarkets(fix){
-  const out=[]; const m=fix?.markets||{}; const fid=fix.fixture_id||fix.fixture?.id;
+  const out=[]; const m=fix?.markets||{}; const fid=fix.fixture_id||fix.fixture?.id; const ctx = buildModelContext(fix);
 
-  if (m.btts?.yes && m.btts.yes>=MIN_ODDS && m.btts.yes<=MAX_ODDS) {
-    const p=Number(m.btts.yes);
-    out.push({fixture_id:fid,market:"BTTS",pick:"Yes",pick_code:"BTTS:Y",selection_label:"BTTS Yes",odds:{price:p},confidence_pct:confFromOdds(p)});
+  const push = (market, pick, pickCode, selectionLabel, rawPrice) => {
+    const price = Number(rawPrice);
+    if (!Number.isFinite(price)) return;
+    const cand = {
+      fixture_id: fid,
+      market,
+      pick,
+      pick_code: pickCode,
+      selection_label: selectionLabel,
+      odds: { price },
+    };
+    applyModelFields(cand, ctx);
+    out.push(cand);
+  };
+
+  if (Number.isFinite(m?.btts?.yes) && m.btts.yes>=MIN_ODDS && m.btts.yes<=MAX_ODDS) {
+    push("BTTS", "Yes", "BTTS:Y", "BTTS Yes", m.btts.yes);
   }
-  if (m.ou25?.over && m.ou25.over>=MIN_ODDS && m.ou25.over<=MAX_ODDS) {
-    const p=Number(m.ou25.over);
-    out.push({fixture_id:fid,market:"OU2.5",pick:"Over 2.5",pick_code:"O2.5",selection_label:"Over 2.5",odds:{price:p},confidence_pct:confFromOdds(p)});
+  if (Number.isFinite(m?.ou25?.over) && m.ou25.over>=MIN_ODDS && m.ou25.over<=MAX_ODDS) {
+    push("OU2.5", "Over 2.5", "O2.5", "Over 2.5", m.ou25.over);
   }
-  if (m.fh_ou15?.over && m.fh_ou15.over>=MIN_ODDS && m.fh_ou15.over<=Math.max(MAX_ODDS,10)) {
-    const p=Number(m.fh_ou15.over);
-    out.push({fixture_id:fid,market:"FH_OU1.5",pick:"Over 1.5 FH",pick_code:"FH O1.5",selection_label:"FH Over 1.5",odds:{price:p},confidence_pct:confFromOdds(p)});
+  if (Number.isFinite(m?.fh_ou15?.over) && m.fh_ou15.over>=MIN_ODDS && m.fh_ou15.over<=Math.max(MAX_ODDS,10)) {
+    push("FH_OU1.5", "Over 1.5 FH", "FH O1.5", "FH Over 1.5", m.fh_ou15.over);
   }
   const htft=m.htft||{}; const ORDER=["hh","dd","aa","hd","dh","ha","ah","da","ad"];
   for (const code of ORDER){
-    const p=Number(htft[code]);
-    if (Number.isFinite(p) && p>=MIN_ODDS && p<=Math.max(MAX_ODDS,10)) {
-      out.push({fixture_id:fid,market:"HTFT",pick:code.toUpperCase(),pick_code:`HTFT:${code.toUpperCase()}`,selection_label:`HT/FT ${code.toUpperCase()}`,odds:{price:p},confidence_pct:confFromOdds(p)});
+    const price=Number(htft[code]);
+    if (Number.isFinite(price) && price>=MIN_ODDS && price<=Math.max(MAX_ODDS,10)) {
+      push("HTFT", code.toUpperCase(), `HTFT:${code.toUpperCase()}`, `HT/FT ${code.toUpperCase()}`, price);
       if (out.length>=6) break;
     }
   }
+
   for (const c of out) {
     c.league=fix.league; c.league_name=fix.league?.name; c.league_country=fix.league?.country;
     c.teams=fix.teams; c.home=fix.home; c.away=fix.away;
     c.kickoff=fix.kickoff; c.kickoff_utc=fix.kickoff_utc||fix.kickoff;
-    c.model_prob=null;
+    if (typeof c.model_prob !== "number") c.model_prob = c.model_prob != null ? Number(c.model_prob) : null;
   }
   return out;
 }
 function oneXtwoOffers(fix){
-  const xs=[]; const x=fix?.markets?.['1x2']||{}; const fid=fix.fixture_id||fix.fixture?.id;
-  const push=(code,label,price)=>{ const p=Number(price); if(Number.isFinite(p)&&p>=MIN_ODDS&&p<=MAX_ODDS) xs.push({
-    fixture_id:fid, market:"1x2", pick:code, selection_label:label, odds:{price:p},
-    confidence_pct:confFromOdds(p), league:fix.league, league_name:fix.league?.name,
-    league_country:fix.league?.country, teams:fix.teams, home:fix.home, away:fix.away,
-    kickoff:fix.kickoff, kickoff_utc:fix.kickoff_utc||fix.kickoff
-  })};
+  const xs=[]; const x=fix?.markets?.['1x2']||{}; const fid=fix.fixture_id||fix.fixture?.id; const ctx = buildModelContext(fix);
+  const push=(code,label,price)=>{
+    const p=Number(price);
+    if(!Number.isFinite(p)||p<MIN_ODDS||p>MAX_ODDS) return;
+    const cand={
+      fixture_id:fid, market:"1x2", pick:code, pick_code:code, selection_label:label, odds:{price:p},
+      league:fix.league, league_name:fix.league?.name,
+      league_country:fix.league?.country, teams:fix.teams, home:fix.home, away:fix.away,
+      kickoff:fix.kickoff, kickoff_utc:fix.kickoff_utc||fix.kickoff
+    };
+    applyModelFields(cand, ctx);
+    xs.push(cand);
+  };
   if (x.home) push("1","Home",x.home);
   if (x.draw) push("X","Draw",x.draw);
   if (x.away) push("2","Away",x.away);
