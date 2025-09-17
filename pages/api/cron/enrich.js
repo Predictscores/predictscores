@@ -51,6 +51,330 @@ function isFinalStatus(s) {
   return /^FT|AET|PEN$/.test(x);
 }
 
+const TEAM_SIDE_KEYS = [
+  ["home", "h"],
+  ["away", "a"],
+  ["total", "t"],
+];
+
+const clampNum = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+
+function roundTo(value, decimals = 2) {
+  if (!Number.isFinite(value)) return null;
+  const factor = 10 ** decimals;
+  return Math.round((value + Number.EPSILON) * factor) / factor;
+}
+
+function parseNumeric(value, decimals = 2) {
+  if (value === undefined || value === null) return null;
+  let num;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return null;
+    num = value;
+  } else if (typeof value === "string") {
+    const cleaned = value.replace(/[^0-9+-.]/g, "");
+    if (!cleaned) return null;
+    num = Number(cleaned);
+    if (!Number.isFinite(num)) return null;
+  } else {
+    return null;
+  }
+  if (typeof decimals === "number") {
+    const rounded = roundTo(num, decimals);
+    return rounded === null ? null : rounded;
+  }
+  return num;
+}
+
+function parsePercentValue(value, denominator, decimals = 0) {
+  if (value === undefined || value === null) return null;
+
+  if (typeof value === "string") {
+    const match = value.match(/-?\d+(?:\.\d+)?/);
+    if (!match) return null;
+    const num = Number(match[0]);
+    if (!Number.isFinite(num)) return null;
+    return clampNum(roundTo(num, decimals), 0, 100);
+  }
+
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return null;
+    if (value >= 0 && value <= 1) {
+      return clampNum(roundTo(value * 100, decimals), 0, 100);
+    }
+    if (Number.isFinite(denominator) && denominator > 0) {
+      return clampNum(roundTo((value / denominator) * 100, decimals), 0, 100);
+    }
+    if (value >= 0 && value <= 100) {
+      return clampNum(roundTo(value, decimals), 0, 100);
+    }
+  }
+
+  return null;
+}
+
+function getTripleNumbers(src, decimals = 2) {
+  if (!src || typeof src !== "object") return null;
+  const out = {};
+  let have = false;
+  for (const [srcKey, alias] of TEAM_SIDE_KEYS) {
+    let raw = src[srcKey];
+    if (raw && typeof raw === "object") {
+      if ("total" in raw) raw = raw.total;
+      else if ("value" in raw) raw = raw.value;
+      else if ("count" in raw) raw = raw.count;
+      else if ("games" in raw) raw = raw.games;
+      else if ("number" in raw) raw = raw.number;
+      else if ("all" in raw) raw = raw.all;
+    }
+    const num = parseNumeric(raw, decimals);
+    if (num !== null) {
+      out[alias] = num;
+      have = true;
+    }
+  }
+  return have ? out : null;
+}
+
+function readPercentageNode(node, denom, decimals = 0) {
+  if (node === undefined || node === null) return null;
+  if (typeof node === "object") {
+    const candidates = [
+      node.percentage,
+      node.percent,
+      node.pct,
+      node.rate,
+      node.ratio,
+      node.value,
+      node.total,
+      node.count,
+    ];
+    for (const cand of candidates) {
+      const pct = parsePercentValue(cand, denom, decimals);
+      if (pct !== null) return pct;
+    }
+    return null;
+  }
+  return parsePercentValue(node, denom, decimals);
+}
+
+function extractPercentageTriple(src, played, decimals = 0) {
+  if (!src || typeof src !== "object") return null;
+  const out = {};
+  let have = false;
+  for (const [srcKey, alias] of TEAM_SIDE_KEYS) {
+    const pct = readPercentageNode(src[srcKey], played?.[alias], decimals);
+    if (pct !== null) {
+      out[alias] = pct;
+      have = true;
+    }
+  }
+
+  if (!have) {
+    const alt = src.percentage || src.percent || src.pct;
+    if (alt && typeof alt === "object") {
+      for (const [srcKey, alias] of TEAM_SIDE_KEYS) {
+        const pct = readPercentageNode(alt[srcKey], played?.[alias], decimals);
+        if (pct !== null) {
+          out[alias] = pct;
+          have = true;
+        }
+      }
+    }
+  }
+
+  return have ? out : null;
+}
+
+function countsToPct(counts, played, decimals = 0) {
+  if (!counts || !played) return null;
+  const out = {};
+  let have = false;
+  for (const [, alias] of TEAM_SIDE_KEYS) {
+    const pct = parsePercentValue(counts[alias], played?.[alias], decimals);
+    if (pct !== null) {
+      out[alias] = pct;
+      have = true;
+    }
+  }
+  return have ? out : null;
+}
+
+function pickFirstNumeric(values, decimals = 2) {
+  if (!values) return null;
+  const list = Array.isArray(values) ? values : [values];
+  for (const value of list) {
+    if (value === undefined || value === null) continue;
+    if (Array.isArray(value)) {
+      const nested = pickFirstNumeric(value, decimals);
+      if (nested !== null) return nested;
+      continue;
+    }
+    if (typeof value === "object") {
+      const nested = pickFirstNumeric(
+        [
+          value.per_match,
+          value.perMatch,
+          value.average,
+          value.avg,
+          value.mean,
+          value.total,
+          value.value,
+          value.count,
+          value.all,
+        ],
+        decimals
+      );
+      if (nested !== null) return nested;
+      continue;
+    }
+    const num = parseNumeric(value, decimals);
+    if (num !== null) return num;
+  }
+  return null;
+}
+
+function extractExpectedXg(response) {
+  const candidatesFor = [
+    response?.expected?.goals?.for,
+    response?.expected?.for,
+    response?.expected_goals?.for,
+    response?.goals?.for?.expected,
+    response?.expected?.goals_for,
+    response?.goals?.expected?.for,
+  ];
+  const candidatesAgainst = [
+    response?.expected?.goals?.against,
+    response?.expected?.against,
+    response?.expected_goals?.against,
+    response?.goals?.against?.expected,
+    response?.expected?.goals_against,
+    response?.goals?.expected?.against,
+  ];
+
+  const xgFor = pickFirstNumeric(candidatesFor, 2);
+  const xgAgainst = pickFirstNumeric(candidatesAgainst, 2);
+
+  if (xgFor === null && xgAgainst === null) return null;
+  const out = {};
+  if (xgFor !== null) out.f = xgFor;
+  if (xgAgainst !== null) out.a = xgAgainst;
+  return Object.keys(out).length ? out : null;
+}
+
+function extractNestedTriple(root, paths, played, decimals = 0) {
+  for (const path of paths) {
+    let node = root;
+    let ok = true;
+    for (const part of path) {
+      if (!node || typeof node !== "object") {
+        ok = false;
+        break;
+      }
+      node = node[part];
+    }
+    if (!ok || !node) continue;
+    const pct = extractPercentageTriple(node, played, decimals);
+    if (pct) return pct;
+    const counts = getTripleNumbers(node, 0);
+    if (counts && played) {
+      const pctFromCounts = countsToPct(counts, played, decimals);
+      if (pctFromCounts) return pctFromCounts;
+    }
+  }
+  return null;
+}
+
+function sanitizeForm(form) {
+  if (!form) return "";
+  return String(form)
+    .replace(/[^WDL]/gi, "")
+    .slice(-10);
+}
+
+function extractTeamStats(stats) {
+  const response = stats?.response;
+  if (!response || typeof response !== "object") return null;
+
+  const out = {};
+
+  const form = sanitizeForm(response.form);
+  if (form) out.form = form;
+
+  const played = getTripleNumbers(response?.fixtures?.played, 0);
+  if (played) out.played = played;
+
+  const gfAvg = getTripleNumbers(response?.goals?.for?.average, 2);
+  if (gfAvg) out.gf_avg = gfAvg;
+
+  const gaAvg = getTripleNumbers(response?.goals?.against?.average, 2);
+  if (gaAvg) out.ga_avg = gaAvg;
+
+  const gfTot = getTripleNumbers(response?.goals?.for?.total, 0);
+  if (gfTot) out.gf_tot = gfTot;
+
+  const gaTot = getTripleNumbers(response?.goals?.against?.total, 0);
+  if (gaTot) out.ga_tot = gaTot;
+
+  const winPct = extractNestedTriple(response, [["fixtures", "wins"]], played, 0);
+  if (winPct) out.win_pct = winPct;
+
+  const losePct = extractNestedTriple(response, [["fixtures", "loses"]], played, 0);
+  if (losePct) out.lose_pct = losePct;
+
+  const drawPct = extractNestedTriple(response, [["fixtures", "draws"]], played, 0);
+  if (drawPct) out.draw_pct = drawPct;
+
+  const bttsPct = extractNestedTriple(
+    response,
+    [["fixtures", "btts"], ["fixtures", "both_to_score"], ["fixtures", "bothteams_to_score"]],
+    played,
+    0
+  );
+  if (bttsPct) out.btts_pct = bttsPct;
+
+  const overPct = extractNestedTriple(
+    response,
+    [
+      ["fixtures", "goals", "over_2_5"],
+      ["fixtures", "goals", "over25"],
+      ["fixtures", "over_2_5"],
+      ["fixtures", "over25"],
+      ["goals", "over_2_5"],
+      ["goals", "over25"],
+    ],
+    played,
+    0
+  );
+  if (overPct) out.over25_pct = overPct;
+
+  const underPct = extractNestedTriple(
+    response,
+    [
+      ["fixtures", "goals", "under_2_5"],
+      ["fixtures", "goals", "under25"],
+      ["fixtures", "under_2_5"],
+      ["fixtures", "under25"],
+      ["goals", "under_2_5"],
+      ["goals", "under25"],
+    ],
+    played,
+    0
+  );
+  if (underPct) out.under25_pct = underPct;
+
+  const cleanPct = extractNestedTriple(response, [["clean_sheet"]], played, 0);
+  if (cleanPct) out.clean_pct = cleanPct;
+
+  const failPct = extractNestedTriple(response, [["failed_to_score"]], played, 0);
+  if (failPct) out.fail_pct = failPct;
+
+  const xg = extractExpectedXg(response);
+  if (xg) out.xg = xg;
+
+  return Object.keys(out).length ? out : null;
+}
+
 export default async function handler(req, res) {
   try {
     const { slot = "am" } = req.query || {};
@@ -96,7 +420,7 @@ export default async function handler(req, res) {
           const meta = {
             ...baseMeta,
             reason: "missing_ids",
-            stats: { haveHome: false, haveAway: false },
+            stats: { haveHome: false, haveAway: false, home: null, away: null },
             injuries: { homeCount: 0, awayCount: 0 },
             h2h: { have: false, count: 0, over2_5_pct: 0, btts_pct: 0, draw_pct: 0 },
             confidence_adj_pp: 0,
@@ -132,7 +456,12 @@ export default async function handler(req, res) {
 
         const meta = {
           ...baseMeta,
-          stats: { haveHome: !!statsH, haveAway: !!statsA }, // i dalje lagano; ne uvlačimo celu statistiku
+          stats: {
+            haveHome: !!statsH,
+            haveAway: !!statsA,
+            home: extractTeamStats(statsH),
+            away: extractTeamStats(statsA),
+          },
           injuries: {
             homeCount: Array.isArray(injH?.response) ? injH.response.length : 0,
             awayCount: Array.isArray(injA?.response) ? injA.response.length : 0,
