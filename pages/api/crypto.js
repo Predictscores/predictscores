@@ -124,9 +124,31 @@ function projectForUI(items) {
     const sl = Number.isFinite(it.sl) ? it.sl : null;
 
     const m30 = numOr0(it.m30_pct), h1 = numOr0(it.h1_pct), h4 = numOr0(it.h4_pct), d24 = numOr0(it.d24_pct), d7 = numOr0(it.d7_pct);
+    const rawStructure = it.structure || it.market_structure || it.marketStructure;
+    const structure = normalizeStructure(rawStructure);
+    const regime = typeof it.regime === "string" ? it.regime : null;
+    const regimeMeta = normalizeRegimeMeta(it.regime_meta || it.regimeMeta || it.regimeInfo);
+    const adxPack = normalizeMetricMap(it.adx, structure, "adx");
+    const volatilityPack = normalizeMetricMap(it.volatility || it.vol || it.realizedVolatility, structure, "vol");
+    const hurstPack = normalizeMetricMap(it.hurst, structure, "hurst");
+    const diPack = normalizeDirectionalIndex(it.directional_index || it.directionalIndex, structure);
 
     return {
       ...it,
+      regime,
+      regime_meta: regimeMeta,
+      regimeMeta: regimeMeta,
+      structure,
+      market_structure: structure,
+      marketStructure: structure,
+      adx: adxPack,
+      volatility: volatilityPack,
+      realizedVolatility: volatilityPack,
+      realized_volatility: volatilityPack,
+      hurst: hurstPack,
+      directional_index: diPack,
+      directionalIndex: diPack,
+
       type: "crypto",
       sport: "crypto",
       category: "crypto",
@@ -318,3 +340,60 @@ function toNum(x, d = 0) { const n = Number(x); return Number.isFinite(n) ? n : 
 function clampInt(v, def, min, max) { const n = parseInt(v,10); if (!Number.isFinite(n)) return def; return Math.min(max, Math.max(min, n)); }
 function parseBool(x){ const s = String(x).toLowerCase(); if (s==="1"||s==="true") return true; if (s==="0"||s==="false") return false; return false; }
 function numOr0(v){ const n = Number(v); return Number.isFinite(n) ? n : 0; }
+function numOrNull(v){ const n = Number(v); return Number.isFinite(n) ? Math.round(n * 100) / 100 : null; }
+function safeString(v){ if (typeof v !== "string") return null; const s = v.trim(); return s ? s : null; }
+function normalizeStructure(raw) {
+  const out = { m30: emptyStructureNode(), h1: emptyStructureNode(), h4: emptyStructureNode() };
+  if (!raw || typeof raw !== "object") return out;
+  for (const tf of ["m30", "h1", "h4"]) {
+    const node = raw[tf] && typeof raw[tf] === "object" ? raw[tf] : {};
+    out[tf] = {
+      adx: numOrNull(node.adx ?? node.ADX),
+      plusDI: numOrNull(node.plusDI ?? node.plus_di ?? node.plus ?? node.pdi),
+      minusDI: numOrNull(node.minusDI ?? node.minus_di ?? node.minus ?? node.mdi),
+      vol: numOrNull(node.vol ?? node.volatility ?? node.rv ?? node.realizedVolatility),
+      hurst: numOrNull(node.hurst ?? node.hurstExponent ?? node.h),
+    };
+  }
+  return out;
+}
+function normalizeMetricMap(raw, structure, key) {
+  const out = { m30: null, h1: null, h4: null };
+  const src = raw && typeof raw === "object" ? raw : {};
+  for (const tf of ["m30", "h1", "h4"]) {
+    const val = src[tf];
+    const fallback = structure?.[tf]?.[key];
+    out[tf] = numOrNull(val != null ? val : fallback);
+  }
+  return out;
+}
+function normalizeDirectionalIndex(raw, structure) {
+  const out = {
+    m30: { plus: null, minus: null },
+    h1: { plus: null, minus: null },
+    h4: { plus: null, minus: null },
+  };
+  const src = raw && typeof raw === "object" ? raw : {};
+  for (const tf of ["m30", "h1", "h4"]) {
+    const node = src[tf] && typeof src[tf] === "object" ? src[tf] : {};
+    const plus = node.plus ?? node.plusDI ?? node.plus_di ?? node.pdi;
+    const minus = node.minus ?? node.minusDI ?? node.minus_di ?? node.mdi;
+    const fallbackPlus = structure?.[tf]?.plusDI;
+    const fallbackMinus = structure?.[tf]?.minusDI;
+    out[tf] = {
+      plus: numOrNull(plus != null ? plus : fallbackPlus),
+      minus: numOrNull(minus != null ? minus : fallbackMinus),
+    };
+  }
+  return out;
+}
+function normalizeRegimeMeta(raw) {
+  if (!raw || typeof raw !== "object") return { focus: null, low_vol: false, event_tf: null, best_adx: null };
+  return {
+    focus: safeString(raw.focus ?? raw.focus_tf ?? raw.focusTf),
+    low_vol: Boolean(raw.low_vol ?? raw.lowVol ?? false),
+    event_tf: safeString(raw.event_tf ?? raw.eventTf ?? raw.high_vol_tf ?? raw.highVolTf ?? raw.focus_event),
+    best_adx: numOrNull(raw.best_adx ?? raw.bestAdx),
+  };
+}
+function emptyStructureNode() { return { adx: null, plusDI: null, minusDI: null, vol: null, hurst: null }; }
