@@ -100,7 +100,7 @@ function mapHTFT(code) {
   const m = String(code || "").trim().toUpperCase();
   const to = (c) => (c === "1" ? "Home" : c === "2" ? "Away" : c === "X" ? "Draw" : c);
   const [a, b] = m.split("/");
-  もう  if (!a || !b) return null;
+  if (!a || !b) return null;
   return `${to(a)}–${to(b)}`;
 }
 function normalizeSelection(it, marketHint) {
