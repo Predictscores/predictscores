@@ -110,9 +110,9 @@ function fromMarkets(fix){
 }
 function oneXtwoOffers(fix){
   const xs=[]; const x=fix?.markets?.['1x2']||{}; const fid=fix.fixture_id||fix.fixture?.id;
-  const push=(code,label,price)=>{ if(Number.isFinite(price)&&price>=1.01) xs.push({
-    fixture_id:fid, market:"1x2", pick:code, selection_label:label, odds:{price:Number(price)},
-    confidence_pct:confFromOdds(Number(price)), league:fix.league, league_name:fix.league?.name,
+  const push=(code,label,price)=>{ const p=Number(price); if(Number.isFinite(p)&&p>=MIN_ODDS&&p<=MAX_ODDS) xs.push({
+    fixture_id:fid, market:"1x2", pick:code, selection_label:label, odds:{price:p},
+    confidence_pct:confFromOdds(p), league:fix.league, league_name:fix.league?.name,
     league_country:fix.league?.country, teams:fix.teams, home:fix.home, away:fix.away,
     kickoff:fix.kickoff, kickoff_utc:fix.kickoff_utc||fix.kickoff
   })};
