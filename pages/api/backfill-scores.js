@@ -1,7 +1,8 @@
 // FILE: pages/api/backfill-scores.js
+import { afxGetJson } from "../../lib/sources/apiFootball";
+
 export const config = { api: { bodyParser: false } };
 
-const BASE = "https://v3.football.api-sports.io";
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const MAX_DAYS = 14;
 const MAX_IDS_PER_CALL = 20; // batch veličina
@@ -25,18 +26,6 @@ async function kvSet(key, value) {
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ value: JSON.stringify(value) }),
   });
-}
-
-/* ---------- AF helper ---------- */
-async function afGet(path) {
-  const key = process.env.API_FOOTBALL_KEY;
-  if (!key) throw new Error("API_FOOTBALL_KEY missing");
-  const r = await fetch(`${BASE}${path}`, {
-    headers: { "x-apisports-key": key, "x-rapidapi-key": key },
-  });
-  if (!r.ok) throw new Error(`AF ${path} ${r.status}`);
-  const j = await r.json();
-  return Array.isArray(j?.response) ? j.response : [];
 }
 
 /* ---------- util ---------- */
@@ -98,10 +87,13 @@ export default async function handler(req, res) {
 
     // 3) Batch fetch rezultata
     let written = 0, skipped = ids.length - need.length, fetched = 0, finals = 0;
+    let budgetStop = false;
     const batches = chunk(need, MAX_IDS_PER_CALL);
     for (const group of batches) {
       const idStr = group.join("-");
-      const rows = await afGet(`/fixtures?ids=${idStr}`);
+      const json = await afxGetJson(`/fixtures?ids=${idStr}`, { priority: "P2" });
+      if (!json) { budgetStop = true; break; }
+      const rows = Array.isArray(json?.response) ? json.response : [];
       fetched += rows.length;
       for (const fx of rows) {
         const id = fx?.fixture?.id;
@@ -123,6 +115,7 @@ export default async function handler(req, res) {
       fetched,
       written,
       finals_recorded: finals,
+      budget_exhausted: budgetStop,
     });
   } catch (e) {
     return res.status(500).json({ ok:false, error: String(e?.message || e) });

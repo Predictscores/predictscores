@@ -1,4 +1,6 @@
 // pages/api/locked-floats.js
+import { afxGetJson, afxOddsByFixture } from "../../lib/sources/apiFootball";
+
 export const config = { api: { bodyParser: false } };
 
 /* ---------- TZ ---------- */
@@ -25,17 +27,6 @@ async function kvSet(key,val){
     body: (typeof val==="string")?val:JSON.stringify(val)
   });
   return r.ok;
-}
-
-/* ---------- API-FOOTBALL ---------- */
-const AF_BASE = "https://v3.football.api-sports.io";
-const AF_KEY  = process.env.API_FOOTBALL_KEY;
-async function af(path){
-  if(!AF_KEY) return null;
-  const r=await fetch(`${AF_BASE}${path}`,{headers:{"x-apisports-key":AF_KEY}, cache:"no-store"});
-  if(!r.ok) return null;
-  const j=await r.json().catch(()=>null);
-  return j?.response || null;
 }
 
 function mapFixtureToBase(fx){
@@ -76,11 +67,14 @@ async function buildDailyTicketsFromAF(fixtures){
   // Uzimamo najviše 12 prvih utakmica (da ostanemo daleko ispod 6000/dan)
   const take = fixtures.slice(0, 12);
   const btts=[], ou25=[], htft=[];
+  let budgetStop = false;
 
   for (const f of take) {
+    if (budgetStop) break;
     const fid = f?.fixture?.id || f?.fixture_id; if(!fid) continue;
-    const oddsResp = await af(`/odds?fixture=${fid}`);
-    const books = oddsResp?.[0]?.bookmakers || [];
+    const oddsResp = await afxOddsByFixture(fid, { priority: "P3" });
+    if (!oddsResp) { budgetStop = true; break; }
+    const books = oddsResp?.response?.[0]?.bookmakers || [];
     // BTTS
     {
       let yes=[], no=[];
@@ -137,7 +131,7 @@ async function buildDailyTicketsFromAF(fixtures){
 
   const sortT = (a,b)=> (conf(b)-conf(a)) || (kts(a)-kts(b));
   btts.sort(sortT); ou25.sort(sortT); htft.sort(sortT);
-  return { btts, ou25, htft };
+  return { btts, ou25, htft, budgetStop };
 }
 
 /* ---------- handler ---------- */
@@ -148,11 +142,23 @@ export default async function handler(req, res){
     // WARM: napravi bazu i (ako treba) dnevne tikete
     if(String(req.query.warm||"") === "1"){
       let baseCount = 0, madeBase = false, ticketsInfo = null;
+      let budgetStop = false;
 
       // 1) BASE SNAPSHOT: ako ne postoji, povuci fixtures za današnji datum i upiši vb:day:<YMD>:(last|union)
       const lastRaw = await kvGet(`vb:day:${today}:last`);
       if (!J(lastRaw)?.length){
-        const fixtures = await af(`/fixtures?date=${today}&timezone=${encodeURIComponent(TZ)}`) || [];
+        const fixturesResp = await afxGetJson(
+          `/fixtures?date=${today}&timezone=${encodeURIComponent(TZ)}`,
+          {
+            cacheKey: `af:fixtures:${today}:${TZ}`,
+            ttlSeconds: 2 * 3600,
+            priority: "P2",
+          }
+        );
+        if (!fixturesResp) {
+          budgetStop = true;
+        }
+        const fixtures = Array.isArray(fixturesResp?.response) ? fixturesResp.response : [];
         const base = fixtures.map(mapFixtureToBase).filter(x=>x.fixture_id);
         if (base.length){
           await kvSet(`vb:day:${today}:last`, base);
@@ -168,14 +174,17 @@ export default async function handler(req, res){
       const tRaw = await kvGet(`tickets:${today}`);
       if(!J(tRaw)){
         const fixtures = J(await kvGet(`vb:day:${today}:last`)) || [];
-        const { btts, ou25, htft } = await buildDailyTicketsFromAF(fixtures);
-        await kvSet(`tickets:${today}`, { btts, ou25, htft });
+        const { btts, ou25, htft, budgetStop: ticketsBudgetStop } = await buildDailyTicketsFromAF(fixtures);
+        if (btts.length || ou25.length || htft.length) {
+          await kvSet(`tickets:${today}`, { btts, ou25, htft });
+        }
         ticketsInfo = { btts: btts.length, ou25: ou25.length, htft: htft.length };
+        budgetStop = budgetStop || ticketsBudgetStop;
       }else{
         const t = J(tRaw); ticketsInfo = { btts: (t?.btts||[]).length, ou25: (t?.ou25||[]).length, htft:(t?.htft||[]).length };
       }
 
-      return res.status(200).json({ ok:true, warm:{ base_created:madeBase, base_count:baseCount, tickets:ticketsInfo } });
+      return res.status(200).json({ ok:true, warm:{ base_created:madeBase, base_count:baseCount, tickets:ticketsInfo, budget_exhausted:budgetStop } });
     }
 
     // Bez warm-a ne radimo ništa teško (ovaj endpoint se zove iz crona da popuni bazu)

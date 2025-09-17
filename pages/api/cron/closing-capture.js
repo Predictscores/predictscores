@@ -1,12 +1,11 @@
 // pages/api/cron/closing-capture.js
 // Per-fixture closing: gleda KO u prozoru [-15min, +5min], max 10 po run-u.
 // Zove /odds?fixture=<id> samo za te mečeve (jeftino).
+import { afxOddsByFixture } from "../../../lib/sources/apiFootball";
 
 export const config = { runtime: "nodejs" };
 
 const TZ = "Europe/Belgrade";
-const AF_BASE = "https://v3.football.api-sports.io";
-const AF_KEY = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY;
 
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN_RO = process.env.KV_REST_API_READ_ONLY_TOKEN;
@@ -41,16 +40,6 @@ function autoSlot(tz = TZ) {
   return "pm";
 }
 
-async function af(path, params = {}) {
-  const qs = new URLSearchParams(params);
-  const url = `${AF_BASE}${path}?${qs}`;
-  const r = await fetch(url, { headers: { "x-apisports-key": AF_KEY }, cache: "no-store" });
-  if (!r.ok) throw new Error(`AF ${path} ${r.status}`);
-  const j = await r.json();
-  if (j.errors && Object.keys(j.errors).length) throw new Error(`AF error: ${JSON.stringify(j.errors)}`);
-  return j;
-}
-
 export default async function handler(req, res) {
   try {
     const qslot = String(req.query.slot || "").toLowerCase();
@@ -72,8 +61,11 @@ export default async function handler(req, res) {
     const target = inWindow.slice(0, MAX_PER_RUN);
 
     let closed = 0;
+    let budgetStop = false;
     for (const it of target) {
-      await af("/odds", { fixture: it.fixture_id }).catch(() => null);
+      if (budgetStop) break;
+      const resp = await afxOddsByFixture(it.fixture_id, { priority: "P1" });
+      if (!resp) { budgetStop = true; break; }
       closed++;
     }
 
@@ -82,6 +74,7 @@ export default async function handler(req, res) {
       ymd, slot,
       targeted: target.length,
       closed,
+      budget_exhausted: budgetStop,
       source: "closing-capture:per-fixture",
     });
   } catch (e) {

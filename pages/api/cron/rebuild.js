@@ -53,7 +53,7 @@ async function kvSET(key, val, trace=[]) {
 }
 
 /* ---------- API-Football thin wrapper (uses official header) ---------- */
-const { afFetch } = require("../../../lib/sources/apiFootball");
+const { afxFixturesByDate } = require("../../../lib/sources/apiFootball");
 
 /* ---------- utils ---------- */
 function canonicalSlot(x){ x=String(x||"auto").toLowerCase(); return x==="late"||x==="am"||x==="pm"?x:"auto"; }
@@ -111,10 +111,15 @@ export default async function handler(req, res){
     const fullItems = Array.isArray(full?.items) ? full.items : (Array.isArray(full)?full:[]);
 
     let items = fullItems.length ? fullItems : baseItems;
+    let budgetStop = false;
 
     // 2) If base empty, fetch fixtures for the day and seed KV
     if (!items.length){
-      const af = await afFetch("/fixtures", { date: ymd });
+      const af = await afxFixturesByDate(ymd, { priority: "P2" });
+      if (!af) {
+        budgetStop = true;
+        trace.push({ afx: "fixtures", ymd, budget: "exhausted" });
+      }
       const list = Array.isArray(af?.response) ? af.response : [];
       const mapped = list
         .filter(f => !isYouthLeague(f?.league?.name))
@@ -158,7 +163,8 @@ export default async function handler(req, res){
       ok:true,
       ymd, slot,
       counts: { full: items.length },
-      source: items.length ? "af:seed-or-kv" : "empty",
+      source: items.length ? "af:seed-or-kv" : (budgetStop ? "budget" : "empty"),
+      budget_exhausted: budgetStop,
       trace
     });
   }catch(e){
