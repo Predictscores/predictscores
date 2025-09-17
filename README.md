@@ -6,6 +6,23 @@ default window is **75 minutes**. Operations can adjust it without editing the
 workflow by defining the repository variable `SNAPSHOT_GUARD_MINUTES`
 (`Settings → Secrets and variables → Actions`).
 
+## Crypto signal volatility tuning
+
+`buildSignals` now derives its intraday vote thresholds from realized log
+volatility so that 30m/1h/4h votes scale with current market conditions. The
+per-timeframe multipliers can be adjusted without redeploying by setting the
+following environment variables:
+
+- `CRYPTO_VOL_MULT_M30` (default **0.35**)
+- `CRYPTO_VOL_MULT_H1` (default **0.30**)
+- `CRYPTO_VOL_MULT_H4` (default **0.25**)
+
+Each multiplier scales the 60-sample log-volatility (expressed in percentage
+points) for its timeframe. Positive values increase or decrease sensitivity,
+while blank/invalid values fall back to the defaults above. If the volatility
+series is unavailable the engine reuses the legacy static thresholds or the
+values provided through `opts.thresh` for compatibility.
+
 ## Value bets meta stats schema
 
 `/api/cron/enrich` now persists a compact stats payload for each team under
