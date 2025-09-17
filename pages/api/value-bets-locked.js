@@ -151,6 +151,25 @@ function applyUefaCap(items, cap){
   return out;
 }
 
+/* ===== Alias layer to match legacy frontend ===== */
+function aliasItem(it){
+  const a = { ...it };
+  // legacy confidence
+  a.confidence = typeof it.confidence !== "undefined" ? it.confidence : (it.confidence_pct ?? 0);
+  // legacy price on root
+  if (it?.odds && typeof it.odds.price !== "undefined") a.price = Number(it.odds.price);
+  // legacy names
+  if (it.home && !a.home_name) a.home_name = it.home;
+  if (it.away && !a.away_name) a.away_name = it.away;
+  // kickoff timestamp if frontend sorts by number
+  a.kickoff_ts = (() => {
+    const s = it.kickoff_utc || it.kickoff;
+    const t = s ? Date.parse(s) : NaN;
+    return Number.isFinite(t) ? t : null;
+  })();
+  return a;
+}
+
 /* =========================
  *  Handler
  * ========================= */
@@ -171,8 +190,8 @@ export default async function handler(req,res){
     if (!base.length) {
       return res.status(200).json({
         ok:true, ymd, slot, source:null,
-        items:[], tickets:{ btts:[], ou25:[], fh_ou15:[], htft:[] }, one_x_two: [],
-        debug:{ trace }
+        items:[], tickets:{ btts:[], ou25:[], fh_ou15:[], htft:[], BTTS:[], OU25:[], FH_OU15:[], HTFT:[] },
+        one_x_two: [], debug:{ trace }
       });
     }
 
@@ -194,11 +213,26 @@ export default async function handler(req,res){
     const oneXtwoAll=[]; for (const f of base) oneXtwoAll.push(...oneXtwoOffers(f));
     oneXtwoAll.sort((a,b)=>(b.confidence_pct||0)-(a.confidence_pct||0));
     const oneXtwoCap = oneXtwoCapForSlot(slot, weekend);
-    const one_x_two = capPerLeague(oneXtwoAll, VB_MAX_PER_LEAGUE).slice(0, oneXtwoCap);
+    const one_x_two_raw = capPerLeague(oneXtwoAll, VB_MAX_PER_LEAGUE).slice(0, oneXtwoCap);
+
+    // ===== Apply aliasing so the legacy UI can render immediately
+    const items = topN.map(aliasItem);
+    const one_x_two = one_x_two_raw.map(aliasItem);
+    const ticketsAliased = {
+      btts:    tickets.btts.map(aliasItem),
+      ou25:    tickets.ou25.map(aliasItem),
+      fh_ou15: tickets.fh_ou15.map(aliasItem),
+      htft:    tickets.htft.map(aliasItem),
+      // Upper-case aliases (if the UI expects these keys)
+      BTTS:    tickets.btts.map(aliasItem),
+      OU25:    tickets.ou25.map(aliasItem),
+      FH_OU15: tickets.fh_ou15.map(aliasItem),
+      HTFT:    tickets.htft.map(aliasItem),
+    };
 
     return res.status(200).json({
       ok:true, ymd, slot, source: full.items.length?"vbl_full":"vb:day",
-      items: topN, tickets, one_x_two, debug:{ trace }
+      items, tickets: ticketsAliased, one_x_two, debug:{ trace }
     });
   }catch(e){
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
