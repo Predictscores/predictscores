@@ -33,7 +33,8 @@ function hourInTZ(d = new Date(), tz = TZ) {
   const f = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", hour12: false });
   return Number(f.formatToParts(d).find(p => p.type === "hour").value);
 }
-function autoSlot(tz = TZ) { const h = hourInTZ(new Date(), tz); if (h < 10) return "late"; if (h < 15) return "am"; return "pm"; }
+function autoSlot(tz = TZ) { const h = hourInTZ(new Date(), tz); if (h < 10) return "late"; if (h < 15) return "am"; return "pm"
+; }
 function labelFor(k) { return k === "1" ? "Home" : k === "2" ? "Away" : k === "X" ? "Draw" : String(k || ""); }
 
 function normalize(it) {
