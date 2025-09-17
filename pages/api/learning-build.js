@@ -11,6 +11,8 @@
 //
 // Napomena: radi samo sa FEATURE_HISTORY=1 (da postoje vb:day:YYYY-MM-DD:union ključevi)
 
+import { evalPick, normalizeMarketPick } from "../../lib/learning/eval";
+
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
@@ -48,50 +50,6 @@ function ymdsBack(days) {
   return out;
 }
 
-function parseScore(obj) {
-  // Očekujemo npr: { ft: { home, away }, ht: {...} } ili sličan oblik.
-  try {
-    const s = typeof obj === "string" ? JSON.parse(obj) : obj;
-    const ft = s && s.ft ? s.ft : s?.fulltime || s?.ft || null;
-    const ht = s && s.ht ? s.ht : s?.halftime || s?.ht || null;
-    return { ft, ht };
-  } catch {
-    return { ft: null, ht: null };
-  }
-}
-
-function evalPick(p, sc) {
-  if (!p || !sc || !sc.ft) return null;
-  const { ft, ht } = sc;
-  // 1X2
-  if (p.market === "1X2") {
-    const diff = (ft.home ?? 0) - (ft.away ?? 0);
-    if (p.pick_code === "1") return diff > 0 ? 1 : 0;
-    if (p.pick_code === "X") return diff === 0 ? 1 : 0;
-    if (p.pick_code === "2") return diff < 0 ? 1 : 0;
-  }
-  // OU2.5
-  if (p.market === "OU2.5") {
-    const goals = (ft.home ?? 0) + (ft.away ?? 0);
-    if (p.pick_code === "O") return goals > 2 ? 1 : 0;
-    if (p.pick_code === "U") return goals < 3 ? 1 : 0;
-  }
-  // BTTS
-  if (p.market === "BTTS") {
-    const yes = (ft.home ?? 0) > 0 && (ft.away ?? 0) > 0;
-    if (p.pick_code === "Y") return yes ? 1 : 0;
-    if (p.pick_code === "N") return !yes ? 1 : 0;
-  }
-  // HT-FT
-  if (p.market === "HT-FT" && ht) {
-    const dft = (ft.home ?? 0) - (ft.away ?? 0);
-    const dht = (ht.home ?? 0) - (ht.away ?? 0);
-    const code = (x) => (x > 0 ? "H" : x < 0 ? "A" : "D");
-    return `${code(dht)}-${code(dft)}` === p.pick_code ? 1 : 0;
-  }
-  return null;
-}
-
 export default async function handler(req, res) {
   try {
     const days = Math.max(1, Math.min(90, Number(req.query.days || "30")));
@@ -105,9 +63,10 @@ export default async function handler(req, res) {
       if (!day || !day.items) continue;
 
       for (const it of day.items) {
-        const pick = it && it.market ? { market: it.market, pick_code: it.pick_code } : null;
+        const pick = normalizeMarketPick(it);
+        if (!pick) continue;
         const sc = await kvGet(`vb:score:${it.fixture_id}`);
-        const won = evalPick(pick, parseScore(sc));
+        const won = evalPick(pick, sc, { normalized: true });
         if (won == null) continue;
 
         const leagueKey = it.league && it.league.id ? `${it.league.id}` : "unknown";

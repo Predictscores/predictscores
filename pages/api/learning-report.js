@@ -1,4 +1,6 @@
 // FILE: pages/api/learning-report.js
+import { evalPick, normalizeMarketPick } from "../../lib/learning/eval";
+
 export const config = { api: { bodyParser: false } };
 
 // ---- KV helpers
@@ -11,35 +13,6 @@ async function kvGet(key) {
   if (!r.ok) return null;
   const { result } = await r.json();
   try { return result ? JSON.parse(result) : null; } catch { return null; }
-}
-
-// ---- Eval market outcome from FT/HT score
-function evalPick(p, sc) {
-  if (!p || !sc || !sc.ft) return null;
-  const { ft, ht } = sc;
-  if (p.market === "1X2") {
-    const diff = (ft.home ?? 0) - (ft.away ?? 0);
-    if (p.pick_code === "1") return diff > 0 ? 1 : 0;
-    if (p.pick_code === "X") return diff === 0 ? 1 : 0;
-    if (p.pick_code === "2") return diff < 0 ? 1 : 0;
-  }
-  if (p.market === "OU2.5") {
-    const goals = (ft.home ?? 0) + (ft.away ?? 0);
-    if (p.pick_code === "O") return goals > 2 ? 1 : 0;
-    if (p.pick_code === "U") return goals < 3 ? 1 : 0;
-  }
-  if (p.market === "BTTS") {
-    const yes = (ft.home ?? 0) > 0 && (ft.away ?? 0) > 0;
-    if (p.pick_code === "Y") return yes ? 1 : 0;
-    if (p.pick_code === "N") return !yes ? 1 : 0;
-  }
-  if (p.market === "HT-FT" && sc.ht) {
-    const dft = (ft.home ?? 0) - (ft.away ?? 0);
-    const dht = (sc.ht.home ?? 0) - (sc.ht.away ?? 0);
-    const code = (x) => (x > 0 ? "H" : x < 0 ? "A" : "D");
-    return `${code(dht)}-${code(dft)}` === p.pick_code ? 1 : 0;
-  }
-  return null;
 }
 
 export default async function handler(req, res) {
@@ -65,11 +38,11 @@ export default async function handler(req, res) {
       if (!snap || !snap.items) continue;
 
       for (const it of snap.items) {
-        const pick = it && it.market ? { market: it.market, pick_code: it.pick_code } : null;
+        const pick = normalizeMarketPick(it);
+        if (!pick) continue;
         const scoreRaw = await kvGet(`vb:score:${it.fixture_id}`);
         if (!scoreRaw) continue;
-        const sc = typeof scoreRaw === "string" ? JSON.parse(scoreRaw) : scoreRaw;
-        const won = evalPick(pick, sc);
+        const won = evalPick(pick, scoreRaw, { normalized: true });
         if (won == null) continue;
 
         rows.push({
