@@ -1,4 +1,6 @@
 // pages/api/cron/refresh-odds.js
+import { afxOddsByFixture } from "../../../lib/sources/apiFootball";
+
 export const config = { api: { bodyParser: false } };
 
 /* =========================
@@ -65,9 +67,9 @@ function consensusPrice(list){ const m=median(list); if (Number.isFinite(m)) ret
  *  ENV / time helpers
  * ========================= */
 const TZ = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
-const SLOT_ODDS_CAP_LATE = Number(process.env.SLOT_ODDS_CAP_LATE || 1200);
-const SLOT_ODDS_CAP_AM   = Number(process.env.SLOT_ODDS_CAP_AM   || 2400);
-const SLOT_ODDS_CAP_PM   = Number(process.env.SLOT_ODDS_CAP_PM   || 2400);
+const SLOT_ODDS_CAP_LATE = Number(process.env.SLOT_ODDS_CAP_LATE || 800);
+const SLOT_ODDS_CAP_AM   = Number(process.env.SLOT_ODDS_CAP_AM   || 1600);
+const SLOT_ODDS_CAP_PM   = Number(process.env.SLOT_ODDS_CAP_PM   || 1600);
 const BACKOFF_MINUTES_EMPTY = Number(process.env.ODDS_BACKOFF_MINUTES || 25);
 
 const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
@@ -75,17 +77,6 @@ const hourInTZ = (d, tz) => Number(new Intl.DateTimeFormat("en-GB",{ timeZone:tz
 function pickSlot(now) { const h=hourInTZ(now,TZ); return h<10?"late":h<15?"am":"pm"; }
 function capForSlot(slot){ if (slot==="late") return SLOT_ODDS_CAP_LATE; if (slot==="am") return SLOT_ODDS_CAP_AM; return SLOT_ODDS_CAP_PM; }
 function leagueTier(leagueName=""){ const s=String(leagueName).toLowerCase(); if(/uefa|champions|europa|conference/.test(s))return 1; if(/premier league|la liga|serie a|bundesliga|ligue 1|eredivisie|primeira|championship|mls/.test(s))return 2; return 3; }
-
-/* =========================
- *  API-Football client + parsing
- * ========================= */
-async function afOddsByFixture(fixtureId, apiKey){
-  const url = `https://v3.football.api-sports.io/odds?fixture=${fixtureId}`;
-  const r = await fetch(url, { headers: { "x-apisports-key": apiKey }, cache:"no-store" });
-  if (!r.ok) return null;
-  const j = await r.json().catch(()=>null);
-  return j;
-}
 
 function extractConsensusMarkets(afResponse){
   const out = {};
@@ -218,7 +209,8 @@ export default async function handler(req, res){
       process.env.API_FOOTBALL_KEY ||
       process.env.APISPORTS_KEY ||
       process.env.APISPORTS_API_KEY ||
-      process.env.X_APISPORTS_KEY;
+      process.env.X_APISPORTS_KEY ||
+      process.env.NEXT_PUBLIC_API_FOOTBALL_KEY;
     if (!apiKey) {
       return res.status(200).json({
         ok:false,
@@ -243,9 +235,10 @@ export default async function handler(req, res){
 
     const CAP = capForSlot(slot);
     let updated = 0, skipped = 0;
+    let budgetStop = false;
 
     for (const f of items) {
-      if (updated >= CAP) break;
+      if (updated >= CAP || budgetStop) break;
 
       const id = f.fixture_id || f.fixture?.id;
       if (!id) { skipped++; continue; }
@@ -263,7 +256,11 @@ export default async function handler(req, res){
         if (Date.now() < until.getTime()) { skipped++; continue; }
       }
 
-      const af = await afOddsByFixture(id, apiKey);
+      const af = await afxOddsByFixture(id);
+      if (!af) {
+        budgetStop = true;
+        break;
+      }
       const markets = extractConsensusMarkets(af);
 
       if (!markets || Object.keys(markets).length === 0) {
@@ -278,7 +275,7 @@ export default async function handler(req, res){
 
     await kvSET(fullKey, { items }, trace);
 
-    return res.status(200).json({ ok:true, ymd, slot, updated, skipped, items_len: items.length, trace });
+    return res.status(200).json({ ok:true, ymd, slot, updated, skipped, items_len: items.length, budget_exhausted: budgetStop, trace });
   }catch(e){
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }

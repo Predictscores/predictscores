@@ -2,6 +2,7 @@
 // Settling i history SAMO nad vb:day:<YMD>:combined (Top 3).
 // Ako combined nedostaje ili je prazan, SAM pokreće /api/cron/rebuild (koji po potrebi poziva /api/score-sync).
 // Podrazumevani YMD je Europe/Belgrade. Presuđuje 1X2, OU, BTTS, HT-FT.
+import { afxGetJson } from "../../../lib/sources/apiFootball";
 
 function kvEnv() {
   const url =
@@ -164,21 +165,14 @@ function decideOutcomeFromFinals(it, finals) {
   return "PENDING";
 }
 
-/* ---------- API-FOOTBALL ---------- */
-
-function apiFootballKey() {
-  return process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || "";
-}
-function apiKey() { return apiFootballKey(); }
 function normalizeName(s) { return String(s||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().replace(/\s+/g," ").trim(); }
 function makePairKey(home, away) { return `${normalizeName(home)}|${normalizeName(away)}`; }
 
 async function fetchFixturesByIds(ids) {
-  const key = apiKey(); if (!key || !ids.length) return {};
-  const url = `https://v3.football.api-sports.io/fixtures?ids=${ids.join(",")}`;
-  const r = await fetch(url, { headers: { "x-apisports-key": key, "Accept": "application/json" }, cache: "no-store" });
-  if (!r.ok) return {};
-  const j = await r.json().catch(() => ({}));
+  if (!ids || !ids.length) return {};
+  const path = `/fixtures?ids=${ids.join(",")}`;
+  const j = await afxGetJson(path, { priority: "P1" });
+  if (!j) return {};
   const map = {};
   for (const row of j?.response || []) {
     const fid = row?.fixture?.id;
@@ -197,11 +191,10 @@ async function fetchFixturesByIds(ids) {
   return map;
 }
 async function fetchFixturesByDate(ymd) {
-  const key = apiKey(); if (!key) return {};
-  const url = `https://v3.football.api-sports.io/fixtures?date=${ymd}&timezone=UTC`;
-  const r = await fetch(url, { headers: { "x-apisports-key": key, "Accept": "application/json" }, cache: "no-store" });
-  if (!r.ok) return {};
-  const j = await r.json().catch(() => ({}));
+  if (!ymd) return {};
+  const path = `/fixtures?date=${ymd}&timezone=UTC`;
+  const j = await afxGetJson(path, { priority: "P1" });
+  if (!j) return {};
   const byPair = {};
   for (const row of j?.response || []) {
     const home = row?.teams?.home?.name, away = row?.teams?.away?.name;
