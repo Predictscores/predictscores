@@ -48,6 +48,9 @@ jobs:
     env:
       TZ_DISPLAY: Europe/Belgrade
       FALLBACK_BASE: https://predictscores.vercel.app
+      # Default guard window (minutes) for slot detection; override via repo variable
+      # `SNAPSHOT_GUARD_MINUTES` to tune without editing the workflow.
+      FREEZE_MINUTES: ${{ vars.SNAPSHOT_GUARD_MINUTES || '75' }}
 
     steps:
       - name: Ensure jq is available
@@ -89,7 +92,11 @@ jobs:
 
           YMD=$(TZ="${TZD:-Europe/Belgrade}" date +%F)
 
-          FM=${FREEZE_MINUTES:-10}
+          FM=${FREEZE_MINUTES:-75}
+          if ! [[ "$FM" =~ ^[0-9]+$ ]]; then
+            echo "::warning::FREEZE_MINUTES ('$FM') is not an integer, falling back to 75"
+            FM=75
+          fi
           now_hm=$(TZ="${TZD:-Europe/Belgrade}" date +%H:%M)
           H=${now_hm%%:*}; M=${now_hm##*:}
           m=$((10#$H*60 + 10#$M))
@@ -118,11 +125,14 @@ jobs:
             pm)   (( d_pm   <= FM )) && run_guard=true ;;
           esac
 
+          echo "Guard decision: run=$run_guard (slot=$SLOT, now=$now_hm, guard_minutes=$FM, schedule=${SCH:-workflow_dispatch})"
+
           {
             echo "run=$run_guard"
             echo "base=$BASE"
             echo "slot=$SLOT"
             echo "ymd=$YMD"
+            echo "guard_minutes=$FM"
           } >> "$GITHUB_OUTPUT"
 
       # 0) Warm — PRIVREMENO ISKLJUČEN da ne piše dnevni tickets:<ymd>
