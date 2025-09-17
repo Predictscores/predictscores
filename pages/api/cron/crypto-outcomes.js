@@ -10,6 +10,9 @@ const {
   CRYPTO_EVAL_BAR = "30m",          // 30m sveće (kao na chartu)
   CRYPTO_EVAL_GRACE_MIN = "30",     // čekaj još malo posle valid_until
   CRYPTO_FEE_PCT = "0.1",           // u %, jednokratno po ulasku/izlasku (npr 0.1)
+  CRYPTO_OUTCOME_LOG_KEY = "crypto:outcomes:log",
+  CRYPTO_OUTCOME_LOG_MAX = "2000",
+  CRYPTO_OUTCOME_LOG_TTL_DAYS = "120",
 } = process.env;
 
 export default async function handler(req, res) {
@@ -50,11 +53,13 @@ export default async function handler(req, res) {
       const side = String(rec.side || "").toUpperCase(); // LONG/SHORT
       const entry = rec.entry, sl = rec.sl, tp = rec.tp;
       let outcome = "expired", exitPrice = null, timeToHitMin = null;
+      let lastClose = null;
 
       for (const k of slice.sort((a,b)=>a.ts-b.ts)) {
         const { high, low } = k;
         const hitTP = side === "LONG" ? (high >= tp) : (low <= tp);
         const hitSL = side === "LONG" ? (low <= sl) : (high >= sl);
+        lastClose = Number.isFinite(k.close) ? k.close : lastClose;
 
         if (hitTP && hitSL) { // tie → gori ishod
           outcome = "sl";
@@ -76,6 +81,10 @@ export default async function handler(req, res) {
         }
       }
 
+      if (!Number.isFinite(exitPrice) && Number.isFinite(lastClose)) {
+        exitPrice = lastClose;
+      }
+
       // realized RR (sa fee, konzervativno)
       const risk = side === "LONG" ? (entry - sl) : (sl - entry);
       let realizedRR = null, win = null;
@@ -89,6 +98,8 @@ export default async function handler(req, res) {
         win = null;
       }
 
+      const pctChange = computePctChange(entry, exitPrice, side);
+
       const updatedRec = {
         ...rec,
         outcome,
@@ -97,8 +108,34 @@ export default async function handler(req, res) {
         time_to_hit_min: timeToHitMin,
         realized_rr: realizedRR,
         evaluated_ts: Date.now(),
+        exit_pct_change: pctChange,
       };
       await kvSetJSON(recKey, updatedRec, 60 * 86400); // produži TTL na 60d
+      await appendOutcomeLog({
+        id,
+        ts: rec.ts || null,
+        evaluated_ts: updatedRec.evaluated_ts,
+        valid_until: rec.valid_until || null,
+        symbol: rec.symbol || rec.symbol1 || null,
+        side,
+        exchange: rec.exchange || null,
+        pair: rec.pair || null,
+        confidence_pct: rec.confidence_pct ?? null,
+        rr: rec.rr ?? null,
+        realized_rr: realizedRR,
+        entry,
+        exit_price: exitPrice,
+        pct_change: pctChange,
+        outcome,
+        win,
+        time_to_hit_min: timeToHitMin,
+        m30_pct: toNum(rec.m30_pct),
+        h1_pct: toNum(rec.h1_pct),
+        h4_pct: toNum(rec.h4_pct),
+        d24_pct: toNum(rec.d24_pct),
+        d7_pct: toNum(rec.d7_pct),
+        votes: rec.votes || null,
+      });
       updated++; checked++;
     }
 
@@ -170,6 +207,25 @@ function authHeader() {
   if (UPSTASH_REDIS_REST_TOKEN) h["Authorization"] = `Bearer ${UPSTASH_REDIS_REST_TOKEN}`;
   return h;
 }
+async function appendOutcomeLog(entry) {
+  const key = CRYPTO_OUTCOME_LOG_KEY || "crypto:outcomes:log";
+  if (!UPSTASH_REDIS_REST_URL || !key) return;
+  try {
+    const base = UPSTASH_REDIS_REST_URL.replace(/\/+$/, "");
+    const payload = encodeURIComponent(JSON.stringify(entry));
+    const urlPush = `${base}/lpush/${encodeURIComponent(key)}/${payload}`;
+    await fetch(urlPush, { headers: authHeader(), cache: "no-store" }).catch(() => {});
+    const maxLen = clampInt(CRYPTO_OUTCOME_LOG_MAX, 2000, 100, 20000);
+    const trimStop = Math.max(0, maxLen - 1);
+    const urlTrim = `${base}/ltrim/${encodeURIComponent(key)}/0/${trimStop}`;
+    await fetch(urlTrim, { headers: authHeader(), cache: "no-store" }).catch(() => {});
+    const ttlSec = clampInt(CRYPTO_OUTCOME_LOG_TTL_DAYS, 120, 1, 365) * 86400;
+    if (ttlSec > 0) {
+      const urlExpire = `${base}/expire/${encodeURIComponent(key)}/${ttlSec}`;
+      await fetch(urlExpire, { headers: authHeader(), cache: "no-store" }).catch(() => {});
+    }
+  } catch {}
+}
 function checkCronKey(req, expected) {
   if (!expected) return false;
   const q = String(req.query.key || "");
@@ -181,3 +237,11 @@ function checkCronKey(req, expected) {
   return false;
 }
 function clampInt(v, def, min, max) { const n = parseInt(v,10); if (!Number.isFinite(n)) return def; return Math.min(max, Math.max(min, n)); }
+function toNum(v, d = 0) { const n = Number(v); return Number.isFinite(n) ? n : d; }
+function computePctChange(entryPrice, exitPrice, side) {
+  const entry = Number(entryPrice);
+  const exit = Number(exitPrice);
+  if (!Number.isFinite(entry) || entry <= 0 || !Number.isFinite(exit)) return null;
+  const raw = side === "LONG" ? ((exit - entry) / entry) : ((entry - exit) / entry);
+  return Number.isFinite(raw) ? Math.round(raw * 10000) / 100 : null;
+}

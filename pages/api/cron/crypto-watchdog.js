@@ -227,6 +227,13 @@ async function logHistory(items, snapshotTs, cfg) {
       confidence_pct: Number.isFinite(it.confidence_pct) ? it.confidence_pct : null,
       valid_until: it.valid_until || null,
 
+      m30_pct: numOrNull(it.m30_pct),
+      h1_pct: numOrNull(it.h1_pct),
+      h4_pct: numOrNull(it.h4_pct),
+      d24_pct: numOrNull(it.d24_pct),
+      d7_pct: numOrNull(it.d7_pct),
+      votes: sanitizeVotes(it.votes),
+
       // outcome polja (popunjava evaluator)
       outcome: null,            // "tp" | "sl" | "expired" | "tie"
       win: null,                // 1/0
@@ -283,3 +290,13 @@ function toNum(x, d = 0) { const n = Number(x); return Number.isFinite(n) ? n : 
 function clampInt(v, def, min, max) { const n = parseInt(v, 10); if (!Number.isFinite(n)) return def; return Math.min(max, Math.max(min, n)); }
 function parseBool(x, def = false) { const s = String(x).toLowerCase(); if (s==="1"||s==="true") return true; if (s==="0"||s==="false") return false; return def; }
 function numOr0(v){ const n = Number(v); return Number.isFinite(n) ? n : 0; }
+function numOrNull(v){ const n = Number(v); return Number.isFinite(n) ? n : null; }
+function sanitizeVotes(v){
+  if (!v || typeof v !== "object") return null;
+  const out = {};
+  for (const key of ["m30","h1","h4","d24","d7","sum"]) {
+    const n = Number(v[key]);
+    out[key] = Number.isFinite(n) ? n : 0;
+  }
+  return out;
+}
