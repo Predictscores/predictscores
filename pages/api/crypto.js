@@ -96,9 +96,12 @@ export default async function handler(req, res) {
     if (!envReport.ok) {
       return res.status(500).json({ ok: false, error: "coingecko_env_incomplete", missing: envReport.missing });
     }
+    const freeMode = envReport.free ?? parseBool(COINGECKO_FREE);
+
     try {
       items = await buildSignals({
         cgApiKey: COINGECKO_API_KEY,
+        cgFree: freeMode,
         minVol: CFG.MIN_VOL,
         minMcap: CFG.MIN_MCAP,
         quorum: CFG.QUORUM,
@@ -267,16 +270,59 @@ function summarizeCoinGeckoEnv({
 } = {}) {
   const freeMode = parseBool(coingeckoFree ?? process.env.COINGECKO_FREE ?? "0");
   const fallbackActive = detectFallbackStore(fallbackStore);
-  const mode = freeMode ? "FREE" : "PAID";
 
-  const validation = validateCoinGeckoApiKey(apiKey);
+  const resolvedUrl = typeof upstashUrl === "string" ? upstashUrl : process.env.UPSTASH_REDIS_REST_URL;
+  const resolvedToken = typeof upstashToken === "string" ? upstashToken : process.env.UPSTASH_REDIS_REST_TOKEN;
+  const resolvedApiKey = typeof apiKey === "string" ? apiKey : process.env.COINGECKO_API_KEY;
 
+  const validation = validateCoinGeckoApiKey(resolvedApiKey);
+  const missing = [];
+
+  const keyStatus = (() => {
+    if (freeMode) {
+      return validation.ok ? "present" : "skipped";
+    }
+    if (validation.ok) return "present";
+    return validation.code || "missing";
+  })();
+
+  if (!freeMode && !validation.ok) {
+    missing.push("coingecko_api_key");
+  }
+
+  if (!fallbackActive) {
+    if (!hasValue(resolvedUrl)) missing.push("upstash_url");
+    if (!hasValue(resolvedToken)) missing.push("upstash_token");
+  }
 
   const log = {
-    mode,
+    mode: freeMode ? "FREE" : "PAID",
     store: fallbackActive ? "fallback" : "upstash",
     coingecko_api_key: keyStatus,
+  };
 
+  const summary = JSON.stringify(log);
+  const missingUnique = [...new Set(missing)];
+
+  return {
+    ok: missingUnique.length === 0,
+    summary,
+    missing: missingUnique,
+    free: freeMode,
+  };
+}
+
+function detectFallbackStore(value) {
+  if (typeof value === "boolean") return value;
+  if (value && typeof value === "object") {
+    if (value.available === true) return true;
+    if (typeof value.mode === "string" && value.mode.toLowerCase() === "fallback") return true;
+    if (typeof value.store === "string" && value.store.toLowerCase() === "fallback") return true;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim().toLowerCase();
+    if (trimmed === "1" || trimmed === "true" || trimmed === "fallback" || trimmed === "yes") return true;
+  }
 
   const tokenHints = [
     process.env.CRYPTO_FALLBACK_STORE_TOKEN,
@@ -284,7 +330,17 @@ function summarizeCoinGeckoEnv({
   ];
   if (tokenHints.some((raw) => typeof raw === "string" && raw.trim())) return true;
 
+  const urlHints = [
+    process.env.CRYPTO_FALLBACK_STORE_URL,
+    process.env.CRYPTO_STORE_FALLBACK_URL,
+  ];
+  if (urlHints.some((raw) => typeof raw === "string" && raw.trim())) return true;
+
   return false;
+}
+
+function hasValue(raw) {
+  return typeof raw === "string" && raw.trim().length > 0;
 }
 
 function isCoinGeckoQuotaError(err) {
