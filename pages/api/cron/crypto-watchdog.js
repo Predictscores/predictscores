@@ -2,6 +2,7 @@
 // Watchdog: izračuna signale i napiše ih u KV (sa Entry/TP/SL), + upis u istoriju.
 
 import { buildSignals, validateCoinGeckoApiKey } from "../../../lib/crypto-core";
+import { upstashFallbackGet, upstashFallbackInfo, upstashFallbackSet } from "../../../lib/upstash-fallback";
 
 const {
   COINGECKO_API_KEY = "",
@@ -204,18 +205,21 @@ function summarizeCoinGeckoEnv({ apiKey, upstashUrl, upstashToken }) {
   const validation = validateCoinGeckoApiKey(apiKey);
   let keyStatus = "present";
   if (!validation.ok) keyStatus = validation.code === "missing" ? "missing" : "invalid";
-  const urlStatus = String(upstashUrl || "").trim() ? "present" : "missing";
-  const tokenStatus = String(upstashToken || "").trim() ? "present" : "missing";
+  const hasUrl = String(upstashUrl || "").trim().length > 0;
+  const hasToken = String(upstashToken || "").trim().length > 0;
+  const fallback = upstashFallbackInfo();
+  const backend = hasUrl && hasToken ? "upstash" : (fallback?.available ? "memory" : "missing");
 
   const log = {
     coingecko_api_key: keyStatus,
-    upstash_redis_rest_url: urlStatus,
-    upstash_redis_rest_token: tokenStatus,
+    upstash_redis_rest_url: hasUrl ? "present" : "missing",
+    upstash_redis_rest_token: hasToken ? "present" : "missing",
+    storage_backend: backend,
   };
 
-  const missing = Object.entries(log)
-    .filter(([, status]) => status !== "present")
-    .map(([name, status]) => ({ name, status }));
+  const missing = [];
+  if (keyStatus !== "present") missing.push({ name: "coingecko_api_key", status: keyStatus });
+  if (backend === "missing") missing.push({ name: "storage_backend", status: backend });
 
   return { ok: missing.length === 0, log, missing };
 }
@@ -242,12 +246,14 @@ function quotaDetails(err) {
   const dayCount = Number(details.dayCount ?? details.day_count);
   const minuteLimit = Number(details.minuteLimit ?? details.minute_limit);
   const dayLimit = Number(details.dayLimit ?? details.day_limit);
+  const backend = typeof details.backend === "string" ? details.backend : null;
   return {
     code: "coingecko_quota_exceeded",
     minute_count: Number.isFinite(minuteCount) ? minuteCount : null,
     day_count: Number.isFinite(dayCount) ? dayCount : null,
     minute_limit: Number.isFinite(minuteLimit) ? minuteLimit : 30,
     day_limit: Number.isFinite(dayLimit) ? dayLimit : 300,
+    backend,
   };
 }
 
@@ -376,21 +382,30 @@ async function logHistory(items, snapshotTs, cfg) {
 
 /* ---------- KV & utils ---------- */
 async function kvGetJSON(key) {
-  if (!UPSTASH_REDIS_REST_URL) return null;
-  const u = `${UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(key)}`;
-  const r = await fetch(u, { headers: authHeader(), cache: "no-store" });
-  if (!r.ok) return null;
-  const raw = await r.json().catch(() => null);
-  const val = raw?.result;
-  if (!val) return null;
-  try { return JSON.parse(val); } catch { return null; }
+  if (!key) return null;
+  if (UPSTASH_REDIS_REST_URL) {
+    const u = `${UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(key)}`;
+    const r = await fetch(u, { headers: authHeader(), cache: "no-store" });
+    if (!r.ok) return null;
+    const raw = await r.json().catch(() => null);
+    const val = raw?.result;
+    if (!val) return null;
+    try { return JSON.parse(val); } catch { return null; }
+  }
+  const fallbackVal = upstashFallbackGet(key);
+  if (fallbackVal == null) return null;
+  try { return JSON.parse(fallbackVal); } catch { return null; }
 }
 async function kvSetJSON(key, obj, ttlSec) {
-  if (!UPSTASH_REDIS_REST_URL) return;
+  if (!key) return;
   const value = JSON.stringify(obj);
-  const u = new URL(`${UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}`);
-  if (ttlSec && ttlSec > 0) u.searchParams.set("EX", String(ttlSec));
-  await fetch(u.toString(), { headers: authHeader(), cache: "no-store" }).catch(() => {});
+  if (UPSTASH_REDIS_REST_URL) {
+    const u = new URL(`${UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}`);
+    if (ttlSec && ttlSec > 0) u.searchParams.set("EX", String(ttlSec));
+    await fetch(u.toString(), { headers: authHeader(), cache: "no-store" }).catch(() => {});
+    return;
+  }
+  upstashFallbackSet(key, value, { ttlSeconds: ttlSec });
 }
 function authHeader() {
   const h = {};
