@@ -70,8 +70,15 @@ function getResult(it) {
   return it?.result || (typeof it?.won !== "undefined" ? (it.won ? "win" : "loss") : null);
 }
 
-export default function HistoryPanel({ days = 14, ymd }) {
+export default function HistoryPanel({ days = 14, ymd, top }) {
+  const topLimit = useMemo(() => {
+    const n = Number(top);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+  }, [top]);
+
+  const [rawItems, setRawItems] = useState([]);
   const [items, setItems] = useState([]);
+  const [totalCount, setTotalCount] = useState(0);
   const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -92,16 +99,29 @@ export default function HistoryPanel({ days = 14, ymd }) {
           body = null;
         }
         const arr = coalesceArray(body) || coalesceArray(body?.history) || [];
-        setItems(arr);
+        const normalized = Array.isArray(arr) ? arr : [];
+        setRawItems(normalized);
+        setTotalCount(normalized.length);
         setErr(null);
       } catch (e) {
         setErr(String(e?.message || e));
+        setRawItems([]);
+        setTotalCount(0);
       } finally {
         setLoading(false);
       }
     })();
     return () => ac.abort();
   }, [days]);
+
+  useEffect(() => {
+    if (Array.isArray(rawItems)) {
+      const limited = topLimit ? rawItems.slice(0, topLimit) : rawItems;
+      setItems(limited);
+    } else {
+      setItems([]);
+    }
+  }, [rawItems, topLimit]);
 
   // --- Crypto (right column) ---
   const dayYmd = useMemo(() => (isValidYmd(ymd) ? ymd : ymdInTZ(new Date())), [ymd]);
@@ -152,6 +172,12 @@ export default function HistoryPanel({ days = 14, ymd }) {
 
       {!loading && !err && (!items || items.length === 0) && (
         <div className="text-sm opacity-70 py-2">No history for the selected period.</div>
+      )}
+
+      {!loading && !err && topLimit && totalCount > items.length && items.length > 0 && (
+        <div className="text-xs opacity-60 py-1">
+          Showing top {items.length} of {totalCount} entries.
+        </div>
       )}
 
       <div className="divide-y">
