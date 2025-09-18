@@ -28,7 +28,7 @@ jobs:
           BASE_URL: ${{ secrets.BASE_URL }}
           CRON_KEY: ${{ secrets.CRON_KEY }}
         run: |
-          set -e
+          set -euo pipefail
           curl --fail --show-error --silent \
             "$BASE_URL/api/cron/crypto-watchdog?key=$CRON_KEY" \
             | tee /dev/stderr
