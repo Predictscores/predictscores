@@ -1,4 +1,6 @@
 // pages/api/history.js
+import { computeROI } from "../../lib/history-utils";
+
 export const config = { api: { bodyParser: false } };
 
 /* ---------- KV ---------- */
@@ -49,34 +51,76 @@ function filterAllowed(arr) {
   return Array.from(by.values());
 }
 
+async function loadHistoryForDay(ymd, trace) {
+  // 1) Primarno: hist:<ymd>
+  const histKey = `hist:${ymd}`;
+  const { raw: rawHist } = await kvGETraw(histKey, trace);
+  let items = filterAllowed(arrFromAny(J(rawHist)));
+  let source = items.length ? histKey : null;
+
+  // 2) Fallback: vb:day:<ymd>:combined (ali filtrirano na h2h)
+  if (!items.length) {
+    const combKey = `vb:day:${ymd}:combined`;
+    const { raw: rawComb } = await kvGETraw(combKey, trace);
+    items = filterAllowed(arrFromAny(J(rawComb)));
+    source = items.length ? combKey : null;
+  }
+
+  return { items, source };
+}
+
+function lastNDaysList(n) {
+  const out = [];
+  const base = new Date();
+  base.setUTCHours(0, 0, 0, 0);
+  for (let i = 0; i < n; i++) {
+    const d = new Date(base);
+    d.setUTCDate(base.getUTCDate() - i);
+    out.push(d.toISOString().slice(0, 10));
+  }
+  return out;
+}
+
 export default async function handler(req, res) {
   try {
     const trace = [];
     const qYmd = String(req.query.ymd||"").trim();
     const ymd = isValidYmd(qYmd) ? qYmd : null;
 
-    if (!ymd) {
-      return res.status(200).json({ ok:false, error:"Provide ymd=YYYY-MM-DD" });
+    let queriedDays = [];
+    if (ymd) {
+      queriedDays = [ymd];
+    } else {
+      const qDaysRaw = String(req.query.days||"").trim();
+      const qDays = Number.parseInt(qDaysRaw, 10);
+      if (!Number.isFinite(qDays) || qDays <= 0) {
+        return res.status(200).json({ ok:false, error:"Provide ymd=YYYY-MM-DD or days=<N>" });
+      }
+      queriedDays = lastNDaysList(qDays);
     }
 
-    // 1) Primarno: hist:<ymd>
-    const histKey = `hist:${ymd}`;
-    const { raw:rawHist } = await kvGETraw(histKey, trace);
-    const histArr = arrFromAny(J(rawHist));
-    let items = filterAllowed(histArr);
-    let source = items.length ? histKey : null;
-
-    // 2) Fallback: vb:day:<ymd>:combined (ali filtrirano na h2h)
-    if (!items.length) {
-      const combKey = `vb:day:${ymd}:combined`;
-      const { raw:rawComb } = await kvGETraw(combKey, trace);
-      const combArr = arrFromAny(J(rawComb));
-      items = filterAllowed(combArr);
-      source = items.length ? combKey : null;
+    const aggregated = [];
+    const daySources = {};
+    for (const day of queriedDays) {
+      const { items: dayItems, source } = await loadHistoryForDay(day, trace);
+      daySources[day] = source;
+      aggregated.push(...dayItems);
     }
+
+    const items = filterAllowed(aggregated);
+    const roi = computeROI(items);
+    const singleYmd = queriedDays.length === 1 ? queriedDays[0] : null;
+    const source = singleYmd ? (daySources[singleYmd] || null) : null;
 
     return res.status(200).json({
-      ok:true, ymd, count: items.length, source, history: items, debug:{ trace, allowed: Array.from(allowSet) }
+      ok:true,
+      ymd: singleYmd,
+      queried_days: queriedDays,
+      count: items.length,
+      source,
+      roi,
+      history: items,
+      debug:{ trace, allowed: Array.from(allowSet), day_sources: daySources }
     });
 
   } catch (e) {
