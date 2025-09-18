@@ -65,14 +65,54 @@ export default async function handler(req, res) {
         .json({ ok: true, triggered: true, upstream: { ok: false, status: 401 } });
     }
 
+    const cacheKey = "crypto:signals:latest";
+
     // 1) kandidati
-    const itemsRaw = await buildSignals({
-      cgApiKey: COINGECKO_API_KEY,
-      minVol: CFG.MIN_VOL,
-      minMcap: CFG.MIN_MCAP,
-      quorum: CFG.QUORUM,
-      binanceTop: CFG.BINANCE_TOP,
-    });
+    let itemsRaw;
+    try {
+      itemsRaw = await buildSignals({
+        cgApiKey: COINGECKO_API_KEY,
+        minVol: CFG.MIN_VOL,
+        minMcap: CFG.MIN_MCAP,
+        quorum: CFG.QUORUM,
+        binanceTop: CFG.BINANCE_TOP,
+      });
+    } catch (err) {
+      if (isCoinGeckoQuotaError(err)) {
+        const snapshot = await kvGetJSON(cacheKey);
+        if (snapshot && Array.isArray(snapshot.items) && snapshot.items.length) {
+          console.warn(
+            `[cron/crypto-watchdog] CoinGecko quota exhausted; using cached snapshot (${snapshot.items.length}).`,
+            err?.details || err
+          );
+          const ageMin = snapshot.ts ? (Date.now() - snapshot.ts) / 60000 : null;
+          return res.status(200).json({
+            ok: true,
+            handled: "coingecko_quota_exceeded",
+            wrote: false,
+            source: "cache_quota",
+            ts: snapshot.ts || Date.now(),
+            ttl_min: snapshot.ttl_min || CFG.REFRESH_MIN,
+            count: snapshot.items.length,
+            sample: snapshot.items.slice(0, 2),
+            quota: quotaDetails(err),
+            cache_age_min: Number.isFinite(ageMin) ? ageMin : null,
+          });
+        }
+        console.warn(
+          `[cron/crypto-watchdog] CoinGecko quota exhausted; no cached snapshot available.`,
+          err?.details || err
+        );
+        return res.status(200).json({
+          ok: true,
+          handled: "coingecko_quota_exceeded",
+          wrote: false,
+          source: "none",
+          quota: quotaDetails(err),
+        });
+      }
+      throw err;
+    }
 
     // 2) policy filteri
     let items = enforcePolicy(itemsRaw, CFG);
@@ -83,7 +123,7 @@ export default async function handler(req, res) {
 
     // 4) upiši u KV (snapshot)
     const payload = { ts: Date.now(), ttl_min: CFG.REFRESH_MIN, items };
-    await kvSetJSON("crypto:signals:latest", payload, CFG.REFRESH_MIN * 60);
+    await kvSetJSON(cacheKey, payload, CFG.REFRESH_MIN * 60);
 
     // 5) ⬇⬇⬇  NOVO: upiši svaki signal u istoriju  ⬇⬇⬇
     await logHistory(items, payload.ts, CFG);
@@ -137,6 +177,29 @@ function normalizeMinExpectedMove(value, fallback) {
   const parsed = toNum(value, fallback);
   if (parsed <= 0) return fallback;
   return Math.max(parsed, fallback);
+}
+
+function isCoinGeckoQuotaError(err) {
+  if (!err) return false;
+  const code = typeof err.code === "string" ? err.code : "";
+  const message = typeof err.message === "string" ? err.message : "";
+  if (code === "coingecko_quota_exceeded") return true;
+  return message.includes("coingecko_quota_exceeded");
+}
+
+function quotaDetails(err) {
+  const details = err && typeof err === "object" && err.details && typeof err.details === "object" ? err.details : {};
+  const minuteCount = Number(details.minuteCount ?? details.minute_count);
+  const dayCount = Number(details.dayCount ?? details.day_count);
+  const minuteLimit = Number(details.minuteLimit ?? details.minute_limit);
+  const dayLimit = Number(details.dayLimit ?? details.day_limit);
+  return {
+    code: "coingecko_quota_exceeded",
+    minute_count: Number.isFinite(minuteCount) ? minuteCount : null,
+    day_count: Number.isFinite(dayCount) ? dayCount : null,
+    minute_limit: Number.isFinite(minuteLimit) ? minuteLimit : 30,
+    day_limit: Number.isFinite(dayLimit) ? dayLimit : 300,
+  };
 }
 
 /* ---------- persistence & dedup ---------- */

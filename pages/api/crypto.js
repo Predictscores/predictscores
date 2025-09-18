@@ -82,13 +82,57 @@ export default async function handler(req, res) {
     }
 
     // LIVE refresh (fallback ako nema cache-a ili ?force=1)
-    let items = await buildSignals({
-      cgApiKey: COINGECKO_API_KEY,
-      minVol: CFG.MIN_VOL,
-      minMcap: CFG.MIN_MCAP,
-      quorum: CFG.QUORUM,
-      binanceTop: CFG.BINANCE_TOP,
-    });
+    let items;
+    try {
+      items = await buildSignals({
+        cgApiKey: COINGECKO_API_KEY,
+        minVol: CFG.MIN_VOL,
+        minMcap: CFG.MIN_MCAP,
+        quorum: CFG.QUORUM,
+        binanceTop: CFG.BINANCE_TOP,
+      });
+    } catch (err) {
+      if (isCoinGeckoQuotaError(err)) {
+        const snapshot =
+          (cached && Array.isArray(cached.items) && cached.items.length)
+            ? cached
+            : await kvGetJSON(cacheKey);
+        if (snapshot && Array.isArray(snapshot.items) && snapshot.items.length) {
+          console.warn(
+            `[api/crypto] CoinGecko quota exhausted; serving cached snapshot (${snapshot.items.length}).`,
+            err?.details || err
+          );
+          const arr = projectForUI(snapshot.items)
+            .sort((a, b) => b.confidence_pct - a.confidence_pct)
+            .slice(0, n);
+          return sendCompat(
+            res,
+            {
+              ok: true,
+              version: "crypto-v1-compat",
+              sport: "crypto",
+              source: "cache_quota",
+              ts: snapshot.ts || Date.now(),
+              ttl_min: snapshot.ttl_min || CFG.REFRESH_MIN,
+              count: arr.length,
+              items: arr,
+              quota: quotaDetails(err),
+              error: "coingecko_quota_exceeded",
+            },
+            shape,
+            429
+          );
+        }
+        console.warn(
+          `[api/crypto] CoinGecko quota exhausted; no cached snapshot available.`,
+          err?.details || err
+        );
+        return res
+          .status(429)
+          .json({ ok: false, error: "coingecko_quota_exceeded", quota: quotaDetails(err) });
+      }
+      throw err;
+    }
 
     items = enforcePolicy(items, CFG);
     items = await applyPersistenceAndDedup(items, CFG);
@@ -179,7 +223,7 @@ function projectForUI(items) {
   });
 }
 
-function sendCompat(res, base, shape) {
+function sendCompat(res, base, shape, statusCode = 200) {
   const items = base.items || [];
   const out = {
     ...base,
@@ -187,9 +231,32 @@ function sendCompat(res, base, shape) {
     data: items, predictions: items, rows: items, list: items, results: items,
     total: base.count,
   };
-  if (shape === "legacy") return res.status(200).json({ ok: out.ok, total: out.count, items: out.items, ...out });
-  if (shape === "slim") return res.status(200).json(items);
-  return res.status(200).json(out);
+  if (shape === "legacy") return res.status(statusCode).json({ ok: out.ok, total: out.count, items: out.items, ...out });
+  if (shape === "slim") return res.status(statusCode).json(items);
+  return res.status(statusCode).json(out);
+}
+
+function isCoinGeckoQuotaError(err) {
+  if (!err) return false;
+  const code = typeof err.code === "string" ? err.code : "";
+  const message = typeof err.message === "string" ? err.message : "";
+  if (code === "coingecko_quota_exceeded") return true;
+  return message.includes("coingecko_quota_exceeded");
+}
+
+function quotaDetails(err) {
+  const details = err && typeof err === "object" && err.details && typeof err.details === "object" ? err.details : {};
+  const minuteCount = Number(details.minuteCount ?? details.minute_count);
+  const dayCount = Number(details.dayCount ?? details.day_count);
+  const minuteLimit = Number(details.minuteLimit ?? details.minute_limit);
+  const dayLimit = Number(details.dayLimit ?? details.day_limit);
+  return {
+    code: "coingecko_quota_exceeded",
+    minute_count: Number.isFinite(minuteCount) ? minuteCount : null,
+    day_count: Number.isFinite(dayCount) ? dayCount : null,
+    minute_limit: Number.isFinite(minuteLimit) ? minuteLimit : 30,
+    day_limit: Number.isFinite(dayLimit) ? dayLimit : 300,
+  };
 }
 
 function normalizeMinExpectedMove(value, fallback) {
