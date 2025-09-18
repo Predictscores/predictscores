@@ -28,6 +28,9 @@ const {
   CRYPTO_PRICE_DIVERGENCE_MAX_PCT = "0",
 } = process.env;
 
+const MIN_EXPECTED_MOVE_DEFAULT = 1.5;
+const MIN_EXPECTED_MOVE = normalizeMinExpectedMove(CRYPTO_MIN_EXPECTED_MOVE_PCT, MIN_EXPECTED_MOVE_DEFAULT);
+
 const CFG = {
   TOP_N: clampInt(CRYPTO_TOP_N, 3, 1, 10),
   MIN_VOL: toNum(CRYPTO_MIN_VOL_USD, 50_000_000),
@@ -39,7 +42,7 @@ const CFG = {
   FORCE_TTL: clampInt(CRYPTO_FORCE_THROTTLE_SEC, 240, 30, 3600),
 
   MIN_RR: toNum(CRYPTO_MIN_RR, 0),
-  MIN_EM: toNum(CRYPTO_MIN_EXPECTED_MOVE_PCT, 0),
+  MIN_EM: MIN_EXPECTED_MOVE,
   REQUIRE_H1H4: parseBool(CRYPTO_REQUIRE_H1_H4),
   INCLUDE_7D: parseBool(CRYPTO_INCLUDE_7D, true),
   PERSIST_SNAPSHOTS: clampInt(CRYPTO_PERSIST_SNAPSHOTS, 0, 0, 10),
@@ -187,6 +190,12 @@ function sendCompat(res, base, shape) {
   if (shape === "legacy") return res.status(200).json({ ok: out.ok, total: out.count, items: out.items, ...out });
   if (shape === "slim") return res.status(200).json(items);
   return res.status(200).json(out);
+}
+
+function normalizeMinExpectedMove(value, fallback) {
+  const parsed = toNum(value, fallback);
+  if (parsed <= 0) return fallback;
+  return Math.max(parsed, fallback);
 }
 
 /* ---------- Policy filter ---------- */

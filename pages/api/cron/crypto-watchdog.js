@@ -33,6 +33,9 @@ const {
   CRYPTO_HISTORY_MAX_IDS = "5000",
 } = process.env;
 
+const MIN_EXPECTED_MOVE_DEFAULT = 1.5;
+const MIN_EXPECTED_MOVE = normalizeMinExpectedMove(CRYPTO_MIN_EXPECTED_MOVE_PCT, MIN_EXPECTED_MOVE_DEFAULT);
+
 const CFG = {
   MIN_VOL: toNum(CRYPTO_MIN_VOL_USD, 50_000_000),
   MIN_MCAP: toNum(CRYPTO_MIN_MCAP_USD, 200_000_000),
@@ -41,7 +44,7 @@ const CFG = {
   BINANCE_TOP: clampInt(CRYPTO_BINANCE_TOP, 150, 20, 400),
 
   MIN_RR: toNum(CRYPTO_MIN_RR, 0),
-  MIN_EM: toNum(CRYPTO_MIN_EXPECTED_MOVE_PCT, 0),
+  MIN_EM: MIN_EXPECTED_MOVE,
   REQUIRE_H1H4: parseBool(CRYPTO_REQUIRE_H1_H4),
   INCLUDE_7D: parseBool(CRYPTO_INCLUDE_7D, true),
   PERSIST_SNAPSHOTS: clampInt(CRYPTO_PERSIST_SNAPSHOTS, 0, 0, 10),
@@ -128,6 +131,12 @@ function enforcePolicy(list, cfg) {
     out.push(it);
   }
   return out;
+}
+
+function normalizeMinExpectedMove(value, fallback) {
+  const parsed = toNum(value, fallback);
+  if (parsed <= 0) return fallback;
+  return Math.max(parsed, fallback);
 }
 
 /* ---------- persistence & dedup ---------- */
