@@ -96,6 +96,175 @@ function getResult(it) {
   return it?.result || (typeof it?.won !== "undefined" ? (it.won ? "win" : "loss") : null);
 }
 
+const SLOT_HOUR_HINT = {
+  late: 4,
+  am: 11,
+  pm: 17,
+};
+
+function normalizeSlot(raw) {
+  if (!raw) return null;
+  const txt = String(raw).trim().toLowerCase();
+  if (!txt) return null;
+  if (["am", "pm", "late"].includes(txt)) return txt;
+  if (txt === "morning") return "am";
+  if (txt === "afternoon") return "pm";
+  if (txt === "early") return "late";
+  return null;
+}
+
+function extractSlot(it) {
+  if (!it || typeof it !== "object") return null;
+  const candidates = [
+    it.slot,
+    it.slot_key,
+    it.slotKey,
+    it.slot_name,
+    it.slotName,
+    it.history_slot,
+    it.meta?.slot,
+    it.meta?.slot_key,
+    it.meta?.slotName,
+  ];
+  for (const cand of candidates) {
+    const slot = normalizeSlot(cand);
+    if (slot) return slot;
+  }
+  return null;
+}
+
+function parseYmdCandidate(value) {
+  if (isValidYmd(value)) return value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (isValidYmd(trimmed)) return trimmed;
+    if (trimmed.length >= 10) {
+      const firstTen = trimmed.slice(0, 10);
+      if (isValidYmd(firstTen)) return firstTen;
+    }
+  }
+  return null;
+}
+
+function extractYmd(it) {
+  if (!it || typeof it !== "object") return null;
+  const candidates = [
+    it.ymd,
+    it.day,
+    it.date,
+    it.date_ymd,
+    it.meta?.ymd,
+    it.meta?.date,
+    it.fixture?.ymd,
+  ];
+  for (const cand of candidates) {
+    const y = parseYmdCandidate(cand);
+    if (y) return y;
+  }
+  return null;
+}
+
+function coerceEpochMs(value) {
+  if (value == null) return null;
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return null;
+    if (value > 1e12) return value;
+    if (value > 1e9) return Math.floor(value * 1000);
+    if (value > 1e6) return Math.floor(value * 1000);
+    return value;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const num = Number(trimmed);
+    if (Number.isFinite(num)) {
+      if (Math.abs(num) > 1e12) return num;
+      if (Math.abs(num) > 1e9) return Math.floor(num * 1000);
+      if (Math.abs(num) > 1e6) return Math.floor(num * 1000);
+      if (num !== 0) return Math.floor(num * 1000);
+      return 0;
+    }
+    let normalized = trimmed.replace(/\s+/, "T");
+    if (!normalized.includes("T")) {
+      normalized = `${normalized}T00:00:00`;
+    }
+    const withZone = /[z+-]\d\d:?\d\d$/i.test(normalized) ? normalized : `${normalized}Z`;
+    const parsed = Date.parse(withZone);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  if (typeof value === "object") {
+    try {
+      if (typeof value.toISOString === "function") {
+        const parsed = Date.parse(value.toISOString());
+        return Number.isFinite(parsed) ? parsed : null;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function deriveYmdSlotTimestamp(it) {
+  const ymd = extractYmd(it);
+  if (!ymd) return null;
+  const base = Date.parse(`${ymd}T00:00:00Z`);
+  if (!Number.isFinite(base)) return null;
+  const slot = extractSlot(it);
+  const hourHint = SLOT_HOUR_HINT[slot] ?? 0;
+  return base + hourHint * 60 * 60 * 1000;
+}
+
+function deriveRecencyTimestamp(it) {
+  const kickoff = getKickoff(it);
+  const kickoffMs = coerceEpochMs(kickoff);
+  if (kickoffMs != null) return kickoffMs;
+
+  const fallbackCandidates = [
+    it?.timestamp,
+    it?.ts,
+    it?.created_at,
+    it?.updated_at,
+    it?.snapshot_at,
+    it?.fixture?.timestamp,
+    it?.fixture?.ts,
+  ];
+  for (const cand of fallbackCandidates) {
+    const parsed = coerceEpochMs(cand);
+    if (parsed != null) return parsed;
+  }
+
+  return deriveYmdSlotTimestamp(it);
+}
+
+export function sortAndLimitHistoryItems(rawItems, topLimit) {
+  if (!Array.isArray(rawItems)) return [];
+  const decorated = rawItems.map((item, index) => ({
+    item,
+    index,
+    ts: deriveRecencyTimestamp(item),
+  }));
+
+  decorated.sort((a, b) => {
+    const ta = Number.isFinite(a.ts) ? a.ts : -Infinity;
+    const tb = Number.isFinite(b.ts) ? b.ts : -Infinity;
+    if (tb !== ta) {
+      return tb - ta;
+    }
+    return a.index - b.index;
+  });
+
+  const sorted = decorated.map((entry) => entry.item);
+  if (typeof topLimit === "number" && topLimit > 0) {
+    return sorted.slice(0, topLimit);
+  }
+  return sorted;
+}
+
 export default function HistoryPanel({ days = 14, ymd, top }) {
   const topLimit = useMemo(() => {
     const n = Number(top);
@@ -171,8 +340,7 @@ export default function HistoryPanel({ days = 14, ymd, top }) {
 
   useEffect(() => {
     if (Array.isArray(rawItems)) {
-      const limited = topLimit ? rawItems.slice(0, topLimit) : rawItems;
-      setItems(limited);
+      setItems(sortAndLimitHistoryItems(rawItems, topLimit));
     } else {
       setItems([]);
     }
