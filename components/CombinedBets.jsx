@@ -86,6 +86,89 @@ function toDec(n) {
   return Number.isFinite(v) ? v : null;
 }
 
+/* ---------- fixture dedupe helpers ---------- */
+function fixtureKeyPart(val) {
+  if (val == null) return "";
+  if (val instanceof Date && !isNaN(val)) return String(val.getTime());
+  if (typeof val === "number" && Number.isFinite(val)) return String(val);
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    return trimmed ? trimmed.toLowerCase() : "";
+  }
+  if (typeof val === "object") {
+    const candidates = [val.id, val.ID, val.fixture_id, val.name, val.team, val.code, val.label];
+    for (const cand of candidates) {
+      const part = fixtureKeyPart(cand);
+      if (part) return part;
+    }
+  }
+  try {
+    const str = String(val).trim();
+    return str ? str.toLowerCase() : "";
+  } catch {
+    return "";
+  }
+}
+
+function rawFixtureKey(it) {
+  if (!it || typeof it !== "object") return null;
+  const fid = it.fixture_id ?? it.fixture?.id;
+  if (fid != null && fid !== "") return `fid:${fid}`;
+  const league = fixtureKeyPart(it.league?.id ?? it.league?.name ?? it.league_name ?? it.league);
+  const kickoff = fixtureKeyPart(it.kickoff_utc ?? it.kickoff ?? it.fixture?.date);
+  const home = fixtureKeyPart(
+    it.teams?.home?.id ?? it.teams?.home?.name ?? it.home?.id ?? it.home?.name ?? it.home_name ?? it.home
+  );
+  const away = fixtureKeyPart(
+    it.teams?.away?.id ?? it.teams?.away?.name ?? it.away?.id ?? it.away?.name ?? it.away_name ?? it.away
+  );
+  const key = [league, kickoff, home, away].filter(Boolean).join("|");
+  return key || null;
+}
+
+function collapseRawOneXtwo(items = []) {
+  const seen = new Set();
+  const out = [];
+  for (const it of items) {
+    const key = rawFixtureKey(it);
+    if (key) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    out.push(it);
+  }
+  return out;
+}
+
+function normalizedFixtureKey(bet) {
+  if (!bet || typeof bet !== "object") return null;
+  const fid = bet.fixtureId ?? (typeof bet.id === "number" || /^\d+$/.test(String(bet.id || "")) ? bet.id : null);
+  if (fid != null && fid !== "") return `fid:${fid}`;
+  const dateTs =
+    bet.date instanceof Date && !isNaN(bet.date)
+      ? String(bet.date.getTime())
+      : fixtureKeyPart(bet.date);
+  const home = fixtureKeyPart(bet.home);
+  const away = fixtureKeyPart(bet.away);
+  const league = fixtureKeyPart(bet.league);
+  const key = [league, dateTs, home, away].filter(Boolean).join("|");
+  return key || null;
+}
+
+function collapseNormalizedBets(bets = []) {
+  const seen = new Set();
+  const out = [];
+  for (const bet of bets) {
+    const key = normalizedFixtureKey(bet);
+    if (key) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    out.push(bet);
+  }
+  return out;
+}
+
 /* ---------- market & selection normalizers ---------- */
 function normMarket(raw) {
   const s = String(raw || "").toLowerCase();
@@ -158,6 +241,8 @@ function normalizeBet(it, marketOverride) {
   const league =
     it?.league_name || it?.league?.name || it?.league || it?.competition || "";
   const date = parseKickoff(it);
+  const fixtureIdRaw = it?.fixture_id ?? it?.fixture?.id ?? null;
+  const fixtureId = fixtureIdRaw != null && fixtureIdRaw !== "" ? fixtureIdRaw : null;
 
   const home = teamName(it?.teams?.home || it?.home);
   const away = teamName(it?.teams?.away || it?.away);
@@ -181,11 +266,11 @@ function normalizeBet(it, marketOverride) {
   );
   conf = Number.isFinite(conf) ? Math.max(0, Math.min(100, conf)) : 0;
 
+  const fallbackId = `${home}-${away}-${Date.parse(date || new Date())}-${market}-${sel}`;
+
   return {
-    id:
-      it?.fixture_id ??
-      it?.fixture?.id ??
-      `${home}-${away}-${Date.parse(date || new Date())}-${market}-${sel}`,
+    id: fixtureId ?? fallbackId,
+    fixtureId,
     league, date, home, away, market, sel, odds, conf, explain: it?.explain,
   };
 }
@@ -362,7 +447,8 @@ function useValueBetsFeed() {
         : Array.isArray(j?.oneXtwo)
         ? j.oneXtwo
         : [];
-      const oneXtwo = oneXtwoRaw.map((it) => normalizeBet(it, "1X2"));
+      const dedupedOneXtwoRaw = collapseRawOneXtwo(oneXtwoRaw);
+      const oneXtwo = collapseNormalizedBets(dedupedOneXtwoRaw.map((it) => normalizeBet(it, "1X2")));
 
       const tb = j?.tickets || {};
       const bttsRaw = Array.isArray(tb.btts) ? tb.btts : [];
@@ -562,8 +648,11 @@ export default function CombinedBets() {
   const [tab, setTab] = useState("Combined");
   const fb = useValueBetsFeed();
   const matchOdds = useMemo(() => {
-    if (Array.isArray(fb.oneXtwo) && fb.oneXtwo.length) return fb.oneXtwo;
-    return fb.items.filter((x) => String(x.market).toUpperCase() === "1X2");
+    const base =
+      Array.isArray(fb.oneXtwo) && fb.oneXtwo.length
+        ? fb.oneXtwo
+        : fb.items.filter((x) => String(x.market).toUpperCase() === "1X2");
+    return collapseNormalizedBets(base);
   }, [fb.items, fb.oneXtwo]);
   const crypto = useCryptoTop3();
   const top3Football = useMemo(
