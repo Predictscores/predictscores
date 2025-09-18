@@ -23,14 +23,28 @@ while blank/invalid values fall back to the defaults above. If the volatility
 series is unavailable the engine reuses the legacy static thresholds or the
 values provided through `opts.thresh` for compatibility.
 
-## CoinGecko Pro API requirement
+## CoinGecko FREE API requirement
 
-Both the `/api/crypto` endpoint and the `crypto-watchdog` cron rely on the
-CoinGecko Pro markets feed. Deployments must provide a valid
-`COINGECKO_API_KEY` environment variable; when it is missing the API now fails
-fast with a `coingecko_api_key_missing` error. Configure the variable in the
-hosting provider (for example Vercel project settings or GitHub Actions
-secrets) so the watchdog and public API remain operational.
+Both the `/api/crypto` endpoint and the `crypto-watchdog` cron now target the
+FREE CoinGecko markets feed (`https://api.coingecko.com/api/v3/coins/markets`).
+Deployments must configure the `COINGECKO_API_KEY` environment variable with a
+valid FREE-plan key (sent through the `x-cg-demo-api-key` header). Missing or
+malformed keys trigger `coingecko_env_incomplete`, while rejected keys return
+`coingecko_api_key_invalid` so the issue is visible in logs.
+
+The guard against CoinGecko rate limits continues to reserve quota through
+Upstash Redis. Provide `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`
+so the watchdog and API can enforce the ≤30 requests/minute and ≤300
+requests/day budget. Every call logs a structured `coingecko.quota` entry with
+the current counters and limits to simplify compliance checks inside GitHub
+Actions output.
+
+When the cron or API handler runs it emits a "CoinGecko env validation" log
+section that records which of the required environment variables are present
+(`present`, `missing`, or `invalid`). Live fetches are blocked while the
+configuration is incomplete, preventing accidental outbound requests before the
+FREE endpoint is fully configured. Cached responses remain available so end
+users can keep consuming data while the configuration is fixed.
 
 ## Value bets meta stats schema
 
