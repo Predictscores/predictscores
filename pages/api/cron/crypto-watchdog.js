@@ -5,6 +5,7 @@ import { buildSignals, validateCoinGeckoApiKey } from "../../../lib/crypto-core"
 
 const {
   COINGECKO_API_KEY = "",
+  COINGECKO_FREE = "",
   UPSTASH_REDIS_REST_URL = "",
   UPSTASH_REDIS_REST_TOKEN = "",
   CRON_KEY = "",
@@ -67,10 +68,11 @@ export default async function handler(req, res) {
 
     const envReport = summarizeCoinGeckoEnv({
       apiKey: COINGECKO_API_KEY,
+      coingeckoFree: COINGECKO_FREE,
       upstashUrl: UPSTASH_REDIS_REST_URL,
       upstashToken: UPSTASH_REDIS_REST_TOKEN,
     });
-    console.log("[cron/crypto-watchdog] CoinGecko env validation", envReport.log);
+    console.log(`[cron] coingecko env: ${envReport.summary}`);
     if (!envReport.ok) {
       return res.status(500).json({
         ok: false,
@@ -200,24 +202,133 @@ function normalizeMinExpectedMove(value, fallback) {
   return Math.max(parsed, fallback);
 }
 
-function summarizeCoinGeckoEnv({ apiKey, upstashUrl, upstashToken }) {
+function summarizeCoinGeckoEnv({
+  apiKey,
+  coingeckoFree,
+  upstashUrl,
+  upstashToken,
+  fallbackStore,
+} = {}) {
+  const freeMode = parseBool(coingeckoFree ?? process.env.COINGECKO_FREE ?? "0");
+  const fallbackActive = detectFallbackStore(fallbackStore);
+  const mode = freeMode ? "FREE" : "PAID";
+
   const validation = validateCoinGeckoApiKey(apiKey);
-  let keyStatus = "present";
-  if (!validation.ok) keyStatus = validation.code === "missing" ? "missing" : "invalid";
+  const trimmedKey = typeof apiKey === "string" ? apiKey.trim() : "";
+  let keyStatus = validation.ok ? "present" : validation.code === "missing" ? "missing" : "invalid";
+  if (freeMode) {
+    keyStatus = trimmedKey ? (validation.ok ? "present" : "invalid") : "skipped";
+  }
+
   const urlStatus = String(upstashUrl || "").trim() ? "present" : "missing";
   const tokenStatus = String(upstashToken || "").trim() ? "present" : "missing";
+  const upstashStatus =
+    urlStatus === "present" && tokenStatus === "present"
+      ? "present"
+      : urlStatus === "missing" && tokenStatus === "missing"
+      ? "missing"
+      : "partial";
+
+  const missing = [];
+  if (!freeMode && !validation.ok) {
+    missing.push({ name: "coingecko_api_key", status: keyStatus });
+  }
+  if (!fallbackActive) {
+    if (urlStatus !== "present") missing.push({ name: "upstash_redis_rest_url", status: urlStatus });
+    if (tokenStatus !== "present") missing.push({ name: "upstash_redis_rest_token", status: tokenStatus });
+  }
+
+  const summaryParts = [
+    `mode=${mode}`,
+    `store=${fallbackActive ? "FALLBACK" : "UPSTASH"}`,
+    `key=${keyStatus}`,
+    `upstash=${upstashStatus}`,
+  ];
 
   const log = {
+    mode,
+    store: fallbackActive ? "fallback" : "upstash",
     coingecko_api_key: keyStatus,
+    upstash: upstashStatus,
     upstash_redis_rest_url: urlStatus,
     upstash_redis_rest_token: tokenStatus,
   };
 
-  const missing = Object.entries(log)
-    .filter(([, status]) => status !== "present")
-    .map(([name, status]) => ({ name, status }));
+  return {
+    ok: missing.length === 0,
+    log,
+    missing,
+    summary: summaryParts.join(", "),
+    mode,
+    fallbackStore: fallbackActive,
+    free: freeMode,
+  };
+}
 
-  return { ok: missing.length === 0, log, missing };
+function detectFallbackStore(hint) {
+  const inspect = (value) => {
+    if (value == null) return null;
+    if (typeof value === "boolean") return value;
+    if (Array.isArray(value)) {
+      for (const it of value) {
+        const res = inspect(it);
+        if (res != null) return res;
+      }
+      return null;
+    }
+    if (typeof value === "object") {
+      for (const it of Object.values(value)) {
+        const res = inspect(it);
+        if (res != null) return res;
+      }
+      return null;
+    }
+    const s = String(value || "").trim().toLowerCase();
+    if (!s) return null;
+    if (["1", "true", "yes", "on"].includes(s)) return true;
+    if (["0", "false", "off", "no"].includes(s)) return false;
+    if (s.includes("fallback")) return true;
+    if (s.includes("vercel")) return true;
+    if (["free", "demo", "readonly", "offline"].includes(s)) return true;
+    return null;
+  };
+
+  const direct = inspect(hint);
+  if (direct != null) return direct;
+
+  const envKeys = [
+    "CRYPTO_FALLBACK_STORE",
+    "CRYPTO_FALLBACK_STORE_ACTIVE",
+    "CRYPTO_STORE_FALLBACK",
+    "CRYPTO_STORE_FALLBACK_ACTIVE",
+    "CRYPTO_USE_FALLBACK_STORE",
+    "CRYPTO_STORE_MODE",
+    "CRYPTO_STORE_DRIVER",
+    "CRYPTO_STORE_FLAVOR",
+    "CRYPTO_STORE_PROVIDER",
+    "CRYPTO_STORE_KIND",
+    "CRYPTO_STORE_TARGET",
+    "CRYPTO_STORE",
+    "CRYPTO_STORE_STRATEGY",
+  ];
+  for (const key of envKeys) {
+    const res = inspect(process.env[key]);
+    if (res != null) return res;
+  }
+
+  const urlHints = [
+    process.env.CRYPTO_FALLBACK_STORE_URL,
+    process.env.CRYPTO_STORE_FALLBACK_URL,
+  ];
+  if (urlHints.some((raw) => typeof raw === "string" && raw.trim())) return true;
+
+  const tokenHints = [
+    process.env.CRYPTO_FALLBACK_STORE_TOKEN,
+    process.env.CRYPTO_STORE_FALLBACK_TOKEN,
+  ];
+  if (tokenHints.some((raw) => typeof raw === "string" && raw.trim())) return true;
+
+  return false;
 }
 
 function isCoinGeckoQuotaError(err) {
