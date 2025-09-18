@@ -6,6 +6,7 @@ import { upstashFallbackGet, upstashFallbackInfo, upstashFallbackSet } from "../
 
 const {
   COINGECKO_API_KEY = "",
+  COINGECKO_FREE = "",
   UPSTASH_REDIS_REST_URL = "",
   UPSTASH_REDIS_REST_TOKEN = "",
   CRON_KEY = "",
@@ -59,10 +60,11 @@ export default async function handler(req, res) {
 
     const envReport = summarizeCoinGeckoEnv({
       apiKey: COINGECKO_API_KEY,
+      coingeckoFree: COINGECKO_FREE,
       upstashUrl: UPSTASH_REDIS_REST_URL,
       upstashToken: UPSTASH_REDIS_REST_TOKEN,
     });
-    console.log("[api/crypto] CoinGecko env validation", envReport.log);
+    console.log(`[api] coingecko env: ${envReport.summary}`);
 
     if (force) {
       if (!checkCronKey(req, CRON_KEY)) return res.status(401).json({ ok: false, error: "unauthorized" });
@@ -256,28 +258,33 @@ function sendCompat(res, base, shape, statusCode = 200) {
   return res.status(statusCode).json(out);
 }
 
-function summarizeCoinGeckoEnv({ apiKey, upstashUrl, upstashToken }) {
-  const validation = validateCoinGeckoApiKey(apiKey);
-  let keyStatus = "present";
-  if (!validation.ok) keyStatus = validation.code === "missing" ? "missing" : "invalid";
+function summarizeCoinGeckoEnv({
+  apiKey,
+  coingeckoFree,
+  upstashUrl,
+  upstashToken,
+  fallbackStore,
+} = {}) {
+  const freeMode = parseBool(coingeckoFree ?? process.env.COINGECKO_FREE ?? "0");
+  const fallbackActive = detectFallbackStore(fallbackStore);
+  const mode = freeMode ? "FREE" : "PAID";
 
-  const hasUrl = String(upstashUrl || "").trim().length > 0;
-  const hasToken = String(upstashToken || "").trim().length > 0;
-  const fallback = upstashFallbackInfo();
-  const backend = hasUrl && hasToken ? "upstash" : (fallback?.available ? "memory" : "missing");
+  const validation = validateCoinGeckoApiKey(apiKey);
+
 
   const log = {
+    mode,
+    store: fallbackActive ? "fallback" : "upstash",
     coingecko_api_key: keyStatus,
-    upstash_redis_rest_url: hasUrl ? "present" : "missing",
-    upstash_redis_rest_token: hasToken ? "present" : "missing",
-    storage_backend: backend,
-  };
 
-  const missing = [];
-  if (keyStatus !== "present") missing.push({ name: "coingecko_api_key", status: keyStatus });
-  if (backend === "missing") missing.push({ name: "storage_backend", status: backend });
 
-  return { ok: missing.length === 0, log, missing };
+  const tokenHints = [
+    process.env.CRYPTO_FALLBACK_STORE_TOKEN,
+    process.env.CRYPTO_STORE_FALLBACK_TOKEN,
+  ];
+  if (tokenHints.some((raw) => typeof raw === "string" && raw.trim())) return true;
+
+  return false;
 }
 
 function isCoinGeckoQuotaError(err) {
