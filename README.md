@@ -23,6 +23,15 @@ while blank/invalid values fall back to the defaults above. If the volatility
 series is unavailable the engine reuses the legacy static thresholds or the
 values provided through `opts.thresh` for compatibility.
 
+## CoinGecko Pro API requirement
+
+Both the `/api/crypto` endpoint and the `crypto-watchdog` cron rely on the
+CoinGecko Pro markets feed. Deployments must provide a valid
+`COINGECKO_API_KEY` environment variable; when it is missing the API now fails
+fast with a `coingecko_api_key_missing` error. Configure the variable in the
+hosting provider (for example Vercel project settings or GitHub Actions
+secrets) so the watchdog and public API remain operational.
+
 ## Value bets meta stats schema
 
 `/api/cron/enrich` now persists a compact stats payload for each team under

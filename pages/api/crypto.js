@@ -92,6 +92,15 @@ export default async function handler(req, res) {
         binanceTop: CFG.BINANCE_TOP,
       });
     } catch (err) {
+      if (isCoinGeckoApiKeyMissing(err)) {
+        console.error("[api/crypto] Missing CoinGecko API key", {
+          code: err?.code || null,
+          message: err?.message || null,
+        });
+        return res
+          .status(500)
+          .json({ ok: false, error: "coingecko_api_key_missing" });
+      }
       if (isCoinGeckoQuotaError(err)) {
         const snapshot =
           (cached && Array.isArray(cached.items) && cached.items.length)
@@ -242,6 +251,14 @@ function isCoinGeckoQuotaError(err) {
   const message = typeof err.message === "string" ? err.message : "";
   if (code === "coingecko_quota_exceeded") return true;
   return message.includes("coingecko_quota_exceeded");
+}
+
+function isCoinGeckoApiKeyMissing(err) {
+  if (!err) return false;
+  const code = typeof err.code === "string" ? err.code : "";
+  if (code === "coingecko_api_key_missing") return true;
+  const message = typeof err.message === "string" ? err.message : "";
+  return message.includes("coingecko_api_key_missing");
 }
 
 function quotaDetails(err) {
