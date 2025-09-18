@@ -2,6 +2,7 @@
 // API sa "compat" projekcijom: dodaje alias polja i shape=slim + Entry/TP/SL/rr/expectedMove.
 
 import { buildSignals, validateCoinGeckoApiKey } from "../../lib/crypto-core";
+import { upstashFallbackGet, upstashFallbackInfo, upstashFallbackSet } from "../../lib/upstash-fallback";
 
 const {
   COINGECKO_API_KEY = "",
@@ -269,113 +270,13 @@ function summarizeCoinGeckoEnv({
   const mode = freeMode ? "FREE" : "PAID";
 
   const validation = validateCoinGeckoApiKey(apiKey);
-  const trimmedKey = typeof apiKey === "string" ? apiKey.trim() : "";
-  let keyStatus = validation.ok ? "present" : validation.code === "missing" ? "missing" : "invalid";
-  if (freeMode) {
-    keyStatus = trimmedKey ? (validation.ok ? "present" : "invalid") : "skipped";
-  }
 
-  const urlStatus = String(upstashUrl || "").trim() ? "present" : "missing";
-  const tokenStatus = String(upstashToken || "").trim() ? "present" : "missing";
-  const upstashStatus =
-    urlStatus === "present" && tokenStatus === "present"
-      ? "present"
-      : urlStatus === "missing" && tokenStatus === "missing"
-      ? "missing"
-      : "partial";
-
-  const missing = [];
-  if (!freeMode && !validation.ok) {
-    missing.push({ name: "coingecko_api_key", status: keyStatus });
-  }
-  if (!fallbackActive) {
-    if (urlStatus !== "present") missing.push({ name: "upstash_redis_rest_url", status: urlStatus });
-    if (tokenStatus !== "present") missing.push({ name: "upstash_redis_rest_token", status: tokenStatus });
-  }
-
-  const summaryParts = [
-    `mode=${mode}`,
-    `store=${fallbackActive ? "FALLBACK" : "UPSTASH"}`,
-    `key=${keyStatus}`,
-    `upstash=${upstashStatus}`,
-  ];
 
   const log = {
     mode,
     store: fallbackActive ? "fallback" : "upstash",
     coingecko_api_key: keyStatus,
-    upstash: upstashStatus,
-    upstash_redis_rest_url: urlStatus,
-    upstash_redis_rest_token: tokenStatus,
-  };
 
-  return {
-    ok: missing.length === 0,
-    log,
-    missing,
-    summary: summaryParts.join(", "),
-    mode,
-    fallbackStore: fallbackActive,
-    free: freeMode,
-  };
-}
-
-function detectFallbackStore(hint) {
-  const inspect = (value) => {
-    if (value == null) return null;
-    if (typeof value === "boolean") return value;
-    if (Array.isArray(value)) {
-      for (const it of value) {
-        const res = inspect(it);
-        if (res != null) return res;
-      }
-      return null;
-    }
-    if (typeof value === "object") {
-      for (const it of Object.values(value)) {
-        const res = inspect(it);
-        if (res != null) return res;
-      }
-      return null;
-    }
-    const s = String(value || "").trim().toLowerCase();
-    if (!s) return null;
-    if (["1", "true", "yes", "on"].includes(s)) return true;
-    if (["0", "false", "off", "no"].includes(s)) return false;
-    if (s.includes("fallback")) return true;
-    if (s.includes("vercel")) return true;
-    if (["free", "demo", "readonly", "offline"].includes(s)) return true;
-    return null;
-  };
-
-  const direct = inspect(hint);
-  if (direct != null) return direct;
-
-  const envKeys = [
-    "CRYPTO_FALLBACK_STORE",
-    "CRYPTO_FALLBACK_STORE_ACTIVE",
-    "CRYPTO_STORE_FALLBACK",
-    "CRYPTO_STORE_FALLBACK_ACTIVE",
-    "CRYPTO_USE_FALLBACK_STORE",
-    "CRYPTO_STORE_MODE",
-    "CRYPTO_STORE_DRIVER",
-    "CRYPTO_STORE_FLAVOR",
-    "CRYPTO_STORE_PROVIDER",
-    "CRYPTO_STORE_KIND",
-    "CRYPTO_STORE_TARGET",
-    "CRYPTO_STORE",
-    "CRYPTO_STORE_STRATEGY",
-  ];
-  for (const key of envKeys) {
-    const res = inspect(process.env[key]);
-    if (res != null) return res;
-  }
-
-  const urlHints = [
-    process.env.CRYPTO_FALLBACK_STORE_URL,
-    process.env.CRYPTO_STORE_FALLBACK_URL,
-  ];
-  if (urlHints.some((raw) => typeof raw === "string" && raw.trim())) return true;
 
   const tokenHints = [
     process.env.CRYPTO_FALLBACK_STORE_TOKEN,
@@ -408,12 +309,14 @@ function quotaDetails(err) {
   const dayCount = Number(details.dayCount ?? details.day_count);
   const minuteLimit = Number(details.minuteLimit ?? details.minute_limit);
   const dayLimit = Number(details.dayLimit ?? details.day_limit);
+  const backend = typeof details.backend === "string" ? details.backend : null;
   return {
     code: "coingecko_quota_exceeded",
     minute_count: Number.isFinite(minuteCount) ? minuteCount : null,
     day_count: Number.isFinite(dayCount) ? dayCount : null,
     minute_limit: Number.isFinite(minuteLimit) ? minuteLimit : 30,
     day_limit: Number.isFinite(dayLimit) ? dayLimit : 300,
+    backend,
   };
 }
 
@@ -528,21 +431,30 @@ async function applyStickiness(items, cooldownMin) {
 
 /* ---------- KV/throttle/security ---------- */
 async function kvGetJSON(key) {
-  if (!UPSTASH_REDIS_REST_URL) return null;
-  const u = `${UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(key)}`;
-  const r = await fetch(u, { headers: authHeader(), cache: "no-store" });
-  if (!r.ok) return null;
-  const raw = await r.json().catch(() => null);
-  const val = raw?.result;
-  if (!val) return null;
-  try { return JSON.parse(val); } catch { return null; }
+  if (!key) return null;
+  if (UPSTASH_REDIS_REST_URL) {
+    const u = `${UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(key)}`;
+    const r = await fetch(u, { headers: authHeader(), cache: "no-store" });
+    if (!r.ok) return null;
+    const raw = await r.json().catch(() => null);
+    const val = raw?.result;
+    if (!val) return null;
+    try { return JSON.parse(val); } catch { return null; }
+  }
+  const fallbackVal = upstashFallbackGet(key);
+  if (fallbackVal == null) return null;
+  try { return JSON.parse(fallbackVal); } catch { return null; }
 }
 async function kvSetJSON(key, obj, ttlSec) {
-  if (!UPSTASH_REDIS_REST_URL) return;
+  if (!key) return;
   const value = JSON.stringify(obj);
-  const u = new URL(`${UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}`);
-  if (ttlSec && ttlSec > 0) u.searchParams.set("EX", String(ttlSec));
-  await fetch(u.toString(), { headers: authHeader(), cache: "no-store" }).catch(() => {});
+  if (UPSTASH_REDIS_REST_URL) {
+    const u = new URL(`${UPSTASH_REDIS_REST_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(value)}`);
+    if (ttlSec && ttlSec > 0) u.searchParams.set("EX", String(ttlSec));
+    await fetch(u.toString(), { headers: authHeader(), cache: "no-store" }).catch(() => {});
+    return;
+  }
+  upstashFallbackSet(key, value, { ttlSeconds: ttlSec });
 }
 function authHeader() {
   const h = {};
@@ -550,12 +462,10 @@ function authHeader() {
   return h;
 }
 async function isForceThrottled() {
-  if (!UPSTASH_REDIS_REST_URL) return false;
   const v = await kvGetJSON("crypto:force:lock");
   return !!v;
 }
 async function setForceLock() {
-  if (!UPSTASH_REDIS_REST_URL) return;
   await kvSetJSON("crypto:force:lock", { ts: Date.now() }, CFG.FORCE_TTL);
 }
 function checkCronKey(req, expected) {

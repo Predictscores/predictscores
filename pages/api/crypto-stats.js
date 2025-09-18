@@ -1,6 +1,8 @@
 // pages/api/crypto-stats.js
 // Vraća zbirne statistike na osnovu crypto:history:item:* zapisa (rolling lookback).
 
+import { upstashFallbackGet } from "../../lib/upstash-fallback";
+
 const {
   UPSTASH_REDIS_REST_URL = "",
   UPSTASH_REDIS_REST_TOKEN = "",
@@ -76,14 +78,19 @@ function bucketByConfidence(rows) {
 
 /* ---------- KV & utils ---------- */
 async function kvGetJSON(key) {
-  if (!UPSTASH_REDIS_REST_URL) return null;
-  const u = `${UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(key)}`;
-  const r = await fetch(u, { headers: authHeader(), cache: "no-store" });
-  if (!r.ok) return null;
-  const raw = await r.json().catch(() => null);
-  const val = raw?.result;
-  if (!val) return null;
-  try { return JSON.parse(val); } catch { return null; }
+  if (!key) return null;
+  if (UPSTASH_REDIS_REST_URL) {
+    const u = `${UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(key)}`;
+    const r = await fetch(u, { headers: authHeader(), cache: "no-store" });
+    if (!r.ok) return null;
+    const raw = await r.json().catch(() => null);
+    const val = raw?.result;
+    if (!val) return null;
+    try { return JSON.parse(val); } catch { return null; }
+  }
+  const fallbackVal = upstashFallbackGet(key);
+  if (fallbackVal == null) return null;
+  try { return JSON.parse(fallbackVal); } catch { return null; }
 }
 function authHeader() {
   const h = {};
