@@ -249,6 +249,58 @@ function applyModelFields(candidate, ctx){
 }
 function oneXtwoCapForSlot(slot, we){ if(slot==="late") return CAP_LATE; if(!we) return slot==="am"?CAP_AM_WD:CAP_PM_WD; return slot==="am"?CAP_AM_WE:CAP_PM_WE; }
 
+function keyPartForFixture(val){
+  if (val == null) return "";
+  if (typeof val === "number" && Number.isFinite(val)) return String(val);
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    return trimmed ? trimmed.toLowerCase() : "";
+  }
+  if (typeof val === "object") {
+    const candidates = [val.id, val.ID, val.fixture_id, val.name, val.team, val.code, val.label];
+    for (const cand of candidates) {
+      const part = keyPartForFixture(cand);
+      if (part) return part;
+    }
+  }
+  try {
+    const str = String(val).trim();
+    return str ? str.toLowerCase() : "";
+  } catch {
+    return "";
+  }
+}
+
+function fixtureKeyForPick(it){
+  if (!it || typeof it !== "object") return null;
+  const fid = it.fixture_id ?? it.fixture?.id;
+  if (fid != null && fid !== "") return `fid:${fid}`;
+  const league = keyPartForFixture(it.league?.id ?? it.league?.name ?? it.league_name ?? it.league);
+  const kickoff = keyPartForFixture(it.kickoff_utc ?? it.kickoff ?? it.fixture?.date);
+  const home = keyPartForFixture(
+    it.teams?.home?.id ?? it.teams?.home?.name ?? it.home?.id ?? it.home?.name ?? it.home_name ?? it.home
+  );
+  const away = keyPartForFixture(
+    it.teams?.away?.id ?? it.teams?.away?.name ?? it.away?.id ?? it.away?.name ?? it.away_name ?? it.away
+  );
+  const key = [league, kickoff, home, away].filter(Boolean).join("|");
+  return key || null;
+}
+
+function dedupeByFixture(items){
+  const out = [];
+  const seen = new Set();
+  for (const it of Array.isArray(items) ? items : []){
+    const key = fixtureKeyForPick(it);
+    if (key){
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    out.push(it);
+  }
+  return out;
+}
+
 /* =========================
  *  Candidate builders
  * ========================= */
@@ -406,8 +458,9 @@ export default async function handler(req,res){
     // 1x2 ponude (po slot cap-u + per-liga)
     const oneXtwoAll=[]; for (const f of base) oneXtwoAll.push(...oneXtwoOffers(f));
     oneXtwoAll.sort((a,b)=>(b.confidence_pct||0)-(a.confidence_pct||0));
+    const rankedOneXtwo = dedupeByFixture(oneXtwoAll);
     const oneXtwoCap = oneXtwoCapForSlot(slot, weekend);
-    const one_x_two_raw = capPerLeague(oneXtwoAll, VB_MAX_PER_LEAGUE).slice(0, oneXtwoCap);
+    const one_x_two_raw = capPerLeague(rankedOneXtwo, VB_MAX_PER_LEAGUE).slice(0, oneXtwoCap);
 
     // ===== Apply aliasing so the legacy UI can render immediately
     const items = topN.map(aliasItem);
