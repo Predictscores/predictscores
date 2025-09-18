@@ -31,6 +31,8 @@ describe("CoinGecko mode handling", () => {
   test("FREE mode bypasses API key validation", async () => {
     process.env.COINGECKO_FREE = "true";
     process.env.COINGECKO_API_KEY = "";
+    process.env.UPSTASH_REDIS_REST_URL = "https://example.upstash.com";
+    process.env.UPSTASH_REDIS_REST_TOKEN = "token";
 
     const payload = [
       {
@@ -48,12 +50,16 @@ describe("CoinGecko mode handling", () => {
     ];
 
     global.fetch.mockImplementation(async (url, opts = {}) => {
-      expect(opts.headers).toBeUndefined();
-      return createMockResponse(payload);
+      const urlStr = typeof url === "string" ? url : url?.toString?.() || "";
+      if (urlStr.includes("coingecko.com/api/v3/coins/markets")) {
+        expect(opts.headers).toBeUndefined();
+        return createMockResponse(payload);
+      }
+      throw new Error(`unexpected fetch call: ${urlStr}`);
     });
 
-    const { fetchCoinGeckoMarkets } = await import("../../lib/crypto-core.js");
-    const result = await fetchCoinGeckoMarkets("");
+    const cryptoCore = await import("../../lib/crypto-core.js");
+    const result = await cryptoCore.fetchCoinGeckoMarkets("");
 
     expect(global.fetch).toHaveBeenCalledTimes(1);
     expect(result).toEqual([
