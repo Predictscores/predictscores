@@ -2,20 +2,23 @@
 // Ulaz (query): ?home=Team+Name&away=Team+Name&ts=YYYY-MM-DDTHH:mm:ssZ
 // Izlaz: { bookmakers: [ { name, bets: [ { name: "1X2", values: [ {value:"HOME|DRAW|AWAY", odd:<decimal>} ] } ] } ] }
 
+import { fetchOddsSnapshot } from "../../lib/sources/theOddsApi";
+
 export const config = { api: { bodyParser: false } };
 
 export default async function handler(req, res) {
-  const ODDS_API_KEY = process.env.ODDS_API_KEY;
-  if (!ODDS_API_KEY) {
+  if (!process.env.ODDS_API_KEY) {
     return res.status(500).json({ error: "Missing ODDS_API_KEY in env" });
   }
 
   const homeQ = String(req.query.home || "").trim();
   const awayQ = String(req.query.away || "").trim();
-  const tsQ   = String(req.query.ts   || "").trim(); // kickoff ISO
+  const tsQ = String(req.query.ts || "").trim(); // kickoff ISO
 
   if (!homeQ || !awayQ || !tsQ) {
-    return res.status(400).json({ error: "Missing query: home, away, ts are required" });
+    return res
+      .status(400)
+      .json({ error: "Missing query: home, away, ts are required" });
   }
 
   // Minimalan skup popularnih liga (možeš dodati još po potrebi)
@@ -30,7 +33,7 @@ export default async function handler(req, res) {
     "soccer_portugal_primeira_liga",
     "soccer_turkey_super_league",
     "soccer_uefa_europa_league",
-    "soccer_uefa_europa_conference_league"
+    "soccer_uefa_europa_conference_league",
   ];
 
   // Normalizacija imena timova
@@ -60,18 +63,24 @@ export default async function handler(req, res) {
 
   // Pokušaćemo ligu po ligu dok ne nađemo odgovarajući event
   let matchedEvent = null;
+  let budgetExhausted = false;
 
   for (const sport of SOCCER_KEYS) {
     try {
-      const url =
-        `https://api.the-odds-api.com/v4/sports/${sport}/odds` +
-        `?regions=eu&markets=h2h&dateFormat=iso&oddsFormat=decimal&apiKey=${ODDS_API_KEY}`;
-      const r = await fetch(url);
-      if (!r.ok) continue;
-      const events = await r.json();
+      const snapshot = await fetchOddsSnapshot(sport, {
+        regions: "eu",
+        markets: "h2h",
+      });
+
+      if (snapshot?.exhausted) {
+        budgetExhausted = true;
+        break;
+      }
+
+      const events = Array.isArray(snapshot?.data) ? snapshot.data : [];
 
       // events: [{ id, home_team, away_team, commence_time, bookmakers:[{title, markets:[{key:"h2h", outcomes:[{name, price}]}]}] }]
-      for (const ev of events || []) {
+      for (const ev of events) {
         const evHome = norm(ev?.home_team);
         const evAway = norm(ev?.away_team);
         const isTeams =
@@ -86,12 +95,20 @@ export default async function handler(req, res) {
       }
 
       if (matchedEvent) break;
-    } catch {
+    } catch (err) {
       // preskoči grešku i nastavi na sledeći sport
+      console.error("odds-sports fetch error", err?.message || err);
     }
   }
 
   if (!matchedEvent) {
+    if (budgetExhausted) {
+      return res.status(200).json({
+        bookmakers: [],
+        message: "Daily odds API budget exhausted",
+      });
+    }
+
     return res.status(200).json({ bookmakers: [] });
   }
 
@@ -101,11 +118,15 @@ export default async function handler(req, res) {
 
   for (const bk of matchedEvent.bookmakers || []) {
     const markets = Array.isArray(bk?.markets) ? bk.markets : [];
-    const h2h = markets.find((m) => String(m?.key || "").toLowerCase() === "h2h");
+    const h2h = markets.find(
+      (m) => String(m?.key || "").toLowerCase() === "h2h"
+    );
     if (!h2h || !Array.isArray(h2h?.outcomes)) continue;
 
     // Nađi kvote za home/draw/away
-    let homeOdd = null, drawOdd = null, awayOdd = null;
+    let homeOdd = null,
+      drawOdd = null,
+      awayOdd = null;
     for (const o of h2h.outcomes) {
       const nameN = norm(o?.name);
       if (nameN === HN) homeOdd = Number(o?.price);
@@ -121,9 +142,7 @@ export default async function handler(req, res) {
     if (values.length) {
       mapBookmakers.push({
         name: bk?.title || "bookmaker",
-        bets: [
-          { name: "1X2", values }
-        ]
+        bets: [{ name: "1X2", values }],
       });
     }
   }
