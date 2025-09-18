@@ -1,7 +1,7 @@
 // pages/api/cron/crypto-watchdog.js
 // Watchdog: izračuna signale i napiše ih u KV (sa Entry/TP/SL), + upis u istoriju.
 
-import { buildSignals } from "../../../lib/crypto-core";
+import { buildSignals, validateCoinGeckoApiKey } from "../../../lib/crypto-core";
 
 const {
   COINGECKO_API_KEY = "",
@@ -65,6 +65,20 @@ export default async function handler(req, res) {
         .json({ ok: true, triggered: true, upstream: { ok: false, status: 401 } });
     }
 
+    const envReport = summarizeCoinGeckoEnv({
+      apiKey: COINGECKO_API_KEY,
+      upstashUrl: UPSTASH_REDIS_REST_URL,
+      upstashToken: UPSTASH_REDIS_REST_TOKEN,
+    });
+    console.log("[cron/crypto-watchdog] CoinGecko env validation", envReport.log);
+    if (!envReport.ok) {
+      return res.status(500).json({
+        ok: false,
+        error: "coingecko_env_incomplete",
+        missing: envReport.missing,
+      });
+    }
+
     const cacheKey = "crypto:signals:latest";
 
     // 1) kandidati
@@ -78,12 +92,12 @@ export default async function handler(req, res) {
         binanceTop: CFG.BINANCE_TOP,
       });
     } catch (err) {
-      if (isCoinGeckoApiKeyMissing(err)) {
-        console.error("[cron/crypto-watchdog] Missing CoinGecko API key", {
+      if (isCoinGeckoApiKeyError(err)) {
+        console.error("[cron/crypto-watchdog] CoinGecko API key error", {
           code: err?.code || null,
           message: err?.message || null,
         });
-        return res.status(500).json({ ok: false, error: "coingecko_api_key_missing" });
+        return res.status(500).json({ ok: false, error: err?.code || "coingecko_api_key_missing" });
       }
       if (isCoinGeckoQuotaError(err)) {
         const snapshot = await kvGetJSON(cacheKey);
@@ -186,6 +200,26 @@ function normalizeMinExpectedMove(value, fallback) {
   return Math.max(parsed, fallback);
 }
 
+function summarizeCoinGeckoEnv({ apiKey, upstashUrl, upstashToken }) {
+  const validation = validateCoinGeckoApiKey(apiKey);
+  let keyStatus = "present";
+  if (!validation.ok) keyStatus = validation.code === "missing" ? "missing" : "invalid";
+  const urlStatus = String(upstashUrl || "").trim() ? "present" : "missing";
+  const tokenStatus = String(upstashToken || "").trim() ? "present" : "missing";
+
+  const log = {
+    coingecko_api_key: keyStatus,
+    upstash_redis_rest_url: urlStatus,
+    upstash_redis_rest_token: tokenStatus,
+  };
+
+  const missing = Object.entries(log)
+    .filter(([, status]) => status !== "present")
+    .map(([name, status]) => ({ name, status }));
+
+  return { ok: missing.length === 0, log, missing };
+}
+
 function isCoinGeckoQuotaError(err) {
   if (!err) return false;
   const code = typeof err.code === "string" ? err.code : "";
@@ -194,12 +228,12 @@ function isCoinGeckoQuotaError(err) {
   return message.includes("coingecko_quota_exceeded");
 }
 
-function isCoinGeckoApiKeyMissing(err) {
+function isCoinGeckoApiKeyError(err) {
   if (!err) return false;
   const code = typeof err.code === "string" ? err.code : "";
-  if (code === "coingecko_api_key_missing") return true;
+  if (code === "coingecko_api_key_missing" || code === "coingecko_api_key_invalid") return true;
   const message = typeof err.message === "string" ? err.message : "";
-  return message.includes("coingecko_api_key_missing");
+  return message.includes("coingecko_api_key_missing") || message.includes("coingecko_api_key_invalid");
 }
 
 function quotaDetails(err) {
