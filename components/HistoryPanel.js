@@ -39,6 +39,32 @@ function coalesceArray(x) {
 
 const isValidYmd = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 
+function pushIfValidYmd(list, value) {
+  if (isValidYmd(value) && !list.includes(value)) {
+    list.push(value);
+  }
+}
+
+function deriveLatestHistoryYmd(body, items = []) {
+  const ymds = [];
+  if (body && typeof body === "object") {
+    pushIfValidYmd(ymds, body.latestYmd);
+    pushIfValidYmd(ymds, body.latest_ymd);
+    pushIfValidYmd(ymds, body.ymd);
+    if (Array.isArray(body.queried_days)) {
+      for (const y of body.queried_days) {
+        pushIfValidYmd(ymds, y);
+      }
+    }
+  }
+  if (Array.isArray(items)) {
+    for (const it of items) {
+      pushIfValidYmd(ymds, it?.ymd);
+    }
+  }
+  return ymds.length ? ymds[0] : null;
+}
+
 // --- Small helpers to format football items robustly (works with several shapes) ---
 function getFixtureId(it) {
   return it?.fixture_id || it?.fixture?.id || it?.id || `${it?.league?.id || "?"}-${it?.kickoff || it?.kickoff_utc || it?.ts || Math.random()}`;
@@ -81,10 +107,21 @@ export default function HistoryPanel({ days = 14, ymd, top }) {
   const [totalCount, setTotalCount] = useState(0);
   const [err, setErr] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [historyInfo, setHistoryInfo] = useState({
+    ok: null,
+    latestYmd: null,
+    roi: null,
+    fallbackRoi: null,
+  });
+  const [roiFallbackRequested, setRoiFallbackRequested] = useState(false);
+  const dayYmd = useMemo(() => (isValidYmd(ymd) ? ymd : ymdInTZ(new Date())), [ymd]);
 
   // --- Football history fetch (existing behavior) ---
   useEffect(() => {
     const ac = new AbortController();
+    setLoading(true);
+    setRoiFallbackRequested(false);
+    setHistoryInfo({ ok: null, latestYmd: null, roi: null, fallbackRoi: null });
     (async () => {
       try {
         const href = `/api/history?days=${encodeURIComponent(days)}`;
@@ -100,15 +137,33 @@ export default function HistoryPanel({ days = 14, ymd, top }) {
         }
         const arr = coalesceArray(body) || coalesceArray(body?.history) || [];
         const normalized = Array.isArray(arr) ? arr : [];
-        setRawItems(normalized);
-        setTotalCount(normalized.length);
-        setErr(null);
+        if (!ac.signal.aborted) {
+          setRawItems(normalized);
+          setTotalCount(normalized.length);
+          setErr(null);
+          const latestYmd = deriveLatestHistoryYmd(body, normalized);
+          const roi = body && typeof body === "object" && body.roi && typeof body.roi === "object"
+            ? body.roi
+            : null;
+          const ok = body && typeof body === "object" ? body.ok !== false : null;
+          setHistoryInfo({
+            ok,
+            latestYmd,
+            roi,
+            fallbackRoi: null,
+          });
+        }
       } catch (e) {
-        setErr(String(e?.message || e));
-        setRawItems([]);
-        setTotalCount(0);
+        if (!ac.signal.aborted) {
+          setErr(String(e?.message || e));
+          setRawItems([]);
+          setTotalCount(0);
+          setHistoryInfo({ ok: false, latestYmd: null, roi: null, fallbackRoi: null });
+        }
       } finally {
-        setLoading(false);
+        if (!ac.signal.aborted) {
+          setLoading(false);
+        }
       }
     })();
     return () => ac.abort();
@@ -123,8 +178,45 @@ export default function HistoryPanel({ days = 14, ymd, top }) {
     }
   }, [rawItems, topLimit]);
 
+  // ROI fallback for the latest available football day (kv fallback)
+  useEffect(() => {
+    if (loading) return;
+    if (roiFallbackRequested) return;
+
+    const preferredYmd = historyInfo?.latestYmd;
+    const targetYmd = isValidYmd(preferredYmd)
+      ? preferredYmd
+      : (isValidYmd(dayYmd) ? dayYmd : null);
+    if (!targetYmd) return;
+
+    const ac = new AbortController();
+    setRoiFallbackRequested(true);
+
+    (async () => {
+      try {
+        const href = `/api/history-roi?ymd=${encodeURIComponent(targetYmd)}`;
+        const r = await fetch(href, { cache: "no-store", signal: ac.signal });
+        const j = await r.json().catch(() => null);
+        if (!ac.signal.aborted) {
+          setHistoryInfo((prev) => ({
+            ...prev,
+            fallbackRoi: j || { ok: false },
+          }));
+        }
+      } catch (e) {
+        if (!ac.signal.aborted) {
+          setHistoryInfo((prev) => ({
+            ...prev,
+            fallbackRoi: { ok: false, error: String(e?.message || e) },
+          }));
+        }
+      }
+    })();
+
+    return () => ac.abort();
+  }, [dayYmd, historyInfo.latestYmd, loading, roiFallbackRequested]);
+
   // --- Crypto (right column) ---
-  const dayYmd = useMemo(() => (isValidYmd(ymd) ? ymd : ymdInTZ(new Date())), [ymd]);
   const [cryptoData, setCryptoData] = useState(null);
   const [cryptoStats, setCryptoStats] = useState(null); // 14d ROI summary
 
