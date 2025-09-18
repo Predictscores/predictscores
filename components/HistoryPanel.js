@@ -180,8 +180,9 @@ export default function HistoryPanel({ days = 14, ymd, top }) {
 
   // ROI fallback for the latest available football day (kv fallback)
   useEffect(() => {
-    if (loading) return;
-    if (roiFallbackRequested) return;
+    if (loading || roiFallbackRequested) {
+      return;
+    }
 
     const preferredYmd = historyInfo?.latestYmd;
     const targetYmd = isValidYmd(preferredYmd)
