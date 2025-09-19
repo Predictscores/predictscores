@@ -129,6 +129,7 @@ function recentDays(base = new Date(), n = 14) {
 
 export default async function handler(req, res) {
   try {
+    const debug = req?.query?.debug === "1";
     const trace = [];
     const qYmd = String(req.query.ymd || "").trim();
     const ymd = isValidYmd(qYmd) ? qYmd : null;
@@ -163,7 +164,9 @@ export default async function handler(req, res) {
       source: daySources,
       roi,
       history: items,
-      debug: { trace, allowed: Array.from(allowSet), day_sources: daySources, day_meta: dayMeta },
+      debug: debug
+        ? { trace, allowed: Array.from(allowSet), day_sources: daySources, day_meta: dayMeta }
+        : undefined,
     });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });

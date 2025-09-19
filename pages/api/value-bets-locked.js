@@ -420,6 +420,7 @@ function aliasItem(it){
  *  Handler
  * ========================= */
 export default async function handler(req,res){
+  const debug = req?.query?.debug === "1";
   const trace=[];
   try{
     const now=new Date(); const ymd=ymdInTZ(now, TZ);
@@ -437,7 +438,7 @@ export default async function handler(req,res){
       return res.status(200).json({
         ok:true, ymd, slot, source:null,
         items:[], tickets:{ btts:[], ou25:[], fh_ou15:[], htft:[], BTTS:[], OU25:[], FH_OU15:[], HTFT:[] },
-        one_x_two: [], debug:{ trace }
+        one_x_two: [], debug: debug ? { trace } : undefined
       });
     }
 
@@ -479,7 +480,7 @@ export default async function handler(req,res){
 
     return res.status(200).json({
       ok:true, ymd, slot, source: full.items.length?"vbl_full":"vb:day",
-      items, tickets: ticketsAliased, one_x_two, debug:{ trace }
+      items, tickets: ticketsAliased, one_x_two, debug: debug ? { trace } : undefined
     });
   }catch(e){
     return res.status(200).json({ ok:false, error:String(e?.message||e) });

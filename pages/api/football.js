@@ -52,6 +52,7 @@ function tierScore(leagueName="") {
 
 export default async function handler(req, res) {
   try {
+    const debug = req?.query?.debug === "1";
     const d = now();
     const ymd = ymdInTZ(d, TZ);
     const h = hourInTZ(d, TZ);
@@ -118,7 +119,13 @@ export default async function handler(req, res) {
       if (picked.length >= 15) break;
     }
 
-    return res.status(200).json({ ok:true, ymd, slot, items: picked.slice(0,15), debug: { reads: readMeta } });
+    return res.status(200).json({
+      ok:true,
+      ymd,
+      slot,
+      items: picked.slice(0,15),
+      debug: debug ? { reads: readMeta } : undefined,
+    });
   } catch (e) {
     return res.status(200).json({ ok:false, error: String(e?.message||e) });
   }

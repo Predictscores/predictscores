@@ -178,6 +178,7 @@ async function mergeCombined({ ymd, slot, top3Items, ticketsSnap, trace }) {
 
 export default async function handler(req, res) {
   try {
+    const debug = req?.query?.debug === "1";
     const trace = [];
     const readMeta = [];
     const now = new Date();
@@ -205,7 +206,15 @@ export default async function handler(req, res) {
     }
 
     if (!baseArr) {
-      return res.status(200).json({ ok:true, ymd, slot, source:null, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, note:"no-source-items", debug:{ trace, reads: readMeta } });
+      return res.status(200).json({
+        ok:true,
+        ymd,
+        slot,
+        source:null,
+        counts:{btts:0,ou25:0,htft:0,fh_ou15:0},
+        note:"no-source-items",
+        debug: debug ? { trace, reads: readMeta } : undefined,
+      });
     }
 
     // --- rangiranje za izbor ---
@@ -250,7 +259,14 @@ export default async function handler(req, res) {
     if (totalNew === 0) {
       // No-clobber za tiket
       trace.push({ note:"no-clobber (no-valid-candidates)" });
-      return res.status(200).json({ ok:true, ymd, slot, source, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, debug:{ trace } });
+      return res.status(200).json({
+        ok:true,
+        ymd,
+        slot,
+        source,
+        counts:{btts:0,ou25:0,htft:0,fh_ou15:0},
+        debug: debug ? { trace } : undefined,
+      });
     }
 
     // --- snap tiketa ---
@@ -280,7 +296,16 @@ export default async function handler(req, res) {
     await mergeCombined({ ymd, slot, top3Items: top3.map(x=>x.it), ticketsSnap: snap, trace });
 
     const counts = { btts: snap.btts.length, ou25: snap.ou25.length, htft: snap.htft.length, fh_ou15: snap.fh_ou15.length };
-    return res.status(200).json({ ok:true, ymd, slot, source, tickets_key:keySlot, counts, min_odds:MIN_ODDS, debug:{ trace, reads: readMeta } });
+    return res.status(200).json({
+      ok:true,
+      ymd,
+      slot,
+      source,
+      tickets_key:keySlot,
+      counts,
+      min_odds:MIN_ODDS,
+      debug: debug ? { trace, reads: readMeta } : undefined,
+    });
 
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });

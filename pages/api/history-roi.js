@@ -98,6 +98,7 @@ async function loadDay(ymd, trace) {
 
 export default async function handler(req, res) {
   try {
+    const debug = req?.query?.debug === "1";
     const trace = [];
     const qYmd = String(req.query.ymd || "").trim();
     const days = Math.min(60, Math.max(1, Number(req.query.days) || 14));
@@ -124,7 +125,9 @@ export default async function handler(req, res) {
       days: ymdd.length,
       roi,
       count: aggregated.length,
-      debug: { trace, allowed: Array.from(allowSet), reads: readMeta },
+      debug: debug
+        ? { trace, allowed: Array.from(allowSet), reads: readMeta }
+        : undefined,
     });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
