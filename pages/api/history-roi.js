@@ -57,7 +57,8 @@ function parseAllowedMarkets(envVal) {
 const allowSet = parseAllowedMarkets(process.env.HISTORY_ALLOWED_MARKETS);
 
 function dedupKey(e, normalizedMarketKey) {
-  const m = normalizedMarketKey ?? normalizeMarketKey(e?.market_key);
+  const rawMarket = e?.market_key ?? e?.market ?? e?.market_label;
+  const m = normalizedMarketKey ?? normalizeMarketKey(rawMarket);
   const pick = String(e?.pick || "").toLowerCase().trim();
   return `${e?.fixture_id || e?.id || "?"}__${m}__${pick}`;
 }
@@ -65,7 +66,8 @@ function dedupKey(e, normalizedMarketKey) {
 function filterAllowed(arr) {
   const by = new Map();
   for (const e of (arr || [])) {
-    const mkey = normalizeMarketKey(e?.market_key);
+    const rawMarket = e?.market_key ?? e?.market ?? e?.market_label;
+    const mkey = normalizeMarketKey(rawMarket);
     if (!mkey || !allowSet.has(mkey)) continue;
     const k = dedupKey(e, mkey);
     if (!by.has(k)) by.set(k, e);
