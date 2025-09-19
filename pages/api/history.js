@@ -1,5 +1,6 @@
 // File: pages/api/history.js
 import { computeROI } from "../../lib/history-utils";
+import { arrFromAny, toJson } from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
 
@@ -38,9 +39,6 @@ async function kvGETraw(key, trace) {
 }
 
 /* ---------- helpers ---------- */
-const J = (s) => {
-  try { return JSON.parse(String(s || "")); } catch { return null; }
-};
 const isValidYmd = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 
 const DEFAULT_MARKET_KEY = "h2h";
@@ -70,13 +68,6 @@ function parseAllowedMarkets(envVal) {
 }
 const allowSet = parseAllowedMarkets(process.env.HISTORY_ALLOWED_MARKETS);
 
-const arrFromAny = (x) =>
-  Array.isArray(x) ? x
-  : (x && typeof x === "object" && Array.isArray(x.items)) ? x.items
-  : (x && typeof x === "object" && Array.isArray(x.history)) ? x.history
-  : (x && typeof x === "object" && Array.isArray(x.list)) ? x.list
-  : [];
-
 const dedupKey = (e, normalizedMarketKey) => {
   const m = normalizedMarketKey ?? normalizeMarketKey(e?.market_key);
   const pick = String(e?.pick || "").toLowerCase().trim();
@@ -98,16 +89,27 @@ async function loadHistoryForDay(ymd, trace) {
   const histKey = `hist:${ymd}`;
   const { raw: rawHist } = await kvGETraw(histKey, trace);
 
-  let items = filterAllowed(arrFromAny(J(rawHist)));
+  const histJson = toJson(rawHist);
+  const histArr = arrFromAny(histJson.value, histJson.meta);
+  let items = filterAllowed(histArr.array);
 
   // Fallback: combined list
   const combKey = `vb:day:${ymd}:combined`;
   const { raw: rawComb } = await kvGETraw(combKey, trace);
-  if (!items.length && rawComb) {
-    items = filterAllowed(arrFromAny(J(rawComb)));
+  const combJson = toJson(rawComb);
+  const combArr = arrFromAny(combJson.value, combJson.meta);
+  if (!items.length) {
+    items = filterAllowed(combArr.array);
   }
 
-  return { items, sources: { hist: !!rawHist, combined: !!rawComb } };
+  return {
+    items,
+    sources: { hist: !!rawHist, combined: !!rawComb },
+    meta: {
+      hist: { json: histJson.meta, array: histArr.meta },
+      combined: { json: combJson.meta, array: combArr.meta },
+    },
+  };
 }
 
 function computeRoi(items) {
@@ -141,9 +143,11 @@ export default async function handler(req, res) {
 
     const aggregated = [];
     const daySources = {};
+    const dayMeta = {};
     for (const day of queriedDays) {
-      const { items, sources } = await loadHistoryForDay(day, trace);
+      const { items, sources, meta } = await loadHistoryForDay(day, trace);
       daySources[day] = sources;
+      dayMeta[day] = meta;
       aggregated.push(...items);
     }
 
@@ -159,7 +163,7 @@ export default async function handler(req, res) {
       source: daySources,
       roi,
       history: items,
-      debug: { trace, allowed: Array.from(allowSet), day_sources: daySources },
+      debug: { trace, allowed: Array.from(allowSet), day_sources: daySources, day_meta: dayMeta },
     });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });

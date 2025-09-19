@@ -1,6 +1,7 @@
 // File: pages/api/history-roi.js
 import { computeROI } from "../../lib/history-utils";
 import { normalizeMarketKey } from "./history";
+import { arrFromAny, toJson } from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
 
@@ -39,7 +40,6 @@ async function kvGETraw(key, trace) {
 }
 
 /* ---------- helpers ---------- */
-const J = (s) => { try { return JSON.parse(String(s || "")); } catch { return null; } };
 const isValidYmd = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 
 const DEFAULT_MARKET_KEY = "h2h";
@@ -54,13 +54,6 @@ function parseAllowedMarkets(envVal) {
   return new Set(list.length ? list : [fallback]);
 }
 const allowSet = parseAllowedMarkets(process.env.HISTORY_ALLOWED_MARKETS);
-
-const arrFromAny = (x) =>
-  Array.isArray(x) ? x
-  : (x && typeof x === "object" && Array.isArray(x.items)) ? x.items
-  : (x && typeof x === "object" && Array.isArray(x.history)) ? x.history
-  : (x && typeof x === "object" && Array.isArray(x.list)) ? x.list
-  : [];
 
 function dedupKey(e, normalizedMarketKey) {
   const m = normalizedMarketKey ?? normalizeMarketKey(e?.market_key);
@@ -83,14 +76,24 @@ async function loadDay(ymd, trace) {
   const histKey = `hist:${ymd}`;
   const { raw: rawHist } = await kvGETraw(histKey, trace);
 
-  let items = filterAllowed(arrFromAny(J(rawHist)));
+  const histJson = toJson(rawHist);
+  const histArr = arrFromAny(histJson.value, histJson.meta);
+  let items = filterAllowed(histArr.array);
 
   const combKey = `vb:day:${ymd}:combined`;
   const { raw: rawComb } = await kvGETraw(combKey, trace);
-  if (!items.length && rawComb) {
-    items = filterAllowed(arrFromAny(J(rawComb)));
+  const combJson = toJson(rawComb);
+  const combArr = arrFromAny(combJson.value, combJson.meta);
+  if (!items.length) {
+    items = filterAllowed(combArr.array);
   }
-  return items;
+  return {
+    items,
+    meta: {
+      hist: { json: histJson.meta, array: histArr.meta },
+      combined: { json: combJson.meta, array: combArr.meta },
+    },
+  };
 }
 
 export default async function handler(req, res) {
@@ -108,8 +111,11 @@ export default async function handler(req, res) {
         });
 
     const aggregated = [];
+    const readMeta = {};
     for (const ymd of ymdd) {
-      aggregated.push(...await loadDay(ymd, trace));
+      const { items, meta } = await loadDay(ymd, trace);
+      aggregated.push(...items);
+      readMeta[ymd] = meta;
     }
 
     const roi = computeROI(aggregated || []);
@@ -118,7 +124,7 @@ export default async function handler(req, res) {
       days: ymdd.length,
       roi,
       count: aggregated.length,
-      debug: { trace, allowed: Array.from(allowSet) },
+      debug: { trace, allowed: Array.from(allowSet), reads: readMeta },
     });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });

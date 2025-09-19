@@ -1,4 +1,6 @@
 // pages/api/crypto-history-day.js
+import { arrFromAny, toJson } from "../../lib/kv-read";
+
 export const config = { api: { bodyParser: false } };
 
 // ---- KV helpers ----
@@ -29,7 +31,6 @@ async function kvGETraw(key) {
   return null;
 }
 
-const J = s=>{ try{ return JSON.parse(String(s||"")); }catch{ return null; } };
 const isValidYmd = (s)=> /^\d{4}-\d{2}-\d{2}$/.test(String(s||""));
 
 // TZ helpers
@@ -75,12 +76,15 @@ export default async function handler(req, res) {
 
     // Učitaj skorašnje ID-eve (dovoljno za jedan dan)
     const idxRaw = await kvGETraw("crypto:history:index");
-    const ids = (J(idxRaw)||[]).slice(-800).reverse(); // recent → old
+    const idxJson = toJson(idxRaw);
+    const idxArr = arrFromAny(idxJson.value, idxJson.meta);
+    const ids = idxArr.array.slice(-800).reverse(); // recent → old
 
     const items = [];
     for (const id of ids) {
       const raw = await kvGETraw(`crypto:history:item:${id}`);
-      const it = J(raw);
+      const itRead = toJson(raw);
+      const it = itRead.value && typeof itRead.value === "object" ? itRead.value : null;
       if (!it) continue;
 
       // probaj redom: ts (created), evaluated_ts, valid_until

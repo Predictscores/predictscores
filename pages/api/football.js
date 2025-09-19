@@ -1,4 +1,6 @@
 // pages/api/football.js
+import { arrFromAny, toJson } from "../../lib/kv-read";
+
 export const config = { api: { bodyParser: false } };
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
@@ -20,8 +22,6 @@ async function kvGetRaw(key) {
     return null;
   } catch { return null; }
 }
-const J = s => { try { return JSON.parse(s); } catch { return null; } };
-
 /* Helpers */
 const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
 const hourInTZ = (d, tz) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour12: false, hour:"2-digit" }).format(d));
@@ -57,15 +57,35 @@ export default async function handler(req, res) {
     const h = hourInTZ(d, TZ);
     const slot = h<10 ? "late" : h<15 ? "am" : "pm";
 
+    const readMeta = [];
+
     // Try locked full for slot
-    const raw = await kvGetRaw(`vbl_full:${ymd}:${slot}`);
-    let items = J(raw) || [];
+    const fullKey = `vbl_full:${ymd}:${slot}`;
+    const fullRead = toJson(await kvGetRaw(fullKey));
+    const fullArr = arrFromAny(fullRead.value, fullRead.meta);
+    readMeta.push({ key: fullKey, json: fullRead.meta, array: fullArr.meta });
+    let items = fullArr.array;
 
     // Fallback: uzmi vb:day:<ymd>:<slot> / union / last (bez poziva frontu)
     if (!items.length) {
-      const fall1 = J(await kvGetRaw(`vb:day:${ymd}:${slot}`)) || [];
-      const fall2 = J(await kvGetRaw(`vb:day:${ymd}:union`)) || [];
-      const fall3 = J(await kvGetRaw(`vb:day:${ymd}:last`)) || [];
+      const keySlot = `vb:day:${ymd}:${slot}`;
+      const fall1Read = toJson(await kvGetRaw(keySlot));
+      const fall1Arr = arrFromAny(fall1Read.value, fall1Read.meta);
+      readMeta.push({ key: keySlot, json: fall1Read.meta, array: fall1Arr.meta });
+
+      const keyUnion = `vb:day:${ymd}:union`;
+      const fall2Read = toJson(await kvGetRaw(keyUnion));
+      const fall2Arr = arrFromAny(fall2Read.value, fall2Read.meta);
+      readMeta.push({ key: keyUnion, json: fall2Read.meta, array: fall2Arr.meta });
+
+      const keyLast = `vb:day:${ymd}:last`;
+      const fall3Read = toJson(await kvGetRaw(keyLast));
+      const fall3Arr = arrFromAny(fall3Read.value, fall3Read.meta);
+      readMeta.push({ key: keyLast, json: fall3Read.meta, array: fall3Arr.meta });
+
+      const fall1 = fall1Arr.array;
+      const fall2 = fall2Arr.array;
+      const fall3 = fall3Arr.array;
       items = fall1.length ? fall1 : (fall2.length ? fall2 : fall3);
     }
 
@@ -98,7 +118,7 @@ export default async function handler(req, res) {
       if (picked.length >= 15) break;
     }
 
-    return res.status(200).json({ ok:true, ymd, slot, items: picked.slice(0,15) });
+    return res.status(200).json({ ok:true, ymd, slot, items: picked.slice(0,15), debug: { reads: readMeta } });
   } catch (e) {
     return res.status(200).json({ ok:false, error: String(e?.message||e) });
   }
