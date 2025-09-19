@@ -76,15 +76,15 @@ export default async function handler(req, res) {
 
     // Učitaj skorašnje ID-eve (dovoljno za jedan dan)
     const idxRaw = await kvGETraw("crypto:history:index");
-    const idxJson = toJson(idxRaw);
-    const idxArr = arrFromAny(idxJson.value, idxJson.meta);
-    const ids = idxArr.array.slice(-800).reverse(); // recent → old
+    const idxValue = toJson(idxRaw);
+    const idxArr = arrFromAny(idxValue);
+    const ids = idxArr.slice(-800).reverse(); // recent → old
 
     const items = [];
     for (const id of ids) {
       const raw = await kvGETraw(`crypto:history:item:${id}`);
-      const itRead = toJson(raw);
-      const it = itRead.value && typeof itRead.value === "object" ? itRead.value : null;
+      const itValue = toJson(raw);
+      const it = itValue && typeof itValue === "object" ? itValue : null;
       if (!it) continue;
 
       // probaj redom: ts (created), evaluated_ts, valid_until

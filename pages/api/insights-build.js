@@ -1,4 +1,5 @@
 // pages/api/insights-build.js
+import { jsonMeta, arrayMeta } from "../../lib/kv-meta";
 import { arrFromAny, toJson } from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
@@ -128,12 +129,18 @@ function dedupKey(e){
   const f = e?.fixture_id || e?.fixture?.id || e?.id;
   return `${f || "?"}__${String(e?.market_key||"").toLowerCase()}__${String(e?.pick||"").toLowerCase()}`;
 }
-async function mergeCombined({ ymd, slot, top3Items, ticketsSnap, trace }) {
+async function mergeCombined({ ymd, slot, top3Items, ticketsSnap, trace, wantDebug = false }) {
   const key = `vb:day:${ymd}:combined`;
-  const prevRead = toJson((await kvGETraw(key, trace)).raw);
-  const prevArr = arrFromAny(prevRead.value, prevRead.meta);
-  const prev = prevArr.array || [];
-  const traceEntry = { combined_key: key, read_meta: { json: prevRead.meta, array: prevArr.meta } };
+  const { raw: prevRaw } = await kvGETraw(key, trace);
+  const prevValue = toJson(prevRaw);
+  const prevArr = arrFromAny(prevValue);
+  const prev = prevArr || [];
+  const traceEntry = { combined_key: key };
+  if (wantDebug) {
+    const prevJsonMeta = jsonMeta(prevRaw, prevValue);
+    const prevArrayMeta = arrayMeta(prevValue, prevArr, prevJsonMeta);
+    traceEntry.read_meta = { json: prevJsonMeta, array: prevArrayMeta };
+  }
   const by = new Map(prev.map(e => [dedupKey(e), e]));
   let added = 0;
 
@@ -179,8 +186,9 @@ async function mergeCombined({ ymd, slot, top3Items, ticketsSnap, trace }) {
 export default async function handler(req, res) {
   try {
     const trace = [];
-    const readMeta = [];
     const now = new Date();
+    const wantDebug = String(req.query?.debug || "") === "1";
+    const readMeta = wantDebug ? [] : null;
 
     const qSlot = canonicalSlot(req.query.slot);
     const slot  = qSlot==="auto" ? autoSlot(now, TZ) : qSlot;
@@ -198,14 +206,18 @@ export default async function handler(req, res) {
     let baseArr=null, source=null;
     for (const k of tried) {
       const { raw } = await kvGETraw(k, trace);
-      const jsonRead = toJson(raw);
-      const arrRead = arrFromAny(jsonRead.value, jsonRead.meta);
-      readMeta.push({ key: k, json: jsonRead.meta, array: arrRead.meta });
-      if (arrRead.array.length){ baseArr=arrRead.array; source=k; break; }
+      const jsonValue = toJson(raw);
+      const arr = arrFromAny(jsonValue);
+      if (wantDebug) {
+        const metaJson = jsonMeta(raw, jsonValue);
+        const metaArray = arrayMeta(jsonValue, arr, metaJson);
+        readMeta.push({ key: k, json: metaJson, array: metaArray });
+      }
+      if (arr.length){ baseArr=arr; source=k; break; }
     }
 
     if (!baseArr) {
-      return res.status(200).json({ ok:true, ymd, slot, source:null, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, note:"no-source-items", debug:{ trace, reads: readMeta } });
+      return res.status(200).json({ ok:true, ymd, slot, source:null, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, note:"no-source-items", debug:{ trace, reads: wantDebug ? readMeta : null } });
     }
 
     // --- rangiranje za izbor ---
@@ -263,8 +275,8 @@ export default async function handler(req, res) {
     // upiši tiket po slotu, a dnevni samo ako ne postoji
     await kvSET(keySlot, snap, trace);
     const { raw:rawDay } = await kvGETraw(`tickets:${ymd}`, trace);
-    const dayRead = toJson(rawDay);
-    const jDay = dayRead.value && typeof dayRead.value === "object" ? dayRead.value : null;
+    const dayValue = toJson(rawDay);
+    const jDay = dayValue && typeof dayValue === "object" ? dayValue : null;
     const hasDay = jDay && (Array.isArray(jDay.btts)||Array.isArray(jDay.ou25)||Array.isArray(jDay.htft)||Array.isArray(jDay.fh_ou15));
     if (!hasDay) await kvSET(`tickets:${ymd}`, snap, trace);
 
@@ -277,10 +289,10 @@ export default async function handler(req, res) {
     }
 
     // --- NEW: merge Top-3 + 4×4 u vb:day:<ymd>:combined (no-clobber & dedup) ---
-    await mergeCombined({ ymd, slot, top3Items: top3.map(x=>x.it), ticketsSnap: snap, trace });
+    await mergeCombined({ ymd, slot, top3Items: top3.map(x=>x.it), ticketsSnap: snap, trace, wantDebug });
 
     const counts = { btts: snap.btts.length, ou25: snap.ou25.length, htft: snap.htft.length, fh_ou15: snap.fh_ou15.length };
-    return res.status(200).json({ ok:true, ymd, slot, source, tickets_key:keySlot, counts, min_odds:MIN_ODDS, debug:{ trace, reads: readMeta } });
+    return res.status(200).json({ ok:true, ymd, slot, source, tickets_key:keySlot, counts, min_odds:MIN_ODDS, debug:{ trace, reads: wantDebug ? readMeta : null } });
 
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
