@@ -24,17 +24,26 @@ async function kvGETraw(key, trace) {
       const j = await r.json().catch(()=>null);
       const payload = j?.result ?? j?.value;
       let raw = null;
+      const fromObject = payload && typeof payload === "object";
       if (typeof payload === "string") {
         raw = payload;
       } else if (payload !== undefined) {
         try { raw = JSON.stringify(payload ?? null); } catch { raw = null; }
       }
-      trace && trace.push({ get:key, ok:r.ok, flavor:b.flavor, hit: typeof raw === "string" });
+      trace && trace.push({ get:key, ok:r.ok, flavor:b.flavor, hit: typeof raw === "string", kvObject: fromObject });
       if (!r.ok) continue;
-      return { raw, flavor:b.flavor };
+      return { raw, flavor:b.flavor, kvObject: fromObject };
     } catch (e) { trace && trace.push({ get:key, ok:false, err:String(e?.message||e) }); }
   }
-  return { raw:null, flavor:null };
+  return { raw:null, flavor:null, kvObject: null };
+}
+
+function recordMeta(store, key, info) {
+  if (!store) return;
+  store[key] = {
+    flavor: info?.flavor ?? null,
+    kvObject: info?.kvObject ?? null,
+  };
 }
 async function kvSET(key, value, trace) {
   const saved = [];
@@ -131,9 +140,11 @@ function dedupKey(e){
   const f = e?.fixture_id || e?.fixture?.id || e?.id;
   return `${f || "?"}__${String(e?.market_key||"").toLowerCase()}__${String(e?.pick||"").toLowerCase()}`;
 }
-async function mergeCombined({ ymd, slot, top3Items, ticketsSnap, trace }) {
+async function mergeCombined({ ymd, slot, top3Items, ticketsSnap, trace, meta }) {
   const key = `vb:day:${ymd}:combined`;
-  const prev = J((await kvGETraw(key, trace)).raw) || [];
+  const prevRes = await kvGETraw(key, trace);
+  recordMeta(meta, key, prevRes);
+  const prev = J(prevRes.raw) || [];
   const by = new Map(prev.map(e => [dedupKey(e), e]));
   let added = 0;
 
@@ -175,8 +186,21 @@ async function mergeCombined({ ymd, slot, top3Items, ticketsSnap, trace }) {
 
 export default async function handler(req, res) {
   try {
-    const trace = [];
+    const debugRequested = req.query.debug === "1";
+    const trace = debugRequested ? [] : null;
+    const kvMeta = debugRequested ? {} : null;
     const now = new Date();
+
+    const buildDebug = () => {
+      if (!debugRequested) return null;
+      const sourceFlavor = {};
+      const kvObject = {};
+      for (const [key, info] of Object.entries(kvMeta || {})) {
+        sourceFlavor[key] = info?.flavor ?? null;
+        kvObject[key] = info?.kvObject ?? null;
+      }
+      return { trace: trace || [], sourceFlavor, kvObject };
+    };
 
     const qSlot = canonicalSlot(req.query.slot);
     const slot  = qSlot==="auto" ? autoSlot(now, TZ) : qSlot;
@@ -193,13 +217,17 @@ export default async function handler(req, res) {
     ];
     let baseArr=null, source=null;
     for (const k of tried) {
-      const { raw } = await kvGETraw(k, trace);
-      const arr = arrFromAny(J(raw));
+      const resGet = await kvGETraw(k, trace);
+      recordMeta(kvMeta, k, resGet);
+      const arr = arrFromAny(J(resGet.raw));
       if (arr.length){ baseArr=arr; source=k; break; }
     }
 
     if (!baseArr) {
-      return res.status(200).json({ ok:true, ymd, slot, source:null, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, note:"no-source-items" });
+      const response = { ok:true, ymd, slot, source:null, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, note:"no-source-items" };
+      const debug = buildDebug();
+      if (debug) response.debug = debug;
+      return res.status(200).json(response);
     }
 
     // --- rangiranje za izbor ---
@@ -243,8 +271,11 @@ export default async function handler(req, res) {
 
     if (totalNew === 0) {
       // No-clobber za tiket
-      trace.push({ note:"no-clobber (no-valid-candidates)" });
-      return res.status(200).json({ ok:true, ymd, slot, source, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, debug:{ trace } });
+      trace && trace.push({ note:"no-clobber (no-valid-candidates)" });
+      const response = { ok:true, ymd, slot, source, counts:{btts:0,ou25:0,htft:0,fh_ou15:0} };
+      const debug = buildDebug();
+      if (debug) response.debug = debug;
+      return res.status(200).json(response);
     }
 
     // --- snap tiketa ---
@@ -256,7 +287,9 @@ export default async function handler(req, res) {
 
     // upiši tiket po slotu, a dnevni samo ako ne postoji
     await kvSET(keySlot, snap, trace);
-    const { raw:rawDay } = await kvGETraw(`tickets:${ymd}`, trace);
+    const dayRes = await kvGETraw(`tickets:${ymd}`, trace);
+    recordMeta(kvMeta, `tickets:${ymd}`, dayRes);
+    const rawDay = dayRes.raw;
     const jDay = J(rawDay);
     const hasDay = jDay && (Array.isArray(jDay.btts)||Array.isArray(jDay.ou25)||Array.isArray(jDay.htft)||Array.isArray(jDay.fh_ou15));
     if (!hasDay) await kvSET(`tickets:${ymd}`, snap, trace);
@@ -270,10 +303,13 @@ export default async function handler(req, res) {
     }
 
     // --- NEW: merge Top-3 + 4×4 u vb:day:<ymd>:combined (no-clobber & dedup) ---
-    await mergeCombined({ ymd, slot, top3Items: top3.map(x=>x.it), ticketsSnap: snap, trace });
+    await mergeCombined({ ymd, slot, top3Items: top3.map(x=>x.it), ticketsSnap: snap, trace, meta: kvMeta });
 
     const counts = { btts: snap.btts.length, ou25: snap.ou25.length, htft: snap.htft.length, fh_ou15: snap.fh_ou15.length };
-    return res.status(200).json({ ok:true, ymd, slot, source, tickets_key:keySlot, counts, min_odds:MIN_ODDS, debug:{ trace } });
+    const response = { ok:true, ymd, slot, source, tickets_key:keySlot, counts, min_odds:MIN_ODDS };
+    const debug = buildDebug();
+    if (debug) response.debug = debug;
+    return res.status(200).json(response);
 
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });

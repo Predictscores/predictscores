@@ -4,21 +4,42 @@ export const config = { api: { bodyParser: false } };
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
 /* KV */
-const KV_URL   = process.env.KV_REST_API_URL;
-const KV_TOKEN = process.env.KV_REST_API_TOKEN;
-async function kvGetRaw(key) {
-  if (!KV_URL || !KV_TOKEN) return null;
-  try {
-    const r = await fetch(`${KV_URL.replace(/\/+$/,"")}/get/${encodeURIComponent(key)}`, { headers:{ Authorization:`Bearer ${KV_TOKEN}` }, cache:"no-store" });
-    if (!r.ok) return null;
-    const j = await r.json().catch(()=>null);
-    const payload = j?.result ?? j?.value;
-    if (typeof payload === "string") return payload;
-    if (payload !== undefined) {
-      try { return JSON.stringify(payload ?? null); } catch { return null; }
+function kvBackends() {
+  const out = [];
+  const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
+  const bU = process.env.UPSTASH_REDIS_REST_URL, bT = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (aU && aT) out.push({ flavor:"vercel-kv", url:aU.replace(/\/+$/,""), tok:aT });
+  if (bU && bT) out.push({ flavor:"upstash-redis", url:bU.replace(/\/+$/,""), tok:bT });
+  return out;
+}
+async function kvGETraw(key, trace) {
+  for (const b of kvBackends()) {
+    try {
+      const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`, { headers:{ Authorization:`Bearer ${b.tok}` }, cache:"no-store" });
+      const j = await r.json().catch(()=>null);
+      const payload = j?.result ?? j?.value;
+      let raw = null;
+      const fromObject = payload && typeof payload === "object";
+      if (typeof payload === "string") {
+        raw = payload;
+      } else if (payload !== undefined) {
+        try { raw = JSON.stringify(payload ?? null); } catch { raw = null; }
+      }
+      trace && trace.push({ get:key, ok:r.ok, flavor:b.flavor, hit: typeof raw === "string", kvObject: fromObject });
+      if (!r.ok) continue;
+      return { raw: typeof raw === "string" ? raw : null, flavor:b.flavor, kvObject: fromObject };
+    } catch (e) {
+      trace && trace.push({ get:key, ok:false, err:String(e?.message||e) });
     }
-    return null;
-  } catch { return null; }
+  }
+  return { raw:null, flavor:null, kvObject:null };
+}
+function recordMeta(store, key, info) {
+  if (!store) return;
+  store[key] = {
+    flavor: info?.flavor ?? null,
+    kvObject: info?.kvObject ?? null,
+  };
 }
 const J = s => { try { return JSON.parse(s); } catch { return null; } };
 
@@ -52,20 +73,34 @@ function tierScore(leagueName="") {
 
 export default async function handler(req, res) {
   try {
+    const debugRequested = req.query.debug === "1";
+    const trace = debugRequested ? [] : null;
+    const kvMeta = debugRequested ? {} : null;
     const d = now();
     const ymd = ymdInTZ(d, TZ);
     const h = hourInTZ(d, TZ);
     const slot = h<10 ? "late" : h<15 ? "am" : "pm";
 
     // Try locked full for slot
-    const raw = await kvGetRaw(`vbl_full:${ymd}:${slot}`);
-    let items = J(raw) || [];
+    const primaryKey = `vbl_full:${ymd}:${slot}`;
+    const primaryRes = await kvGETraw(primaryKey, trace);
+    recordMeta(kvMeta, primaryKey, primaryRes);
+    let items = J(primaryRes.raw) || [];
 
     // Fallback: uzmi vb:day:<ymd>:<slot> / union / last (bez poziva frontu)
     if (!items.length) {
-      const fall1 = J(await kvGetRaw(`vb:day:${ymd}:${slot}`)) || [];
-      const fall2 = J(await kvGetRaw(`vb:day:${ymd}:union`)) || [];
-      const fall3 = J(await kvGetRaw(`vb:day:${ymd}:last`)) || [];
+      const fallbackKeys = [
+        `vb:day:${ymd}:${slot}`,
+        `vb:day:${ymd}:union`,
+        `vb:day:${ymd}:last`,
+      ];
+      const [fall1, fall2, fall3] = await Promise.all(
+        fallbackKeys.map(async (key) => {
+          const resGet = await kvGETraw(key, trace);
+          recordMeta(kvMeta, key, resGet);
+          return J(resGet.raw) || [];
+        })
+      );
       items = fall1.length ? fall1 : (fall2.length ? fall2 : fall3);
     }
 
@@ -98,7 +133,18 @@ export default async function handler(req, res) {
       if (picked.length >= 15) break;
     }
 
-    return res.status(200).json({ ok:true, ymd, slot, items: picked.slice(0,15) });
+    const response = { ok:true, ymd, slot, items: picked.slice(0,15) };
+    if (debugRequested) {
+      const sourceFlavor = {};
+      const kvObject = {};
+      for (const [key, info] of Object.entries(kvMeta || {})) {
+        sourceFlavor[key] = info?.flavor ?? null;
+        kvObject[key] = info?.kvObject ?? null;
+      }
+      response.debug = { trace: trace || [], sourceFlavor, kvObject };
+    }
+
+    return res.status(200).json(response);
   } catch (e) {
     return res.status(200).json({ ok:false, error: String(e?.message||e) });
   }

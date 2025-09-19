@@ -78,7 +78,7 @@ describe("API history market normalization", () => {
 
     const { default: handler } = require("../../../pages/api/history");
 
-    const req = { query: { ymd: "2024-05-01" } };
+    const req = { query: { ymd: "2024-05-01", debug: "1" } };
     const res = createMockRes();
 
     await handler(req, res);
@@ -99,7 +99,7 @@ describe("API history market normalization", () => {
 
     const { default: handler } = require("../../../pages/api/history-roi");
 
-    const req = { query: { ymd: "2024-05-01" } };
+    const req = { query: { ymd: "2024-05-01", debug: "1" } };
     const res = createMockRes();
 
     await handler(req, res);

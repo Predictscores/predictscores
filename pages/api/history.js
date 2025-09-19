@@ -22,19 +22,28 @@ async function kvGETraw(key, trace) {
       const j = await r.json().catch(() => null);
       const payload = j?.result ?? j?.value;
       let raw = null;
+      const fromObject = payload && typeof payload === "object";
       if (typeof payload === "string") {
         raw = payload;
       } else if (payload !== undefined) {
         try { raw = JSON.stringify(payload ?? null); } catch { raw = null; }
       }
-      trace && trace.push({ get: key, ok: r.ok, flavor: b.flavor, hit: typeof raw === "string" });
+      trace && trace.push({ get: key, ok: r.ok, flavor: b.flavor, hit: typeof raw === "string", kvObject: fromObject });
       if (!r.ok) continue;
-      return { raw, flavor: b.flavor };
+      return { raw, flavor: b.flavor, kvObject: fromObject };
     } catch (e) {
       trace && trace.push({ get: key, ok: false, err: String(e?.message || e) });
     }
   }
-  return { raw: null, flavor: null };
+  return { raw: null, flavor: null, kvObject: null };
+}
+
+function recordMeta(store, key, info) {
+  if (!store) return;
+  store[key] = {
+    flavor: info?.flavor ?? null,
+    kvObject: info?.kvObject ?? null,
+  };
 }
 
 /* ---------- helpers ---------- */
@@ -94,15 +103,19 @@ function filterAllowed(arr) {
   return Array.from(by.values());
 }
 
-async function loadHistoryForDay(ymd, trace) {
+async function loadHistoryForDay(ymd, trace, meta) {
   const histKey = `hist:${ymd}`;
-  const { raw: rawHist } = await kvGETraw(histKey, trace);
+  const histRes = await kvGETraw(histKey, trace);
+  recordMeta(meta, histKey, histRes);
+  const rawHist = histRes.raw;
 
   let items = filterAllowed(arrFromAny(J(rawHist)));
 
   // Fallback: combined list
   const combKey = `vb:day:${ymd}:combined`;
-  const { raw: rawComb } = await kvGETraw(combKey, trace);
+  const combRes = await kvGETraw(combKey, trace);
+  recordMeta(meta, combKey, combRes);
+  const rawComb = combRes.raw;
   if (!items.length && rawComb) {
     items = filterAllowed(arrFromAny(J(rawComb)));
   }
@@ -127,7 +140,9 @@ function recentDays(base = new Date(), n = 14) {
 
 export default async function handler(req, res) {
   try {
-    const trace = [];
+    const debugRequested = req.query.debug === "1";
+    const trace = debugRequested ? [] : null;
+    const kvMeta = debugRequested ? {} : null;
     const qYmd = String(req.query.ymd || "").trim();
     const ymd = isValidYmd(qYmd) ? qYmd : null;
 
@@ -142,7 +157,7 @@ export default async function handler(req, res) {
     const aggregated = [];
     const daySources = {};
     for (const day of queriedDays) {
-      const { items, sources } = await loadHistoryForDay(day, trace);
+      const { items, sources } = await loadHistoryForDay(day, trace, kvMeta);
       daySources[day] = sources;
       aggregated.push(...items);
     }
@@ -151,7 +166,7 @@ export default async function handler(req, res) {
     const roi = computeRoi(items);
 
     const singleYmd = ymd || (queriedDays.length ? queriedDays[0] : null);
-    return res.status(200).json({
+    const response = {
       ok: true,
       ymd: singleYmd,
       queried_days: queriedDays,
@@ -159,8 +174,25 @@ export default async function handler(req, res) {
       source: daySources,
       roi,
       history: items,
-      debug: { trace, allowed: Array.from(allowSet), day_sources: daySources },
-    });
+    };
+
+    if (debugRequested) {
+      const sourceFlavor = {};
+      const kvObject = {};
+      for (const [key, info] of Object.entries(kvMeta || {})) {
+        sourceFlavor[key] = info?.flavor ?? null;
+        kvObject[key] = info?.kvObject ?? null;
+      }
+      response.debug = {
+        trace: trace || [],
+        allowed: Array.from(allowSet),
+        day_sources: daySources,
+        sourceFlavor,
+        kvObject,
+      };
+    }
+
+    return res.status(200).json(response);
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
