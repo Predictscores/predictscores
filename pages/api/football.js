@@ -12,7 +12,12 @@ async function kvGetRaw(key) {
     const r = await fetch(`${KV_URL.replace(/\/+$/,"")}/get/${encodeURIComponent(key)}`, { headers:{ Authorization:`Bearer ${KV_TOKEN}` }, cache:"no-store" });
     if (!r.ok) return null;
     const j = await r.json().catch(()=>null);
-    return typeof j?.result === "string" ? j.result : null;
+    const payload = j?.result ?? j?.value;
+    if (typeof payload === "string") return payload;
+    if (payload !== undefined) {
+      try { return JSON.stringify(payload ?? null); } catch { return null; }
+    }
+    return null;
   } catch { return null; }
 }
 const J = s => { try { return JSON.parse(s); } catch { return null; } };
