@@ -1,4 +1,6 @@
 // pages/api/insights-build.js
+import { arrFromAny, toJson } from "../../lib/kv-read";
+
 export const config = { api: { bodyParser: false } };
 
 /* ---------- TZ (samo TZ_DISPLAY) ---------- */
@@ -51,13 +53,8 @@ async function kvSET(key, value, trace) {
 }
 
 /* ---------- utils ---------- */
-const J = s=>{ try{ return JSON.parse(String(s||"")); }catch{ return null; } };
 const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
 const hourInTZ = (d, tz) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour12:false, hour:"2-digit" }).format(d));
-const arrFromAny = x => Array.isArray(x) ? x
-  : (x && typeof x==="object" && Array.isArray(x.items)) ? x.items
-  : (x && typeof x==="object" && Array.isArray(x.football)) ? x.football
-  : (x && typeof x==="object" && Array.isArray(x.list)) ? x.list : [];
 function canonicalSlot(x){ x=String(x||"auto").toLowerCase(); return x==="late"||x==="am"||x==="pm"?x:"auto"; }
 function autoSlot(d,tz){ const h=hourInTZ(d,tz); return h<10?"late":(h<15?"am":"pm"); }
 // Uvek "danas" (workflow prosleđuje ymd kad je drugi dan potreban)
@@ -133,7 +130,10 @@ function dedupKey(e){
 }
 async function mergeCombined({ ymd, slot, top3Items, ticketsSnap, trace }) {
   const key = `vb:day:${ymd}:combined`;
-  const prev = J((await kvGETraw(key, trace)).raw) || [];
+  const prevRead = toJson((await kvGETraw(key, trace)).raw);
+  const prevArr = arrFromAny(prevRead.value, prevRead.meta);
+  const prev = prevArr.array || [];
+  const traceEntry = { combined_key: key, read_meta: { json: prevRead.meta, array: prevArr.meta } };
   const by = new Map(prev.map(e => [dedupKey(e), e]));
   let added = 0;
 
@@ -167,15 +167,19 @@ async function mergeCombined({ ymd, slot, top3Items, ticketsSnap, trace }) {
   if (added > 0) {
     const merged = Array.from(by.values());
     await kvSET(key, merged, trace);
-    trace && trace.push({ combined_key:key, added, total: merged.length });
+    traceEntry.added = added;
+    traceEntry.total = merged.length;
   } else {
-    trace && trace.push({ combined_key:key, added:0, note:"no-op" });
+    traceEntry.added = 0;
+    traceEntry.note = "no-op";
   }
+  trace && trace.push(traceEntry);
 }
 
 export default async function handler(req, res) {
   try {
     const trace = [];
+    const readMeta = [];
     const now = new Date();
 
     const qSlot = canonicalSlot(req.query.slot);
@@ -194,12 +198,14 @@ export default async function handler(req, res) {
     let baseArr=null, source=null;
     for (const k of tried) {
       const { raw } = await kvGETraw(k, trace);
-      const arr = arrFromAny(J(raw));
-      if (arr.length){ baseArr=arr; source=k; break; }
+      const jsonRead = toJson(raw);
+      const arrRead = arrFromAny(jsonRead.value, jsonRead.meta);
+      readMeta.push({ key: k, json: jsonRead.meta, array: arrRead.meta });
+      if (arrRead.array.length){ baseArr=arrRead.array; source=k; break; }
     }
 
     if (!baseArr) {
-      return res.status(200).json({ ok:true, ymd, slot, source:null, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, note:"no-source-items" });
+      return res.status(200).json({ ok:true, ymd, slot, source:null, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, note:"no-source-items", debug:{ trace, reads: readMeta } });
     }
 
     // --- rangiranje za izbor ---
@@ -257,7 +263,8 @@ export default async function handler(req, res) {
     // upiši tiket po slotu, a dnevni samo ako ne postoji
     await kvSET(keySlot, snap, trace);
     const { raw:rawDay } = await kvGETraw(`tickets:${ymd}`, trace);
-    const jDay = J(rawDay);
+    const dayRead = toJson(rawDay);
+    const jDay = dayRead.value && typeof dayRead.value === "object" ? dayRead.value : null;
     const hasDay = jDay && (Array.isArray(jDay.btts)||Array.isArray(jDay.ou25)||Array.isArray(jDay.htft)||Array.isArray(jDay.fh_ou15));
     if (!hasDay) await kvSET(`tickets:${ymd}`, snap, trace);
 
@@ -273,7 +280,7 @@ export default async function handler(req, res) {
     await mergeCombined({ ymd, slot, top3Items: top3.map(x=>x.it), ticketsSnap: snap, trace });
 
     const counts = { btts: snap.btts.length, ou25: snap.ou25.length, htft: snap.htft.length, fh_ou15: snap.fh_ou15.length };
-    return res.status(200).json({ ok:true, ymd, slot, source, tickets_key:keySlot, counts, min_odds:MIN_ODDS, debug:{ trace } });
+    return res.status(200).json({ ok:true, ymd, slot, source, tickets_key:keySlot, counts, min_odds:MIN_ODDS, debug:{ trace, reads: readMeta } });
 
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
