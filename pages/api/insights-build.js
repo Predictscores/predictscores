@@ -1,5 +1,4 @@
 // pages/api/insights-build.js
-import { jsonMeta, arrayMeta } from "../../lib/kv-meta";
 import { arrFromAny, toJson } from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
@@ -134,11 +133,11 @@ async function mergeCombined({ ymd, slot, top3Items, ticketsSnap, trace, wantDeb
   const { raw: prevRaw } = await kvGETraw(key, trace);
   const prevValue = toJson(prevRaw);
   const prevArr = arrFromAny(prevValue);
-  const prev = prevArr || [];
+  const prev = prevArr.array || [];
   const traceEntry = { combined_key: key };
   if (wantDebug) {
-    const prevJsonMeta = jsonMeta(prevRaw, prevValue);
-    const prevArrayMeta = arrayMeta(prevValue, prevArr, prevJsonMeta);
+    const prevJsonMeta = { ...prevValue.meta };
+    const prevArrayMeta = { ...prevArr.meta };
     traceEntry.read_meta = { json: prevJsonMeta, array: prevArrayMeta };
   }
   const by = new Map(prev.map(e => [dedupKey(e), e]));
@@ -209,11 +208,11 @@ export default async function handler(req, res) {
       const jsonValue = toJson(raw);
       const arr = arrFromAny(jsonValue);
       if (wantDebug) {
-        const metaJson = jsonMeta(raw, jsonValue);
-        const metaArray = arrayMeta(jsonValue, arr, metaJson);
+        const metaJson = { ...jsonValue.meta };
+        const metaArray = { ...arr.meta };
         readMeta.push({ key: k, json: metaJson, array: metaArray });
       }
-      if (arr.length){ baseArr=arr; source=k; break; }
+      if (arr.array.length){ baseArr=arr.array; source=k; break; }
     }
 
     if (!baseArr) {
@@ -276,7 +275,7 @@ export default async function handler(req, res) {
     await kvSET(keySlot, snap, trace);
     const { raw:rawDay } = await kvGETraw(`tickets:${ymd}`, trace);
     const dayValue = toJson(rawDay);
-    const jDay = dayValue && typeof dayValue === "object" ? dayValue : null;
+    const jDay = dayValue.value && typeof dayValue.value === "object" ? dayValue.value : null;
     const hasDay = jDay && (Array.isArray(jDay.btts)||Array.isArray(jDay.ou25)||Array.isArray(jDay.htft)||Array.isArray(jDay.fh_ou15));
     if (!hasDay) await kvSET(`tickets:${ymd}`, snap, trace);
 
