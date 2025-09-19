@@ -26,6 +26,11 @@ const sampleHistoryPayload = {
 
 const realFetch = global.fetch;
 
+const kvResponseModes = [
+  ["string payloads", (payload) => ({ result: JSON.stringify(payload) })],
+  ["object payloads", (payload) => ({ result: payload })],
+];
+
 function createMockRes() {
   return {
     statusCode: 200,
@@ -41,18 +46,18 @@ function createMockRes() {
   };
 }
 
-function mockKvResponses(fetchMock, payload) {
-  fetchMock.mockResolvedValueOnce({
-    ok: true,
-    json: async () => ({ result: JSON.stringify(payload) }),
-  });
-  fetchMock.mockResolvedValueOnce({
-    ok: true,
-    json: async () => ({ result: null }),
-  });
-}
+describe.each(kvResponseModes)("API history market normalization (%s)", (modeLabel, makeEnvelope) => {
+  function mockKvResponses(fetchMock, payload) {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => makeEnvelope(payload),
+    });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ result: null }),
+    });
+  }
 
-describe("API history market normalization", () => {
   beforeEach(() => {
     jest.resetModules();
     process.env.HISTORY_ALLOWED_MARKETS = " h2h , total-goals?? ";
@@ -78,7 +83,7 @@ describe("API history market normalization", () => {
 
     const { default: handler } = require("../../../pages/api/history");
 
-    const req = { query: { ymd: "2024-05-01" } };
+    const req = { query: { ymd: "2024-05-01", debug: "1" } };
     const res = createMockRes();
 
     await handler(req, res);
@@ -99,7 +104,7 @@ describe("API history market normalization", () => {
 
     const { default: handler } = require("../../../pages/api/history-roi");
 
-    const req = { query: { ymd: "2024-05-01" } };
+    const req = { query: { ymd: "2024-05-01", debug: "1" } };
     const res = createMockRes();
 
     await handler(req, res);
@@ -108,5 +113,6 @@ describe("API history market normalization", () => {
     expect(res.statusCode).toBe(200);
     expect(res.jsonPayload.count).toBe(2);
     expect(res.jsonPayload.roi).toMatchObject({ played: 2, wins: 1 });
+    expect(res.jsonPayload.debug.allowed).toEqual(["h2h", "total-goals"]);
   });
 });
