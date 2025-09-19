@@ -15,9 +15,15 @@ async function kvGETraw(key) {
     try {
       const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`, { headers:{ Authorization:`Bearer ${b.tok}` }, cache:"no-store" });
       const j = await r.json().catch(()=>null);
-      const raw = typeof j?.result === "string" ? j.result : null;
+      const payload = j?.result ?? j?.value;
+      let raw = null;
+      if (typeof payload === "string") {
+        raw = payload;
+      } else if (payload !== undefined) {
+        try { raw = JSON.stringify(payload ?? null); } catch { raw = null; }
+      }
       if (!r.ok) continue;
-      return raw;
+      return typeof raw === "string" ? raw : null;
     } catch {}
   }
   return null;

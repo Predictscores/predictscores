@@ -20,8 +20,14 @@ async function kvGETraw(key, trace) {
         cache: "no-store",
       });
       const j = await r.json().catch(() => null);
-      const raw = typeof j?.result === "string" ? j.result : null;
-      trace && trace.push({ get: key, ok: r.ok, flavor: b.flavor, hit: !!raw });
+      const payload = j?.result ?? j?.value;
+      let raw = null;
+      if (typeof payload === "string") {
+        raw = payload;
+      } else if (payload !== undefined) {
+        try { raw = JSON.stringify(payload ?? null); } catch { raw = null; }
+      }
+      trace && trace.push({ get: key, ok: r.ok, flavor: b.flavor, hit: typeof raw === "string" });
       if (!r.ok) continue;
       return { raw, flavor: b.flavor };
     } catch (e) {
