@@ -1,4 +1,5 @@
 // pages/api/football.js
+import { jsonMeta, arrayMeta } from "../../lib/kv-meta";
 import { arrFromAny, toJson } from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
@@ -57,35 +58,56 @@ export default async function handler(req, res) {
     const h = hourInTZ(d, TZ);
     const slot = h<10 ? "late" : h<15 ? "am" : "pm";
 
-    const readMeta = [];
+    const wantDebug = String(req.query?.debug || "") === "1";
+    const readMeta = wantDebug ? [] : null;
 
     // Try locked full for slot
     const fullKey = `vbl_full:${ymd}:${slot}`;
-    const fullRead = toJson(await kvGetRaw(fullKey));
-    const fullArr = arrFromAny(fullRead.value, fullRead.meta);
-    readMeta.push({ key: fullKey, json: fullRead.meta, array: fullArr.meta });
-    let items = fullArr.array;
+    const fullRaw = await kvGetRaw(fullKey);
+    const fullValue = toJson(fullRaw);
+    const fullArr = arrFromAny(fullValue);
+    if (wantDebug) {
+      const fullJsonMeta = jsonMeta(fullRaw, fullValue);
+      const fullArrayMeta = arrayMeta(fullValue, fullArr, fullJsonMeta);
+      readMeta.push({ key: fullKey, json: fullJsonMeta, array: fullArrayMeta });
+    }
+    let items = fullArr;
 
     // Fallback: uzmi vb:day:<ymd>:<slot> / union / last (bez poziva frontu)
     if (!items.length) {
       const keySlot = `vb:day:${ymd}:${slot}`;
-      const fall1Read = toJson(await kvGetRaw(keySlot));
-      const fall1Arr = arrFromAny(fall1Read.value, fall1Read.meta);
-      readMeta.push({ key: keySlot, json: fall1Read.meta, array: fall1Arr.meta });
+      const fall1Raw = await kvGetRaw(keySlot);
+      const fall1Value = toJson(fall1Raw);
+      const fall1Arr = arrFromAny(fall1Value);
+      if (wantDebug) {
+        const fall1JsonMeta = jsonMeta(fall1Raw, fall1Value);
+        const fall1ArrayMeta = arrayMeta(fall1Value, fall1Arr, fall1JsonMeta);
+        readMeta.push({ key: keySlot, json: fall1JsonMeta, array: fall1ArrayMeta });
+      }
 
       const keyUnion = `vb:day:${ymd}:union`;
-      const fall2Read = toJson(await kvGetRaw(keyUnion));
-      const fall2Arr = arrFromAny(fall2Read.value, fall2Read.meta);
-      readMeta.push({ key: keyUnion, json: fall2Read.meta, array: fall2Arr.meta });
+      const fall2Raw = await kvGetRaw(keyUnion);
+      const fall2Value = toJson(fall2Raw);
+      const fall2Arr = arrFromAny(fall2Value);
+      if (wantDebug) {
+        const fall2JsonMeta = jsonMeta(fall2Raw, fall2Value);
+        const fall2ArrayMeta = arrayMeta(fall2Value, fall2Arr, fall2JsonMeta);
+        readMeta.push({ key: keyUnion, json: fall2JsonMeta, array: fall2ArrayMeta });
+      }
 
       const keyLast = `vb:day:${ymd}:last`;
-      const fall3Read = toJson(await kvGetRaw(keyLast));
-      const fall3Arr = arrFromAny(fall3Read.value, fall3Read.meta);
-      readMeta.push({ key: keyLast, json: fall3Read.meta, array: fall3Arr.meta });
+      const fall3Raw = await kvGetRaw(keyLast);
+      const fall3Value = toJson(fall3Raw);
+      const fall3Arr = arrFromAny(fall3Value);
+      if (wantDebug) {
+        const fall3JsonMeta = jsonMeta(fall3Raw, fall3Value);
+        const fall3ArrayMeta = arrayMeta(fall3Value, fall3Arr, fall3JsonMeta);
+        readMeta.push({ key: keyLast, json: fall3JsonMeta, array: fall3ArrayMeta });
+      }
 
-      const fall1 = fall1Arr.array;
-      const fall2 = fall2Arr.array;
-      const fall3 = fall3Arr.array;
+      const fall1 = fall1Arr;
+      const fall2 = fall2Arr;
+      const fall3 = fall3Arr;
       items = fall1.length ? fall1 : (fall2.length ? fall2 : fall3);
     }
 
@@ -118,7 +140,7 @@ export default async function handler(req, res) {
       if (picked.length >= 15) break;
     }
 
-    return res.status(200).json({ ok:true, ymd, slot, items: picked.slice(0,15), debug: { reads: readMeta } });
+    return res.status(200).json({ ok:true, ymd, slot, items: picked.slice(0,15), debug: { reads: wantDebug ? readMeta : null } });
   } catch (e) {
     return res.status(200).json({ ok:false, error: String(e?.message||e) });
   }

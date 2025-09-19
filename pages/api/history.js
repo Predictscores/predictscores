@@ -1,5 +1,6 @@
 // File: pages/api/history.js
 import { computeROI } from "../../lib/history-utils";
+import { jsonMeta, arrayMeta } from "../../lib/kv-meta";
 import { arrFromAny, toJson } from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
@@ -85,30 +86,39 @@ function filterAllowed(arr) {
   return Array.from(by.values());
 }
 
-async function loadHistoryForDay(ymd, trace) {
+async function loadHistoryForDay(ymd, trace, wantDebug = false) {
   const histKey = `hist:${ymd}`;
   const { raw: rawHist } = await kvGETraw(histKey, trace);
 
-  const histJson = toJson(rawHist);
-  const histArr = arrFromAny(histJson.value, histJson.meta);
-  let items = filterAllowed(histArr.array);
+  const histValue = toJson(rawHist);
+  const histItems = arrFromAny(histValue);
+  let items = filterAllowed(histItems);
 
   // Fallback: combined list
   const combKey = `vb:day:${ymd}:combined`;
   const { raw: rawComb } = await kvGETraw(combKey, trace);
-  const combJson = toJson(rawComb);
-  const combArr = arrFromAny(combJson.value, combJson.meta);
+  const combValue = toJson(rawComb);
+  const combItems = arrFromAny(combValue);
   if (!items.length) {
-    items = filterAllowed(combArr.array);
+    items = filterAllowed(combItems);
+  }
+
+  let meta = null;
+  if (wantDebug) {
+    const histJsonMeta = jsonMeta(rawHist, histValue);
+    const histArrayMeta = arrayMeta(histValue, histItems, histJsonMeta);
+    const combJsonMeta = jsonMeta(rawComb, combValue);
+    const combArrayMeta = arrayMeta(combValue, combItems, combJsonMeta);
+    meta = {
+      hist: { json: histJsonMeta, array: histArrayMeta },
+      combined: { json: combJsonMeta, array: combArrayMeta },
+    };
   }
 
   return {
     items,
     sources: { hist: !!rawHist, combined: !!rawComb },
-    meta: {
-      hist: { json: histJson.meta, array: histArr.meta },
-      combined: { json: combJson.meta, array: combArr.meta },
-    },
+    meta,
   };
 }
 
@@ -132,6 +142,7 @@ export default async function handler(req, res) {
     const trace = [];
     const qYmd = String(req.query.ymd || "").trim();
     const ymd = isValidYmd(qYmd) ? qYmd : null;
+    const wantDebug = String(req.query?.debug || "") === "1";
 
     let queriedDays = [];
     if (ymd) {
@@ -143,11 +154,13 @@ export default async function handler(req, res) {
 
     const aggregated = [];
     const daySources = {};
-    const dayMeta = {};
+    const dayMeta = wantDebug ? {} : null;
     for (const day of queriedDays) {
-      const { items, sources, meta } = await loadHistoryForDay(day, trace);
+      const { items, sources, meta } = await loadHistoryForDay(day, trace, wantDebug);
       daySources[day] = sources;
-      dayMeta[day] = meta;
+      if (wantDebug && meta) {
+        dayMeta[day] = meta;
+      }
       aggregated.push(...items);
     }
 
@@ -163,7 +176,12 @@ export default async function handler(req, res) {
       source: daySources,
       roi,
       history: items,
-      debug: { trace, allowed: Array.from(allowSet), day_sources: daySources, day_meta: dayMeta },
+      debug: {
+        trace,
+        allowed: Array.from(allowSet),
+        day_sources: daySources,
+        day_meta: wantDebug ? dayMeta : null,
+      },
     });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
