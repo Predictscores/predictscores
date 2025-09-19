@@ -1,5 +1,6 @@
 // File: pages/api/history-roi.js
 import { computeROI } from "../../lib/history-utils";
+import { normalizeMarketKey } from "./history";
 
 export const config = { api: { bodyParser: false } };
 
@@ -35,12 +36,16 @@ async function kvGETraw(key, trace) {
 const J = (s) => { try { return JSON.parse(String(s || "")); } catch { return null; } };
 const isValidYmd = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 
+const DEFAULT_MARKET_KEY = "h2h";
+
 function parseAllowedMarkets(envVal) {
-  const raw = String(envVal ?? "h2h");
-  const list = raw.split(",")
-    .map(s => s.toLowerCase().replace(/[^a-z0-9_:-]/g, "").trim())
+  const raw = String(envVal ?? DEFAULT_MARKET_KEY);
+  const list = raw
+    .split(",")
+    .map(normalizeMarketKey)
     .filter(Boolean);
-  return new Set(list.length ? list : ["h2h"]);
+  const fallback = normalizeMarketKey(DEFAULT_MARKET_KEY) || DEFAULT_MARKET_KEY;
+  return new Set(list.length ? list : [fallback]);
 }
 const allowSet = parseAllowedMarkets(process.env.HISTORY_ALLOWED_MARKETS);
 
@@ -51,12 +56,18 @@ const arrFromAny = (x) =>
   : (x && typeof x === "object" && Array.isArray(x.list)) ? x.list
   : [];
 
+function dedupKey(e, normalizedMarketKey) {
+  const m = normalizedMarketKey ?? normalizeMarketKey(e?.market_key);
+  const pick = String(e?.pick || "").toLowerCase().trim();
+  return `${e?.fixture_id || e?.id || "?"}__${m}__${pick}`;
+}
+
 function filterAllowed(arr) {
   const by = new Map();
   for (const e of (arr || [])) {
-    const mkey = String(e?.market_key || "").toLowerCase();
-    if (!allowSet.has(mkey)) continue;
-    const k = `${e?.fixture_id || e?.id || "?"}__${mkey}__${String(e?.pick || "").toLowerCase()}`;
+    const mkey = normalizeMarketKey(e?.market_key);
+    if (!mkey || !allowSet.has(mkey)) continue;
+    const k = dedupKey(e, mkey);
     if (!by.has(k)) by.set(k, e);
   }
   return Array.from(by.values());

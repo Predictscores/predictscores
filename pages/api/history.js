@@ -37,13 +37,30 @@ const J = (s) => {
 };
 const isValidYmd = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 
+const DEFAULT_MARKET_KEY = "h2h";
+const MARKET_KEY_SYNONYMS = {
+  moneyline: "h2h",
+  ml: "h2h",
+};
+
+export function normalizeMarketKey(value) {
+  const cleaned = String(value || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9_:-]/g, "");
+  if (!cleaned) return "";
+  return MARKET_KEY_SYNONYMS[cleaned] || cleaned;
+}
+
 // Robust market parser (ignores stray punctuation; defaults to "h2h")
 function parseAllowedMarkets(envVal) {
-  const raw = String(envVal ?? "h2h");
-  const list = raw.split(",")
-    .map(s => s.toLowerCase().replace(/[^a-z0-9_:-]/g, "").trim())
+  const raw = String(envVal ?? DEFAULT_MARKET_KEY);
+  const list = raw
+    .split(",")
+    .map(normalizeMarketKey)
     .filter(Boolean);
-  return new Set(list.length ? list : ["h2h"]);
+  const fallback = normalizeMarketKey(DEFAULT_MARKET_KEY) || DEFAULT_MARKET_KEY;
+  return new Set(list.length ? list : [fallback]);
 }
 const allowSet = parseAllowedMarkets(process.env.HISTORY_ALLOWED_MARKETS);
 
@@ -54,15 +71,18 @@ const arrFromAny = (x) =>
   : (x && typeof x === "object" && Array.isArray(x.list)) ? x.list
   : [];
 
-const dedupKey = (e) =>
-  `${e?.fixture_id || e?.id || "?"}__${String(e?.market_key || "").toLowerCase()}__${String(e?.pick || "").toLowerCase()}`;
+const dedupKey = (e, normalizedMarketKey) => {
+  const m = normalizedMarketKey ?? normalizeMarketKey(e?.market_key);
+  const pick = String(e?.pick || "").toLowerCase().trim();
+  return `${e?.fixture_id || e?.id || "?"}__${m}__${pick}`;
+};
 
 function filterAllowed(arr) {
   const by = new Map();
   for (const e of (arr || [])) {
-    const mkey = String(e?.market_key || "").toLowerCase();
-    if (!allowSet.has(mkey)) continue;
-    const k = dedupKey(e);
+    const mkey = normalizeMarketKey(e?.market_key);
+    if (!mkey || !allowSet.has(mkey)) continue;
+    const k = dedupKey(e, mkey);
     if (!by.has(k)) by.set(k, e);
   }
   return Array.from(by.values());
