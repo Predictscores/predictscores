@@ -78,13 +78,13 @@ export default async function handler(req, res) {
     const idxRaw = await kvGETraw("crypto:history:index");
     const idxValue = toJson(idxRaw);
     const idxArr = arrFromAny(idxValue);
-    const ids = idxArr.slice(-800).reverse(); // recent → old
+    const ids = idxArr.array.slice(-800).reverse(); // recent → old
 
     const items = [];
     for (const id of ids) {
       const raw = await kvGETraw(`crypto:history:item:${id}`);
       const itValue = toJson(raw);
-      const it = itValue && typeof itValue === "object" ? itValue : null;
+      const it = itValue.value && typeof itValue.value === "object" ? itValue.value : null;
       if (!it) continue;
 
       // probaj redom: ts (created), evaluated_ts, valid_until

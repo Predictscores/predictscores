@@ -1,7 +1,6 @@
 // File: pages/api/history-roi.js
 import { computeROI } from "../../lib/history-utils";
 import { normalizeMarketKey } from "./history";
-import { jsonMeta, arrayMeta } from "../../lib/kv-meta";
 import { arrFromAny, toJson } from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
@@ -81,21 +80,21 @@ async function loadDay(ymd, trace, wantDebug = false) {
 
   const histValue = toJson(rawHist);
   const histItems = arrFromAny(histValue);
-  let items = filterAllowed(histItems);
+  let items = filterAllowed(histItems.array);
 
   const combKey = `vb:day:${ymd}:combined`;
   const { raw: rawComb } = await kvGETraw(combKey, trace);
   const combValue = toJson(rawComb);
   const combItems = arrFromAny(combValue);
   if (!items.length) {
-    items = filterAllowed(combItems);
+    items = filterAllowed(combItems.array);
   }
   let meta = null;
   if (wantDebug) {
-    const histJsonMeta = jsonMeta(rawHist, histValue);
-    const histArrayMeta = arrayMeta(histValue, histItems, histJsonMeta);
-    const combJsonMeta = jsonMeta(rawComb, combValue);
-    const combArrayMeta = arrayMeta(combValue, combItems, combJsonMeta);
+    const histJsonMeta = { ...histValue.meta };
+    const histArrayMeta = { ...histItems.meta };
+    const combJsonMeta = { ...combValue.meta };
+    const combArrayMeta = { ...combItems.meta };
     meta = {
       hist: { json: histJsonMeta, array: histArrayMeta },
       combined: { json: combJsonMeta, array: combArrayMeta },

@@ -1,5 +1,4 @@
 // pages/api/football.js
-import { jsonMeta, arrayMeta } from "../../lib/kv-meta";
 import { arrFromAny, toJson } from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
@@ -67,11 +66,11 @@ export default async function handler(req, res) {
     const fullValue = toJson(fullRaw);
     const fullArr = arrFromAny(fullValue);
     if (wantDebug) {
-      const fullJsonMeta = jsonMeta(fullRaw, fullValue);
-      const fullArrayMeta = arrayMeta(fullValue, fullArr, fullJsonMeta);
+      const fullJsonMeta = { ...fullValue.meta };
+      const fullArrayMeta = { ...fullArr.meta };
       readMeta.push({ key: fullKey, json: fullJsonMeta, array: fullArrayMeta });
     }
-    let items = fullArr;
+    let items = fullArr.array;
 
     // Fallback: uzmi vb:day:<ymd>:<slot> / union / last (bez poziva frontu)
     if (!items.length) {
@@ -80,8 +79,8 @@ export default async function handler(req, res) {
       const fall1Value = toJson(fall1Raw);
       const fall1Arr = arrFromAny(fall1Value);
       if (wantDebug) {
-        const fall1JsonMeta = jsonMeta(fall1Raw, fall1Value);
-        const fall1ArrayMeta = arrayMeta(fall1Value, fall1Arr, fall1JsonMeta);
+        const fall1JsonMeta = { ...fall1Value.meta };
+        const fall1ArrayMeta = { ...fall1Arr.meta };
         readMeta.push({ key: keySlot, json: fall1JsonMeta, array: fall1ArrayMeta });
       }
 
@@ -90,8 +89,8 @@ export default async function handler(req, res) {
       const fall2Value = toJson(fall2Raw);
       const fall2Arr = arrFromAny(fall2Value);
       if (wantDebug) {
-        const fall2JsonMeta = jsonMeta(fall2Raw, fall2Value);
-        const fall2ArrayMeta = arrayMeta(fall2Value, fall2Arr, fall2JsonMeta);
+        const fall2JsonMeta = { ...fall2Value.meta };
+        const fall2ArrayMeta = { ...fall2Arr.meta };
         readMeta.push({ key: keyUnion, json: fall2JsonMeta, array: fall2ArrayMeta });
       }
 
@@ -100,14 +99,14 @@ export default async function handler(req, res) {
       const fall3Value = toJson(fall3Raw);
       const fall3Arr = arrFromAny(fall3Value);
       if (wantDebug) {
-        const fall3JsonMeta = jsonMeta(fall3Raw, fall3Value);
-        const fall3ArrayMeta = arrayMeta(fall3Value, fall3Arr, fall3JsonMeta);
+        const fall3JsonMeta = { ...fall3Value.meta };
+        const fall3ArrayMeta = { ...fall3Arr.meta };
         readMeta.push({ key: keyLast, json: fall3JsonMeta, array: fall3ArrayMeta });
       }
 
-      const fall1 = fall1Arr;
-      const fall2 = fall2Arr;
-      const fall3 = fall3Arr;
+      const fall1 = fall1Arr.array;
+      const fall2 = fall2Arr.array;
+      const fall3 = fall3Arr.array;
       items = fall1.length ? fall1 : (fall2.length ? fall2 : fall3);
     }
 
