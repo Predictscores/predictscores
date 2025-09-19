@@ -66,6 +66,53 @@ async function loadHistoryForDay(ymd, trace) {
     source = items.length ? combKey : null;
   }
 
+  // 3) Fallback chain: union -> last -> per-slot vbl_full (merge+dedupe)
+  if (!items.length) {
+    const unionKey = `vb:day:${ymd}:union`;
+    const { raw: rawUnion } = await kvGETraw(unionKey, trace);
+    const unionItems = filterAllowed(arrFromAny(J(rawUnion)));
+    if (unionItems.length) {
+      items = unionItems;
+      source = unionKey;
+    }
+  }
+
+  if (!items.length) {
+    const lastKey = `vb:day:${ymd}:last`;
+    const { raw: rawLast } = await kvGETraw(lastKey, trace);
+    const lastItems = filterAllowed(arrFromAny(J(rawLast)));
+    if (lastItems.length) {
+      items = lastItems;
+      source = lastKey;
+    }
+  }
+
+  if (!items.length) {
+    const slots = ["am", "pm", "late"];
+    const slotMap = new Map();
+    for (const slot of slots) {
+      const key = `vbl_full:${ymd}:${slot}`;
+      const { raw } = await kvGETraw(key, trace);
+      const slotItems = arrFromAny(J(raw));
+      if (!slotItems.length) continue;
+      for (const entry of slotItems) {
+        const dk = dedupKey(entry);
+        if (!slotMap.has(dk)) slotMap.set(dk, { entry, key });
+      }
+    }
+    const merged = filterAllowed(Array.from(slotMap.values()).map(v=>v.entry));
+    if (merged.length) {
+      items = merged;
+      const srcSet = new Set();
+      for (const it of merged) {
+        const dk = dedupKey(it);
+        const meta = slotMap.get(dk);
+        if (meta?.key) srcSet.add(meta.key);
+      }
+      source = srcSet.size ? Array.from(srcSet).join(",") : null;
+    }
+  }
+
   return { items, source };
 }
 
@@ -105,6 +152,9 @@ export default async function handler(req, res) {
       const { items: dayItems, source } = await loadHistoryForDay(day, trace);
       daySources[day] = source;
       aggregated.push(...dayItems);
+      if (process.env.NODE_ENV !== "production") {
+        console.info("[history]", { ymd: day, source, count: dayItems.length });
+      }
     }
 
     const items = filterAllowed(aggregated);
