@@ -1,3 +1,18 @@
+## History smoke test script
+
+`scripts/smoke-history.mjs` performs a lightweight check against `/api/history` for today's date. The run fails when the endpoint responds with a zero count so CI jobs can catch stale data early.
+
+### Environment variables
+
+- `BASE`: Base URL for the deployment under test. Defaults to `http://localhost:3000` when undefined.
+
+### Usage
+
+```bash
+node scripts/smoke-history.mjs
+BASE="https://predictscores.example.com" node scripts/smoke-history.mjs
+```
+
 ## Snapshots guard tuning
 
 The scheduled "Snapshots (AM/PM/LATE)" workflow uses a guard window to avoid
