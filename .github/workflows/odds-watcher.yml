@@ -51,19 +51,6 @@ jobs:
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "Resolved BASE=$BASE"
 
-      - name: Rebuild KV (always)
-        run: |
-          set -euo pipefail
-          BASE="${{ steps.base.outputs.base }}"
-          SLOT="${{ steps.ctx.outputs.slot }}"
-          echo "Rebuilding KV for SLOT=$SLOT …"
-          curl -fsS \
-            -A "gha-odds-watcher/1.1" \
-            --connect-timeout 10 \
-            --max-time 180 \
-            --retry 2 --retry-all-errors --retry-delay 3 --retry-max-time 200 \
-            "$BASE/api/cron/rebuild?slot=$SLOT" || true
-
       - name: Ensure KV has items (self-warm if empty)
         id: warm
         run: |
@@ -81,7 +68,52 @@ jobs:
           fi
           echo "vb_locked_response_len=$N" >> "$GITHUB_OUTPUT"
 
-      - name: Refresh odds for current slot (always)
+      - name: Guard rebuild / refresh
+        id: guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MINUTE: ${{ steps.ctx.outputs.minute }}
+          VB_LOCKED_LEN: ${{ steps.warm.outputs.vb_locked_response_len }}
+        run: |
+          set -euo pipefail
+          EVENT="$EVENT_NAME"
+          MIN="$MINUTE"
+          LOCKED="${VB_LOCKED_LEN:-0}"
+          SHOULD_RUN="false"
+          REASON="scheduled run with data present"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            SHOULD_RUN="true"
+            REASON="manual dispatch"
+          elif [ "$LOCKED" = "0" ]; then
+            SHOULD_RUN="true"
+            REASON="locked feed empty"
+          elif [ "$MIN" = "05" ]; then
+            SHOULD_RUN="true"
+            REASON="minute is 05"
+          fi
+          if [ "$SHOULD_RUN" = "true" ]; then
+            echo "Guard: proceeding with rebuild/refresh (reason: $REASON, minute=$MIN, locked_len=$LOCKED, event=$EVENT)"
+          else
+            echo "Guard: skipping rebuild/refresh at $MIN (reason: $REASON, locked_len=$LOCKED, event=$EVENT)"
+          fi
+          echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
+
+      - name: Rebuild KV (guarded)
+        if: steps.guard.outputs.should_run == 'true'
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.base.outputs.base }}"
+          SLOT="${{ steps.ctx.outputs.slot }}"
+          echo "Rebuilding KV for SLOT=$SLOT …"
+          curl -fsS \
+            -A "gha-odds-watcher/1.1" \
+            --connect-timeout 10 \
+            --max-time 180 \
+            --retry 2 --retry-all-errors --retry-delay 3 --retry-max-time 200 \
+            "$BASE/api/cron/rebuild?slot=$SLOT" || true
+
+      - name: Refresh odds for current slot (guarded)
+        if: steps.guard.outputs.should_run == 'true'
         run: |
           set -euo pipefail
           BASE="${{ steps.base.outputs.base }}"
