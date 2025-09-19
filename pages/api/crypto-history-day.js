@@ -8,35 +8,38 @@ function kvBackends() {
   const out = [];
   const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
   const bU = process.env.UPSTASH_REDIS_REST_URL, bT = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (aU && aT) out.push({ flavor:"vercel-kv", url:aU.replace(/\/+$/,""), tok:aT });
-  if (bU && bT) out.push({ flavor:"upstash-redis", url:bU.replace(/\/+$/,""), tok:bT });
+  if (aU && aT) out.push({ flavor: "vercel-kv", url: aU.replace(/\/+$/, ""), tok: aT });
+  if (bU && bT) out.push({ flavor: "upstash-redis", url: bU.replace(/\/+$/, ""), tok: bT });
   return out;
 }
-async function kvGETraw(key) {
+async function kvGETvalue(key) {
   for (const b of kvBackends()) {
     try {
-      const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`, { headers:{ Authorization:`Bearer ${b.tok}` }, cache:"no-store" });
-      const j = await r.json().catch(()=>null);
-      const payload = j?.result ?? j?.value;
-      let raw = null;
-      if (typeof payload === "string") {
-        raw = payload;
-      } else if (payload !== undefined) {
-        try { raw = JSON.stringify(payload ?? null); } catch { raw = null; }
-      }
+      const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`, {
+        headers: { Authorization: `Bearer ${b.tok}` },
+        cache: "no-store",
+      });
+      const j = await r.json().catch(() => null);
+      const res = j && ("result" in j ? j.result : j);
+      const obj = toJson(res);
       if (!r.ok) continue;
-      return typeof raw === "string" ? raw : null;
+      return { obj, flavor: b.flavor, kvResult: res };
     } catch {}
   }
-  return null;
+  return { obj: null, flavor: null, kvResult: null };
 }
 
-const isValidYmd = (s)=> /^\d{4}-\d{2}-\d{2}$/.test(String(s||""));
+const isValidYmd = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 
 // TZ helpers
 function pickTZ() {
   const raw = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
-  try { new Intl.DateTimeFormat("en-GB",{ timeZone:raw }); return raw; } catch { return "Europe/Belgrade"; }
+  try {
+    new Intl.DateTimeFormat("en-GB", { timeZone: raw });
+    return raw;
+  } catch {
+    return "Europe/Belgrade";
+  }
 }
 const TZ = pickTZ();
 const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
@@ -45,49 +48,49 @@ const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).fo
 function toDateFlexible(ts) {
   if (ts == null) return null;
 
-  // If ISO string
   if (typeof ts === "string" && /\D/.test(ts)) {
     const d = new Date(ts);
-    return isNaN(d.getTime()) ? null : d;
+    return Number.isNaN(d.getTime()) ? null : d;
   }
 
-  // Numeric-like
   const n0 = Number(ts);
   if (!Number.isFinite(n0)) return null;
 
   let n = n0;
 
-  // If clearly in seconds (10 digits or too small), scale up
-  if (n < 1e11) n = n * 1000;
+  if (n < 1e11) n *= 1000;
 
-  // If clearly too large (microseconds / *10 etc.), scale down by 10 until < ~year 2100
   while (n > 4e12) n = Math.floor(n / 10);
 
   const d = new Date(n);
-  return isNaN(d.getTime()) ? null : d;
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 
 export default async function handler(req, res) {
   try {
-    const qYmd = String(req.query.ymd||"").trim();
+    const qYmd = String(req.query.ymd || "").trim();
     if (!isValidYmd(qYmd)) {
-      return res.status(200).json({ ok:false, error:"Provide ymd=YYYY-MM-DD" });
+      return res.status(200).json({ ok: false, error: "Provide ymd=YYYY-MM-DD" });
     }
 
-    // Učitaj skorašnje ID-eve (dovoljno za jedan dan)
-    const idxRaw = await kvGETraw("crypto:history:index");
-    const idxValue = toJson(idxRaw);
-    const idxArr = arrFromAny(idxValue);
-    const ids = idxArr.slice(-800).reverse(); // recent → old
+    const wantDebug = String(req.query?.debug || "") === "1";
+
+    const idxData = await kvGETvalue("crypto:history:index");
+    const idxArr = arrFromAny(idxData.obj);
+    const ids = idxArr.slice(-800).reverse();
+
+    let debugFlavor = idxData.flavor;
+    let debugResult = idxData.kvResult;
 
     const items = [];
     for (const id of ids) {
-      const raw = await kvGETraw(`crypto:history:item:${id}`);
-      const itValue = toJson(raw);
+      const itData = await kvGETvalue(`crypto:history:item:${id}`);
+      if (!debugFlavor && itData.flavor) debugFlavor = itData.flavor;
+      if (debugResult === undefined && itData.kvResult !== undefined) debugResult = itData.kvResult;
+      const itValue = itData.obj;
       const it = itValue && typeof itValue === "object" ? itValue : null;
       if (!it) continue;
 
-      // probaj redom: ts (created), evaluated_ts, valid_until
       const d =
         toDateFlexible(it.ts) ||
         toDateFlexible(it.evaluated_ts) ||
@@ -111,40 +114,55 @@ export default async function handler(req, res) {
           rr: it.rr ?? null,
           confidence_pct: it.confidence_pct ?? null,
           valid_until: it.valid_until ?? null,
-          outcome: it.outcome || null,   // "tp" | "sl" | "expired" | null
-          win: (typeof it.win!=="undefined" ? it.win : (typeof it.won!=="undefined"?it.won:null)),
+          outcome: it.outcome || null,
+          win:
+            typeof it.win !== "undefined"
+              ? it.win
+              : typeof it.won !== "undefined"
+              ? it.won
+              : null,
           exit_price: it.exit_price ?? null,
           realized_rr: it.realized_rr ?? null,
-          evaluated_ts: it.evaluated_ts ?? null
+          evaluated_ts: it.evaluated_ts ?? null,
         });
       } else if (items.length && y !== qYmd) {
-        // čim prođemo granicu dana, prekini radi performansi
         break;
       }
     }
 
-    // Rezime nad odlučenim (tp/sl). expired ne ulazi u win-rate.
-    const decided = items.filter(i => i.outcome==="tp" || i.outcome==="sl");
-    const wins = decided.filter(i => i.outcome==="tp").length;
-    const avgRR = decided.length ? decided.reduce((s,i)=> s + (Number(i.realized_rr)||0), 0)/decided.length : null;
-    const medianRR = decided.length
-      ? decided.map(i=>Number(i.realized_rr)||0).sort((a,b)=>a-b)[Math.floor(decided.length/2)]
+    const decided = items.filter((i) => i.outcome === "tp" || i.outcome === "sl");
+    const wins = decided.filter((i) => i.outcome === "tp").length;
+    const avgRR = decided.length
+      ? decided.reduce((s, i) => s + (Number(i.realized_rr) || 0), 0) / decided.length
       : null;
-    const winRate = decided.length ? Math.round(100*wins/decided.length) : null;
+    const medianRR = decided.length
+      ? decided.map((i) => Number(i.realized_rr) || 0).sort((a, b) => a - b)[Math.floor(decided.length / 2)]
+      : null;
+    const winRate = decided.length ? Math.round((100 * wins) / decided.length) : null;
 
-    return res.status(200).json({
-      ok:true,
-      ymd:qYmd, tz:TZ,
+    const payload = {
+      ok: true,
+      ymd: qYmd,
+      tz: TZ,
       totals: {
         count: items.length,
         decided: decided.length,
         win_rate_pct: winRate,
         avg_rr: avgRR,
-        median_rr: medianRR
+        median_rr: medianRR,
       },
-      items
-    });
+      items,
+    };
+
+    if (wantDebug) {
+      payload.debug = {
+        sourceFlavor: debugFlavor || "unknown",
+        kvObject: typeof debugResult === "object",
+      };
+    }
+
+    return res.status(200).json(payload);
   } catch (e) {
-    return res.status(200).json({ ok:false, error:String(e?.message||e) });
+    return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
 }

@@ -1,7 +1,6 @@
 // File: pages/api/history-roi.js
 import { computeROI } from "../../lib/history-utils";
 import { normalizeMarketKey } from "./history";
-import { jsonMeta, arrayMeta } from "../../lib/kv-meta";
 import { arrFromAny, toJson } from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
@@ -15,7 +14,7 @@ function kvBackends() {
   if (bU && bT) out.push({ flavor: "upstash-redis", url: bU.replace(/\/+$/, ""), tok: bT });
   return out;
 }
-async function kvGETraw(key, trace) {
+async function kvGETitems(key) {
   for (const b of kvBackends()) {
     try {
       const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`, {
@@ -23,21 +22,14 @@ async function kvGETraw(key, trace) {
         cache: "no-store",
       });
       const j = await r.json().catch(() => null);
-      const payload = j?.result ?? j?.value;
-      let raw = null;
-      if (typeof payload === "string") {
-        raw = payload;
-      } else if (payload !== undefined) {
-        try { raw = JSON.stringify(payload ?? null); } catch { raw = null; }
-      }
-      trace && trace.push({ get: key, ok: r.ok, flavor: b.flavor, hit: typeof raw === "string" });
+      const res = j && ("result" in j ? j.result : j);
+      const obj = toJson(res);
+      const items = arrFromAny(obj);
       if (!r.ok) continue;
-      return { raw, flavor: b.flavor };
-    } catch (e) {
-      trace && trace.push({ get: key, ok: false, err: String(e?.message || e) });
-    }
+      return { items, obj, flavor: b.flavor, kvResult: res };
+    } catch {}
   }
-  return { raw: null, flavor: null };
+  return { items: [], obj: null, flavor: null, kvResult: null };
 }
 
 /* ---------- helpers ---------- */
@@ -64,7 +56,7 @@ function dedupKey(e, normalizedMarketKey) {
 
 function filterAllowed(arr) {
   const by = new Map();
-  for (const e of (arr || [])) {
+  for (const e of arr || []) {
     const mkey = normalizeMarketKey(e?.market_key);
     if (!mkey || !allowSet.has(mkey)) continue;
     const k = dedupKey(e, mkey);
@@ -73,41 +65,26 @@ function filterAllowed(arr) {
   return Array.from(by.values());
 }
 
-async function loadDay(ymd, trace, wantDebug = false) {
-  const histKey = `hist:${ymd}`;
-  const { raw: rawHist } = await kvGETraw(histKey, trace);
+async function loadDay(ymd) {
+  const hist = await kvGETitems(`hist:${ymd}`);
+  const histItems = filterAllowed(hist.items);
 
-  const histValue = toJson(rawHist);
-  const histItems = arrFromAny(histValue);
-  let items = filterAllowed(histItems);
+  const comb = await kvGETitems(`vb:day:${ymd}:combined`);
+  const combItems = filterAllowed(comb.items);
 
-  const combKey = `vb:day:${ymd}:combined`;
-  const { raw: rawComb } = await kvGETraw(combKey, trace);
-  const combValue = toJson(rawComb);
-  const combItems = arrFromAny(combValue);
-  if (!items.length) {
-    items = filterAllowed(combItems);
-  }
-  let meta = null;
-  if (wantDebug) {
-    const histJsonMeta = jsonMeta(rawHist, histValue);
-    const histArrayMeta = arrayMeta(histValue, histItems, histJsonMeta);
-    const combJsonMeta = jsonMeta(rawComb, combValue);
-    const combArrayMeta = arrayMeta(combValue, combItems, combJsonMeta);
-    meta = {
-      hist: { json: histJsonMeta, array: histArrayMeta },
-      combined: { json: combJsonMeta, array: combArrayMeta },
-    };
-  }
+  const useHist = histItems.length > 0;
+  const chosenItems = useHist ? histItems : combItems;
+  const chosen = useHist ? hist : comb;
+
   return {
-    items,
-    meta,
+    items: chosenItems,
+    debugFlavor: chosen.flavor,
+    debugResult: chosen.kvResult,
   };
 }
 
 export default async function handler(req, res) {
   try {
-    const trace = [];
     const qYmd = String(req.query.ymd || "").trim();
     const days = Math.min(60, Math.max(1, Number(req.query.days) || 14));
     const wantDebug = String(req.query?.debug || "") === "1";
@@ -121,27 +98,34 @@ export default async function handler(req, res) {
         });
 
     const aggregated = [];
-    const readMeta = wantDebug ? {} : null;
+    let debugFlavor = null;
+    let debugResult;
+
     for (const ymd of ymdd) {
-      const { items, meta } = await loadDay(ymd, trace, wantDebug);
+      const { items, debugFlavor: dayFlavor, debugResult: dayResult } = await loadDay(ymd);
       aggregated.push(...items);
-      if (wantDebug && meta) {
-        readMeta[ymd] = meta;
+      if (wantDebug) {
+        if (!debugFlavor && dayFlavor) debugFlavor = dayFlavor;
+        if (debugResult === undefined && dayResult !== undefined) debugResult = dayResult;
       }
     }
 
     const roi = computeROI(aggregated || []);
-    return res.status(200).json({
+    const payload = {
       ok: true,
       days: ymdd.length,
       roi,
       count: aggregated.length,
-      debug: {
-        trace,
-        allowed: Array.from(allowSet),
-        reads: wantDebug ? readMeta : null,
-      },
-    });
+    };
+
+    if (wantDebug) {
+      payload.debug = {
+        sourceFlavor: debugFlavor || "unknown",
+        kvObject: typeof debugResult === "object",
+      };
+    }
+
+    return res.status(200).json(payload);
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }

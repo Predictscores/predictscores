@@ -27,8 +27,8 @@ const sampleHistoryPayload = {
 const realFetch = global.fetch;
 
 const kvResponseModes = [
-  ["string payloads", (payload) => ({ result: JSON.stringify(payload) })],
-  ["object payloads", (payload) => ({ result: payload })],
+  ["string payloads", (payload) => ({ result: JSON.stringify(payload) }), false],
+  ["object payloads", (payload) => ({ result: payload }), true],
 ];
 
 function createMockRes() {
@@ -46,7 +46,7 @@ function createMockRes() {
   };
 }
 
-describe.each(kvResponseModes)("API history market normalization (%s)", (modeLabel, makeEnvelope) => {
+describe.each(kvResponseModes)("API history market normalization (%s)", (modeLabel, makeEnvelope, expectKvObject) => {
   function mockKvResponses(fetchMock, payload) {
     fetchMock.mockResolvedValueOnce({
       ok: true,
@@ -94,7 +94,10 @@ describe.each(kvResponseModes)("API history market normalization (%s)", (modeLab
     expect(res.jsonPayload.history.map((e) => e.market_key)).toEqual(
       expect.arrayContaining(["H2H!!! ", "Total-Goals??"])
     );
-    expect(res.jsonPayload.debug.allowed).toEqual(["h2h", "total-goals"]);
+    expect(res.jsonPayload.debug).toEqual({
+      sourceFlavor: "vercel-kv",
+      kvObject: expectKvObject,
+    });
   });
 
   it("includes normalized market keys in ROI calculations", async () => {
@@ -113,6 +116,9 @@ describe.each(kvResponseModes)("API history market normalization (%s)", (modeLab
     expect(res.statusCode).toBe(200);
     expect(res.jsonPayload.count).toBe(2);
     expect(res.jsonPayload.roi).toMatchObject({ played: 2, wins: 1 });
-    expect(res.jsonPayload.debug.allowed).toEqual(["h2h", "total-goals"]);
+    expect(res.jsonPayload.debug).toEqual({
+      sourceFlavor: "vercel-kv",
+      kvObject: expectKvObject,
+    });
   });
 });
