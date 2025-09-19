@@ -250,7 +250,7 @@ function Legend() {
   );
 }
 
-export default function IndexPage() {
+export default function IndexPage({ initialHistory }) {
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
@@ -270,7 +270,7 @@ export default function IndexPage() {
           <HeaderBar />
           <div className="mt-6">
             {mounted ? (
-              <CombinedBets />
+              <CombinedBets initialHistory={initialHistory} />
             ) : (
               <div className="text-slate-400 text-sm">Loading…</div>
             )}
@@ -280,4 +280,45 @@ export default function IndexPage() {
       </main>
     </>
   );
+}
+
+export async function getServerSideProps() {
+  try {
+    const { fetchHistoryAggregation } = await import("../lib/server/history-loader");
+    const historyData = await fetchHistoryAggregation({ days: 14 });
+    const safeHistory = JSON.parse(JSON.stringify(historyData));
+    const keySource = Array.isArray(safeHistory?.queried_days)
+      ? `${safeHistory.queried_days.length}:${safeHistory.queried_days[0] || ""}`
+      : safeHistory?.ymd
+      ? `ymd:${safeHistory.ymd}`
+      : "unknown";
+
+    return {
+      props: {
+        initialHistory: {
+          data: safeHistory,
+          params: { days: 14 },
+          key: keySource,
+          generatedAt: new Date().toISOString(),
+        },
+      },
+    };
+  } catch (e) {
+    return {
+      props: {
+        initialHistory: {
+          data: {
+            ok: false,
+            error: String(e?.message || e),
+            history: [],
+            queried_days: [],
+            count: 0,
+          },
+          params: { days: 14 },
+          key: "error",
+          generatedAt: new Date().toISOString(),
+        },
+      },
+    };
+  }
 }

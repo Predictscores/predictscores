@@ -1,7 +1,7 @@
 // components/HistoryPanel.js
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 /**
  * HistoryPanel (always two columns)
@@ -265,28 +265,94 @@ export function sortAndLimitHistoryItems(rawItems, topLimit) {
   return sorted;
 }
 
-export default function HistoryPanel({ days = 14, ymd, top }) {
+export default function HistoryPanel({ days = 14, ymd, top, initialHistory }) {
   const topLimit = useMemo(() => {
     const n = Number(top);
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
   }, [top]);
 
-  const [rawItems, setRawItems] = useState([]);
-  const [items, setItems] = useState([]);
-  const [totalCount, setTotalCount] = useState(0);
-  const [err, setErr] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const historyPayload = initialHistory?.data ?? null;
+  const historyParams = initialHistory?.params ?? null;
+  const historyKey = initialHistory?.key ?? null;
+  const historyGeneratedAt = initialHistory?.generatedAt ?? null;
+  const numericDays = Number(days);
+  const requestedDays = Number(historyParams?.days);
+  const hasMatchingDays = Number.isFinite(requestedDays)
+    ? requestedDays === numericDays
+    : Array.isArray(historyPayload?.queried_days)
+    ? historyPayload.queried_days.length === numericDays
+    : false;
+  const shouldUseInitial = Boolean(historyPayload) && hasMatchingDays;
+
+  const initialRawItems = useMemo(
+    () => (shouldUseInitial ? coalesceArray(historyPayload?.history) : []),
+    [historyPayload, shouldUseInitial]
+  );
+  const initialTotalCount = shouldUseInitial
+    ? (() => {
+        const num = Number(historyPayload?.count);
+        return Number.isFinite(num) ? num : initialRawItems.length;
+      })()
+    : 0;
+  const initialError = shouldUseInitial && historyPayload?.ok === false
+    ? historyPayload?.error || "Error"
+    : null;
+  const initialLatestYmd = shouldUseInitial
+    ? deriveLatestHistoryYmd(historyPayload, initialRawItems)
+    : null;
+  const initialOk = shouldUseInitial ? historyPayload?.ok ?? null : null;
+  const initialRoi = shouldUseInitial ? historyPayload?.roi ?? null : null;
+
+  const [rawItems, setRawItems] = useState(initialRawItems);
+  const [items, setItems] = useState(() =>
+    sortAndLimitHistoryItems(initialRawItems, topLimit)
+  );
+  const [totalCount, setTotalCount] = useState(initialTotalCount);
+  const [err, setErr] = useState(initialError);
+  const [loading, setLoading] = useState(!shouldUseInitial);
   const [historyInfo, setHistoryInfo] = useState({
-    ok: null,
-    latestYmd: null,
-    roi: null,
+    ok: initialOk,
+    latestYmd: initialLatestYmd,
+    roi: initialRoi,
     fallbackRoi: null,
   });
   const [roiFallbackRequested, setRoiFallbackRequested] = useState(false);
   const dayYmd = useMemo(() => (isValidYmd(ymd) ? ymd : ymdInTZ(new Date())), [ymd]);
+  const appliedInitialRef = useRef(null);
+
+  useEffect(() => {
+    if (!shouldUseInitial) {
+      appliedInitialRef.current = null;
+      return;
+    }
+
+    const appliedKey = `${historyKey || ""}|${historyGeneratedAt || ""}`;
+    if (appliedInitialRef.current === appliedKey) {
+      return;
+    }
+    appliedInitialRef.current = appliedKey;
+
+    const arr = coalesceArray(historyPayload?.history);
+    const countNum = Number(historyPayload?.count);
+    setRawItems(arr);
+    setTotalCount(Number.isFinite(countNum) ? countNum : arr.length);
+    setErr(historyPayload?.ok === false ? historyPayload?.error || "Error" : null);
+    setHistoryInfo({
+      ok: historyPayload?.ok ?? null,
+      latestYmd: deriveLatestHistoryYmd(historyPayload, arr),
+      roi: historyPayload?.roi ?? null,
+      fallbackRoi: null,
+    });
+    setLoading(false);
+    setRoiFallbackRequested(false);
+  }, [historyGeneratedAt, historyKey, historyPayload, shouldUseInitial]);
 
   // --- Football history fetch (existing behavior) ---
   useEffect(() => {
+    if (shouldUseInitial) {
+      return;
+    }
+
     const ac = new AbortController();
     setLoading(true);
     setRoiFallbackRequested(false);
@@ -307,13 +373,15 @@ export default function HistoryPanel({ days = 14, ymd, top }) {
         const arr = coalesceArray(body) || coalesceArray(body?.history) || [];
         const normalized = Array.isArray(arr) ? arr : [];
         if (!ac.signal.aborted) {
+          const countNum = Number(body?.count);
           setRawItems(normalized);
-          setTotalCount(normalized.length);
+          setTotalCount(Number.isFinite(countNum) ? countNum : normalized.length);
           setErr(null);
           const latestYmd = deriveLatestHistoryYmd(body, normalized);
-          const roi = body && typeof body === "object" && body.roi && typeof body.roi === "object"
-            ? body.roi
-            : null;
+          const roi =
+            body && typeof body === "object" && body.roi && typeof body.roi === "object"
+              ? body.roi
+              : null;
           const ok = body && typeof body === "object" ? body.ok !== false : null;
           setHistoryInfo({
             ok,
@@ -336,7 +404,7 @@ export default function HistoryPanel({ days = 14, ymd, top }) {
       }
     })();
     return () => ac.abort();
-  }, [days]);
+  }, [days, shouldUseInitial]);
 
   useEffect(() => {
     if (Array.isArray(rawItems)) {

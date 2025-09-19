@@ -563,7 +563,7 @@ function FootballBody({ matchOdds, tickets }) {
       </div>
 
       {tab === "hist" ? (
-        <HistoryPanel days={14} top={3} />
+        <HistoryPanel days={14} top={3} initialHistory={initialHistory} />
       ) : (
         <div className="rounded-2xl bg-[#15182a] p-4">
           <div className="text-base font-semibold text-white mb-3">{tab === "ko" ? "Kick-Off" : "Confidence"}</div>
@@ -644,7 +644,7 @@ function CryptoBody({ list }) {
 }
 
 /* ===================== main ===================== */
-export default function CombinedBets() {
+export default function CombinedBets({ initialHistory }) {
   const [tab, setTab] = useState("Combined");
   const fb = useValueBetsFeed();
   const matchOdds = useMemo(() => {
