@@ -1,5 +1,6 @@
 // File: pages/api/history.js
 import { computeROI } from "../../lib/history-utils";
+import { arrFromAny, toJson } from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
 
@@ -38,9 +39,6 @@ async function kvGETraw(key, trace) {
 }
 
 /* ---------- helpers ---------- */
-const J = (s) => {
-  try { return JSON.parse(String(s || "")); } catch { return null; }
-};
 const isValidYmd = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 
 const DEFAULT_MARKET_KEY = "h2h";
@@ -70,13 +68,6 @@ function parseAllowedMarkets(envVal) {
 }
 const allowSet = parseAllowedMarkets(process.env.HISTORY_ALLOWED_MARKETS);
 
-const arrFromAny = (x) =>
-  Array.isArray(x) ? x
-  : (x && typeof x === "object" && Array.isArray(x.items)) ? x.items
-  : (x && typeof x === "object" && Array.isArray(x.history)) ? x.history
-  : (x && typeof x === "object" && Array.isArray(x.list)) ? x.list
-  : [];
-
 const dedupKey = (e, normalizedMarketKey) => {
   const m = normalizedMarketKey ?? normalizeMarketKey(e?.market_key);
   const pick = String(e?.pick || "").toLowerCase().trim();
@@ -98,13 +89,13 @@ async function loadHistoryForDay(ymd, trace) {
   const histKey = `hist:${ymd}`;
   const { raw: rawHist } = await kvGETraw(histKey, trace);
 
-  let items = filterAllowed(arrFromAny(J(rawHist)));
+  let items = filterAllowed(arrFromAny(toJson(rawHist)));
 
   // Fallback: combined list
   const combKey = `vb:day:${ymd}:combined`;
   const { raw: rawComb } = await kvGETraw(combKey, trace);
   if (!items.length && rawComb) {
-    items = filterAllowed(arrFromAny(J(rawComb)));
+    items = filterAllowed(arrFromAny(toJson(rawComb)));
   }
 
   return { items, sources: { hist: !!rawHist, combined: !!rawComb } };
