@@ -31,6 +31,27 @@ const J = s=>{ try{ return JSON.parse(String(s||"")); }catch{ return null; } };
 const isValidYmd = (s)=> /^\d{4}-\d{2}-\d{2}$/.test(String(s||""));
 const onlyMarketsCSV = (process.env.HISTORY_ALLOWED_MARKETS || "h2h").split(",").map(s=>s.trim().toLowerCase()).filter(Boolean);
 const allowSet = new Set(onlyMarketsCSV.length ? onlyMarketsCSV : ["h2h"]);
+const BELGRADE_TZ = "Europe/Belgrade";
+const belgradeDateFormatter = new Intl.DateTimeFormat("en-CA", {
+  timeZone: BELGRADE_TZ,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit"
+});
+const belgradeMiddayAnchor = (date) => {
+  const parts = { year: NaN, month: NaN, day: NaN };
+  for (const part of belgradeDateFormatter.formatToParts(date)) {
+    if (part.type === "year") parts.year = Number(part.value);
+    else if (part.type === "month") parts.month = Number(part.value);
+    else if (part.type === "day") parts.day = Number(part.value);
+  }
+  if (!Number.isFinite(parts.year) || !Number.isFinite(parts.month) || !Number.isFinite(parts.day)) {
+    const fallback = new Date(date);
+    fallback.setUTCHours(12, 0, 0, 0);
+    return fallback;
+  }
+  return new Date(Date.UTC(parts.year, parts.month - 1, parts.day, 12, 0, 0));
+};
 const arrFromAny = x => Array.isArray(x) ? x
   : (x && typeof x==="object" && Array.isArray(x.items)) ? x.items
   : (x && typeof x==="object" && Array.isArray(x.history)) ? x.history
@@ -70,13 +91,12 @@ async function loadHistoryForDay(ymd, trace) {
 }
 
 function lastNDaysList(n) {
+  if (!Number.isFinite(n) || n <= 0) return [];
   const out = [];
-  const base = new Date();
-  base.setUTCHours(0, 0, 0, 0);
+  let cursor = belgradeMiddayAnchor(new Date());
   for (let i = 0; i < n; i++) {
-    const d = new Date(base);
-    d.setUTCDate(base.getUTCDate() - i);
-    out.push(d.toISOString().slice(0, 10));
+    out.push(belgradeDateFormatter.format(cursor));
+    cursor.setUTCDate(cursor.getUTCDate() - 1);
   }
   return out;
 }
