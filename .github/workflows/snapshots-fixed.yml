@@ -2,29 +2,23 @@ name: Snapshots (AM/PM/LATE)
 
 on:
   schedule:
-    # AM 10:00 Europe/Belgrade -> 08:00/09:00 UTC (airbag -2/0/+2)
-    - cron: "58 7 * * *"
-    - cron: "0 8 * * *"
-    - cron: "2 8 * * *"
-    - cron: "58 8 * * *"
-    - cron: "0 9 * * *"
-    - cron: "2 9 * * *"
+    # Each slot keeps a single cron definition that runs at the intended Belgrade
+    # local time. GitHub evaluates the cron in UTC, so the timezone field keeps
+    # the trigger aligned with 10:00 (AM), 15:00 (PM) and 00:00 (LATE) even when
+    # daylight saving shifts. If slots change in the future, update both the
+    # hour below and the slot detection case-statement further down.
 
-    # PM 15:00 Europe/Belgrade -> 13:00/14:00 UTC (airbag -2/0/+2)
-    - cron: "58 12 * * *"
-    - cron: "0 13 * * *"
-    - cron: "2 13 * * *"
-    - cron: "58 13 * * *"
-    - cron: "0 14 * * *"
-    - cron: "2 14 * * *"
+    # AM slot — 10:00 Europe/Belgrade
+    - cron: "0 10 * * *"
+      timezone: "Europe/Belgrade"
 
-    # LATE 00:00 Europe/Belgrade -> 22:00/23:00 UTC (prethodni dan) (airbag -2/0/+2)
-    - cron: "58 21 * * *"
-    - cron: "0 22 * * *"
-    - cron: "2 22 * * *"
-    - cron: "58 22 * * *"
-    - cron: "0 23 * * *"
-    - cron: "2 23 * * *"
+    # PM slot — 15:00 Europe/Belgrade
+    - cron: "0 15 * * *"
+      timezone: "Europe/Belgrade"
+
+    # LATE slot — 00:00 Europe/Belgrade (previous day UTC)
+    - cron: "0 0 * * *"
+      timezone: "Europe/Belgrade"
 
   workflow_dispatch:
     inputs:
@@ -77,9 +71,9 @@ jobs:
             SLOT="${INP_SLOT}"
           else
             case "${SCH:-}" in
-              "58 7 * * *"|"0 8 * * *"|"2 8 * * *"|"58 8 * * *"|"0 9 * * *"|"2 9 * * *") SLOT="am" ;;
-              "58 12 * * *"|"0 13 * * *"|"2 13 * * *"|"58 13 * * *"|"0 14 * * *"|"2 14 * * *") SLOT="pm" ;;
-              "58 21 * * *"|"0 22 * * *"|"2 22 * * *"|"58 22 * * *"|"0 23 * * *"|"2 23 * * *") SLOT="late" ;;
+              "0 10 * * *") SLOT="am" ;;
+              "0 15 * * *") SLOT="pm" ;;
+              "0 0 * * *")  SLOT="late" ;;
               *)
                 H=$(TZ="${TZD:-Europe/Belgrade}" date +%H)
                 if   [ "$H" -lt 10 ]; then SLOT="late"
