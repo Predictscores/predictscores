@@ -1,45 +1,29 @@
 #!/usr/bin/env node
 
 const DEFAULT_BASE = "http://localhost:3000";
-const baseEnv = (process.env.BASE || "").trim();
-const base = (baseEnv || DEFAULT_BASE).replace(/\/+$/, "");
+const base = (process.env.BASE || DEFAULT_BASE).replace(/\/+$/, "");
+const today = new Date().toISOString().slice(0, 10);
+const url = `${base}/api/history?ymd=${today}${process.env.DEBUG ? "&debug=1" : ""}`;
 
-const today = new Date();
-const todayUtc = new Date(Date.UTC(
-  today.getUTCFullYear(),
-  today.getUTCMonth(),
-  today.getUTCDate(),
-));
-const ymd = todayUtc.toISOString().slice(0, 10);
-
-const endpoint = `${base}/api/history?ymd=${encodeURIComponent(ymd)}`;
-
-const fail = (message) => {
-  console.error(`[smoke-history] ${message}`);
-  process.exit(1);
-};
+console.log(`[smoke-history] ${url}`);
 
 try {
-  const response = await fetch(endpoint, {
+  const response = await fetch(url, {
     headers: { Accept: "application/json" },
     cache: "no-store",
   });
-
-  if (!response.ok) {
-    fail(`Request failed: ${response.status} ${response.statusText}`);
+  const bodyText = await response.text();
+  let payload = null;
+  try {
+    payload = JSON.parse(bodyText);
+  } catch {}
+  if (response.status !== 200 || !payload || payload.ok !== true || payload.count === 0) {
+    console.error(`[smoke-history] status=${response.status} body=${bodyText.slice(0, 400)}`);
+    process.exit(1);
   }
-
-  const payload = await response.json().catch(() => null);
-
-  if (!payload || typeof payload.count !== "number") {
-    fail("Response missing numeric 'count'.");
-  }
-
-  if (payload.count === 0) {
-    fail("History count is zero.");
-  }
-
-  console.log(`[smoke-history] count=${payload.count}`);
+  console.log(`[smoke-history] ok count=${payload.count}`);
+  process.exit(0);
 } catch (error) {
-  fail(error?.message || String(error));
+  console.error(`[smoke-history] request error: ${error?.message || error}`);
+  process.exit(1);
 }

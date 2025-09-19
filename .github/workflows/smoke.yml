@@ -1,0 +1,33 @@
+name: Smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Start app
+        run: PORT=3000 npm start &
+      - name: Wait for history endpoint
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:3000/api/history > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server did not become ready" >&2
+          exit 1
+      - name: Smoke history
+        run: BASE=http://localhost:3000 node scripts/smoke-history.mjs
