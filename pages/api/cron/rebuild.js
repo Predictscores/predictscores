@@ -113,14 +113,28 @@ export default async function handler(req, res){
     let items = fullItems.length ? fullItems : baseItems;
     let budgetStop = false;
 
+    const respond = ({ items: responseItems = items, source } = {}) => {
+      const resolvedSource = source ?? (responseItems.length ? "af:seed-or-kv" : (budgetStop ? "budget" : "empty"));
+      return res.status(200).json({
+        ok:true,
+        ymd, slot,
+        counts: { full: responseItems.length },
+        source: resolvedSource,
+        budget_exhausted: budgetStop,
+        trace
+      });
+    };
+
     // 2) If base empty, fetch fixtures for the day and seed KV
     if (!items.length){
       const af = await afxFixturesByDate(ymd, { priority: "P2" });
-      if (!af) {
+      const list = Array.isArray(af?.response) ? af.response : null;
+      if (!list) {
         budgetStop = true;
         trace.push({ afx: "fixtures", ymd, budget: "exhausted" });
+        const preserved = fullItems.length ? fullItems : baseItems;
+        return respond({ items: preserved, source: "budget" });
       }
-      const list = Array.isArray(af?.response) ? af.response : [];
       const mapped = list
         .filter(f => !isYouthLeague(f?.league?.name))
         .filter(f => slotFilter(kickoffISOFromAF(f), slot))
@@ -150,7 +164,7 @@ export default async function handler(req, res){
         if (cur < capPerLeague){ slim.push(it); perLeagueCounter.set(key, cur+1); }
       }
 
-      await kvSET(fullKey,  { items: mapped }, trace);
+      await kvSET(fullKey,  { items: slim   }, trace);
       await kvSET(unionKey, { items: slim   }, trace);
       await kvSET(`vb:day:${ymd}:last`,  { items: slim }, trace);
       await kvSET(`vb:day:${ymd}:union`, { items: slim }, trace);
@@ -159,14 +173,7 @@ export default async function handler(req, res){
     }
 
     // Response diagnostic
-    return res.status(200).json({
-      ok:true,
-      ymd, slot,
-      counts: { full: items.length },
-      source: items.length ? "af:seed-or-kv" : (budgetStop ? "budget" : "empty"),
-      budget_exhausted: budgetStop,
-      trace
-    });
+    return respond();
   }catch(e){
     return res.status(200).json({ ok:false, error: String(e?.message||e) });
   }
