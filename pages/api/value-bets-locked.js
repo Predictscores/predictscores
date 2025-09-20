@@ -123,6 +123,67 @@ function probabilityValue(src, keys){
   }
   return null;
 }
+const HTFT_CODES = ["HH","HD","HA","DH","DD","DA","AH","AD","AA"];
+function normalizeHtftOutcomeCode(raw){
+  if (raw == null) return null;
+  let str;
+  try {
+    str = String(raw);
+  } catch {
+    return null;
+  }
+  if (!str) return null;
+  str = str.toUpperCase();
+  str = str.replace(/HOME/g, "H").replace(/DRAW/g, "D").replace(/AWAY/g, "A");
+  let out = "";
+  for (const ch of str) {
+    if (ch === "H" || ch === "1") out += "H";
+    else if (ch === "D" || ch === "X") out += "D";
+    else if (ch === "A" || ch === "2") out += "A";
+  }
+  if (out.length >= 2) return out.slice(0, 2);
+  return null;
+}
+function collectHtftProbabilities(fix){
+  const addFromSource = (out, src) => {
+    if (!src || typeof src !== "object") return;
+    for (const [rawKey, rawVal] of Object.entries(src)) {
+      const code = normalizeHtftOutcomeCode(rawKey);
+      if (!code) continue;
+      const prob = toProbability(rawVal);
+      if (prob != null) out[code] = prob;
+    }
+  };
+  const out = {};
+  const sources = [
+    fix?.model_probs?.htft,
+    fix?.model_probs?.htft_probs,
+    fix?.model_probs?.htft_probabilities,
+    fix?.model?.htft,
+    fix?.model?.htft_probs,
+    fix?.model?.htft_probabilities,
+    fix?.models?.htft,
+    fix?.models?.htft_probs,
+    fix?.models?.htft_probabilities,
+    fix?.htft,
+    fix?.htft_probs,
+  ];
+  for (const src of sources) addFromSource(out, src);
+  for (const code of HTFT_CODES) {
+    if (out[code] != null) continue;
+    const lower = code.toLowerCase();
+    const prob = probabilityFromPaths(fix, [
+      ["model_probs","htft",lower],
+      ["model_probs","htft",code],
+      ["model","htft",lower],
+      ["model","htft",code],
+      ["models","htft",lower],
+      ["models","htft",code],
+    ]);
+    if (prob != null) out[code] = prob;
+  }
+  return Object.keys(out).length ? out : null;
+}
 function normalizedModelProbs(fix){
   const candidates = [fix?.model_probs, fix?.model?.probs, fix?.model?.probabilities, fix?.models?.probs, fix?.models?.probabilities];
   for (const src of candidates) {
@@ -166,6 +227,7 @@ function buildModelContext(fix){
       ["model","fh_ou15","over"],
       ["models","fh_ou15","over"],
     ]),
+    htft: collectHtftProbabilities(fix),
   };
 }
 function impliedFromPrice(price){
@@ -227,6 +289,40 @@ function modelProbabilityFor(ctx, marketRaw, pickCodeRaw, pickRaw, labelRaw){
     return null;
   }
 
+  if (market === "HTFT" || market === "HT/FT" || market === "HT-FT") {
+    const map = ctx?.htft;
+    if (!map) return null;
+    let lookup = code.trim();
+    if (!lookup) return null;
+    let negate = false;
+    const NEG_PREFIXES = ["NOT ", "NO "];
+    for (const pre of NEG_PREFIXES) {
+      if (lookup.startsWith(pre)) {
+        negate = true;
+        lookup = lookup.slice(pre.length).trim();
+        break;
+      }
+    }
+    if (!negate && lookup.startsWith("!")) {
+      negate = true;
+      lookup = lookup.slice(1).trim();
+    }
+    const NEG_SUFFIXES = [" NOT", " NO", "_NOT", "_NO", "-NOT", "-NO", "/NOT", "/NO"];
+    for (const suf of NEG_SUFFIXES) {
+      if (lookup.endsWith(suf)) {
+        negate = true;
+        lookup = lookup.slice(0, -suf.length).trim();
+        break;
+      }
+    }
+    const htftCode = normalizeHtftOutcomeCode(lookup);
+    if (!htftCode) return null;
+    const prob = map[htftCode];
+    if (prob == null) return null;
+    if (negate) return 1 - prob;
+    return prob;
+  }
+
   return null;
 }
 function confidenceFromModel(prob, implied){
@@ -253,8 +349,12 @@ function applyModelFields(candidate, ctx){
   const implied = impliedFromPrice(candidate?.odds?.price);
   candidate.model_prob = prob != null ? prob : null;
   candidate.implied_prob = implied != null ? implied : null;
-  if ((candidate.market || "").toUpperCase() === "1X2" && ctx?.oneXtwo) {
+  const marketKey = (candidate.market || "").toUpperCase();
+  if (marketKey === "1X2" && ctx?.oneXtwo) {
     candidate.model_probs = ctx.oneXtwo;
+  }
+  if ((marketKey === "HTFT" || marketKey === "HT/FT" || marketKey === "HT-FT") && ctx?.htft) {
+    candidate.model_probs_htft = { ...ctx.htft };
   }
   candidate.confidence_pct = confidenceFromModel(prob, implied);
   return candidate;
