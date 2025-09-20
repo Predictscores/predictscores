@@ -223,8 +223,9 @@ export default async function handler(req, res){
     const lastKey  = `vb:last-odds:${slot}`;
     const union = kvToItems(await kvGET(unionKey, trace));
     const full  = kvToItems(await kvGET(fullKey,  trace));
+    const hadFull = full.items.length > 0;
 
-    const items = (full.items.length ? full.items : union.items).slice();
+    const items = (hadFull ? full.items : union.items).slice();
 
     // Prioritet: bez markets prvo, pa UEFA/top5
     items.sort((a,b)=>{
@@ -274,10 +275,43 @@ export default async function handler(req, res){
       updated++;
     }
 
-    await kvSET(fullKey, { items }, trace);
-    await kvSET(lastKey, { ts: now.toISOString(), ymd, slot, updated }, trace);
+    const enriched = updated > 0;
 
-    return res.status(200).json({ ok:true, ymd, slot, updated, skipped, items_len: items.length, budget_exhausted: budgetStop, trace });
+    if (budgetStop && !enriched) {
+      return res.status(200).json({
+        ok:false,
+        ymd,
+        slot,
+        updated,
+        skipped,
+        items_len: items.length,
+        budget_exhausted: budgetStop,
+        trace,
+        had_full: hadFull,
+        reason: "Stopped early after upstream budget/transport error before enriching fixtures; snapshot unchanged"
+      });
+    }
+
+    const shouldPersist = enriched || !hadFull;
+
+    if (shouldPersist) {
+      await kvSET(fullKey, { items }, trace);
+      await kvSET(lastKey, { ts: now.toISOString(), ymd, slot, updated }, trace);
+    }
+
+    return res.status(200).json({
+      ok:true,
+      ymd,
+      slot,
+      updated,
+      skipped,
+      items_len: items.length,
+      budget_exhausted: budgetStop,
+      trace,
+      had_full: hadFull,
+      enriched,
+      persisted: shouldPersist
+    });
   }catch(e){
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
