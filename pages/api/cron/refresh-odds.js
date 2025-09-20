@@ -58,6 +58,17 @@ function kvToItems(doc) {
   if (v && Array.isArray(v.items)) return v;
   return { items: [] };
 }
+function kvToObject(doc) {
+  if (doc == null) return null;
+  let v = doc;
+  if (typeof v === "string") {
+    try { v = JSON.parse(v); } catch { return null; }
+  }
+  if (v && typeof v === "object" && typeof v.value === "string") {
+    try { v = JSON.parse(v.value); } catch { return null; }
+  }
+  return (v && typeof v === "object") ? v : null;
+}
 // math helpers
 function median(arr){ const a=arr.filter(Number.isFinite).slice().sort((x,y)=>x-y); if(!a.length) return NaN; const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; }
 function trimmedMean(arr, trim=0.15){ const a=arr.filter(Number.isFinite).slice().sort((x,y)=>x-y); if(!a.length) return NaN; const k=Math.floor(a.length*trim); const b=a.slice(k,a.length-k); return b.reduce((p,c)=>p+c,0)/b.length; }
@@ -221,10 +232,33 @@ export default async function handler(req, res){
     const unionKey = `vb:day:${ymd}:${slot}`;
     const fullKey  = `vbl_full:${ymd}:${slot}`;
     const lastKey  = `vb:last-odds:${slot}`;
+    const metaKey  = `vbl_meta:${ymd}:${slot}`;
     const union = kvToItems(await kvGET(unionKey, trace));
     const full  = kvToItems(await kvGET(fullKey,  trace));
+    let meta    = kvToObject(await kvGET(metaKey, trace)) || {};
 
     const items = (full.items.length ? full.items : union.items).slice();
+    const incParam = req.query.incremental;
+    const incRaw = Array.isArray(incParam) ? incParam[0] : incParam;
+    const incNormalized = String(incRaw ?? "").trim().toLowerCase();
+    const incremental = incNormalized === "1" || incNormalized === "true" || incNormalized === "yes";
+
+    trace.push({ meta: metaKey, sealed: !!meta?.sealed, incremental });
+
+    if (meta?.sealed && !incremental) {
+      return res.status(200).json({
+        ok: true,
+        ymd,
+        slot,
+        sealed: true,
+        sealed_at: meta?.sealed_at ?? null,
+        updated: 0,
+        skipped: 0,
+        items_len: items.length,
+        budget_exhausted: false,
+        trace,
+      });
+    }
 
     // Prioritet: bez markets prvo, pa UEFA/top5
     items.sort((a,b)=>{
@@ -234,11 +268,17 @@ export default async function handler(req, res){
       return la-lb;
     });
 
-    const CAP = capForSlot(slot);
+    const baseCap = capForSlot(slot);
+    let CAP = baseCap;
+    let workItems = items;
+    if (meta?.sealed) {
+      CAP = Math.max(1, Math.min(baseCap, SLOT_ODDS_CAP_LATE));
+      workItems = items.slice(0, Math.min(items.length, CAP));
+    }
     let updated = 0, skipped = 0;
     let budgetStop = false;
 
-    for (const f of items) {
+    for (const f of workItems) {
       if (updated >= CAP || budgetStop) break;
 
       const id = f.fixture_id || f.fixture?.id;
@@ -276,6 +316,11 @@ export default async function handler(req, res){
 
     await kvSET(fullKey, { items }, trace);
     await kvSET(lastKey, { ts: now.toISOString(), ymd, slot, updated }, trace);
+
+    if (!meta?.sealed && !budgetStop && items.length) {
+      meta = { sealed: true, sealed_at: now.toISOString() };
+      await kvSET(metaKey, meta, trace);
+    }
 
     return res.status(200).json({ ok:true, ymd, slot, updated, skipped, items_len: items.length, budget_exhausted: budgetStop, trace });
   }catch(e){
