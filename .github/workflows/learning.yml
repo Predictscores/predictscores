@@ -6,12 +6,15 @@ on:
     branches:
       - main
   schedule:
-    # 00:00 Europe/Belgrade  ≈ 22:00 UTC (tokom CEST)
-    - cron: '0 22 * * *'
-    # 10:00 Europe/Belgrade ≈ 08:00 UTC
-    - cron: '0 8 * * *'
-    # 15:00 Europe/Belgrade ≈ 13:00 UTC
-    - cron: '0 13 * * *'
+    # 00:00 Europe/Belgrade
+    - cron: '0 0 * * *'
+      timezone: 'Europe/Belgrade'
+    # 10:00 Europe/Belgrade
+    - cron: '0 10 * * *'
+      timezone: 'Europe/Belgrade'
+    # 15:00 Europe/Belgrade
+    - cron: '0 15 * * *'
+      timezone: 'Europe/Belgrade'
 
 concurrency:
   group: snapshots-${{ github.ref }}
