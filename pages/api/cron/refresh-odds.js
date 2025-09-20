@@ -67,9 +67,9 @@ function consensusPrice(list){ const m=median(list); if (Number.isFinite(m)) ret
  *  ENV / time helpers
  * ========================= */
 const TZ = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
-const SLOT_ODDS_CAP_LATE = Number(process.env.SLOT_ODDS_CAP_LATE || 800);
-const SLOT_ODDS_CAP_AM   = Number(process.env.SLOT_ODDS_CAP_AM   || 1600);
-const SLOT_ODDS_CAP_PM   = Number(process.env.SLOT_ODDS_CAP_PM   || 1600);
+const SLOT_ODDS_CAP_LATE = Number(process.env.SLOT_ODDS_CAP_LATE || 1000);
+const SLOT_ODDS_CAP_AM   = Number(process.env.SLOT_ODDS_CAP_AM   || 2000);
+const SLOT_ODDS_CAP_PM   = Number(process.env.SLOT_ODDS_CAP_PM   || 3000);
 const BACKOFF_MINUTES_EMPTY = Number(process.env.ODDS_BACKOFF_MINUTES || 25);
 
 const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
