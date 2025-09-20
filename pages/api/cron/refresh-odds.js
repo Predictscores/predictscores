@@ -223,7 +223,7 @@ export default async function handler(req, res){
     const lastKey  = `vb:last-odds:${slot}`;
     const union = kvToItems(await kvGET(unionKey, trace));
     const full  = kvToItems(await kvGET(fullKey,  trace));
-    const hadFull = full.items.length > 0;
+    const hadFull = (full?.items?.length ?? 0) > 0;
 
     const items = (hadFull ? full.items : union.items).slice();
 
