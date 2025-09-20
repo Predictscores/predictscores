@@ -60,6 +60,19 @@ jobs:
           OUT=$(curl -fsS -A "gha-odds-watcher/1.1" --connect-timeout 10 --max-time 30 \
                 "$BASE/api/value-bets-locked?slot=$SLOT&n=1" || echo '{}')
           N=$(printf "%s" "$OUT" | jq -r '(.items|length) // 0' 2>/dev/null || echo 0)
+          LAST=$(printf "%s" "$OUT" | jq -r 'try (.meta.last_odds_refresh.ts // "") catch ""' 2>/dev/null || echo "")
+          UPDATED=$(printf "%s" "$OUT" | jq -r 'try (.meta.last_odds_refresh.updated // "") catch ""' 2>/dev/null || echo "")
+          if [ "$LAST" = "null" ]; then LAST=""; fi
+          if [ "$UPDATED" = "null" ]; then UPDATED=""; fi
+          if [ -n "$LAST" ]; then
+            if [ -n "$UPDATED" ]; then
+              echo "Last odds refresh metadata: ts=$LAST updated=$UPDATED"
+            else
+              echo "Last odds refresh timestamp: $LAST"
+            fi
+          else
+            echo "Last odds refresh timestamp unavailable"
+          fi
           if [ "$N" -eq 0 ]; then
             echo "KV empty -> warm via rebuild + short sleep"
             curl -fsS -A "gha-odds-watcher/1.1" --connect-timeout 10 --max-time 120 \
@@ -67,6 +80,7 @@ jobs:
             sleep 3
           fi
           echo "vb_locked_response_len=$N" >> "$GITHUB_OUTPUT"
+          echo "last_refresh_ts=$LAST" >> "$GITHUB_OUTPUT"
 
       - name: Guard rebuild / refresh
         id: guard
@@ -74,11 +88,37 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           MINUTE: ${{ steps.ctx.outputs.minute }}
           VB_LOCKED_LEN: ${{ steps.warm.outputs.vb_locked_response_len }}
+          LAST_REFRESH_TS: ${{ steps.warm.outputs.last_refresh_ts }}
+          COOLDOWN_MINUTES: ${{ vars.ODDS_WATCHER_COOLDOWN_MINUTES }}
+          COOLDOWN_MINUTES_SECRET: ${{ secrets.ODDS_WATCHER_COOLDOWN_MINUTES }}
         run: |
           set -euo pipefail
           EVENT="$EVENT_NAME"
           MIN="$MINUTE"
           LOCKED="${VB_LOCKED_LEN:-0}"
+          LAST="${LAST_REFRESH_TS:-}"
+          if [ "$LAST" = "null" ]; then LAST=""; fi
+          RAW_COOLDOWN="${COOLDOWN_MINUTES:-}"
+          if [ -z "$RAW_COOLDOWN" ]; then RAW_COOLDOWN="${COOLDOWN_MINUTES_SECRET:-}"; fi
+          if ! [[ "$RAW_COOLDOWN" =~ ^[0-9]+$ ]]; then RAW_COOLDOWN=12; fi
+          COOLDOWN="$RAW_COOLDOWN"
+          COOLDOWN_SECS=$((COOLDOWN*60))
+          AGE_LABEL="unknown"
+          AGE_SECS=""
+          RECENT="false"
+          if [ -n "$LAST" ]; then
+            if LAST_EPOCH=$(date -d "$LAST" +%s 2>/dev/null); then
+              NOW_EPOCH=$(date -u +%s)
+              AGE_SECS=$((NOW_EPOCH - LAST_EPOCH))
+              AGE_MIN=$((AGE_SECS/60))
+              AGE_LABEL="${AGE_SECS}s (~${AGE_MIN}m)"
+              if [ "$AGE_SECS" -lt "$COOLDOWN_SECS" ]; then
+                RECENT="true"
+              fi
+            else
+              AGE_LABEL="unparsed"
+            fi
+          fi
           SHOULD_RUN="false"
           REASON="scheduled run with data present"
           if [ "$EVENT" = "workflow_dispatch" ]; then
@@ -87,14 +127,19 @@ jobs:
           elif [ "$LOCKED" = "0" ]; then
             SHOULD_RUN="true"
             REASON="locked feed empty"
-          elif [ "$MIN" = "05" ]; then
-            SHOULD_RUN="true"
-            REASON="minute is 05"
+          else
+            if [ "$RECENT" = "true" ]; then
+              SHOULD_RUN="false"
+              REASON="recent odds refresh (${AGE_LABEL} ago < ${COOLDOWN}m cooldown)"
+            elif [ "$MIN" = "05" ]; then
+              SHOULD_RUN="true"
+              REASON="minute is 05"
+            fi
           fi
           if [ "$SHOULD_RUN" = "true" ]; then
-            echo "Guard: proceeding with rebuild/refresh (reason: $REASON, minute=$MIN, locked_len=$LOCKED, event=$EVENT)"
+            echo "Guard: proceeding with rebuild/refresh (reason: $REASON, minute=$MIN, locked_len=$LOCKED, event=$EVENT, last_refresh=$LAST, cooldown_m=$COOLDOWN, age=$AGE_LABEL)"
           else
-            echo "Guard: skipping rebuild/refresh at $MIN (reason: $REASON, locked_len=$LOCKED, event=$EVENT)"
+            echo "Guard: skipping rebuild/refresh at $MIN (reason: $REASON, locked_len=$LOCKED, event=$EVENT, last_refresh=$LAST, cooldown_m=$COOLDOWN, age=$AGE_LABEL)"
           fi
           echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
 
