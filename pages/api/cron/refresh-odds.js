@@ -220,6 +220,7 @@ export default async function handler(req, res){
 
     const unionKey = `vb:day:${ymd}:${slot}`;
     const fullKey  = `vbl_full:${ymd}:${slot}`;
+    const lastKey  = `vb:last-odds:${slot}`;
     const union = kvToItems(await kvGET(unionKey, trace));
     const full  = kvToItems(await kvGET(fullKey,  trace));
 
@@ -274,6 +275,7 @@ export default async function handler(req, res){
     }
 
     await kvSET(fullKey, { items }, trace);
+    await kvSET(lastKey, { ts: now.toISOString(), ymd, slot, updated }, trace);
 
     return res.status(200).json({ ok:true, ymd, slot, updated, skipped, items_len: items.length, budget_exhausted: budgetStop, trace });
   }catch(e){

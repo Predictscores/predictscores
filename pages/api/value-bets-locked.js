@@ -40,6 +40,18 @@ function kvToItems(doc) {
   return { items: [] };
 }
 
+function kvToObject(doc) {
+  if (doc == null) return null;
+  let v = doc;
+  if (typeof v === "string") {
+    try { v = JSON.parse(v); } catch { return null; }
+  }
+  if (v && typeof v === "object" && typeof v.value === "string") {
+    try { v = JSON.parse(v.value); } catch { return null; }
+  }
+  return (v && typeof v === "object") ? v : null;
+}
+
 /* =========================
  *  ENV / time helpers
  * ========================= */
@@ -429,15 +441,17 @@ export default async function handler(req,res){
 
     const unionKey=`vb:day:${ymd}:${slot}`;
     const fullKey =`vbl_full:${ymd}:${slot}`;
+    const lastKey =`vb:last-odds:${slot}`;
     const union=kvToItems(await kvGET(unionKey, trace));
     const full =kvToItems(await kvGET(fullKey,  trace));
+    const lastRefresh=kvToObject(await kvGET(lastKey, trace));
     const base = full.items.length ? full.items : union.items;
 
     if (!base.length) {
       return res.status(200).json({
         ok:true, ymd, slot, source:null,
         items:[], tickets:{ btts:[], ou25:[], fh_ou15:[], htft:[], BTTS:[], OU25:[], FH_OU15:[], HTFT:[] },
-        one_x_two: [], debug:{ trace }
+        one_x_two: [], meta:{ last_odds_refresh: lastRefresh }, debug:{ trace }
       });
     }
 
@@ -479,7 +493,7 @@ export default async function handler(req,res){
 
     return res.status(200).json({
       ok:true, ymd, slot, source: full.items.length?"vbl_full":"vb:day",
-      items, tickets: ticketsAliased, one_x_two, debug:{ trace }
+      items, tickets: ticketsAliased, one_x_two, meta:{ last_odds_refresh: lastRefresh }, debug:{ trace }
     });
   }catch(e){
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
