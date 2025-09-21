@@ -198,11 +198,6 @@ function extractConsensusMarkets(afResponse){
 export default async function handler(req, res){
   const trace = [];
   try{
-    const now = new Date();
-    const ymd = ymdInTZ(now, TZ);
-    let slot = String(req.query.slot||"auto").toLowerCase();
-    if (!["late","am","pm"].includes(slot)) slot = pickSlot(now);
-
     // READ API KEY — supports your 'API_FOOTBALL_KEY'
     const apiKey =
       process.env.APIFOOTBALL_KEY ||
@@ -212,11 +207,13 @@ export default async function handler(req, res){
       process.env.X_APISPORTS_KEY ||
       process.env.NEXT_PUBLIC_API_FOOTBALL_KEY;
     if (!apiKey) {
-      return res.status(200).json({
-        ok:false,
-        error:"API-Football key missing (tried: APIFOOTBALL_KEY, API_FOOTBALL_KEY, APISPORTS_KEY, APISPORTS_API_KEY, X_APISPORTS_KEY)"
-      });
+      return res.status(200).json({ ok:false, reason:"missing API_FOOTBALL_KEY" });
     }
+
+    const now = new Date();
+    const ymd = ymdInTZ(now, TZ);
+    let slot = String(req.query.slot||"auto").toLowerCase();
+    if (!["late","am","pm"].includes(slot)) slot = pickSlot(now);
 
     const unionKey = `vb:day:${ymd}:${slot}`;
     const fullKey  = `vbl_full:${ymd}:${slot}`;
