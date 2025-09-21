@@ -214,6 +214,7 @@ export default async function handler(req, res){
     if (!apiKey) {
       return res.status(200).json({
         ok:false,
+        reason:"missing API_FOOTBALL_KEY",
         error:"API-Football key missing (tried: APIFOOTBALL_KEY, API_FOOTBALL_KEY, APISPORTS_KEY, APISPORTS_API_KEY, X_APISPORTS_KEY)"
       });
     }
