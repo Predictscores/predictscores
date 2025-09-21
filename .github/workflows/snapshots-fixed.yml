@@ -45,8 +45,25 @@ jobs:
       # Default guard window (minutes) for slot detection; override via repo variable
       # `SNAPSHOT_GUARD_MINUTES` to tune without editing the workflow.
       FREEZE_MINUTES: ${{ vars.SNAPSHOT_GUARD_MINUTES || '75' }}
+      API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
 
     steps:
+      - name: Check API key
+        id: api_key
+        env:
+          SECRET_NAME: API_FOOTBALL_KEY
+          API_KEY: ${{ env.API_FOOTBALL_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${API_KEY:-}" ]; then
+            echo "::notice::Skipping API-dependent steps because secret ${SECRET_NAME} is not configured."
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "API key from secret ${SECRET_NAME} is available; continuing with API-dependent steps."
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Ensure jq is available
         shell: bash
         run: |
@@ -143,7 +160,7 @@ jobs:
 
       # 1) Rebuild (pass 1)
       - name: Rebuild snapshot (pass 1)
-        if: steps.ctx.outputs.run == 'true'
+        if: steps.ctx.outputs.run == 'true' && steps.api_key.outputs.has_key == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
@@ -156,7 +173,7 @@ jobs:
 
       # 2) Refresh odds (kratko, batch ×2)
       - name: Refresh odds (batch, force)
-        if: steps.ctx.outputs.run == 'true'
+        if: steps.ctx.outputs.run == 'true' && steps.api_key.outputs.has_key == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
@@ -171,7 +188,7 @@ jobs:
 
       # 3) Rebuild (final)
       - name: Rebuild snapshot (final)
-        if: steps.ctx.outputs.run == 'true'
+        if: steps.ctx.outputs.run == 'true' && steps.api_key.outputs.has_key == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
@@ -184,7 +201,7 @@ jobs:
 
       # 4) Insights (grupiše specijale i zamrzava po slotu)
       - name: Build insights (tickets)
-        if: steps.ctx.outputs.run == 'true'
+        if: steps.ctx.outputs.run == 'true' && steps.api_key.outputs.has_key == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
@@ -196,7 +213,7 @@ jobs:
 
       # 5) Apply learning
       - name: Apply learning
-        if: steps.ctx.outputs.run == 'true'
+        if: steps.ctx.outputs.run == 'true' && steps.api_key.outputs.has_key == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
@@ -208,6 +225,7 @@ jobs:
 
       # 6) Sanity check
       - name: Sanity check (locked feed)
+        if: steps.api_key.outputs.has_key == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
