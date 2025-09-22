@@ -26,11 +26,13 @@ async function kvGETraw(key, trace) {
       let raw = null;
       if (typeof payload === "string") {
         raw = payload;
-      } else if (payload !== undefined) {
-        try { raw = JSON.stringify(payload ?? null); } catch { raw = null; }
+      } else if (payload !== undefined && payload !== null) {
+        try { raw = JSON.stringify(payload); } catch { raw = null; }
       }
-      trace && trace.push({ get: key, ok: r.ok, flavor: b.flavor, hit: typeof raw === "string" });
+      const hit = typeof raw === "string";
+      trace && trace.push({ get: key, ok: r.ok, flavor: b.flavor, hit });
       if (!r.ok) continue;
+      if (!hit) continue;
       return { raw, flavor: b.flavor };
     } catch (e) {
       trace && trace.push({ get: key, ok: false, err: String(e?.message || e) });
