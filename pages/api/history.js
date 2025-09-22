@@ -55,8 +55,9 @@ async function kvGETraw(key, trace) {
 /* ---------- helpers ---------- */
 const isValidYmd = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 
-const DEFAULT_MARKET_KEY = "h2h";
+export const DEFAULT_MARKET_KEY = "h2h";
 const MARKET_KEY_SYNONYMS = {
+  "1x2": "h2h",
   moneyline: "h2h",
   ml: "h2h",
 };
