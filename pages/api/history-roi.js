@@ -14,6 +14,15 @@ function kvBackends() {
   if (bU && bT) out.push({ flavor: "upstash-redis", url: bU.replace(/\/+$/, ""), tok: bT });
   return out;
 }
+const CLEARED_STRING_MARKERS = new Set(["null", "undefined", "nil", "none"]);
+function looksClearedString(value) {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  if (!trimmed) return true;
+  const unquoted = trimmed.replace(/^"+|"+$/g, "").trim();
+  if (!unquoted) return true;
+  return CLEARED_STRING_MARKERS.has(unquoted.toLowerCase());
+}
 async function kvGETraw(key, trace) {
   for (const b of kvBackends()) {
     try {
@@ -28,6 +37,9 @@ async function kvGETraw(key, trace) {
         raw = payload;
       } else if (payload !== undefined && payload !== null) {
         try { raw = JSON.stringify(payload); } catch { raw = null; }
+      }
+      if (looksClearedString(raw)) {
+        raw = null;
       }
       const hit = typeof raw === "string";
       trace && trace.push({ get: key, ok: r.ok, flavor: b.flavor, hit });
