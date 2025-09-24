@@ -68,30 +68,68 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: "missing_ymd" });
     }
     const trace = [];
-    const unionKey = `vb:day:${ymd}:union`;
     const combinedKey = `vb:day:${ymd}:combined`;
-    const unionPayload = await kvGET(unionKey, trace);
-    const unionItems = Array.isArray(unionPayload?.items)
-      ? unionPayload.items
-      : Array.isArray(unionPayload)
-      ? unionPayload
-      : [];
-    const count = unionItems.length;
-    if (count <= 0) {
-      return res.status(200).json({ ok: true, ymd, wrote: false, union_count: count, trace });
+    const slots = ["am", "pm", "late"];
+    const counts = {
+      amCombined: 0,
+      amUnion: 0,
+      pmCombined: 0,
+      pmUnion: 0,
+      lateCombined: 0,
+      lateUnion: 0,
+    };
+    const collected = [];
+    const asArray = (payload) =>
+      Array.isArray(payload?.items) ? payload.items : Array.isArray(payload) ? payload : [];
+    for (const slot of slots) {
+      const slotCombinedKey = `vb:day:${ymd}:${slot}:combined`;
+      const slotUnionKey = `vb:day:${ymd}:${slot}:union`;
+      const combinedPayload = await kvGET(slotCombinedKey, trace);
+      const combinedItems = asArray(combinedPayload);
+      counts[`${slot}Combined`] = combinedItems.length;
+      let useItems = [];
+      let usedSource = "none";
+      if (combinedPayload != null && combinedItems.length > 0) {
+        useItems = combinedItems;
+        usedSource = "combined";
+      } else {
+        const unionPayload = await kvGET(slotUnionKey, trace);
+        const unionItems = asArray(unionPayload);
+        counts[`${slot}Union`] = unionItems.length;
+        if (unionItems.length > 0) {
+          useItems = unionItems;
+          usedSource = "union";
+        }
+      }
+      if (useItems.length > 0) {
+        collected.push(...useItems);
+      }
+      trace.push({ slot, used: usedSource, count: useItems.length });
     }
-    const payload =
-      unionPayload && typeof unionPayload === "object" && unionPayload.items
-        ? JSON.parse(JSON.stringify(unionPayload))
-        : { items: JSON.parse(JSON.stringify(unionItems)) };
-    await kvSET(combinedKey, payload, trace);
-    trace.push({ alias_combined: { from: "union", count } });
+    const total_before_dedupe = collected.length;
+    const seen = new Set();
+    const merged = [];
+    for (const item of collected) {
+      const rawFixtureId = item?.model?.fixture ?? item?.fixture ?? item?.fixture_id;
+      const dedupeKey = rawFixtureId !== undefined && rawFixtureId !== null ? String(rawFixtureId) : "";
+      if (dedupeKey) {
+        if (seen.has(dedupeKey)) continue;
+        seen.add(dedupeKey);
+      }
+      merged.push(item);
+    }
+    const total_after_dedupe = merged.length;
+    const wrote = total_after_dedupe > 0;
+    if (wrote) {
+      await kvSET(combinedKey, merged, trace);
+    }
     return res.status(200).json({
       ok: true,
       ymd,
-      wrote: true,
-      union_count: count,
-      combined_count: count,
+      wrote,
+      ...counts,
+      total_before_dedupe,
+      total_after_dedupe,
       trace,
     });
   } catch (err) {
