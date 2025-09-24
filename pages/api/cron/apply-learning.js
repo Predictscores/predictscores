@@ -2,7 +2,8 @@
 // Settling i history SAMO nad vb:day:<YMD>:combined (Top 3).
 // Ako combined nedostaje ili je prazan, SAM pokreće /api/cron/rebuild (koji po potrebi poziva /api/score-sync).
 // Podrazumevani YMD je Europe/Belgrade. Presuđuje 1X2, OU, BTTS, HT-FT.
-import { afxGetJson } from "../../../lib/sources/apiFootball";
+const { afxGetJson } = require("../../../lib/sources/apiFootball");
+const { kvBackends: sharedKvBackends, readKeyFromBackends } = require("../../../lib/kv-helpers");
 
 function kvEnv() {
   const url =
@@ -46,18 +47,13 @@ async function kvGetJSON(key) {
 async function kvSetJSON(key, obj) { return kvSet(key, JSON.stringify(obj)); }
 
 function kvBackends() {
-  const out = [];
-  const vercelUrlRaw = process.env.KV_REST_API_URL || process.env.KV_URL;
-  const vercelTok = process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN;
-  const upstashUrlRaw = process.env.UPSTASH_REDIS_REST_URL;
-  const upstashTok = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (vercelUrlRaw && vercelTok) out.push({ flavor: "vercel-kv", url: vercelUrlRaw.replace(/\/+$/, ""), token: vercelTok });
-  if (upstashUrlRaw && upstashTok) out.push({ flavor: "upstash-redis", url: upstashUrlRaw.replace(/\/+$/, ""), token: upstashTok });
-  if (!out.length) {
-    const { url, token } = kvEnv();
-    if (url && token) out.push({ flavor: "default", url: url.replace(/\/+$/, ""), token });
+  const shared = sharedKvBackends();
+  if (shared && shared.length) return shared;
+  const { url, token } = kvEnv();
+  if (url && token) {
+    return [{ flavor: "default", url: url.replace(/\/+$/, ""), token }];
   }
-  return out;
+  return [];
 }
 function safeJsonParse(raw) {
   if (typeof raw !== "string") return raw;
@@ -174,23 +170,6 @@ function extractArray(payload) {
 
   return Array.isArray(best) ? best : [];
 }
-async function kvGetJSONFromBackend(key, backend) {
-  try {
-    const url = `${backend.url}/get/${encodeURIComponent(key)}`;
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${backend.token}` }, cache: "no-store" });
-    if (!res.ok) return { key, flavor: backend.flavor, value: null, items: [], count: 0 };
-    const json = await res.json().catch(() => null);
-    let value = json?.result ?? json?.value ?? null;
-    if (value == null) return { key, flavor: backend.flavor, value: null, items: [], count: 0 };
-    const parsed = safeJsonParse(value);
-    if (typeof parsed !== "undefined") value = parsed;
-    const items = extractArray(value);
-    return { key, flavor: backend.flavor, value, items, count: Array.isArray(items) ? items.length : 0 };
-  } catch (err) {
-    return { key, flavor: backend.flavor, value: null, items: [], count: 0, error: String(err?.message || err) };
-  }
-}
-
 function ymdInTZ(tz = "Europe/Belgrade", d = new Date()) {
   const parts = new Intl.DateTimeFormat("en-GB", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(d);
   const y = parts.find(p => p.type === "year")?.value;
@@ -220,19 +199,44 @@ function fixtureKeyForDedupe(it) {
   return String(fixtureId);
 }
 
-function dedupeBySignature(items = []) {
-  const out = [];
-  const seen = new Set();
-  let fallback = 0;
-  for (const it of Array.isArray(items) ? items : []) {
-    if (!it || typeof it !== "object") continue;
-    const key = fixtureKeyForDedupe(it);
-    const sig = key != null ? key : `__auto_${fallback++}`;
-    if (seen.has(sig)) continue;
-    seen.add(sig);
-    out.push(it);
-  }
-  return out;
+function dedupeByFixtureStrongest(items = []) {
+  const bestByFixture = new Map();
+  const loose = [];
+  const list = Array.isArray(items) ? items : [];
+
+  list.forEach((entry, index) => {
+    if (!entry || typeof entry !== "object") return;
+    const key = fixtureKeyForDedupe(entry);
+    if (key == null) {
+      loose.push({ entry, index });
+      return;
+    }
+    const candidates = [
+      Number(entry.prob),
+      Number(entry.model_prob),
+      Number(entry?.model?.model_prob),
+    ];
+    let probScore = -Infinity;
+    for (const candidate of candidates) {
+      const num = Number(candidate);
+      if (Number.isFinite(num)) {
+        probScore = num;
+        break;
+      }
+    }
+    const prev = bestByFixture.get(key);
+    if (!prev || probScore > prev.prob || (probScore === prev.prob && index < prev.index)) {
+      bestByFixture.set(key, { entry, prob: probScore, index });
+    }
+  });
+
+  const ordered = Array.from(bestByFixture.values())
+    .sort((a, b) => a.index - b.index)
+    .map((row) => row.entry);
+
+  loose.sort((a, b) => a.index - b.index);
+
+  return [...ordered, ...loose.map((row) => row.entry)];
 }
 
 function normalizeMarketLabel(value) {
@@ -245,7 +249,7 @@ function normalizeMarketLabel(value) {
   return raw;
 }
 
-function normalizeValueBetEntry(entry) {
+function normalizeValueBetEntry(entry, sourceSlot) {
   if (!entry || typeof entry !== "object") return null;
   const normalized = { ...entry };
   const fixtureId = coerceFixtureId(
@@ -288,9 +292,9 @@ function normalizeValueBetEntry(entry) {
     }
   }
   if (!market) market = "1X2";
-  normalized.market = market;
-  if (!normalized.market_label) normalized.market_label = market;
-  if (!normalized.market_key) normalized.market_key = market.toLowerCase();
+  normalized.market = "1X2";
+  normalized.market_label = "1X2";
+  normalized.market_key = "1x2";
 
   const selectionCandidates = [
     entry.selection,
@@ -324,9 +328,12 @@ function normalizeValueBetEntry(entry) {
     }
     if (!normalized.predicted && mapped) normalized.predicted = mapped;
   }
-  if (normalizedSelection != null && normalized.selection == null) normalized.selection = normalizedSelection;
-  if (selectionLabel && !normalized.selection_label) normalized.selection_label = selectionLabel;
-  if (selectionLabel && !normalized.pick) normalized.pick = selectionLabel;
+  const finalSelection = selectionLabel || (normalizedSelection != null ? String(normalizedSelection).toUpperCase() : "");
+  if (finalSelection) {
+    normalized.selection = finalSelection;
+    normalized.selection_label = finalSelection;
+    normalized.pick = finalSelection;
+  }
 
   const probabilityCandidates = [
     entry.model_prob,
@@ -356,11 +363,21 @@ function normalizeValueBetEntry(entry) {
   }
   if (prob != null) {
     normalized.model_prob = prob;
-    if (normalized.prob == null) normalized.prob = prob;
+    normalized.prob = prob;
     if (modelBase.model_prob == null) modelBase.model_prob = prob;
   }
 
   if (Object.keys(modelBase).length) normalized.model = modelBase;
+  if (finalSelection && typeof finalSelection === "string") {
+    const lowered = finalSelection.toLowerCase();
+    if (!normalized.predicted) {
+      normalized.predicted = lowered === "home" ? "home" : lowered === "away" ? "away" : lowered === "draw" ? "draw" : lowered;
+    }
+    if (normalized.model && typeof normalized.model === "object" && !normalized.model.predicted) {
+      normalized.model.predicted = normalized.predicted;
+    }
+  }
+  if (sourceSlot && !normalized.source_slot) normalized.source_slot = sourceSlot;
 
   return normalized;
 }
@@ -440,7 +457,7 @@ function coerceFixtureId(...values) {
   return null;
 }
 
-function normalizeModelEntry(entry) {
+function normalizeModelEntry(entry, sourceSlot) {
   if (!entry || typeof entry !== "object") return null;
   const model = extractModelContainer(entry);
   const fixtureId = coerceFixtureId(
@@ -486,7 +503,7 @@ function normalizeModelEntry(entry) {
     market: "1X2",
     market_label: "1X2",
     market_key: "1x2",
-    selection: normalizedSelection,
+    selection: displayLabel,
     selection_label: displayLabel,
     pick: displayLabel,
     predicted: normalizedSelection,
@@ -513,6 +530,8 @@ function normalizeModelEntry(entry) {
         predicted: normalizedSelection,
         ...(hasProb ? { model_prob: probNum } : {}),
       };
+
+  if (sourceSlot && !normalized.source_slot) normalized.source_slot = sourceSlot;
 
   return normalized;
 }
@@ -546,7 +565,7 @@ function looksLikeModelCandidate(it) {
   return String(selection || "").trim() !== "";
 }
 
-function parseCombinedPayload(raw) {
+function parseCombinedPayload(raw, { sourceSlot } = {}) {
   const extracted = extractArray(raw);
   const queue = Array.isArray(extracted) ? [...extracted] : [];
   const objects = [];
@@ -582,7 +601,7 @@ function parseCombinedPayload(raw) {
 
   for (const candidate of meaningful) {
     if (looksLikeValueBetItem(candidate)) {
-      const normalizedValue = normalizeValueBetEntry(candidate);
+      const normalizedValue = normalizeValueBetEntry(candidate, sourceSlot);
       if (normalizedValue) {
         normalized.push(normalizedValue);
         valueShape += 1;
@@ -590,7 +609,7 @@ function parseCombinedPayload(raw) {
       }
     }
     if (looksLikeModelCandidate(candidate)) {
-      const normalizedModel = normalizeModelEntry(candidate);
+      const normalizedModel = normalizeModelEntry(candidate, sourceSlot);
       if (normalizedModel) {
         normalized.push(normalizedModel);
         modelShape += 1;
@@ -773,7 +792,7 @@ async function ensureFinalsFor(ymd, items) {
 
 /* ---------- handler ---------- */
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   try {
     res.setHeader("Cache-Control", "no-store");
 
@@ -800,39 +819,32 @@ export default async function handler(req, res) {
         { label: "last", key: `vb:day:${theDay}:last` },
       ];
       const slotOptions = [
-        { label: "slot:am", slot: "am", key: `vb:day:${theDay}:am` },
-        { label: "slot:pm", slot: "pm", key: `vb:day:${theDay}:pm` },
-        { label: "slot:late", slot: "late", key: `vb:day:${theDay}:late` },
+        { label: "slot:am", slot: "am", key: `vb:day:${theDay}:am:combined` },
+        { label: "slot:pm", slot: "pm", key: `vb:day:${theDay}:pm:combined` },
+        { label: "slot:late", slot: "late", key: `vb:day:${theDay}:late:combined` },
       ];
       const tried = [...dayOptions.map((opt) => opt.label), ...slotOptions.map((opt) => opt.label)];
       const triedKeys = [];
       let slotTried = [];
       const hasNormalized = (payload) => Array.isArray(payload?.normalized) && payload.normalized.length > 0;
-      const loadSource = async (key) => {
+      const loadSource = async (key, opts = {}) => {
         if (!kvFlavors.length) {
-          triedKeys.push(`${key}@none`);
+          triedKeys.push(`${key}@fallback`);
           const fallbackRaw = await kvGetJSON(key);
-          return { parsed: parseCombinedPayload(fallbackRaw), flavor: null };
+          return { parsed: parseCombinedPayload(fallbackRaw, opts), flavor: null, count: 0 };
         }
-        let chosenValue = null;
-        let chosenFlavor = null;
-        let fallbackValue = null;
-        let fallbackFlavor = null;
-        for (const backend of kvFlavors) {
-          const attempt = await kvGetJSONFromBackend(key, backend);
-          triedKeys.push(`${key}@${backend.flavor}`);
-          if (attempt.count > 0 && chosenValue == null) {
-            chosenValue = attempt.value;
-            chosenFlavor = backend.flavor;
-          }
-          if (fallbackValue == null && attempt.value != null) {
-            fallbackValue = attempt.value;
-            fallbackFlavor = backend.flavor;
+        const read = await readKeyFromBackends(key, { backends: kvFlavors });
+        if (Array.isArray(read?.tried)) {
+          for (const attempt of read.tried) {
+            const flavorLabel = attempt?.flavor || "unknown";
+            triedKeys.push(`${key}@${flavorLabel}`);
           }
         }
-        const value = chosenValue ?? fallbackValue ?? null;
-        const flavor = chosenValue != null ? chosenFlavor : fallbackValue != null ? fallbackFlavor : null;
-        return { parsed: parseCombinedPayload(value), flavor };
+        return {
+          parsed: parseCombinedPayload(read.value, opts),
+          flavor: read.flavor,
+          count: Number(read.count || 0),
+        };
       };
 
       const combinedOption = dayOptions[0];
@@ -889,7 +901,7 @@ export default async function handler(req, res) {
         let slotFlavor = null;
         let slotShape = null;
         for (const slotOpt of slotOptions) {
-          const slotResult = await loadSource(slotOpt.key);
+          const slotResult = await loadSource(slotOpt.key, { sourceSlot: slotOpt.slot });
           const slotParsed = slotResult.parsed;
           const normalized = Array.isArray(slotParsed.normalized) ? slotParsed.normalized : [];
           const slotInputRaw = Number(slotParsed.inputCount ?? 0);
@@ -903,7 +915,7 @@ export default async function handler(req, res) {
             slotFlavor = slotResult.flavor;
           }
         }
-        const dedupedSlots = dedupeBySignature(aggregated);
+        const dedupedSlots = dedupeByFixtureStrongest(aggregated);
         const aggregatedInputCount = aggregated.length > 0 ? aggregated.length : aggregatedInput;
         parsed = {
           shape: slotShape || parsed.shape || "value_bets",
@@ -917,10 +929,11 @@ export default async function handler(req, res) {
       const sourceKey = chosenOption.key;
       const sourceLabel = chosenOption.label;
       const normalizedCombined = Array.isArray(parsed.normalized) ? parsed.normalized : [];
-      const items = dedupeBySignature(normalizedCombined);
+      const items = dedupeByFixtureStrongest(normalizedCombined);
       const inputShape = parsed.shape === "model" ? "model" : "value_bets";
       const inputCountRaw = Number(parsed.inputCount ?? 0);
-      const inputCount = Number.isFinite(inputCountRaw) ? inputCountRaw : 0;
+      const fallbackInput = normalizedCombined.length;
+      const inputCount = Number.isFinite(inputCountRaw) && inputCountRaw > 0 ? inputCountRaw : fallbackInput;
       const normalizedCount = items.length;
 
       // 2) finalni rezultati
