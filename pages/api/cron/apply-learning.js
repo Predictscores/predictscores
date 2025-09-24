@@ -66,6 +66,215 @@ function dedupeBySignature(items = []) {
   }
   return out;
 }
+
+function normalizeModelSelection(value) {
+  if (value == null) return "";
+  const raw = String(value).trim().toLowerCase();
+  if (!raw) return "";
+  if (raw === "1" || raw === "home" || raw === "h" || raw.includes("home")) return "home";
+  if (raw === "2" || raw === "away" || raw === "a" || raw.includes("away")) return "away";
+  if (raw === "x" || raw === "draw" || raw === "d" || raw === "tie" || raw.includes("draw") || raw.includes("tie")) return "draw";
+  return raw;
+}
+
+function coerceFixtureId(...values) {
+  for (const value of values) {
+    if (value == null) continue;
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) continue;
+      const asNumber = Number(trimmed);
+      if (!Number.isNaN(asNumber)) return asNumber;
+      return trimmed;
+    }
+    if (typeof value === "object") {
+      const nested = coerceFixtureId(
+        value.fixture_id,
+        value.fixtureId,
+        value.fixture,
+        value.id,
+        value.match_id,
+        value.matchId
+      );
+      if (nested != null) return nested;
+    }
+  }
+  return null;
+}
+
+function normalizeModelEntry(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const model = typeof entry.model === "object" && entry.model ? entry.model : entry;
+  const fixtureId = coerceFixtureId(
+    entry.fixture_id,
+    entry.fixtureId,
+    entry.fixture,
+    entry.id,
+    entry.match_id,
+    entry.matchId,
+    model.fixture_id,
+    model.fixtureId,
+    model.fixture,
+    model.id
+  );
+  if (fixtureId == null) return null;
+
+  const rawSelection =
+    model.predicted ??
+    entry.predicted ??
+    model.pick ??
+    entry.pick ??
+    model.selection ??
+    entry.selection ??
+    model.side ??
+    entry.side ??
+    null;
+  const normalizedSelection = normalizeModelSelection(rawSelection);
+  if (!normalizedSelection || !["home", "away", "draw"].includes(normalizedSelection)) return null;
+
+  const probRaw =
+    model.model_prob ??
+    model.modelProbability ??
+    model.prob ??
+    model.probability ??
+    entry.model_prob ??
+    entry.prob ??
+    entry.probability;
+  const probNum = Number(probRaw);
+  const hasProb = Number.isFinite(probNum);
+
+  const displayLabel =
+    normalizedSelection === "home"
+      ? "HOME"
+      : normalizedSelection === "away"
+      ? "AWAY"
+      : "DRAW";
+
+  const normalized = {
+    ...entry,
+    fixture_id: fixtureId,
+    fixtureId,
+    market: "1X2",
+    market_label: "1X2",
+    market_key: "1x2",
+    selection: normalizedSelection,
+    selection_label: displayLabel,
+    pick: displayLabel,
+    predicted: normalizedSelection,
+  };
+  if (normalized.id == null) normalized.id = fixtureId;
+  if (hasProb) {
+    normalized.prob = probNum;
+    normalized.model_prob = probNum;
+  } else {
+    delete normalized.prob;
+    delete normalized.model_prob;
+  }
+
+  const modelClone = typeof entry.model === "object" && entry.model ? { ...entry.model } : {};
+  if (modelClone && typeof modelClone === "object") {
+    if (modelClone.fixture == null) modelClone.fixture = fixtureId;
+    if (modelClone.predicted == null) modelClone.predicted = normalizedSelection;
+    if (hasProb && modelClone.model_prob == null) modelClone.model_prob = probNum;
+  }
+  normalized.model = Object.keys(modelClone).length
+    ? modelClone
+    : {
+        fixture: fixtureId,
+        predicted: normalizedSelection,
+        ...(hasProb ? { model_prob: probNum } : {}),
+      };
+
+  return normalized;
+}
+
+function looksLikeValueBetItem(it) {
+  if (!it || typeof it !== "object") return false;
+  const fixture = it.fixture_id ?? it.id ?? it.fixtureId ?? it?.fixture?.id ?? null;
+  const selection = it.pick ?? it.selection ?? it.selection_label ?? it.pick_code ?? null;
+  if (fixture == null) return false;
+  if (selection == null) return false;
+  return String(selection).trim() !== "";
+}
+
+function looksLikeModelCandidate(it) {
+  if (!it || typeof it !== "object") return false;
+  const model = typeof it.model === "object" && it.model ? it.model : it;
+  const fixture = coerceFixtureId(
+    it.fixture_id,
+    it.fixtureId,
+    it.fixture,
+    it.id,
+    it.match_id,
+    it.matchId,
+    model.fixture_id,
+    model.fixtureId,
+    model.fixture,
+    model.id
+  );
+  if (fixture == null) return false;
+  const selection = normalizeModelSelection(
+    model.predicted ??
+      it.predicted ??
+      model.pick ??
+      it.pick ??
+      model.selection ??
+      it.selection ??
+      model.side ??
+      it.side ??
+      null
+  );
+  return String(selection || "").trim() !== "";
+}
+
+function gatherCombinedCandidates(raw, depth = 0) {
+  if (raw == null || depth > 3) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw !== "object") return [];
+
+  const keys = [
+    "value_bets",
+    "valueBets",
+    "value-bets",
+    "valuebets",
+    "items",
+    "picks",
+    "bets",
+    "entries",
+    "list",
+    "data",
+  ];
+  for (const key of keys) {
+    if (!(key in raw)) continue;
+    const candidate = raw[key];
+    if (Array.isArray(candidate)) return candidate;
+    if (candidate && typeof candidate === "object") {
+      const nested = gatherCombinedCandidates(candidate, depth + 1);
+      if (nested.length) return nested;
+    }
+  }
+  if (typeof raw.model === "object" && raw.model) return [raw];
+  const values = Object.values(raw).filter((v) => typeof v === "object" && v !== null);
+  return values;
+}
+
+function parseCombinedPayload(raw) {
+  const candidates = gatherCombinedCandidates(raw);
+  const objects = candidates.filter((it) => it && typeof it === "object");
+  const meaningful = objects.filter((it) => looksLikeValueBetItem(it) || looksLikeModelCandidate(it));
+  const inputCount = meaningful.length;
+  const valueBetItems = meaningful.filter(looksLikeValueBetItem);
+  if (valueBetItems.length) {
+    return { shape: "value_bets", inputCount, normalized: valueBetItems };
+  }
+  const normalizedModelItems = meaningful.map(normalizeModelEntry).filter(Boolean);
+  if (normalizedModelItems.length) {
+    return { shape: "model", inputCount, normalized: normalizedModelItems };
+  }
+  const hasModelCandidates = meaningful.some(looksLikeModelCandidate);
+  return { shape: hasModelCandidates ? "model" : "value_bets", inputCount, normalized: [] };
+}
 function rankOf(it) {
   const c = Number(it?.confidence_pct);
   const p = Number(it?.model_prob);
@@ -251,20 +460,34 @@ export default async function handler(req, res) {
 
     for (const theDay of ymds) {
       // 1) pokušaj combined
-      let combined = await kvGetJSON(`vb:day:${theDay}:combined`);
-      if (!Array.isArray(combined) || !combined.length) {
+      const sourceKey = `vb:day:${theDay}:combined`;
+      const fetchCombined = async () => parseCombinedPayload(await kvGetJSON(sourceKey));
+
+      let combinedParsed = await fetchCombined();
+      if (!Array.isArray(combinedParsed.normalized) || !combinedParsed.normalized.length) {
         // 1a) probaj rebuild (on po potrebi zove score-sync)
-        await fetch(`${base}/api/cron/rebuild?ymd=${encodeURIComponent(theDay)}`, { cache: "no-store" }).then(r => r.text()).catch(() => {});
-        combined = await kvGetJSON(`vb:day:${theDay}:combined`);
+        await fetch(`${base}/api/cron/rebuild?ymd=${encodeURIComponent(theDay)}`, { cache: "no-store" })
+          .then(r => r.text())
+          .catch(() => {});
+        combinedParsed = await fetchCombined();
       }
-      if (!Array.isArray(combined) || !combined.length) {
+      if (!Array.isArray(combinedParsed.normalized) || !combinedParsed.normalized.length) {
         // 1b) kao poslednji fallback, pokušaj score-sync → rebuild
-        await fetch(`${base}/api/score-sync?ymd=${encodeURIComponent(theDay)}`, { cache: "no-store" }).then(r => r.text()).catch(() => {});
-        await fetch(`${base}/api/cron/rebuild?ymd=${encodeURIComponent(theDay)}`, { cache: "no-store" }).then(r => r.text()).catch(() => {});
-        combined = await kvGetJSON(`vb:day:${theDay}:combined`);
+        await fetch(`${base}/api/score-sync?ymd=${encodeURIComponent(theDay)}`, { cache: "no-store" })
+          .then(r => r.text())
+          .catch(() => {});
+        await fetch(`${base}/api/cron/rebuild?ymd=${encodeURIComponent(theDay)}`, { cache: "no-store" })
+          .then(r => r.text())
+          .catch(() => {});
+        combinedParsed = await fetchCombined();
       }
 
-      const items = Array.isArray(combined) ? dedupeBySignature(combined) : [];
+      const normalizedCombined = Array.isArray(combinedParsed.normalized) ? combinedParsed.normalized : [];
+      const items = dedupeBySignature(normalizedCombined);
+      const inputShape = combinedParsed.shape === "model" ? "model" : "value_bets";
+      const inputCountRaw = Number(combinedParsed.inputCount ?? 0);
+      const inputCount = Number.isFinite(inputCountRaw) ? inputCountRaw : 0;
+      const normalizedCount = items.length;
 
       // 2) finalni rezultati
       const { byId, byPair } = await ensureFinalsFor(theDay, items);
@@ -319,6 +542,10 @@ export default async function handler(req, res) {
           finals_by_id: Object.keys(byId).length,
           matchedById, matchedByName,
           source: "combined",
+          source_key: sourceKey,
+          input_shape: inputShape,
+          input_count: inputCount,
+          normalized_count: normalizedCount,
         },
       };
 
