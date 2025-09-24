@@ -5,28 +5,76 @@ const { CRON_KEY = "" } = process.env;
 
 function kvBackends() {
   const out = [];
-  const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
-  const bU = process.env.UPSTASH_REDIS_REST_URL, bT = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (aU && aT) out.push({ flavor: "vercel-kv", url: aU.replace(/\/+$/, ""), tok: aT });
-  if (bU && bT) out.push({ flavor: "upstash-redis", url: bU.replace(/\/+$/, ""), tok: bT });
+  const aUraw = process.env.KV_REST_API_URL || process.env.KV_URL;
+  const aT = process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN;
+  const bUraw = process.env.UPSTASH_REDIS_REST_URL;
+  const bT = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (aUraw && aT) out.push({ flavor: "vercel-kv", url: aUraw.replace(/\/+$/, ""), tok: aT });
+  if (bUraw && bT) out.push({ flavor: "upstash-redis", url: bUraw.replace(/\/+$/, ""), tok: bT });
   return out;
 }
-async function kvGET(key, trace = []) {
-  for (const b of kvBackends()) {
-    try {
-      const u = `${b.url}/get/${encodeURIComponent(key)}`;
-      const r = await fetch(u, { headers: { Authorization: `Bearer ${b.tok}` }, cache: "no-store" });
-      if (!r.ok) continue;
-      const j = await r.json().catch(() => null);
-      const v = j?.result ?? j?.value ?? null;
-      if (v == null) continue;
-      const out = typeof v === "string" ? JSON.parse(v) : v;
-      trace.push({ kv: "hit", key, flavor: b.flavor, size: Array.isArray(out?.items) ? out.items.length : Array.isArray(out) ? out.length : 0 });
-      return out;
-    } catch {}
+function safeJsonParse(raw) {
+  if (typeof raw !== "string") return raw;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
   }
-  trace.push({ kv: "miss", key });
-  return null;
+}
+function extractArray(payload, depth = 0) {
+  if (payload == null || depth > 3) return [];
+  if (Array.isArray(payload)) return payload;
+  if (typeof payload !== "object") return [];
+  const preferredKeys = [
+    "items",
+    "value_bets",
+    "valueBets",
+    "value-bets",
+    "valuebets",
+    "bets",
+    "entries",
+    "picks",
+    "list",
+    "data",
+    "normalized",
+  ];
+  for (const key of preferredKeys) {
+    const candidate = payload[key];
+    if (Array.isArray(candidate)) return candidate;
+  }
+  for (const key of preferredKeys) {
+    const candidate = payload[key];
+    if (candidate && typeof candidate === "object") {
+      const nested = extractArray(candidate, depth + 1);
+      if (nested.length) return nested;
+    }
+  }
+  for (const value of Object.values(payload)) {
+    if (Array.isArray(value)) return value;
+  }
+  for (const value of Object.values(payload)) {
+    if (value && typeof value === "object") {
+      const nested = extractArray(value, depth + 1);
+      if (nested.length) return nested;
+    }
+  }
+  return [];
+}
+async function kvGETFromBackend(key, backend) {
+  try {
+    const u = `${backend.url}/get/${encodeURIComponent(key)}`;
+    const r = await fetch(u, { headers: { Authorization: `Bearer ${backend.tok}` }, cache: "no-store" });
+    if (!r.ok) return { flavor: backend.flavor, items: [] };
+    const j = await r.json().catch(() => null);
+    let v = j?.result ?? j?.value ?? null;
+    if (v == null) return { flavor: backend.flavor, items: [] };
+    const parsed = safeJsonParse(v);
+    if (typeof parsed !== "undefined") v = parsed;
+    const items = extractArray(v);
+    return { flavor: backend.flavor, items };
+  } catch {
+    return { flavor: backend.flavor, items: [] };
+  }
 }
 async function kvSET(key, val, trace = []) {
   const saves = [];
@@ -67,50 +115,43 @@ export default async function handler(req, res) {
     if (!ymd) {
       return res.status(400).json({ ok: false, error: "missing_ymd" });
     }
-    const trace = [];
+    const debugMode = String(req.query?.debug || req.body?.debug || "") === "1";
     const combinedKey = `vb:day:${ymd}:combined`;
-    const slots = ["am", "pm", "late"];
-    const counts = {
-      amCombined: 0,
-      amUnion: 0,
-      pmCombined: 0,
-      pmUnion: 0,
-      lateCombined: 0,
-      lateUnion: 0,
-    };
+    const sources = [
+      combinedKey,
+      `vb:day:${ymd}:am`,
+      `vb:day:${ymd}:pm`,
+      `vb:day:${ymd}:late`,
+      `vb:day:${ymd}:union`,
+    ];
     const collected = [];
-    const asArray = (payload) =>
-      Array.isArray(payload?.items) ? payload.items : Array.isArray(payload) ? payload : [];
-    for (const slot of slots) {
-      const slotCombinedKey = `vb:day:${ymd}:${slot}:combined`;
-      const slotUnionKey = `vb:day:${ymd}:${slot}:union`;
-      const combinedPayload = await kvGET(slotCombinedKey, trace);
-      const combinedItems = asArray(combinedPayload);
-      counts[`${slot}Combined`] = combinedItems.length;
-      let useItems = [];
-      let usedSource = "none";
-      if (combinedPayload != null && combinedItems.length > 0) {
-        useItems = combinedItems;
-        usedSource = "combined";
-      } else {
-        const unionPayload = await kvGET(slotUnionKey, trace);
-        const unionItems = asArray(unionPayload);
-        counts[`${slot}Union`] = unionItems.length;
-        if (unionItems.length > 0) {
-          useItems = unionItems;
-          usedSource = "union";
+    const perKeyCounts = {};
+    const knownFlavors = ["vercel-kv", "upstash-redis"];
+    const backends = kvBackends();
+    for (const key of sources) {
+      perKeyCounts[key] = { "vercel-kv": 0, "upstash-redis": 0 };
+      let chosen = [];
+      for (const backend of backends) {
+        const { flavor, items } = await kvGETFromBackend(key, backend);
+        const count = Array.isArray(items) ? items.length : 0;
+        if (knownFlavors.includes(flavor)) {
+          perKeyCounts[key][flavor] = count;
+        } else {
+          perKeyCounts[key][flavor] = count;
+        }
+        if (!chosen.length && count > 0) {
+          chosen = items;
         }
       }
-      if (useItems.length > 0) {
-        collected.push(...useItems);
+      if (chosen.length) {
+        collected.push(...chosen);
       }
-      trace.push({ slot, used: usedSource, count: useItems.length });
     }
     const total_before_dedupe = collected.length;
     const seen = new Set();
     const merged = [];
     for (const item of collected) {
-      const rawFixtureId = item?.model?.fixture ?? item?.fixture ?? item?.fixture_id;
+      const rawFixtureId = item?.model?.fixture ?? item?.fixture_id ?? item?.fixture;
       const dedupeKey = rawFixtureId !== undefined && rawFixtureId !== null ? String(rawFixtureId) : "";
       if (dedupeKey) {
         if (seen.has(dedupeKey)) continue;
@@ -121,17 +162,27 @@ export default async function handler(req, res) {
     const total_after_dedupe = merged.length;
     const wrote = total_after_dedupe > 0;
     if (wrote) {
-      await kvSET(combinedKey, merged, trace);
+      await kvSET(combinedKey, merged);
     }
-    return res.status(200).json({
+    const response = {
       ok: true,
       ymd,
       wrote,
-      ...counts,
       total_before_dedupe,
       total_after_dedupe,
-      trace,
-    });
+    };
+    response.totalBeforeDedupe = total_before_dedupe;
+    response.totalAfterDedupe = total_after_dedupe;
+    if (debugMode) {
+      response.perKeyCounts = perKeyCounts;
+      response.debug = {
+        perKeyCounts,
+        totalBeforeDedupe: total_before_dedupe,
+        totalAfterDedupe: total_after_dedupe,
+        wrote,
+      };
+    }
+    return res.status(200).json(response);
   } catch (err) {
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }

@@ -45,6 +45,84 @@ async function kvGetJSON(key) {
 }
 async function kvSetJSON(key, obj) { return kvSet(key, JSON.stringify(obj)); }
 
+function kvBackends() {
+  const out = [];
+  const vercelUrlRaw = process.env.KV_REST_API_URL || process.env.KV_URL;
+  const vercelTok = process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN;
+  const upstashUrlRaw = process.env.UPSTASH_REDIS_REST_URL;
+  const upstashTok = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (vercelUrlRaw && vercelTok) out.push({ flavor: "vercel-kv", url: vercelUrlRaw.replace(/\/+$/, ""), token: vercelTok });
+  if (upstashUrlRaw && upstashTok) out.push({ flavor: "upstash-redis", url: upstashUrlRaw.replace(/\/+$/, ""), token: upstashTok });
+  if (!out.length) {
+    const { url, token } = kvEnv();
+    if (url && token) out.push({ flavor: "default", url: url.replace(/\/+$/, ""), token });
+  }
+  return out;
+}
+function safeJsonParse(raw) {
+  if (typeof raw !== "string") return raw;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+}
+function extractArray(payload, depth = 0) {
+  if (payload == null || depth > 3) return [];
+  if (Array.isArray(payload)) return payload;
+  if (typeof payload !== "object") return [];
+  const preferredKeys = [
+    "items",
+    "value_bets",
+    "valueBets",
+    "value-bets",
+    "valuebets",
+    "bets",
+    "entries",
+    "picks",
+    "list",
+    "data",
+    "normalized",
+  ];
+  for (const key of preferredKeys) {
+    const candidate = payload[key];
+    if (Array.isArray(candidate)) return candidate;
+  }
+  for (const key of preferredKeys) {
+    const candidate = payload[key];
+    if (candidate && typeof candidate === "object") {
+      const nested = extractArray(candidate, depth + 1);
+      if (nested.length) return nested;
+    }
+  }
+  for (const value of Object.values(payload)) {
+    if (Array.isArray(value)) return value;
+  }
+  for (const value of Object.values(payload)) {
+    if (value && typeof value === "object") {
+      const nested = extractArray(value, depth + 1);
+      if (nested.length) return nested;
+    }
+  }
+  return [];
+}
+async function kvGetJSONFromBackend(key, backend) {
+  try {
+    const url = `${backend.url}/get/${encodeURIComponent(key)}`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${backend.token}` }, cache: "no-store" });
+    if (!res.ok) return { key, flavor: backend.flavor, value: null, items: [], count: 0 };
+    const json = await res.json().catch(() => null);
+    let value = json?.result ?? json?.value ?? null;
+    if (value == null) return { key, flavor: backend.flavor, value: null, items: [], count: 0 };
+    const parsed = safeJsonParse(value);
+    if (typeof parsed !== "undefined") value = parsed;
+    const items = extractArray(value);
+    return { key, flavor: backend.flavor, value, items, count: Array.isArray(items) ? items.length : 0 };
+  } catch (err) {
+    return { key, flavor: backend.flavor, value: null, items: [], count: 0, error: String(err?.message || err) };
+  }
+}
+
 function ymdInTZ(tz = "Europe/Belgrade", d = new Date()) {
   const parts = new Intl.DateTimeFormat("en-GB", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(d);
   const y = parts.find(p => p.type === "year")?.value;
@@ -457,27 +535,61 @@ export default async function handler(req, res) {
     });
 
     const reports = [];
+    const kvFlavors = kvBackends();
 
     for (const theDay of ymds) {
       const sourceOptions = [
         { label: "combined", key: `vb:day:${theDay}:combined` },
         { label: "union", key: `vb:day:${theDay}:union` },
         { label: "last", key: `vb:day:${theDay}:last` },
+        { label: "slot:am", key: `vb:day:${theDay}:am` },
+        { label: "slot:pm", key: `vb:day:${theDay}:pm` },
+        { label: "slot:late", key: `vb:day:${theDay}:late` },
       ];
       const tried = sourceOptions.map((opt) => opt.label);
+      const triedKeys = [];
       const hasNormalized = (payload) => Array.isArray(payload?.normalized) && payload.normalized.length > 0;
-      const loadPayload = async (key) => parseCombinedPayload(await kvGetJSON(key));
+      const loadSource = async (key) => {
+        if (!kvFlavors.length) {
+          triedKeys.push(`${key}@none`);
+          const fallbackRaw = await kvGetJSON(key);
+          return { parsed: parseCombinedPayload(fallbackRaw), flavor: null };
+        }
+        let chosenValue = null;
+        let chosenFlavor = null;
+        let fallbackValue = null;
+        let fallbackFlavor = null;
+        for (const backend of kvFlavors) {
+          const attempt = await kvGetJSONFromBackend(key, backend);
+          triedKeys.push(`${key}@${backend.flavor}`);
+          if (attempt.count > 0 && chosenValue == null) {
+            chosenValue = attempt.value;
+            chosenFlavor = backend.flavor;
+          }
+          if (fallbackValue == null && attempt.value != null) {
+            fallbackValue = attempt.value;
+            fallbackFlavor = backend.flavor;
+          }
+        }
+        const value = chosenValue ?? fallbackValue ?? null;
+        const flavor = chosenValue != null ? chosenFlavor : fallbackValue != null ? fallbackFlavor : null;
+        return { parsed: parseCombinedPayload(value), flavor };
+      };
 
       const combinedOption = sourceOptions[0];
-      const fetchCombined = async () => loadPayload(combinedOption.key);
+      const fetchCombined = async () => loadSource(combinedOption.key);
 
-      let parsed = await fetchCombined();
+      let combinedResult = await fetchCombined();
+      let parsed = combinedResult.parsed;
+      let flavorPicked = combinedResult.flavor;
       if (!hasNormalized(parsed)) {
         // 1a) probaj rebuild (on po potrebi zove score-sync)
         await fetch(`${base}/api/cron/rebuild?ymd=${encodeURIComponent(theDay)}`, { cache: "no-store" })
           .then(r => r.text())
           .catch(() => {});
-        parsed = await fetchCombined();
+        combinedResult = await fetchCombined();
+        parsed = combinedResult.parsed;
+        flavorPicked = combinedResult.flavor;
       }
       if (!hasNormalized(parsed)) {
         // 1b) kao poslednji fallback, pokušaj score-sync → rebuild
@@ -487,21 +599,26 @@ export default async function handler(req, res) {
         await fetch(`${base}/api/cron/rebuild?ymd=${encodeURIComponent(theDay)}`, { cache: "no-store" })
           .then(r => r.text())
           .catch(() => {});
-        parsed = await fetchCombined();
+        combinedResult = await fetchCombined();
+        parsed = combinedResult.parsed;
+        flavorPicked = combinedResult.flavor;
       }
 
       let chosenOption = combinedOption;
       if (!hasNormalized(parsed)) {
         for (const fallback of sourceOptions.slice(1)) {
-          const fallbackParsed = await loadPayload(fallback.key);
+          const fallbackResult = await loadSource(fallback.key);
+          const fallbackParsed = fallbackResult.parsed;
           if (hasNormalized(fallbackParsed)) {
             chosenOption = fallback;
             parsed = fallbackParsed;
+            flavorPicked = fallbackResult.flavor;
             break;
           }
           if (!hasNormalized(parsed)) {
             chosenOption = fallback;
             parsed = fallbackParsed;
+            flavorPicked = fallbackResult.flavor;
           }
         }
       }
@@ -570,6 +687,8 @@ export default async function handler(req, res) {
           source: sourceLabel,
           source_key: sourceKey,
           tried,
+          triedKeys,
+          flavorPicked: flavorPicked ?? null,
           input_shape: inputShape,
           input_count: inputCount,
           normalized_count: normalizedCount,
@@ -583,7 +702,15 @@ export default async function handler(req, res) {
         ymd: theDay,
         totals: historyPayload.counts,
         roi: historyPayload.roi,
-        ...(debug ? { meta: historyPayload.meta } : {}),
+        ...(debug
+          ? {
+              meta: historyPayload.meta,
+              triedKeys,
+              flavorPicked: flavorPicked ?? null,
+              input_count: inputCount,
+              normalized_count: normalizedCount,
+            }
+          : {}),
       });
     }
 
