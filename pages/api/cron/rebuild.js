@@ -1067,6 +1067,13 @@ export default async function handler(req, res){
     // 1) try existing KV
     const unionKey = `vb:day:${ymd}:${slot}`;
     const fullKey  = `vbl_full:${ymd}:${slot}`;
+    const combinedKey = `vb:day:${ymd}:combined`;
+    let combinedSynced = false;
+    const persistCombined = async (payload) => {
+      await kvSET(combinedKey, payload, trace);
+      trace.push({ note: `set ${combinedKey}` });
+      combinedSynced = true;
+    };
     let base = await kvGET(unionKey, trace);
     let full  = await kvGET(fullKey,  trace);
     const baseItems = Array.isArray(base?.items) ? base.items : (Array.isArray(base)?base:[]);
@@ -1140,6 +1147,7 @@ export default async function handler(req, res){
       await kvSET(unionKey, { items: slim   }, trace);
       await kvSET(`vb:day:${ymd}:last`,  { items: slim }, trace);
       await kvSET(`vb:day:${ymd}:union`, { items: slim }, trace);
+      await persistCombined({ items: slim });
 
       items = slim;
     }
@@ -1150,6 +1158,7 @@ export default async function handler(req, res){
         unionKey,
         `vb:day:${ymd}:last`,
         `vb:day:${ymd}:union`,
+        combinedKey,
       ])
     ).filter(Boolean);
 
@@ -1157,6 +1166,9 @@ export default async function handler(req, res){
       const enrich = await enrichFixturesForDay({ items, ymd, slot, trace, persistKeys });
       if (enrich.stopReason === "budget") budgetStop = true;
       const sourceOverride = enrich.stopReason === "budget" ? "budget" : undefined;
+      if (!combinedSynced) {
+        await persistCombined({ items });
+      }
       return respond({
         items,
         source: sourceOverride,
@@ -1164,6 +1176,10 @@ export default async function handler(req, res){
         updated: enrich.updated,
         stopReason: enrich.stopReason,
       });
+    }
+
+    if (!combinedSynced) {
+      await persistCombined({ items });
     }
 
     return respond();
