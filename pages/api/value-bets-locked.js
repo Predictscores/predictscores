@@ -1,6 +1,18 @@
 // pages/api/value-bets-locked.js
 export const config = { api: { bodyParser: false } };
 
+const {
+  DEFAULT_FLAGS: LEARNING_DEFAULT_FLAGS,
+  normalizeFlags,
+  resolveLeagueTier,
+  resolveMarketBucket,
+  resolveOddsBand,
+  applyCalibration,
+  applyLeagueAdjustment,
+  applyEvGuard,
+  resolveDefaultEvGuard,
+} = require("../../lib/learning/runtime");
+
 /* =========================
  *  Inline helpers (KV)
  * ========================= */
@@ -50,6 +62,47 @@ function kvToObject(doc) {
     try { v = JSON.parse(v.value); } catch { return null; }
   }
   return (v && typeof v === "object") ? v : null;
+}
+
+async function kvSET(key, value, trace = []) {
+  const saves = [];
+  const serialized = typeof value === "string" ? value : JSON.stringify(value);
+  for (const b of kvBackends()) {
+    const record = { flavor: b.flavor, ok: false };
+    try {
+      const url = `${b.url}/set/${encodeURIComponent(key)}`;
+      const body = JSON.stringify({ value: serialized });
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${b.tok}`,
+          "Content-Type": "application/json",
+        },
+        body,
+      });
+      record.status = res.status;
+      if (res.ok) {
+        record.ok = true;
+      } else {
+        const fallbackUrl = `${b.url}/set/${encodeURIComponent(key)}/${encodeURIComponent(serialized)}`;
+        const fallbackRes = await fetch(fallbackUrl, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${b.tok}` },
+        }).catch(() => null);
+        if (fallbackRes && fallbackRes.ok) {
+          record.ok = true;
+          record.status = fallbackRes.status;
+        } else {
+          record.error = `http_${res.status}`;
+        }
+      }
+    } catch (err) {
+      record.error = String(err?.message || err);
+    }
+    saves.push(record);
+  }
+  if (trace) trace.push({ set: key, saves });
+  return saves.some((s) => s.ok);
 }
 
 /* =========================
@@ -414,6 +467,277 @@ function dedupeByFixture(items){
 }
 
 /* =========================
+ *  Learning helpers
+ * ========================= */
+function pickKeyForCandidate(it) {
+  if (!it || typeof it !== "object") return null;
+  const fid = it.fixture_id ?? it.fixture?.id ?? it.model?.fixture ?? it.model?.fixture_id ?? null;
+  const fixturePart = fid != null ? `fid:${fid}` : (fixtureKeyForPick(it) || `kick:${String(it.kickoff_utc || it.kickoff || "")}`);
+  const market = resolveMarketBucket(it.market || "");
+  const pickCodeRaw = it.pick_code || it.pick || it.selection_label || it.selection || "";
+  const pick = String(pickCodeRaw).trim().toUpperCase() || "?";
+  const price = Number(it?.odds?.price ?? it.price);
+  const pricePart = Number.isFinite(price) ? price.toFixed(2) : "na";
+  return `${fixturePart}|${market}|${pick}|${pricePart}`;
+}
+
+function learningBucketForCandidate(it) {
+  const marketBucket = resolveMarketBucket(it?.market || "");
+  const rawPrice = Number(it?.odds?.price ?? it.price);
+  const oddsBand = resolveOddsBand(rawPrice);
+  const leagueObj = it?.league || it?.fixture?.league || null;
+  const leagueTier = resolveLeagueTier(leagueObj || {});
+  const leagueId = it?.league?.id ?? it?.league_id ?? it?.leagueId ?? leagueObj?.id ?? null;
+  const leagueKey = leagueId != null && leagueId !== "" ? String(leagueId) : null;
+  return { marketBucket, oddsBand, leagueTier, leagueKey, price: Number.isFinite(rawPrice) ? rawPrice : null };
+}
+
+function edgeFromProb(prob, implied) {
+  if (!Number.isFinite(prob) || !Number.isFinite(implied)) return null;
+  const edge = (prob - implied) * 100;
+  return Number.isFinite(edge) ? Number(edge.toFixed(3)) : null;
+}
+
+function ensureLearningMetaEntry(metaMap, candidate, bucket, baselineEdge, baselineProb) {
+  const key = pickKeyForCandidate(candidate);
+  if (!key) return null;
+  const implied = Number.isFinite(candidate?.implied_prob)
+    ? candidate.implied_prob
+    : impliedFromPrice(candidate?.odds?.price);
+  let entry = metaMap.get(key);
+  if (!entry) {
+    entry = {
+      pick_key: key,
+      fixture_id: candidate.fixture_id ?? candidate.fixture?.id ?? null,
+      market: resolveMarketBucket(candidate.market || ""),
+      pick_code: candidate.pick_code || candidate.pick || candidate.selection_label || null,
+      odds_price: Number.isFinite(candidate?.odds?.price) ? Number(candidate.odds.price) : null,
+      implied_prob: Number.isFinite(implied) ? implied : null,
+      baseline_prob: Number.isFinite(baselineProb) ? baselineProb : null,
+      baseline_edge_pp: Number.isFinite(baselineEdge) ? baselineEdge : null,
+      buckets: bucket,
+      samples: { calib: null, evmin: null, league: null },
+      adjustments: { calib: false, evmin: false, league: false },
+    };
+    metaMap.set(key, entry);
+  } else {
+    if (entry.buckets == null && bucket) entry.buckets = bucket;
+    if (entry.baseline_prob == null && Number.isFinite(baselineProb)) entry.baseline_prob = baselineProb;
+    if (entry.baseline_edge_pp == null && Number.isFinite(baselineEdge)) entry.baseline_edge_pp = baselineEdge;
+    if (entry.implied_prob == null && Number.isFinite(implied)) entry.implied_prob = implied;
+  }
+  return entry;
+}
+
+function cloneCandidate(it) {
+  try {
+    if (typeof structuredClone === "function") return structuredClone(it);
+    return JSON.parse(JSON.stringify(it));
+  } catch {
+    return JSON.parse(JSON.stringify(it));
+  }
+}
+
+function applyLearningToCandidate(original, context, metaMap, bucketMap) {
+  if (!original || typeof original !== "object") return null;
+  const clone = cloneCandidate(original);
+  const key = pickKeyForCandidate(original);
+  const bucket = (key && bucketMap.get(key)) || learningBucketForCandidate(original);
+
+  const implied = Number.isFinite(clone?.implied_prob)
+    ? Number(clone.implied_prob)
+    : impliedFromPrice(clone?.odds?.price);
+  if (Number.isFinite(implied)) clone.implied_prob = implied;
+
+  const baselineProb = Number.isFinite(original?.model_prob) ? Number(original.model_prob) : null;
+  const baselineEdge = Number.isFinite(original?.edge_pp) ? Number(original.edge_pp) : null;
+  const metaEntry = ensureLearningMetaEntry(metaMap, clone, bucket, baselineEdge, baselineProb);
+
+  let prob = baselineProb;
+  if (!Number.isFinite(prob)) {
+    if (metaEntry) {
+      metaEntry.learned_prob = prob;
+      metaEntry.learned_edge_pp = baselineEdge;
+      metaEntry.ev_guard_used = null;
+      metaEntry.passes_ev = true;
+    }
+    clone.learning_meta = {
+      buckets: bucket,
+      calibration: null,
+      league: null,
+      ev: null,
+      passes_ev: true,
+    };
+    clone.edge_pp = baselineEdge;
+    clone.confidence_pct = Number.isFinite(clone.confidence_pct)
+      ? clone.confidence_pct
+      : confidenceFromModel(prob, implied);
+    clone.confidence = clone.confidence_pct;
+    return { candidate: clone, passesEv: true };
+  }
+
+  let calibrationResult = null;
+  const calibrationKey = bucket && bucket.marketBucket && bucket.leagueTier && bucket.oddsBand
+    ? `${bucket.marketBucket}:${bucket.leagueTier}:${bucket.oddsBand}`
+    : null;
+  if (context.flags.enable_calib && calibrationKey) {
+    const doc = context.calibrations.get(calibrationKey);
+    if (doc) {
+      calibrationResult = applyCalibration(prob, doc);
+      prob = calibrationResult.prob;
+    }
+  }
+
+  let leagueResult = null;
+  const leagueKey = bucket && bucket.leagueKey ? String(bucket.leagueKey) : null;
+  if (context.flags.enable_league_adj && leagueKey) {
+    const doc = context.leagueAdj.get(leagueKey);
+    if (doc) {
+      leagueResult = applyLeagueAdjustment(prob, doc);
+      prob = leagueResult.prob;
+    }
+  }
+
+  prob = Math.max(0, Math.min(1, prob));
+  clone.model_prob = prob;
+
+  const edge = edgeFromProb(prob, implied);
+  clone.edge_pp = edge;
+
+  const marketForGuard = bucket?.marketBucket || resolveMarketBucket(clone.market || "");
+  let guard = resolveDefaultEvGuard(marketForGuard);
+  let evResult = { guard_pp: guard, applied: false, samples: 0 };
+  const evKey = bucket && bucket.marketBucket && bucket.oddsBand ? `${bucket.marketBucket}:${bucket.oddsBand}` : null;
+  if (context.flags.enable_evmin && evKey) {
+    const doc = context.evmin.get(evKey);
+    if (doc) {
+      evResult = applyEvGuard(guard, doc);
+      guard = evResult.guard_pp;
+    }
+  }
+  guard = Math.max(0.5, Math.min(8, guard));
+  clone.ev_guard_pp = guard;
+
+  const passesEv = !(Number.isFinite(edge) && edge < guard);
+
+  clone.learning_meta = {
+    buckets: bucket,
+    calibration: calibrationResult ? { key: calibrationKey, ...calibrationResult } : null,
+    league: leagueResult ? { key: leagueKey, ...leagueResult } : null,
+    ev: evResult ? { key: evKey, ...evResult } : null,
+    passes_ev: passesEv,
+  };
+
+  clone.confidence_pct = confidenceFromModel(prob, implied);
+  clone.confidence = clone.confidence_pct;
+
+  if (metaEntry) {
+    metaEntry.learned_prob = prob;
+    metaEntry.learned_edge_pp = edge;
+    metaEntry.ev_guard_used = guard;
+    metaEntry.passes_ev = passesEv;
+    metaEntry.samples = {
+      calib: calibrationResult ? calibrationResult.samples : metaEntry.samples?.calib ?? null,
+      evmin: evResult ? evResult.samples : metaEntry.samples?.evmin ?? null,
+      league: leagueResult ? leagueResult.samples : metaEntry.samples?.league ?? null,
+    };
+    metaEntry.adjustments = {
+      calib: Boolean(calibrationResult && calibrationResult.applied),
+      evmin: Boolean(evResult && evResult.applied),
+      league: Boolean(leagueResult && leagueResult.applied),
+    };
+  }
+
+  return { candidate: clone, passesEv };
+}
+
+function applyLearningSet(list, context, metaMap, bucketMap) {
+  const picks = [];
+  const dropped = [];
+  for (const item of Array.isArray(list) ? list : []) {
+    const res = applyLearningToCandidate(item, context, metaMap, bucketMap);
+    if (!res) continue;
+    if (res.passesEv) picks.push(res.candidate);
+    else dropped.push(res.candidate);
+  }
+  return { picks, dropped };
+}
+
+async function loadLearningContext(bucketMap, flags, trace) {
+  const calibrations = new Map();
+  const evmin = new Map();
+  const leagueAdj = new Map();
+  const normalized = normalizeFlags(flags || LEARNING_DEFAULT_FLAGS);
+
+  const calibKeys = new Set();
+  const evKeys = new Set();
+  const leagueKeys = new Set();
+
+  for (const bucket of bucketMap.values()) {
+    if (!bucket) continue;
+    if (normalized.enable_calib && bucket.marketBucket !== "UNK" && bucket.oddsBand !== "UNK") {
+      calibKeys.add(`${bucket.marketBucket}:${bucket.leagueTier}:${bucket.oddsBand}`);
+    }
+    if (normalized.enable_evmin && bucket.marketBucket !== "UNK" && bucket.oddsBand !== "UNK") {
+      evKeys.add(`${bucket.marketBucket}:${bucket.oddsBand}`);
+    }
+    if (normalized.enable_league_adj && bucket.leagueKey) {
+      leagueKeys.add(String(bucket.leagueKey));
+    }
+  }
+
+  const tasks = [];
+  for (const key of calibKeys) {
+    tasks.push((async () => {
+      const [market, tier, odds] = key.split(":");
+      const kvKey = `learn:calib:v2:${market}:${tier}:${odds}`;
+      const doc = kvToObject(await kvGET(kvKey, trace));
+      calibrations.set(key, doc);
+    })());
+  }
+  for (const key of evKeys) {
+    tasks.push((async () => {
+      const [market, odds] = key.split(":");
+      const kvKey = `learn:evmin:v2:${market}:${odds}`;
+      const doc = kvToObject(await kvGET(kvKey, trace));
+      evmin.set(key, doc);
+    })());
+  }
+  for (const leagueId of leagueKeys) {
+    tasks.push((async () => {
+      const kvKey = `learn:league_adj:v1:${leagueId}`;
+      const doc = kvToObject(await kvGET(kvKey, trace));
+      leagueAdj.set(leagueId, doc);
+    })());
+  }
+
+  await Promise.all(tasks);
+
+  return { flags: normalized, calibrations, evmin, leagueAdj };
+}
+
+function buildSelections({ candidates, oneXtwoAll, slot, weekend }) {
+  const ranked = (Array.isArray(candidates) ? candidates : []).slice().sort((a, b) => (b.confidence_pct || 0) - (a.confidence_pct || 0));
+  const afterUefa = applyUefaCap(ranked, UEFA_DAILY_CAP);
+  const leagueCapped = capPerLeague(afterUefa, VB_MAX_PER_LEAGUE);
+  const topN = leagueCapped.slice(0, VB_LIMIT);
+  const tickets = topKPerMarket(leagueCapped, 3, 5);
+
+  const oneXtwoSorted = (Array.isArray(oneXtwoAll) ? oneXtwoAll : []).slice().sort((a, b) => (b.confidence_pct || 0) - (a.confidence_pct || 0));
+  const deduped = dedupeByFixture(oneXtwoSorted);
+  const cap = oneXtwoCapForSlot(slot, weekend);
+  const one_x_two_raw = capPerLeague(deduped, VB_MAX_PER_LEAGUE).slice(0, cap);
+
+  return { topN, tickets, one_x_two_raw };
+}
+
+async function readLearningFlags(trace) {
+  const raw = await kvGET("cfg:learning", trace);
+  const obj = kvToObject(raw);
+  return normalizeFlags(obj || LEARNING_DEFAULT_FLAGS);
+}
+
+/* =========================
  *  Candidate builders
  * ========================= */
 function fromMarkets(fix){
@@ -555,45 +879,148 @@ export default async function handler(req,res){
       });
     }
 
-    // Svi kandidati (BTTS/OU/FH/HTFT), real-odds confidence
-    const candidates=[]; for (const f of base) candidates.push(...fromMarkets(f));
+    const candidates = [];
+    for (const f of base) candidates.push(...fromMarkets(f));
 
-    // Rang po confidence, UEFA cap, per-league cap
-    const ranked = candidates.slice().sort((a,b)=>(b.confidence_pct||0)-(a.confidence_pct||0));
-    const afterUefa = applyUefaCap(ranked, UEFA_DAILY_CAP);
-    const leagueCapped = capPerLeague(afterUefa, VB_MAX_PER_LEAGUE);
+    const oneXtwoAll = [];
+    for (const f of base) oneXtwoAll.push(...oneXtwoOffers(f));
 
-    // Football tab (kombinovani topN)
-    const topN = leagueCapped.slice(0, VB_LIMIT);
+    const bucketMap = new Map();
+    const learningMeta = new Map();
 
-    // Tiketi: topK po tržištu (garantuje FH tiket ako postoji ponuda)
-    const tickets = topKPerMarket(leagueCapped, 3, 5);
+    for (const cand of candidates) {
+      const bucket = learningBucketForCandidate(cand);
+      const key = pickKeyForCandidate(cand);
+      if (key) bucketMap.set(key, bucket);
+      const prob = Number.isFinite(cand.model_prob) ? Number(cand.model_prob) : null;
+      const implied = Number.isFinite(cand.implied_prob) ? Number(cand.implied_prob) : impliedFromPrice(cand?.odds?.price);
+      if (Number.isFinite(implied)) cand.implied_prob = implied;
+      const edge = edgeFromProb(prob, implied);
+      if (edge != null) cand.edge_pp = edge;
+      cand.confidence = cand.confidence_pct;
+      ensureLearningMetaEntry(learningMeta, cand, bucket, edge, prob);
+    }
 
-    // 1x2 ponude (po slot cap-u + per-liga)
-    const oneXtwoAll=[]; for (const f of base) oneXtwoAll.push(...oneXtwoOffers(f));
-    oneXtwoAll.sort((a,b)=>(b.confidence_pct||0)-(a.confidence_pct||0));
-    const rankedOneXtwo = dedupeByFixture(oneXtwoAll);
-    const oneXtwoCap = oneXtwoCapForSlot(slot, weekend);
-    const one_x_two_raw = capPerLeague(rankedOneXtwo, VB_MAX_PER_LEAGUE).slice(0, oneXtwoCap);
+    for (const cand of oneXtwoAll) {
+      const bucket = learningBucketForCandidate(cand);
+      const key = pickKeyForCandidate(cand);
+      if (key) bucketMap.set(key, bucket);
+      const prob = Number.isFinite(cand.model_prob) ? Number(cand.model_prob) : null;
+      const implied = Number.isFinite(cand.implied_prob) ? Number(cand.implied_prob) : impliedFromPrice(cand?.odds?.price);
+      if (Number.isFinite(implied)) cand.implied_prob = implied;
+      const edge = edgeFromProb(prob, implied);
+      if (edge != null) cand.edge_pp = edge;
+      cand.confidence = cand.confidence_pct;
+      ensureLearningMetaEntry(learningMeta, cand, bucket, edge, prob);
+    }
 
-    // ===== Apply aliasing so the legacy UI can render immediately
-    const items = topN.map(aliasItem);
-    const one_x_two = one_x_two_raw.map(aliasItem);
-    const ticketsAliased = {
-      btts:    tickets.btts.map(aliasItem),
-      ou25:    tickets.ou25.map(aliasItem),
-      fh_ou15: tickets.fh_ou15.map(aliasItem),
-      htft:    tickets.htft.map(aliasItem),
-      // Upper-case aliases (if the UI expects these keys)
-      BTTS:    tickets.btts.map(aliasItem),
-      OU25:    tickets.ou25.map(aliasItem),
-      FH_OU15: tickets.fh_ou15.map(aliasItem),
-      HTFT:    tickets.htft.map(aliasItem),
+    const baselineSelections = buildSelections({ candidates, oneXtwoAll, slot, weekend });
+
+    const aliasTickets = (ticketsObj) => ({
+      btts: ticketsObj.btts.map(aliasItem),
+      ou25: ticketsObj.ou25.map(aliasItem),
+      fh_ou15: ticketsObj.fh_ou15.map(aliasItem),
+      htft: ticketsObj.htft.map(aliasItem),
+      BTTS: ticketsObj.btts.map(aliasItem),
+      OU25: ticketsObj.ou25.map(aliasItem),
+      FH_OU15: ticketsObj.fh_ou15.map(aliasItem),
+      HTFT: ticketsObj.htft.map(aliasItem),
+    });
+
+    const baselineItems = baselineSelections.topN.map(aliasItem);
+    const baselineTicketsAliased = aliasTickets(baselineSelections.tickets);
+    const baselineOneXtwo = baselineSelections.one_x_two_raw.map(aliasItem);
+
+    const flags = await readLearningFlags(trace);
+    const learningEnabled = Boolean(flags.enable_calib || flags.enable_evmin || flags.enable_league_adj);
+    const shadowKey = `vb:shadow:${ymd}:${slot}`;
+    const baseSource = full.items.length ? "vbl_full" : "vb:day";
+
+    let finalItems = baselineItems;
+    let finalTickets = baselineTicketsAliased;
+    let finalOneXtwo = baselineOneXtwo;
+    let responseSource = baseSource;
+    let shadowWriteOk = false;
+
+    let learningDebug = {
+      flags,
+      enabled: learningEnabled,
+      shadow_mode: flags.shadow_mode,
+      applied: false,
+      shadow_key: shadowKey,
+      wrote_shadow: false,
     };
 
+    if (learningEnabled) {
+      const context = await loadLearningContext(bucketMap, flags, trace);
+      const learnedCandidates = applyLearningSet(candidates, context, learningMeta, bucketMap);
+      const learnedOneXtwo = applyLearningSet(oneXtwoAll, context, learningMeta, bucketMap);
+      const learnedSelections = buildSelections({
+        candidates: learnedCandidates.picks,
+        oneXtwoAll: learnedOneXtwo.picks,
+        slot,
+        weekend,
+      });
+
+      const learnedItems = learnedSelections.topN.map(aliasItem);
+      const learnedTicketsAliased = aliasTickets(learnedSelections.tickets);
+      const learnedOneXtwoAliased = learnedSelections.one_x_two_raw.map(aliasItem);
+
+      const shadowPayload = {
+        baseline: baselineItems,
+        learned: learnedItems,
+        one_x_two_baseline: baselineOneXtwo,
+        one_x_two_learned: learnedOneXtwoAliased,
+        tickets: {
+          baseline: baselineTicketsAliased,
+          learned: learnedTicketsAliased,
+        },
+        meta: {
+          ymd,
+          slot,
+          generated_at: new Date().toISOString(),
+          flags,
+          shadow_mode: flags.shadow_mode,
+          picks: Array.from(learningMeta.values()),
+        },
+      };
+
+      try {
+        shadowWriteOk = await kvSET(shadowKey, shadowPayload, trace);
+      } catch {
+        shadowWriteOk = false;
+      }
+
+      learningDebug = {
+        ...learningDebug,
+        context_keys: {
+          calib: context.calibrations.size,
+          evmin: context.evmin.size,
+          league: context.leagueAdj.size,
+        },
+        wrote_shadow: Boolean(shadowWriteOk),
+        dropped: learnedCandidates.dropped.length + learnedOneXtwo.dropped.length,
+      };
+
+      if (!flags.shadow_mode) {
+        finalItems = learnedItems;
+        finalTickets = learnedTicketsAliased;
+        finalOneXtwo = learnedOneXtwoAliased;
+        responseSource = `${baseSource}+learning`;
+        learningDebug.applied = true;
+      }
+    }
+
     return res.status(200).json({
-      ok:true, ymd, slot, source: full.items.length?"vbl_full":"vb:day",
-      items, tickets: ticketsAliased, one_x_two, meta:{ last_odds_refresh: lastRefresh }, debug:{ trace }
+      ok: true,
+      ymd,
+      slot,
+      source: responseSource,
+      items: finalItems,
+      tickets: finalTickets,
+      one_x_two: finalOneXtwo,
+      meta: { last_odds_refresh: lastRefresh },
+      debug: { trace, learning: learningDebug },
     });
   }catch(e){
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
