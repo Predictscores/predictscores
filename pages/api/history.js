@@ -56,6 +56,7 @@ async function kvGETraw(key, trace) {
 const isValidYmd = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 
 export const DEFAULT_MARKET_KEY = "h2h";
+const ALWAYS_ALLOWED_MARKETS = ["1x2", "h2h"];
 const MARKET_KEY_SYNONYMS = {
   "1x2": "h2h",
   moneyline: "h2h",
@@ -71,17 +72,24 @@ export function normalizeMarketKey(value) {
   return MARKET_KEY_SYNONYMS[cleaned] || cleaned;
 }
 
-// Robust market parser (ignores stray punctuation; defaults to "h2h")
+// Robust market parser (ignores stray punctuation; defaults to "h2h,1x2")
 function parseAllowedMarkets(envVal) {
-  const raw = String(envVal ?? DEFAULT_MARKET_KEY);
+  const raw = String(envVal ?? `${DEFAULT_MARKET_KEY},1x2`);
   const list = raw
     .split(",")
     .map(normalizeMarketKey)
     .filter(Boolean);
-  const fallback = normalizeMarketKey(DEFAULT_MARKET_KEY) || DEFAULT_MARKET_KEY;
-  return new Set(list.length ? list : [fallback]);
+  const fallback = ALWAYS_ALLOWED_MARKETS.map((key) => normalizeMarketKey(key) || key);
+  return new Set(list.length ? list : fallback);
 }
 const allowSet = parseAllowedMarkets(process.env.HISTORY_ALLOWED_MARKETS);
+allowSet.add(normalizeMarketKey("h2h") || "h2h");
+const effectiveAllowSet = new Set(allowSet);
+for (const alias of ALWAYS_ALLOWED_MARKETS) {
+  effectiveAllowSet.add(alias.toLowerCase());
+  const normalized = normalizeMarketKey(alias);
+  if (normalized) effectiveAllowSet.add(normalized);
+}
 
 const dedupKey = (e, normalizedMarketKey) => {
   const rawMarket = e?.market_key ?? e?.market ?? e?.market_label;
@@ -90,14 +98,34 @@ const dedupKey = (e, normalizedMarketKey) => {
   return `${e?.fixture_id || e?.id || "?"}__${m}__${pick}`;
 };
 
+function withHistoryMarketDisplay(entry, canonicalKey) {
+  if (!entry || typeof entry !== "object") return entry;
+  if (canonicalKey !== "1x2") return entry;
+  const displayLabel = "1X2";
+  const clone = { ...entry };
+  clone.market = "1x2";
+  clone.market_label = displayLabel;
+  if ("market_display" in clone) clone.market_display = displayLabel;
+  if ("marketDisplay" in clone) clone.marketDisplay = displayLabel;
+  if ("marketName" in clone) clone.marketName = displayLabel;
+  if ("marketKey" in clone) clone.marketKey = "1x2";
+  if ("market_slug" in clone) clone.market_slug = "1x2";
+  if ("marketSlug" in clone) clone.marketSlug = "1x2";
+  return clone;
+}
+
 function filterAllowed(arr) {
   const by = new Map();
   for (const e of (arr || [])) {
+    if (!e) continue;
     const rawMarket = e?.market_key ?? e?.market ?? e?.market_label;
     const mkey = normalizeMarketKey(rawMarket);
-    if (!mkey || !allowSet.has(mkey)) continue;
-    const k = dedupKey(e, mkey);
-    if (!by.has(k)) by.set(k, e);
+    if (!mkey) continue;
+    const canonical = mkey === "h2h" ? "1x2" : mkey;
+    if (!effectiveAllowSet.has(mkey) && !effectiveAllowSet.has(canonical)) continue;
+    const prepared = canonical === "1x2" ? withHistoryMarketDisplay(e, canonical) : e;
+    const k = dedupKey(prepared, canonical);
+    if (!by.has(k)) by.set(k, prepared);
   }
   return Array.from(by.values());
 }
