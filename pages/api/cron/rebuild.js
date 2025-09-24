@@ -995,7 +995,7 @@ async function processFixture(fixture, ctx) {
   return { updated: true, fixture: updatedFixture };
 }
 
-async function enrichFixturesForDay({ items, ymd, slot, trace, persistKeys }) {
+async function enrichFixturesForDay({ items, ymd, slot, trace, persistKeys, persistCombined }) {
   const caches = {
     stats: new Map(),
     recent: new Map(),
@@ -1039,9 +1039,12 @@ async function enrichFixturesForDay({ items, ymd, slot, trace, persistKeys }) {
       }
     }
     if (batchChanged && targets.length) {
-      const payload = { items };
+      const payload = { items: JSON.parse(JSON.stringify(items)) };
       for (const key of targets) {
         await kvSET(key, payload, trace);
+      }
+      if (typeof persistCombined === "function") {
+        await persistCombined(payload);
       }
       batchesSaved += 1;
     }
@@ -1069,9 +1072,20 @@ export default async function handler(req, res){
     const fullKey  = `vbl_full:${ymd}:${slot}`;
     const combinedKey = `vb:day:${ymd}:combined`;
     let combinedSynced = false;
-    const persistCombined = async (payload) => {
+    const persistCombined = async (payloadSource) => {
+      const payloadItems = Array.isArray(payloadSource?.items)
+        ? payloadSource.items
+        : Array.isArray(payloadSource)
+        ? payloadSource
+        : [];
+      const count = Array.isArray(payloadItems) ? payloadItems.length : 0;
+      if (count <= 0) return;
+      const payload =
+        payloadSource && typeof payloadSource === "object" && payloadSource.items
+          ? JSON.parse(JSON.stringify(payloadSource))
+          : { items: JSON.parse(JSON.stringify(payloadItems)) };
       await kvSET(combinedKey, payload, trace);
-      trace.push({ note: `set ${combinedKey}` });
+      trace.push({ alias_combined: { from: "union", count } });
       combinedSynced = true;
     };
     let base = await kvGET(unionKey, trace);
@@ -1143,11 +1157,12 @@ export default async function handler(req, res){
         if (cur < capPerLeague){ slim.push(it); perLeagueCounter.set(key, cur+1); }
       }
 
-      await kvSET(fullKey,  { items: slim   }, trace);
-      await kvSET(unionKey, { items: slim   }, trace);
-      await kvSET(`vb:day:${ymd}:last`,  { items: slim }, trace);
-      await kvSET(`vb:day:${ymd}:union`, { items: slim }, trace);
-      await persistCombined({ items: slim });
+      const slimPayload = { items: JSON.parse(JSON.stringify(slim)) };
+      await kvSET(fullKey, slimPayload, trace);
+      await kvSET(unionKey, slimPayload, trace);
+      await kvSET(`vb:day:${ymd}:last`, slimPayload, trace);
+      await kvSET(`vb:day:${ymd}:union`, slimPayload, trace);
+      await persistCombined(slimPayload);
 
       items = slim;
     }
@@ -1158,16 +1173,15 @@ export default async function handler(req, res){
         unionKey,
         `vb:day:${ymd}:last`,
         `vb:day:${ymd}:union`,
-        combinedKey,
       ])
     ).filter(Boolean);
 
     if (items.length) {
-      const enrich = await enrichFixturesForDay({ items, ymd, slot, trace, persistKeys });
+      const enrich = await enrichFixturesForDay({ items, ymd, slot, trace, persistKeys, persistCombined });
       if (enrich.stopReason === "budget") budgetStop = true;
       const sourceOverride = enrich.stopReason === "budget" ? "budget" : undefined;
       if (!combinedSynced) {
-        await persistCombined({ items });
+        await persistCombined({ items: JSON.parse(JSON.stringify(items)) });
       }
       return respond({
         items,
@@ -1179,7 +1193,7 @@ export default async function handler(req, res){
     }
 
     if (!combinedSynced) {
-      await persistCombined({ items });
+      await persistCombined({ items: JSON.parse(JSON.stringify(items)) });
     }
 
     return respond();

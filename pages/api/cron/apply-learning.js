@@ -459,19 +459,27 @@ export default async function handler(req, res) {
     const reports = [];
 
     for (const theDay of ymds) {
-      // 1) pokušaj combined
-      const sourceKey = `vb:day:${theDay}:combined`;
-      const fetchCombined = async () => parseCombinedPayload(await kvGetJSON(sourceKey));
+      const sourceOptions = [
+        { label: "combined", key: `vb:day:${theDay}:combined` },
+        { label: "union", key: `vb:day:${theDay}:union` },
+        { label: "last", key: `vb:day:${theDay}:last` },
+      ];
+      const tried = sourceOptions.map((opt) => opt.label);
+      const hasNormalized = (payload) => Array.isArray(payload?.normalized) && payload.normalized.length > 0;
+      const loadPayload = async (key) => parseCombinedPayload(await kvGetJSON(key));
 
-      let combinedParsed = await fetchCombined();
-      if (!Array.isArray(combinedParsed.normalized) || !combinedParsed.normalized.length) {
+      const combinedOption = sourceOptions[0];
+      const fetchCombined = async () => loadPayload(combinedOption.key);
+
+      let parsed = await fetchCombined();
+      if (!hasNormalized(parsed)) {
         // 1a) probaj rebuild (on po potrebi zove score-sync)
         await fetch(`${base}/api/cron/rebuild?ymd=${encodeURIComponent(theDay)}`, { cache: "no-store" })
           .then(r => r.text())
           .catch(() => {});
-        combinedParsed = await fetchCombined();
+        parsed = await fetchCombined();
       }
-      if (!Array.isArray(combinedParsed.normalized) || !combinedParsed.normalized.length) {
+      if (!hasNormalized(parsed)) {
         // 1b) kao poslednji fallback, pokušaj score-sync → rebuild
         await fetch(`${base}/api/score-sync?ymd=${encodeURIComponent(theDay)}`, { cache: "no-store" })
           .then(r => r.text())
@@ -479,13 +487,31 @@ export default async function handler(req, res) {
         await fetch(`${base}/api/cron/rebuild?ymd=${encodeURIComponent(theDay)}`, { cache: "no-store" })
           .then(r => r.text())
           .catch(() => {});
-        combinedParsed = await fetchCombined();
+        parsed = await fetchCombined();
       }
 
-      const normalizedCombined = Array.isArray(combinedParsed.normalized) ? combinedParsed.normalized : [];
+      let chosenOption = combinedOption;
+      if (!hasNormalized(parsed)) {
+        for (const fallback of sourceOptions.slice(1)) {
+          const fallbackParsed = await loadPayload(fallback.key);
+          if (hasNormalized(fallbackParsed)) {
+            chosenOption = fallback;
+            parsed = fallbackParsed;
+            break;
+          }
+          if (!hasNormalized(parsed)) {
+            chosenOption = fallback;
+            parsed = fallbackParsed;
+          }
+        }
+      }
+
+      const sourceKey = chosenOption.key;
+      const sourceLabel = chosenOption.label;
+      const normalizedCombined = Array.isArray(parsed.normalized) ? parsed.normalized : [];
       const items = dedupeBySignature(normalizedCombined);
-      const inputShape = combinedParsed.shape === "model" ? "model" : "value_bets";
-      const inputCountRaw = Number(combinedParsed.inputCount ?? 0);
+      const inputShape = parsed.shape === "model" ? "model" : "value_bets";
+      const inputCountRaw = Number(parsed.inputCount ?? 0);
       const inputCount = Number.isFinite(inputCountRaw) ? inputCountRaw : 0;
       const normalizedCount = items.length;
 
@@ -527,7 +553,7 @@ export default async function handler(req, res) {
         else if (outcome === "VOID" || outcome === "PUSH") { settled += 1; voided += 1; }
         else { pending += 1; }
 
-        settledItems.push({ ...it, outcome, finals: finals || null, _day: theDay, _source: "combined" });
+        settledItems.push({ ...it, outcome, finals: finals || null, _day: theDay, _source: sourceLabel });
       }
 
       const roi = staked > 0 ? (returned - staked) / staked : 0;
@@ -541,8 +567,9 @@ export default async function handler(req, res) {
           builtAt: new Date().toISOString(),
           finals_by_id: Object.keys(byId).length,
           matchedById, matchedByName,
-          source: "combined",
+          source: sourceLabel,
           source_key: sourceKey,
+          tried,
           input_shape: inputShape,
           input_count: inputCount,
           normalized_count: normalizedCount,
