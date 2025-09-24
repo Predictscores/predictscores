@@ -62,6 +62,7 @@ const {
   afxCacheGet,
   afxCacheSet,
 } = require("../../../lib/sources/apiFootball");
+const { saveCombinedAlias } = require("../../../lib/kv-helpers");
 
 /* ---------- utils ---------- */
 function canonicalSlot(x){ x=String(x||"auto").toLowerCase(); return x==="late"||x==="am"||x==="pm"?x:"auto"; }
@@ -1070,7 +1071,6 @@ export default async function handler(req, res){
     // 1) try existing KV
     const unionKey = `vb:day:${ymd}:${slot}`;
     const fullKey  = `vbl_full:${ymd}:${slot}`;
-    const combinedKey = `vb:day:${ymd}:combined`;
     let combinedSynced = false;
     const persistCombined = async (payloadSource) => {
       const payloadItems = Array.isArray(payloadSource?.items)
@@ -1078,15 +1078,19 @@ export default async function handler(req, res){
         : Array.isArray(payloadSource)
         ? payloadSource
         : [];
-      const count = Array.isArray(payloadItems) ? payloadItems.length : 0;
-      if (count <= 0) return;
       const payload =
         payloadSource && typeof payloadSource === "object" && payloadSource.items
           ? JSON.parse(JSON.stringify(payloadSource))
           : { items: JSON.parse(JSON.stringify(payloadItems)) };
-      await kvSET(combinedKey, payload, trace);
-      trace.push({ alias_combined: { from: "union", count } });
-      combinedSynced = true;
+      const { count } = await saveCombinedAlias({
+        ymd,
+        payload,
+        from: "union",
+        trace,
+      });
+      if (count > 0) {
+        combinedSynced = true;
+      }
     };
     let base = await kvGET(unionKey, trace);
     let full  = await kvGET(fullKey,  trace);
