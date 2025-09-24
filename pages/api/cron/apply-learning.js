@@ -155,6 +155,45 @@ function normalizeModelSelection(value) {
   return raw;
 }
 
+function extractModelContainer(entry) {
+  if (entry && typeof entry === "object" && entry.model && typeof entry.model === "object") {
+    return entry.model;
+  }
+  return entry;
+}
+
+function extractModelRawSelection(entry, model = extractModelContainer(entry)) {
+  if (!entry || typeof entry !== "object") return null;
+  const candidates = [
+    model?.predicted,
+    entry?.predicted,
+    model?.prediction,
+    entry?.prediction,
+    model?.pick,
+    entry?.pick,
+    model?.selection,
+    entry?.selection,
+    model?.side,
+    entry?.side,
+    model?.model_pick,
+    entry?.model_pick,
+    model?.modelPick,
+    entry?.modelPick,
+    model?.model_pred,
+    entry?.model_pred,
+    model?.modelPred,
+    entry?.modelPred,
+    model?.model_prediction,
+    entry?.model_prediction,
+    model?.modelPrediction,
+    entry?.modelPrediction,
+  ];
+  for (const candidate of candidates) {
+    if (candidate != null) return candidate;
+  }
+  return null;
+}
+
 function coerceFixtureId(...values) {
   for (const value of values) {
     if (value == null) continue;
@@ -183,7 +222,7 @@ function coerceFixtureId(...values) {
 
 function normalizeModelEntry(entry) {
   if (!entry || typeof entry !== "object") return null;
-  const model = typeof entry.model === "object" && entry.model ? entry.model : entry;
+  const model = extractModelContainer(entry);
   const fixtureId = coerceFixtureId(
     entry.fixture_id,
     entry.fixtureId,
@@ -198,16 +237,7 @@ function normalizeModelEntry(entry) {
   );
   if (fixtureId == null) return null;
 
-  const rawSelection =
-    model.predicted ??
-    entry.predicted ??
-    model.pick ??
-    entry.pick ??
-    model.selection ??
-    entry.selection ??
-    model.side ??
-    entry.side ??
-    null;
+  const rawSelection = extractModelRawSelection(entry, model);
   const normalizedSelection = normalizeModelSelection(rawSelection);
   if (!normalizedSelection || !["home", "away", "draw"].includes(normalizedSelection)) return null;
 
@@ -278,7 +308,7 @@ function looksLikeValueBetItem(it) {
 
 function looksLikeModelCandidate(it) {
   if (!it || typeof it !== "object") return false;
-  const model = typeof it.model === "object" && it.model ? it.model : it;
+  const model = extractModelContainer(it);
   const fixture = coerceFixtureId(
     it.fixture_id,
     it.fixtureId,
@@ -292,17 +322,7 @@ function looksLikeModelCandidate(it) {
     model.id
   );
   if (fixture == null) return false;
-  const selection = normalizeModelSelection(
-    model.predicted ??
-      it.predicted ??
-      model.pick ??
-      it.pick ??
-      model.selection ??
-      it.selection ??
-      model.side ??
-      it.side ??
-      null
-  );
+  const selection = normalizeModelSelection(extractModelRawSelection(it, model));
   return String(selection || "").trim() !== "";
 }
 
