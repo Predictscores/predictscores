@@ -34,6 +34,13 @@ describe("apply-learning history writer", () => {
     delete process.env.UPSTASH_REDIS_REST_TOKEN;
     fetchMock = jest.fn(async (url, options = {}) => {
       if (url === `https://kv.example/get/${encodeURIComponent(`vb:day:${ymd}:union`)}`) {
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+        };
+      }
+      if (url === `https://kv.example/get/${encodeURIComponent(`vb:day:${ymd}:combined`)}`) {
         const payload = {
           items: [
             {
@@ -102,6 +109,7 @@ describe("apply-learning history writer", () => {
     const req = {
       url: `/api/cron/apply-learning?ymd=${encodeURIComponent(ymd)}&debug=1`,
       headers: { host: "example.test", "x-forwarded-proto": "https" },
+      query: { ymd },
     };
     const res = createMockRes();
 
