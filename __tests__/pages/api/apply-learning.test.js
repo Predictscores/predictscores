@@ -23,11 +23,11 @@ function createMockRes() {
 describe("apply-learning history writer", () => {
   const ymd = "2024-07-01";
   let fetchMock;
-  let pipelineCalls;
+  let setCalls;
 
   beforeEach(() => {
     jest.resetModules();
-    pipelineCalls = [];
+    setCalls = [];
     process.env.KV_REST_API_URL = "https://kv.example";
     process.env.KV_REST_API_TOKEN = "test-token";
     delete process.env.UPSTASH_REDIS_REST_URL;
@@ -77,12 +77,15 @@ describe("apply-learning history writer", () => {
           json: async () => ({ result: JSON.stringify(payload) }),
         };
       }
-      if (url === "https://kv.example/pipeline") {
-        const body = options?.body ? JSON.parse(options.body) : [];
-        pipelineCalls.push(body);
+      const setMatch = url.match(/^https:\/\/kv\.example\/set\/(.+)$/);
+      if (setMatch) {
+        const key = decodeURIComponent(setMatch[1]);
+        const bodyJson = options?.body ? JSON.parse(options.body) : {};
+        setCalls.push({ key, body: bodyJson });
         return {
           ok: true,
-          json: async () => body.map(() => ({ result: "OK" })),
+          status: 200,
+          json: async () => ({ result: "OK" }),
         };
       }
       return {
@@ -118,20 +121,20 @@ describe("apply-learning history writer", () => {
     expect(res.statusCode).toBe(200);
     expect(res.jsonPayload.ok).toBe(true);
     expect(res.jsonPayload.count).toBeGreaterThan(0);
-    const histArrayCall = pipelineCalls.find((cmds) => Array.isArray(cmds) && cmds[0]?.[1] === `hist:${ymd}`);
+    const histArrayCall = setCalls.find((call) => call.key === `hist:${ymd}`);
     expect(histArrayCall).toBeDefined();
-    const histArrayPayload = histArrayCall[0][2];
+    const histArrayPayload = histArrayCall.body?.value;
     const parsedHist = JSON.parse(histArrayPayload);
     expect(Array.isArray(parsedHist)).toBe(true);
     expect(parsedHist.length).toBeGreaterThan(0);
     expect(parsedHist[0].league.name).toBe("Sample League");
     expect(parsedHist[0].teams.home.name).toBe("Alpha");
 
-    const histDayCall = pipelineCalls.find((cmds) => Array.isArray(cmds) && cmds[0]?.[1] === `hist:day:${ymd}`);
+    const histDayCall = setCalls.find((call) => call.key === `hist:day:${ymd}`);
     expect(histDayCall).toBeDefined();
     expect(fetchMock).toHaveBeenCalled();
     expect(res.jsonPayload.trace).toEqual(expect.arrayContaining([
-      expect.objectContaining({ kv: "set", key: `hist:day:${ymd}` }),
+      expect.objectContaining({ kv: "set", key: `hist:day:${ymd}`, ok: true }),
     ]));
   });
 });
