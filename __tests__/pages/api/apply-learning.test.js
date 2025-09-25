@@ -85,6 +85,19 @@ describe("apply-learning history writer", () => {
                 away: { id: 3002, name: "Delta" },
               },
             },
+            {
+              fixture_id: 404,
+              market: "1x2",
+              selection: "Home",
+              home_name: "Omega FC",
+              away_name: "Sigma FC",
+              model: {
+                fixture: 404,
+                predicted: "home",
+                home_team: "Omega FC",
+                away_team: "Sigma FC",
+              },
+            },
           ],
         };
         return {
@@ -142,7 +155,7 @@ describe("apply-learning history writer", () => {
     const histArrayPayload = histArrayCall.body?.value;
     const parsedHist = JSON.parse(histArrayPayload);
     expect(Array.isArray(parsedHist)).toBe(true);
-    expect(parsedHist.length).toBe(2);
+    expect(parsedHist.length).toBe(3);
     expect(parsedHist[0].league.name).toBe("Sample League");
     expect(parsedHist[0].teams.home.name).toBe("Alpha");
     const relaxedEntry = parsedHist.find((entry) => entry.fixture_id === 303);
@@ -150,12 +163,27 @@ describe("apply-learning history writer", () => {
     expect(relaxedEntry.teams.home.name).toBe("Gamma");
     expect(relaxedEntry.teams.away.name).toBe("Delta");
     expect(relaxedEntry.market_key.toLowerCase()).toBe("h2h");
+    const fallbackEntry = parsedHist.find((entry) => entry.fixture_id === 404);
+    expect(fallbackEntry).toBeDefined();
+    expect(fallbackEntry.teams.home.name).toBe("Omega FC");
+    expect(fallbackEntry.teams.home.id).toBeNull();
+    expect(fallbackEntry.teams.away.name).toBe("Sigma FC");
+    expect(fallbackEntry.teams.away.id).toBeNull();
+    expect(fallbackEntry.market_key.toLowerCase()).toBe("h2h");
 
     expect(res.jsonPayload.trace).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ filter: "history_requirements", kept: 2 }),
+        expect.objectContaining({ filter: "history_requirements", kept: 3 }),
       ])
     );
+    expect(res.jsonPayload.trace).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ normalize: "teams", filled: expect.objectContaining({ home: expect.any(Number), away: expect.any(Number) }) }),
+      ])
+    );
+    const historyTrace = res.jsonPayload.trace.find((row) => row.filter === "history_requirements");
+    expect(historyTrace).toBeDefined();
+    expect(historyTrace.reasons.noTeams).toBe(0);
 
     const histDayCall = setCalls.find((call) => call.key === `hist:day:${ymd}`);
     expect(histDayCall).toBeDefined();
