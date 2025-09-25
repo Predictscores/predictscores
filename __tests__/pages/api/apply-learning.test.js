@@ -133,8 +133,10 @@ describe("apply-learning history writer", () => {
     const histDayCall = setCalls.find((call) => call.key === `hist:day:${ymd}`);
     expect(histDayCall).toBeDefined();
     expect(fetchMock).toHaveBeenCalled();
-    expect(res.jsonPayload.trace).toEqual(expect.arrayContaining([
-      expect.objectContaining({ kv: "set", key: `hist:day:${ymd}`, ok: true }),
-    ]));
+    expect(res.jsonPayload.trace).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kv: "set", key: `hist:day:${ymd}`, size: expect.any(Number) }),
+      ])
+    );
   });
 });
