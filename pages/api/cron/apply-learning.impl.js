@@ -715,7 +715,7 @@ function isLikelyH2H(entry) {
   }
   return false;
 }
-function finalizeH2HEntry(entry, fixtureId) {
+function finalizeH2HEntry(entry, fixtureId, fillCounts) {
   const clone = { ...entry };
   const effectiveFixture = fixtureId ?? clone.fixture_id ?? clone.id ?? clone.fixtureId;
   if (effectiveFixture != null) {
@@ -745,16 +745,17 @@ function finalizeH2HEntry(entry, fixtureId) {
   clone.market = "1X2";
   clone.market_label = "1X2";
   clone.market_key = "1x2";
+  populateNormalizedTeams(clone, fillCounts);
   return clone;
 }
-function filterH2HOnly(items = []) {
+function filterH2HOnly(items = [], fillCounts) {
   const out = [];
   for (const item of items || []) {
     if (!item || typeof item !== "object") continue;
     const fixtureId = coerceFixtureId(item.fixture_id, item.fixtureId, item.fixture, item.id, item?.fixture?.id);
     if (fixtureId == null) continue;
     if (!isLikelyH2H(item)) continue;
-    out.push(finalizeH2HEntry(item, fixtureId));
+    out.push(finalizeH2HEntry(item, fixtureId, fillCounts));
   }
   return out;
 }
@@ -956,6 +957,88 @@ function extractLeagueMeta(entry) {
   return { id: leagueId, name: leagueName };
 }
 
+function normalizeTeamCandidate(raw) {
+  if (raw == null) return null;
+  if (typeof raw === "object") {
+    const id = firstValidId([raw.id, raw.team_id, raw.teamId]);
+    const name = firstValidName([raw.name, raw.team_name, raw]);
+    if (!name) return null;
+    return { id: id ?? null, name };
+  }
+  const name = firstValidName([raw]);
+  if (!name) return null;
+  return { id: null, name };
+}
+
+function deriveTeamFromSources(entry, side) {
+  const root = side === "home" ? "home" : "away";
+  const sources = [
+    () => entry?.teams?.[root],
+    () => entry?.fixture?.teams?.[root],
+    () => {
+      const name = firstValidName([entry?.[`${root}_name`], entry?.[root]]);
+      if (!name) return null;
+      return { id: null, name };
+    },
+    () => entry?.fixture?.[root],
+    () => {
+      const name = firstValidName([entry?.model?.[`${root}_team`]]);
+      if (!name) return null;
+      return { id: null, name };
+    },
+  ];
+  for (const getter of sources) {
+    try {
+      const candidate = normalizeTeamCandidate(typeof getter === "function" ? getter() : getter);
+      if (candidate && candidate.name) {
+        return { id: candidate.id ?? null, name: candidate.name };
+      }
+    } catch (err) {
+      // ignore malformed sources
+    }
+  }
+  return null;
+}
+
+function applyTeamCandidate(existing, candidate) {
+  const base = existing && typeof existing === "object" ? { ...existing } : {};
+  if (!candidate || !candidate.name) return base;
+  if (base.id == null) base.id = candidate.id ?? null;
+  if (base.team_id == null) base.team_id = candidate.id ?? null;
+  if (base.teamId == null) base.teamId = candidate.id ?? null;
+  if (!coerceName(base.name)) base.name = candidate.name;
+  if (!coerceName(base.team_name)) base.team_name = candidate.name;
+  if (!coerceName(base.full)) base.full = candidate.name;
+  return base;
+}
+
+function populateNormalizedTeams(target, fillCounts) {
+  if (!target || typeof target !== "object") return;
+  const homeCandidate = deriveTeamFromSources(target, "home");
+  const awayCandidate = deriveTeamFromSources(target, "away");
+  if (!homeCandidate && !awayCandidate) return;
+
+  const teams = target.teams && typeof target.teams === "object" ? { ...target.teams } : {};
+  if (homeCandidate) {
+    teams.home = applyTeamCandidate(teams.home, homeCandidate);
+    if (fillCounts && typeof fillCounts.home === "number") fillCounts.home += 1;
+  }
+  if (awayCandidate) {
+    teams.away = applyTeamCandidate(teams.away, awayCandidate);
+    if (fillCounts && typeof fillCounts.away === "number") fillCounts.away += 1;
+  }
+  target.teams = teams;
+
+  if (target.fixture && typeof target.fixture === "object") {
+    const fixtureClone = { ...target.fixture };
+    const fixtureTeams = fixtureClone.teams && typeof fixtureClone.teams === "object" ? { ...fixtureClone.teams } : {};
+    if (homeCandidate) fixtureTeams.home = applyTeamCandidate(fixtureTeams.home, homeCandidate);
+    if (awayCandidate) fixtureTeams.away = applyTeamCandidate(fixtureTeams.away, awayCandidate);
+    fixtureClone.teams = fixtureTeams;
+    target.fixture = fixtureClone;
+  }
+}
+
 function extractTeamMeta(entry, side) {
   const root = side === "home" ? "home" : "away";
   const upper = root.charAt(0).toUpperCase() + root.slice(1);
@@ -965,6 +1048,9 @@ function extractTeamMeta(entry, side) {
     entry?.teams?.[root]?.teamId,
     entry?.fixture?.teams?.[root]?.id,
     entry?.fixture?.teams?.[root]?.team_id,
+    entry?.fixture?.[root]?.id,
+    entry?.fixture?.[root]?.team_id,
+    entry?.fixture?.[root]?.teamId,
     entry?.fixture?.[`team_${root}_id`],
     entry?.fixture?.[`team${upper}Id`],
     entry?.[`team_${root}_id`],
@@ -982,6 +1068,8 @@ function extractTeamMeta(entry, side) {
     entry?.teams?.[`${root}Name`],
     entry?.fixture?.teams?.[root]?.name,
     entry?.fixture?.teams?.[root],
+    entry?.fixture?.[root]?.name,
+    entry?.fixture?.[root],
     entry?.fixture?.[`team_${root}_name`],
     entry?.fixture?.[`team${upper}Name`],
     entry?.[`team_${root}_name`],
@@ -996,8 +1084,8 @@ function extractTeamMeta(entry, side) {
     entry?.[`${root}_name`],
     entry?.[`team_${root}`],
   ]);
-  if (id == null || !name) return null;
-  return { id, name };
+  if (!name) return null;
+  return { id: id ?? null, name };
 }
 
 function mergeTeam(existing, required) {
@@ -1283,7 +1371,11 @@ export async function runApplyLearning(req, res) {
     const { items } = await loadSnapshotsForDay(ymd, context);
 
     currentPhase = "normalize";
-    const filtered = filterH2HOnly(items);
+    const teamFillCounts = { home: 0, away: 0 };
+    const filtered = filterH2HOnly(items, teamFillCounts);
+    if (trace && typeof trace.push === "function") {
+      trace.push({ normalize: "teams", filled: { home: teamFillCounts.home, away: teamFillCounts.away } });
+    }
     const deduped = dedupeByFixtureStrongest(filtered);
     historyItems = enforceHistoryRequirements(deduped, trace);
 
