@@ -96,22 +96,20 @@ const dedupKey = (e, normalizedMarketKey) => {
   return `${e?.fixture_id || e?.id || "?"}__${m}__${pick}`;
 };
 
-// helper: robustly parse KV payload into an array of items
 function parseHistPayload(raw) {
-  let val = raw;
-  if (typeof val === "string") {
+  let v = raw;
+  if (typeof v === "string") {
     try {
-      val = JSON.parse(val);
+      v = JSON.parse(v);
     } catch {
-      /* leave as string */
+      /* keep as string */
     }
   }
-  if (Array.isArray(val)) return val;
-
-  if (val && typeof val === "object") {
-    if (Array.isArray(val.items)) return val.items;
-    if (Array.isArray(val.history)) return val.history;
-    if (val.data && Array.isArray(val.data.items)) return val.data.items;
+  if (Array.isArray(v)) return v;
+  if (v && typeof v === "object") {
+    if (Array.isArray(v.items)) return v.items;
+    if (Array.isArray(v.history)) return v.history;
+    if (v.data && Array.isArray(v.data.items)) return v.data.items;
   }
   return [];
 }
@@ -216,70 +214,70 @@ function filterAllowed(arr) {
 async function loadHistoryForDay(ymd, trace, wantDebug = false) {
   const histDayKey = `hist:day:${ymd}`;
   const { raw: rawHistDay } = await kvGETraw(histDayKey, trace, `hist:${ymd}`);
+
+  let sourceUsed = "hist_day";
+  let arr = parseHistPayload(rawHistDay);
+  const beforeHistDay = Array.isArray(arr) ? arr.length : 0;
+
+  let histRespRaw = null;
+  if (beforeHistDay === 0) {
+    const { raw } = await kvGETraw(`hist:${ymd}`, trace);
+    histRespRaw = raw;
+    const fromHist = parseHistPayload(raw);
+    if (fromHist.length > 0) {
+      arr = fromHist;
+      sourceUsed = "hist";
+    }
+  }
+
+  let combRespRaw = null;
+  if ((Array.isArray(arr) ? arr.length : 0) === 0) {
+    const { raw } = await kvGETraw(`vb:day:${ymd}:combined`, trace);
+    combRespRaw = raw;
+    const fromCombined = parseHistPayload(raw);
+    if (fromCombined.length > 0) {
+      arr = fromCombined;
+      sourceUsed = "combined";
+    }
+  }
+
+  const before = Array.isArray(arr) ? arr.length : 0;
+
   const histDayValue = toJson(rawHistDay);
-
-  let items = [];
-  let usedSource = null;
-
-  if (rawHistDay !== null) {
-    const parsed = parseHistPayload(histDayValue?.value ?? rawHistDay);
-    if (parsed.length > 0) {
-      items = parsed;
-      usedSource = "hist_day";
-    }
-  }
-
-  const needHistFallback = items.length === 0;
-  const histResp = needHistFallback ? await kvGETraw(`hist:${ymd}`, trace) : { raw: null };
-  const rawHist = histResp.raw;
-  const histValue = toJson(rawHist);
+  const histDayItems = arrFromAny(histDayValue);
+  const histValue = toJson(histRespRaw);
   const histItems = arrFromAny(histValue);
-
-  if (needHistFallback && rawHist !== null) {
-    const parsedHist = parseHistPayload(histValue?.value ?? rawHist);
-    if (parsedHist.length > 0) {
-      items = parsedHist;
-      usedSource = "hist";
-    }
-  }
-
-  const combKey = `vb:day:${ymd}:combined`;
-  const { raw: rawComb } = await kvGETraw(combKey, trace);
-  const combValue = toJson(rawComb);
+  const combValue = toJson(combRespRaw);
   const combItems = arrFromAny(combValue);
-
-  if (!items.length) {
-    items = combItems.array;
-    if (items.length) usedSource = "combined";
-  }
-
-  if (!usedSource) {
-    if (rawHistDay !== null) usedSource = "hist_day";
-    else if (rawHist !== null) usedSource = "hist";
-    else if (rawComb !== null) usedSource = "combined";
-  }
 
   let meta = null;
   if (wantDebug) {
-    const histDayItems = arrFromAny(histDayValue);
-    const histDayJsonMeta = { ...histDayValue.meta };
-    const histDayArrayMeta = { ...histDayItems.meta };
-    const histJsonMeta = { ...histValue.meta };
-    const histArrayMeta = { ...histItems.meta };
-    const combJsonMeta = { ...combValue.meta };
-    const combArrayMeta = { ...combItems.meta };
     meta = {
-      hist_day: { json: histDayJsonMeta, array: histDayArrayMeta },
-      hist: { json: histJsonMeta, array: histArrayMeta },
-      combined: { json: combJsonMeta, array: combArrayMeta },
+      hist_day: {
+        json: { ...histDayValue.meta },
+        array: { ...histDayItems.meta },
+      },
+      hist: {
+        json: { ...histValue.meta },
+        array: { ...histItems.meta },
+      },
+      combined: {
+        json: { ...combValue.meta },
+        array: { ...combItems.meta },
+      },
     };
   }
 
   return {
-    items,
-    sources: { hist_day: !!rawHistDay, hist: !!rawHist, combined: !!rawComb },
-    usedSource,
+    items: Array.isArray(arr) ? arr : [],
+    sources: {
+      hist_day: rawHistDay !== null,
+      hist: histRespRaw !== null,
+      combined: combRespRaw !== null,
+    },
+    usedSource: sourceUsed,
     meta,
+    before,
   };
 }
 
@@ -360,6 +358,19 @@ export default async function handler(req, res) {
     trace.push({ history_filter: historyFilterInfo });
 
     const singleYmd = ymd || (queriedDays.length ? queriedDays[0] : null);
+    const debugInfo = {
+      trace,
+      allowed: Array.from(allowSet),
+      day_sources: daySources,
+      day_meta: wantDebug ? dayMeta : null,
+    };
+    if (wantDebug) {
+      debugInfo.history_filter = {
+        ...(debugInfo.history_filter || {}),
+        ...historyFilterInfo,
+      };
+    }
+
     return res.status(200).json({
       ok: true,
       ymd: singleYmd,
@@ -368,13 +379,7 @@ export default async function handler(req, res) {
       source: daySources,
       roi,
       history: items,
-      debug: {
-        trace,
-        allowed: Array.from(allowSet),
-        day_sources: daySources,
-        day_meta: wantDebug ? dayMeta : null,
-        history_filter: wantDebug ? historyFilterInfo : undefined,
-      },
+      debug: debugInfo,
     });
   } catch (e) {
     return res.status(200).json({ ok: false, error: String(e?.message || e) });
