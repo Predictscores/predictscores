@@ -1014,6 +1014,7 @@ function mergeTeam(existing, required) {
 function enforceHistoryRequirements(items = [], trace) {
   const sanitized = [];
   let dropped = 0;
+  const allowedMarkets = new Set(["1x2", "h2h"]);
   for (const original of items || []) {
     if (!original || typeof original !== "object") {
       dropped += 1;
@@ -1028,19 +1029,26 @@ function enforceHistoryRequirements(items = [], trace) {
       original.match_id,
       original.matchId
     );
-    const normalized = finalizeH2HEntry(original, fixtureId);
-    const marketLabel = String(
-      normalized.market || normalized.market_label || normalized.market_key || ""
-    ).trim();
-    const selectionLabel = String(
-      normalized.selection || normalized.selection_label || normalized.pick || ""
-    ).trim();
-    if (!marketLabel || !selectionLabel) {
+    if (fixtureId == null) {
       dropped += 1;
       continue;
     }
-    const league = extractLeagueMeta(normalized);
-    if (!league) {
+    const normalized = finalizeH2HEntry(original, fixtureId);
+    const marketCandidates = [
+      normalized.market_key,
+      normalized.market,
+      normalized.market_label,
+      original.market_key,
+      original.market,
+      original.market_label,
+    ];
+    const marketKey = marketCandidates
+      .map((value) => String(value ?? "").trim().toLowerCase())
+      .find((value) => value && allowedMarkets.has(value));
+    const selectionLabel = String(
+      normalized.selection || normalized.selection_label || normalized.pick || ""
+    ).trim();
+    if (!marketKey || !selectionLabel) {
       dropped += 1;
       continue;
     }
@@ -1051,30 +1059,33 @@ function enforceHistoryRequirements(items = [], trace) {
       continue;
     }
     const prepared = { ...normalized };
-    prepared.league_id = prepared.league_id ?? league.id;
-    prepared.leagueId = prepared.leagueId ?? league.id;
-    prepared.league = {
-      ...(prepared.league && typeof prepared.league === "object" ? prepared.league : {}),
-      id: league.id,
-      name: league.name,
-    };
-    if (!prepared.league_name) prepared.league_name = league.name;
-    if (!prepared.league?.name) prepared.league.name = league.name;
+    const league = extractLeagueMeta(normalized);
+    if (league) {
+      prepared.league_id = prepared.league_id ?? league.id;
+      prepared.leagueId = prepared.leagueId ?? league.id;
+      prepared.league = {
+        ...(prepared.league && typeof prepared.league === "object" ? prepared.league : {}),
+        id: league.id,
+        name: league.name,
+      };
+      if (!prepared.league_name) prepared.league_name = league.name;
+      if (!prepared.league?.name) prepared.league.name = league.name;
+    }
     const teams = prepared.teams && typeof prepared.teams === "object" ? { ...prepared.teams } : {};
     teams.home = mergeTeam(teams.home, homeTeam);
     teams.away = mergeTeam(teams.away, awayTeam);
     prepared.teams = teams;
-    if (prepared.fixture && typeof prepared.fixture === "object") {
-      const fixtureClone = { ...prepared.fixture };
-      const fixtureTeams = fixtureClone.teams && typeof fixtureClone.teams === "object" ? { ...fixtureClone.teams } : {};
-      fixtureTeams.home = mergeTeam(fixtureTeams.home, homeTeam);
-      fixtureTeams.away = mergeTeam(fixtureTeams.away, awayTeam);
-      fixtureClone.teams = fixtureTeams;
-      if (fixtureClone.league && typeof fixtureClone.league === "object") {
-        fixtureClone.league = { ...fixtureClone.league, id: league.id, name: league.name };
+      if (prepared.fixture && typeof prepared.fixture === "object") {
+        const fixtureClone = { ...prepared.fixture };
+        const fixtureTeams = fixtureClone.teams && typeof fixtureClone.teams === "object" ? { ...fixtureClone.teams } : {};
+        fixtureTeams.home = mergeTeam(fixtureTeams.home, homeTeam);
+        fixtureTeams.away = mergeTeam(fixtureTeams.away, awayTeam);
+        fixtureClone.teams = fixtureTeams;
+        if (fixtureClone.league && typeof fixtureClone.league === "object" && league) {
+          fixtureClone.league = { ...fixtureClone.league, id: league.id, name: league.name };
+        }
+        prepared.fixture = fixtureClone;
       }
-      prepared.fixture = fixtureClone;
-    }
     if (!prepared.home && homeTeam.name) prepared.home = homeTeam.name;
     if (!prepared.home_team && homeTeam.name) prepared.home_team = homeTeam.name;
     if (!prepared.home_team_name && homeTeam.name) prepared.home_team_name = homeTeam.name;
@@ -1087,7 +1098,7 @@ function enforceHistoryRequirements(items = [], trace) {
     if (prepared.away_id == null) prepared.away_id = awayTeam.id;
     sanitized.push(prepared);
   }
-  if (trace && dropped) {
+  if (trace && typeof trace.push === "function") {
     trace.push({ filter: "history_requirements", dropped, kept: sanitized.length });
   }
   return sanitized;
