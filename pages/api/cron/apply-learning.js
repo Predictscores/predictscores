@@ -708,100 +708,95 @@ function filterH2HOnly(items = []) {
   }
   return out;
 }
-async function readSnapshot(key, { label, sourceSlot } = {}, context) {
+async function readSnapshot(key, { sourceSlot } = {}, context) {
   const { kvFlavors, trace } = context;
-  let value = null;
-  let flavor = null;
-  let count = 0;
-  if (kvFlavors.length) {
-    try {
-      const read = await readKeyFromBackends(key, { backends: kvFlavors });
-      value = read.value;
-      flavor = read.flavor || null;
-      count = Number(read.count || 0);
-      trace.push({ kv: "get", key, label, flavor, count });
-    } catch (err) {
-      trace.push({ kv: "get", key, label, error: String(err?.message || err) });
-    }
-  } else {
-    trace.push({ kv: "get", key, label, flavor: null, count: 0, skipped: "no_backends" });
+  let items = [];
+  let ok = false;
+
+  if (!Array.isArray(kvFlavors) || kvFlavors.length === 0) {
+    trace.push({ kv: "get", key, ok: false, size: 0 });
+    return { items };
   }
-  let parsed = { normalized: [], inputCount: 0 };
+
   try {
-    parsed = parseCombinedPayload(value, { sourceSlot }) || parsed;
+    const read = await readKeyFromBackends(key, { backends: kvFlavors });
+    try {
+      const parsed = parseCombinedPayload(read?.value, { sourceSlot });
+      if (parsed && Array.isArray(parsed.normalized)) {
+        items = parsed.normalized;
+      }
+    } catch (parseErr) {
+      trace.push({ error: { phase: "parse", key, message: String(parseErr?.message || parseErr) } });
+    }
+    ok = Array.isArray(items) && items.length > 0;
   } catch (err) {
-    trace.push({ source: label || key, key, parse_error: String(err?.message || err) });
+    trace.push({ error: { phase: "read", key, message: String(err?.message || err) } });
   }
-  const filtered = filterH2HOnly(Array.isArray(parsed.normalized) ? parsed.normalized : []);
-  const deduped = dedupeByFixtureStrongest(filtered);
-  trace.push({ source: label || key, key, size: deduped.length, input: parsed.inputCount ?? null });
-  return { items: deduped, parsed };
+
+  trace.push({ kv: "get", key, ok, size: Array.isArray(items) ? items.length : 0 });
+  return { items: Array.isArray(items) ? items : [] };
 }
 async function loadSnapshotsForDay(ymd, context) {
-  const attempts = [
-    { key: `vb:day:${ymd}:union`, label: "union" },
-    { key: `vb:day:${ymd}:combined`, label: "combined" },
-  ];
-  for (const attempt of attempts) {
-    const { items } = await readSnapshot(attempt.key, attempt, context);
+  const attempts = [`vb:day:${ymd}:union`, `vb:day:${ymd}:combined`];
+  for (const key of attempts) {
+    const { items } = await readSnapshot(key, {}, context);
     if (items.length > 0) {
-      context.trace.push({ chosen: attempt.label, size: items.length });
-      return { items, meta: { source: attempt.label } };
+      return { items, meta: { source: key } };
     }
   }
-  const slotSizes = {};
   let aggregated = [];
+  const slotSizes = {};
   for (const slot of ["am", "pm", "late"]) {
-    const variants = [
-      { key: `vb:day:${ymd}:${slot}:combined`, label: `slot:${slot}:combined` },
-      { key: `vb:day:${ymd}:${slot}`, label: `slot:${slot}` },
-    ];
-    let slotItems = [];
-    for (const variant of variants) {
-      const attempt = { ...variant, sourceSlot: slot };
-      const { items } = await readSnapshot(attempt.key, attempt, context);
-      if (items.length) {
-        slotItems = items;
-        break;
-      }
+    const { items } = await readSnapshot(`vb:day:${ymd}:${slot}`, { sourceSlot: slot }, context);
+    slotSizes[slot] = items.length;
+    if (items.length) {
+      aggregated = aggregated.concat(items);
     }
-    slotSizes[slot] = slotItems.length;
-    if (slotItems.length) aggregated = aggregated.concat(slotItems);
   }
-  const deduped = dedupeByFixtureStrongest(aggregated);
-  context.trace.push({ chosen: "slots", size: deduped.length, slots: slotSizes });
-  return { items: deduped, meta: { source: "slots", slotSizes } };
+  const combined = dedupeByFixtureStrongest(aggregated);
+  context.trace.push({ slots: slotSizes, size: combined.length });
+  return { items: combined, meta: { source: "slots", slotSizes } };
 }
-async function writeHistoryKey(key, payload, trace, kvFlavors) {
-  const size = Array.isArray(payload)
-    ? payload.length
-    : Array.isArray(payload?.items)
-    ? payload.items.length
-    : 0;
-  if (!Array.isArray(kvFlavors) || kvFlavors.length === 0) {
-    trace.push({ kv: "set", key, size, skipped: "no_backends" });
-    return;
-  }
-  try {
-    const saves = await writeKeyToBackends(key, payload, { backends: kvFlavors });
-    const ok = Array.isArray(saves) ? saves.some((attempt) => attempt?.ok) : false;
-    trace.push({ kv: "set", key, size, ok, saves });
-  } catch (err) {
-    trace.push({ kv: "set", key, size, error: String(err?.message || err) });
-  }
-}
-async function writeHistoryPayload(ymd, items, meta, trace, kvFlavors) {
-  const payloadObject = {
-    ymd,
-    count: items.length,
-    items,
-    meta: {
-      ...(meta || {}),
-      writtenAt: new Date().toISOString(),
+
+function createKvClient(kvFlavors) {
+  const backends = Array.isArray(kvFlavors) ? kvFlavors : [];
+  return {
+    async setJSON(key, value) {
+      if (!backends.length) {
+        const err = new Error("kv_not_configured");
+        err.code = "KV_NOT_CONFIGURED";
+        throw err;
+      }
+      const saves = await writeKeyToBackends(key, value, { backends });
+      const ok = Array.isArray(saves) ? saves.some((attempt) => attempt?.ok) : false;
+      if (!ok) {
+        const err = new Error(`kv_write_failed:${key}`);
+        err.code = "KV_WRITE_FAILED";
+        err.saves = saves;
+        throw err;
+      }
+      return { ok, saves };
     },
   };
-  await writeHistoryKey(`hist:${ymd}`, items, trace, kvFlavors);
-  await writeHistoryKey(`hist:day:${ymd}`, payloadObject, trace, kvFlavors);
+}
+
+async function persistHistory(ymd, history, trace, kvFlavors) {
+  const kv = createKvClient(kvFlavors);
+  const size = Array.isArray(history) ? history.length : 0;
+  const listKey = `hist:${ymd}`;
+  await setJsonWithTrace(kv, listKey, history, size, trace);
+  const dayKey = `hist:day:${ymd}`;
+  await setJsonWithTrace(kv, dayKey, { ymd, items: history }, size, trace);
+}
+
+async function setJsonWithTrace(kv, key, value, size, trace) {
+  try {
+    await kv.setJSON(key, value);
+    trace.push({ kv: "set", key, size });
+  } catch (err) {
+    trace.push({ kv: "set", key, size, ok: false, error: String(err?.message || err) });
+    throw err;
+  }
 }
 
 
@@ -1057,24 +1052,75 @@ function resolveRequestedYmd(req, fallbackYmd, trace) {
   }
   return fallbackYmd;
 }
+function isDebugEnabled(req) {
+  const fromQuery = req?.query?.debug;
+  if (Array.isArray(fromQuery)) {
+    if (fromQuery.some((value) => String(value).trim() === "1")) return true;
+    if (fromQuery.some((value) => String(value).toLowerCase().trim() === "true")) return true;
+  } else if (fromQuery !== undefined) {
+    const value = String(fromQuery).trim();
+    if (value === "1" || value.toLowerCase() === "true") return true;
+  }
+  const rawUrl = typeof req?.url === "string" ? req.url : "";
+  if (rawUrl) {
+    try {
+      const host = req?.headers?.host || "localhost";
+      const parsed = new URL(rawUrl, `http://${host}`);
+      const debugParam = parsed.searchParams.get("debug");
+      if (typeof debugParam === "string") {
+        const trimmed = debugParam.trim();
+        if (trimmed === "1" || trimmed.toLowerCase() === "true") return true;
+      }
+    } catch (err) {
+      // ignore parse errors for debug detection
+    }
+  }
+  return false;
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
   const trace = [];
-  let responseYmd = null;
-  let finalCount = 0;
+  const debug = isDebugEnabled(req);
+  let currentPhase = "init";
+  let ymd = null;
+  let historyItems = [];
   try {
+    currentPhase = "resolve_ymd";
     const tzYmd = ymdInTZ("Europe/Belgrade");
-    const ymd = resolveRequestedYmd(req, tzYmd, trace);
-    responseYmd = ymd;
+    ymd = resolveRequestedYmd(req, tzYmd, trace);
+
+    currentPhase = "load";
     const kvFlavors = kvBackends();
     const context = { kvFlavors, trace };
-    const { items, meta } = await loadSnapshotsForDay(ymd, context);
-    const historyItems = enforceHistoryRequirements(items, trace);
-    await writeHistoryPayload(ymd, historyItems, meta, trace, kvFlavors);
-    finalCount = historyItems.length;
-    res.status(200).json({ ok: true, ymd, count: finalCount, trace });
+    const { items } = await loadSnapshotsForDay(ymd, context);
+
+    currentPhase = "normalize";
+    const filtered = filterH2HOnly(items);
+    const deduped = dedupeByFixtureStrongest(filtered);
+    historyItems = enforceHistoryRequirements(deduped, trace);
+
+    currentPhase = "persist";
+    await persistHistory(ymd, historyItems, trace, kvFlavors);
+
+    res.status(200).json({
+      ok: true,
+      ymd,
+      count: historyItems.length,
+      trace: debug ? trace : [],
+    });
   } catch (err) {
-    trace.push({ error: String(err?.message || err), ymd: responseYmd });
-    res.status(200).json({ ok: true, ymd: responseYmd, count: finalCount, trace });
+    const errorPayload = {
+      phase: currentPhase,
+      message: err?.message || String(err),
+      stack: err?.stack || null,
+    };
+    res.status(200).json({
+      ok: false,
+      ymd,
+      count: 0,
+      trace: debug ? trace : [],
+      error: errorPayload,
+    });
   }
 };
