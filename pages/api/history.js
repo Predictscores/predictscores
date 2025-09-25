@@ -22,7 +22,8 @@ function looksClearedString(value) {
   if (!unquoted) return true;
   return CLEARED_STRING_MARKERS.has(unquoted.toLowerCase());
 }
-async function kvGETraw(key, trace) {
+async function kvGETraw(key, trace, traceKey) {
+  const label = traceKey || key;
   for (const b of kvBackends()) {
     try {
       const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`, {
@@ -41,12 +42,20 @@ async function kvGETraw(key, trace) {
         raw = null;
       }
       const hit = typeof raw === "string";
-      trace && trace.push({ get: key, ok: r.ok, flavor: b.flavor, hit });
+      if (trace) {
+        const entry = { get: label, ok: r.ok, flavor: b.flavor, hit };
+        if (label !== key) entry.actual_key = key;
+        trace.push(entry);
+      }
       if (!r.ok) continue;
       if (!hit) continue;
       return { raw, flavor: b.flavor };
     } catch (e) {
-      trace && trace.push({ get: key, ok: false, err: String(e?.message || e) });
+      if (trace) {
+        const entry = { get: label, ok: false, err: String(e?.message || e) };
+        if (label !== key) entry.actual_key = key;
+        trace.push(entry);
+      }
     }
   }
   return { raw: null, flavor: null };
@@ -72,6 +81,13 @@ export function normalizeMarketKey(value) {
 }
 
 const allowSet = new Set([DEFAULT_MARKET_KEY]);
+const envAllowedRaw = String(process.env.HISTORY_ALLOWED_MARKETS || "");
+if (envAllowedRaw) {
+  for (const part of envAllowedRaw.split(/[,\s]+/)) {
+    const normalized = normalizeMarketKey(part);
+    if (normalized) allowSet.add(normalized);
+  }
+}
 
 const dedupKey = (e, normalizedMarketKey) => {
   const rawMarket = e?.market_key ?? e?.market ?? e?.market_label;
@@ -110,12 +126,16 @@ function filterAllowed(arr) {
   const by = new Map();
   for (const e of arr || []) {
     if (!e || typeof e !== "object") continue;
-    const rawMarket = e?.market_key ?? e?.market ?? e?.market_label ?? "";
-    const marketRaw = String(rawMarket || "").toLowerCase();
-    const normalizedMarket = marketRaw === "1x2" ? "h2h" : marketRaw;
-    if (normalizedMarket !== "h2h") continue;
-    const prepared = { ...e };
-    prepared.market_key = normalizedMarket;
+
+    const rawMarketValue = e?.market_key ?? e?.market ?? e?.market_label ?? "";
+    const rawMarketString = rawMarketValue == null ? "" : String(rawMarketValue);
+    const marketRaw = rawMarketString.toLowerCase();
+    let normalizedMarket = marketRaw === "1x2" ? "h2h" : marketRaw;
+    if (normalizedMarket) {
+      normalizedMarket = normalizeMarketKey(normalizedMarket);
+      if (normalizedMarket === "1x2") normalizedMarket = "h2h";
+    }
+
     const pickValue =
       e?.pick ??
       e?.selection ??
@@ -125,13 +145,48 @@ function filterAllowed(arr) {
       e?.pickLabel ??
       "";
     const normalizedPick = normalizeSelection(pickValue);
+
+    const teams = e?.teams;
+    const hasTeams = Boolean(
+      (teams && (teams.home || teams.away)) ||
+        e?.home ||
+        e?.away ||
+        e?.home_name ||
+        e?.away_name ||
+        e?.homeName ||
+        e?.awayName ||
+        e?.home_id ||
+        e?.away_id ||
+        e?.homeId ||
+        e?.awayId
+    );
+
+    if (!normalizedMarket && normalizedPick && hasTeams) {
+      normalizedMarket = "h2h";
+    }
+
+    if (!normalizedMarket) continue;
+    if (!allowSet.has(normalizedMarket)) continue;
+
+    const prepared = { ...e };
+    if (!prepared.market_key) {
+      prepared.market_key = rawMarketString || normalizedMarket;
+    }
+    if (!prepared.market && normalizedMarket === "h2h") {
+      prepared.market = "h2h";
+    }
+
     const finalPick = normalizedPick || normalizeSelection(prepared.pick ?? "");
     if (finalPick) {
       prepared.pick = finalPick;
       prepared.selection = finalPick;
     }
-    const canonical = "1x2";
-    const displayReady = withHistoryMarketDisplay(prepared, canonical);
+
+    const canonical = normalizedMarket === "h2h" ? "1x2" : normalizedMarket;
+    const displayReady =
+      normalizedMarket === "h2h"
+        ? withHistoryMarketDisplay(prepared, canonical)
+        : prepared;
     const k = dedupKey(displayReady, canonical);
     if (!by.has(k)) by.set(k, displayReady);
   }
@@ -140,34 +195,52 @@ function filterAllowed(arr) {
 
 async function loadHistoryForDay(ymd, trace, wantDebug = false) {
   const histDayKey = `hist:day:${ymd}`;
-  const { raw: rawHistDay } = await kvGETraw(histDayKey, trace);
+  const { raw: rawHistDay } = await kvGETraw(histDayKey, trace, `hist:${ymd}`);
   const histDayValue = toJson(rawHistDay);
-  const histDayItems = arrFromAny(histDayValue);
-  const dayPresent = rawHistDay !== null;
 
-  let rawHist = null;
-  let histValue = { value: null, meta: {} };
-  let histItems = { array: [], meta: {} };
-  if (!dayPresent) {
-    const histResp = await kvGETraw(`hist:${ymd}`, trace);
-    rawHist = histResp.raw;
-    histValue = toJson(rawHist);
-    histItems = arrFromAny(histValue);
+  let items = [];
+  let usedSource = null;
+
+  if (rawHistDay !== null) {
+    const payload = histDayValue?.value;
+    if (payload && typeof payload === "object" && Array.isArray(payload.items)) {
+      items = payload.items;
+    } else {
+      const parsedItems = arrFromAny(histDayValue);
+      items = parsedItems.array;
+    }
+    usedSource = "hist_day";
   }
 
-  let items = dayPresent ? histDayItems.array : histItems.array;
+  const histResp = rawHistDay === null ? await kvGETraw(`hist:${ymd}`, trace) : { raw: null };
+  const rawHist = histResp.raw;
+  const histValue = toJson(rawHist);
+  const histItems = arrFromAny(histValue);
 
-  // Fallback: combined list
+  if (rawHistDay === null && rawHist !== null) {
+    items = histItems.array;
+    usedSource = "hist";
+  }
+
   const combKey = `vb:day:${ymd}:combined`;
   const { raw: rawComb } = await kvGETraw(combKey, trace);
   const combValue = toJson(rawComb);
   const combItems = arrFromAny(combValue);
-  if (!items.length && !dayPresent) {
+
+  if (rawHistDay === null && rawHist === null && !items.length) {
     items = combItems.array;
+    if (items.length) usedSource = "combined";
+  }
+
+  if (!usedSource) {
+    if (rawHistDay !== null) usedSource = "hist_day";
+    else if (rawHist !== null) usedSource = "hist";
+    else if (rawComb !== null) usedSource = "combined";
   }
 
   let meta = null;
   if (wantDebug) {
+    const histDayItems = arrFromAny(histDayValue);
     const histDayJsonMeta = { ...histDayValue.meta };
     const histDayArrayMeta = { ...histDayItems.meta };
     const histJsonMeta = { ...histValue.meta };
@@ -184,6 +257,7 @@ async function loadHistoryForDay(ymd, trace, wantDebug = false) {
   return {
     items,
     sources: { hist_day: !!rawHistDay, hist: !!rawHist, combined: !!rawComb },
+    usedSource,
     meta,
   };
 }
@@ -222,8 +296,8 @@ export default async function handler(req, res) {
     const daySources = {};
     const dayMeta = wantDebug ? {} : null;
     for (const day of queriedDays) {
-      const { items, sources, meta } = await loadHistoryForDay(day, trace, wantDebug);
-      daySources[day] = sources;
+      const { items, sources, usedSource, meta } = await loadHistoryForDay(day, trace, wantDebug);
+      daySources[day] = { ...sources, used: usedSource };
       if (wantDebug && meta) {
         dayMeta[day] = meta;
       }
@@ -235,7 +309,14 @@ export default async function handler(req, res) {
     const afterFilter = items.length;
     const roi = computeRoi(items);
 
-    trace.push({ history_filter: { before: beforeFilter, after: afterFilter, normalized: true } });
+    const historyFilterInfo = { before: beforeFilter, after: afterFilter, normalized: true };
+    if (wantDebug) {
+      historyFilterInfo.sources_used = Object.fromEntries(
+        Object.entries(daySources).map(([d, s]) => [d, s?.used || null])
+      );
+    }
+
+    trace.push({ history_filter: historyFilterInfo });
 
     const singleYmd = ymd || (queriedDays.length ? queriedDays[0] : null);
     return res.status(200).json({
@@ -251,6 +332,7 @@ export default async function handler(req, res) {
         allowed: Array.from(allowSet),
         day_sources: daySources,
         day_meta: wantDebug ? dayMeta : null,
+        history_filter: wantDebug ? historyFilterInfo : undefined,
       },
     });
   } catch (e) {
