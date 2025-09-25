@@ -149,7 +149,7 @@ describe("apply-learning history writer", () => {
     expect(relaxedEntry).toBeDefined();
     expect(relaxedEntry.teams.home.name).toBe("Gamma");
     expect(relaxedEntry.teams.away.name).toBe("Delta");
-    expect(relaxedEntry.market_key.toLowerCase()).toBe("1x2");
+    expect(relaxedEntry.market_key.toLowerCase()).toBe("h2h");
 
     expect(res.jsonPayload.trace).toEqual(
       expect.arrayContaining([
