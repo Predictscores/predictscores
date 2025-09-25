@@ -1,15 +1,12 @@
 // pages/api/cron/apply-learning.js
 // Builds history KV records from learned value-bet snapshots while guarding against missing data.
-import kvHelpers from "../../../lib/kv-helpers";
 
 export const config = { runtime: "nodejs" };
 export const dynamic = "force-dynamic";
 
-const {
-  kvBackends: sharedKvBackends,
-  readKeyFromBackends,
-  writeKeyToBackends,
-} = kvHelpers;
+let sharedKvBackendsRef = null;
+let readKeyFromBackendsRef = null;
+let writeKeyToBackendsRef = null;
 
 /* ---------- KV helpers ---------- */
 function kvEnv() {
@@ -26,13 +23,64 @@ function kvEnv() {
   return { url, token };
 }
 function kvBackends() {
-  const shared = sharedKvBackends();
-  if (shared && shared.length) return shared;
+  if (typeof sharedKvBackendsRef === "function") {
+    try {
+      const shared = sharedKvBackendsRef();
+      if (shared && shared.length) return shared;
+    } catch (err) {
+      // defer error handling to caller via trace logging
+    }
+  }
   const { url, token } = kvEnv();
   if (url && token) {
     return [{ flavor: "default", url: url.replace(/\/+$/, ""), token }];
   }
   return [];
+}
+
+async function fallbackReadKeyFromBackends(key, options = {}) {
+  const { backends = kvBackends() } = options || {};
+  for (const backend of Array.isArray(backends) ? backends : []) {
+    if (!backend || !backend.url || !backend.token) continue;
+    try {
+      const url = `${backend.url}/get/${encodeURIComponent(key)}`;
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${backend.token}` },
+        cache: "no-store",
+      });
+      if (!res.ok) continue;
+      const json = await res.json().catch(() => null);
+      const raw = json?.result ?? json?.value ?? null;
+      return { value: raw };
+    } catch (err) {
+      // ignore and continue to next backend
+    }
+  }
+  return { value: null };
+}
+
+async function fallbackWriteKeyToBackends(key, value, options = {}) {
+  const { backends = kvBackends() } = options || {};
+  const saves = [];
+  for (const backend of Array.isArray(backends) ? backends : []) {
+    if (!backend || !backend.url || !backend.token) continue;
+    try {
+      const bodyValue = typeof value === "string" ? value : JSON.stringify(value);
+      const url = `${backend.url}/set/${encodeURIComponent(key)}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${backend.token}`,
+        },
+        body: JSON.stringify({ value: bodyValue }),
+      });
+      saves.push({ flavor: backend.flavor || "default", ok: res.ok, status: res.status });
+    } catch (err) {
+      saves.push({ flavor: backend.flavor || "default", ok: false, error: String(err?.message || err) });
+    }
+  }
+  return saves;
 }
 
 /* ---------- parsing helpers ---------- */
@@ -713,18 +761,28 @@ function filterH2HOnly(items = []) {
   }
   return out;
 }
-async function readSnapshot(key, { sourceSlot } = {}, context) {
+async function readSnapshot(key, { sourceSlot } = {}, context = {}) {
   const { kvFlavors, trace } = context;
+  const readKey = typeof context?.readKey === "function" ? context.readKey : readKeyFromBackendsRef;
   let items = [];
   let ok = false;
 
   if (!Array.isArray(kvFlavors) || kvFlavors.length === 0) {
-    trace.push({ kv: "get", key, ok: false, size: 0 });
+    if (trace && typeof trace.push === "function") {
+      trace.push({ kv: "get", key, ok: false, size: 0, skipped: "no_backends" });
+    }
+    return { items };
+  }
+
+  if (typeof readKey !== "function") {
+    if (trace && typeof trace.push === "function") {
+      trace.push({ kv: "get", key, ok: false, size: 0, skipped: "no_reader" });
+    }
     return { items };
   }
 
   try {
-    const read = await readKeyFromBackends(key, { backends: kvFlavors });
+    const read = await readKey(key, { backends: kvFlavors });
     try {
       const parsed = parseCombinedPayload(read?.value, { sourceSlot });
       if (parsed && Array.isArray(parsed.normalized)) {
@@ -772,7 +830,12 @@ function createKvClient(kvFlavors) {
         err.code = "KV_NOT_CONFIGURED";
         throw err;
       }
-      const saves = await writeKeyToBackends(key, value, { backends });
+      if (typeof writeKeyToBackendsRef !== "function") {
+        const err = new Error("kv_writer_unavailable");
+        err.code = "KV_WRITE_UNAVAILABLE";
+        throw err;
+      }
+      const saves = await writeKeyToBackendsRef(key, value, { backends });
       const ok = Array.isArray(saves) ? saves.some((attempt) => attempt?.ok) : false;
       if (!ok) {
         const err = new Error(`kv_write_failed:${key}`);
@@ -1088,6 +1151,10 @@ function isDebugEnabled(req) {
 }
 
 export default async function handler(req, res) {
+  if (req.query && req.query.probe === "1") {
+    return res.status(200).json({ ok: true, probe: true });
+  }
+
   res.setHeader("Cache-Control", "no-store");
   const trace = [];
   const debug = isDebugEnabled(req);
@@ -1095,13 +1162,34 @@ export default async function handler(req, res) {
     ? req.query.probe.find((value) => String(value).trim().length > 0)
     : req?.query?.probe;
   if (String(probeParam ?? "").trim() === "1") {
-    res.status(200).json({ ok: true, probe: true });
-    return;
+    return res.status(200).json({ ok: true, probe: true });
   }
+
   let currentPhase = "init";
   let ymd = null;
   let historyItems = [];
+
   try {
+    currentPhase = "import";
+    try {
+      const kvHelpers = await import("../../../lib/kv-helpers.js");
+      sharedKvBackendsRef = typeof kvHelpers?.kvBackends === "function" ? kvHelpers.kvBackends : null;
+      readKeyFromBackendsRef = typeof kvHelpers?.readKeyFromBackends === "function" ? kvHelpers.readKeyFromBackends : null;
+      writeKeyToBackendsRef = typeof kvHelpers?.writeKeyToBackends === "function" ? kvHelpers.writeKeyToBackends : null;
+    } catch (importErr) {
+      sharedKvBackendsRef = null;
+      readKeyFromBackendsRef = null;
+      writeKeyToBackendsRef = null;
+      trace.push({ error: { phase: "import", message: String(importErr?.message || importErr) } });
+    }
+
+    if (typeof readKeyFromBackendsRef !== "function") {
+      readKeyFromBackendsRef = fallbackReadKeyFromBackends;
+    }
+    if (typeof writeKeyToBackendsRef !== "function") {
+      writeKeyToBackendsRef = fallbackWriteKeyToBackends;
+    }
+
     currentPhase = "resolve_ymd";
     const tzYmd = ymdInTZ("Europe/Belgrade");
     ymd = resolveRequestedYmd(req, tzYmd, trace);
@@ -1114,7 +1202,7 @@ export default async function handler(req, res) {
       trace.push({ error: { phase: "kv_init", message: String(kvErr?.message || kvErr) } });
       kvFlavors = [];
     }
-    const context = { kvFlavors, trace };
+    const context = { kvFlavors, trace, readKey: readKeyFromBackendsRef };
     const { items } = await loadSnapshotsForDay(ymd, context);
 
     currentPhase = "normalize";
