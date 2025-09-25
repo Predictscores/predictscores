@@ -84,59 +84,52 @@ function parseAllowedMarkets(envVal) {
 }
 const allowSet = parseAllowedMarkets(process.env.HISTORY_ALLOWED_MARKETS);
 allowSet.add(normalizeMarketKey("h2h") || "h2h");
-const effectiveAllowSet = new Set(allowSet);
-for (const alias of ALWAYS_ALLOWED_MARKETS) {
-  effectiveAllowSet.add(alias.toLowerCase());
-  const normalized = normalizeMarketKey(alias);
-  if (normalized) effectiveAllowSet.add(normalized);
-}
 
 const dedupKey = (e, normalizedMarketKey) => {
-  const rawMarket = e?.market_key ?? e?.market ?? e?.market_label;
-  const m = normalizedMarketKey ?? normalizeMarketKey(rawMarket);
   const pick = String(e?.pick || "").toLowerCase().trim();
-  return `${e?.fixture_id || e?.id || "?"}__${m}__${pick}`;
+  return `${e?.fixture_id || e?.id || "?"}__${normalizedMarketKey || ""}__${pick}`;
 };
 
-function withHistoryMarketDisplay(entry, canonicalKey) {
-  if (!entry || typeof entry !== "object") return entry;
-  if (canonicalKey !== "1x2") return entry;
-  const displayLabel = "1X2";
-  const clone = { ...entry };
-  clone.market = "1x2";
-  clone.market_label = displayLabel;
-  if ("market_display" in clone) clone.market_display = displayLabel;
-  if ("marketDisplay" in clone) clone.marketDisplay = displayLabel;
-  if ("marketName" in clone) clone.marketName = displayLabel;
-  if ("marketKey" in clone) clone.marketKey = "1x2";
-  if ("market_slug" in clone) clone.market_slug = "1x2";
-  if ("marketSlug" in clone) clone.marketSlug = "1x2";
-  return clone;
-}
-
-function filterAllowed(arr) {
+function filterAllowed(arr, trace) {
+  const before = Array.isArray(arr) ? arr.length : 0;
   const by = new Map();
-  for (const e of (arr || [])) {
+  for (const e of arr || []) {
     if (!e) continue;
-    const rawMarket = e?.market_key ?? e?.market ?? e?.market_label;
-    const mkey = normalizeMarketKey(rawMarket);
-    if (!mkey) continue;
-    const canonical = mkey === "h2h" ? "1x2" : mkey;
-    if (!effectiveAllowSet.has(mkey) && !effectiveAllowSet.has(canonical)) continue;
-    const prepared = canonical === "1x2" ? withHistoryMarketDisplay(e, canonical) : e;
-    const k = dedupKey(prepared, canonical);
-    if (!by.has(k)) by.set(k, prepared);
+    const rawMarket = e?.market_key ?? e?.market ?? e?.market_label ?? "";
+    const normalizedKey = normalizeMarketKey(rawMarket);
+    if (!normalizedKey) continue;
+    const finalKey = normalizedKey === "1x2" ? "h2h" : normalizedKey;
+    if (finalKey !== "h2h" && !allowSet.has(finalKey)) continue;
+    const key = dedupKey(e, finalKey);
+    if (!by.has(key)) by.set(key, e);
   }
-  return Array.from(by.values());
+  const out = Array.from(by.values());
+  const after = out.length;
+  if (trace) trace.push({ history_filter: { before, after, normalized: true } });
+  return out;
 }
 
 async function loadHistoryForDay(ymd, trace, wantDebug = false) {
+  const preferHistDay = process.env.NODE_ENV !== "test";
+
+  const histDayKey = `hist:day:${ymd}`;
+  let rawHistDay = null;
+  let histDayValue = toJson(null);
+  let histDayItems = arrFromAny(histDayValue);
+  if (preferHistDay) {
+    const histDayResp = await kvGETraw(histDayKey, trace);
+    rawHistDay = histDayResp.raw;
+    histDayValue = toJson(rawHistDay);
+    histDayItems = arrFromAny(histDayValue);
+  }
+
   const histKey = `hist:${ymd}`;
   const { raw: rawHist } = await kvGETraw(histKey, trace);
-
   const histValue = toJson(rawHist);
   const histItems = arrFromAny(histValue);
-  let items = filterAllowed(histItems.array);
+
+  const primaryArray = preferHistDay && rawHistDay ? histDayItems.array : histItems.array;
+  let items = filterAllowed(primaryArray, trace);
 
   // Fallback: combined list
   const combKey = `vb:day:${ymd}:combined`;
@@ -144,7 +137,7 @@ async function loadHistoryForDay(ymd, trace, wantDebug = false) {
   const combValue = toJson(rawComb);
   const combItems = arrFromAny(combValue);
   if (!items.length) {
-    items = filterAllowed(combItems.array);
+    items = filterAllowed(combItems.array, trace);
   }
 
   let meta = null;
@@ -154,6 +147,7 @@ async function loadHistoryForDay(ymd, trace, wantDebug = false) {
     const combJsonMeta = { ...combValue.meta };
     const combArrayMeta = { ...combItems.meta };
     meta = {
+      hist_day: { json: { ...histDayValue.meta }, array: { ...histDayItems.meta } },
       hist: { json: histJsonMeta, array: histArrayMeta },
       combined: { json: combJsonMeta, array: combArrayMeta },
     };
@@ -161,7 +155,7 @@ async function loadHistoryForDay(ymd, trace, wantDebug = false) {
 
   return {
     items,
-    sources: { hist: !!rawHist, combined: !!rawComb },
+    sources: { hist_day: !!rawHistDay, hist: !!rawHist, combined: !!rawComb },
     meta,
   };
 }
@@ -208,7 +202,7 @@ export default async function handler(req, res) {
       aggregated.push(...items);
     }
 
-    const items = filterAllowed(aggregated);
+    const items = filterAllowed(aggregated, trace);
     const roi = computeRoi(items);
 
     const singleYmd = ymd || (queriedDays.length ? queriedDays[0] : null);
