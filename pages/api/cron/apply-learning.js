@@ -1051,15 +1051,36 @@ function ymdInTZ(tz = "Europe/Belgrade", d = new Date()) {
   const dd = parts.find((p) => p.type === "day")?.value;
   return `${y}-${m}-${dd}`;
 }
+
+function resolveRequestedYmd(req, fallbackYmd, trace) {
+  const queryCandidate = req?.query?.ymd;
+  const fromQuery = typeof queryCandidate === "string" ? queryCandidate.trim() : String(queryCandidate || "").trim();
+  if (fromQuery) return fromQuery;
+  const rawUrl = typeof req?.url === "string" ? req.url : "";
+  if (rawUrl) {
+    try {
+      const host = req?.headers?.host || "localhost";
+      const parsed = new URL(rawUrl, `http://${host}`);
+      const fromUrl = parsed.searchParams.get("ymd");
+      if (typeof fromUrl === "string" && fromUrl.trim()) {
+        return fromUrl.trim();
+      }
+    } catch (err) {
+      if (trace && typeof trace.push === "function") {
+        trace.push({ query: "ymd", source: "url", error: String(err?.message || err) });
+      }
+    }
+  }
+  return fallbackYmd;
+}
 module.exports = async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
   const trace = [];
   let responseYmd = null;
   let finalCount = 0;
   try {
-    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const tzYmd = ymdInTZ("Europe/Belgrade");
-    const ymd = url.searchParams.get("ymd") || tzYmd;
+    const ymd = resolveRequestedYmd(req, tzYmd, trace);
     responseYmd = ymd;
     const kvFlavors = kvBackends();
     const context = { kvFlavors, trace };
