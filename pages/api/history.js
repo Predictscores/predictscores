@@ -56,7 +56,6 @@ async function kvGETraw(key, trace) {
 const isValidYmd = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ""));
 
 export const DEFAULT_MARKET_KEY = "h2h";
-const ALWAYS_ALLOWED_MARKETS = ["1x2", "h2h"];
 const MARKET_KEY_SYNONYMS = {
   "1x2": "h2h",
   moneyline: "h2h",
@@ -72,24 +71,7 @@ export function normalizeMarketKey(value) {
   return MARKET_KEY_SYNONYMS[cleaned] || cleaned;
 }
 
-// Robust market parser (ignores stray punctuation; defaults to "h2h,1x2")
-function parseAllowedMarkets(envVal) {
-  const raw = String(envVal ?? `${DEFAULT_MARKET_KEY},1x2`);
-  const list = raw
-    .split(",")
-    .map(normalizeMarketKey)
-    .filter(Boolean);
-  const fallback = ALWAYS_ALLOWED_MARKETS.map((key) => normalizeMarketKey(key) || key);
-  return new Set(list.length ? list : fallback);
-}
-const allowSet = parseAllowedMarkets(process.env.HISTORY_ALLOWED_MARKETS);
-allowSet.add(normalizeMarketKey("h2h") || "h2h");
-const effectiveAllowSet = new Set(allowSet);
-for (const alias of ALWAYS_ALLOWED_MARKETS) {
-  effectiveAllowSet.add(alias.toLowerCase());
-  const normalized = normalizeMarketKey(alias);
-  if (normalized) effectiveAllowSet.add(normalized);
-}
+const allowSet = new Set([DEFAULT_MARKET_KEY]);
 
 const dedupKey = (e, normalizedMarketKey) => {
   const rawMarket = e?.market_key ?? e?.market ?? e?.market_label;
@@ -114,46 +96,86 @@ function withHistoryMarketDisplay(entry, canonicalKey) {
   return clone;
 }
 
+function normalizeSelection(value) {
+  const raw = value == null ? "" : String(value).trim();
+  if (!raw) return raw;
+  const lower = raw.toLowerCase();
+  if (lower === "home" || lower === "away" || lower === "draw") {
+    return lower;
+  }
+  return lower;
+}
+
 function filterAllowed(arr) {
   const by = new Map();
-  for (const e of (arr || [])) {
-    if (!e) continue;
-    const rawMarket = e?.market_key ?? e?.market ?? e?.market_label;
-    const mkey = normalizeMarketKey(rawMarket);
-    if (!mkey) continue;
-    const canonical = mkey === "h2h" ? "1x2" : mkey;
-    if (!effectiveAllowSet.has(mkey) && !effectiveAllowSet.has(canonical)) continue;
-    const prepared = canonical === "1x2" ? withHistoryMarketDisplay(e, canonical) : e;
-    const k = dedupKey(prepared, canonical);
-    if (!by.has(k)) by.set(k, prepared);
+  for (const e of arr || []) {
+    if (!e || typeof e !== "object") continue;
+    const rawMarket = e?.market_key ?? e?.market ?? e?.market_label ?? "";
+    const marketRaw = String(rawMarket || "").toLowerCase();
+    const normalizedMarket = marketRaw === "1x2" ? "h2h" : marketRaw;
+    if (normalizedMarket !== "h2h") continue;
+    const prepared = { ...e };
+    prepared.market_key = normalizedMarket;
+    const pickValue =
+      e?.pick ??
+      e?.selection ??
+      e?.selection_key ??
+      e?.selectionKey ??
+      e?.pick_label ??
+      e?.pickLabel ??
+      "";
+    const normalizedPick = normalizeSelection(pickValue);
+    const finalPick = normalizedPick || normalizeSelection(prepared.pick ?? "");
+    if (finalPick) {
+      prepared.pick = finalPick;
+      prepared.selection = finalPick;
+    }
+    const canonical = "1x2";
+    const displayReady = withHistoryMarketDisplay(prepared, canonical);
+    const k = dedupKey(displayReady, canonical);
+    if (!by.has(k)) by.set(k, displayReady);
   }
   return Array.from(by.values());
 }
 
 async function loadHistoryForDay(ymd, trace, wantDebug = false) {
-  const histKey = `hist:${ymd}`;
-  const { raw: rawHist } = await kvGETraw(histKey, trace);
+  const histDayKey = `hist:day:${ymd}`;
+  const { raw: rawHistDay } = await kvGETraw(histDayKey, trace);
+  const histDayValue = toJson(rawHistDay);
+  const histDayItems = arrFromAny(histDayValue);
+  const dayPresent = rawHistDay !== null;
 
-  const histValue = toJson(rawHist);
-  const histItems = arrFromAny(histValue);
-  let items = filterAllowed(histItems.array);
+  let rawHist = null;
+  let histValue = { value: null, meta: {} };
+  let histItems = { array: [], meta: {} };
+  if (!dayPresent) {
+    const histResp = await kvGETraw(`hist:${ymd}`, trace);
+    rawHist = histResp.raw;
+    histValue = toJson(rawHist);
+    histItems = arrFromAny(histValue);
+  }
+
+  let items = dayPresent ? histDayItems.array : histItems.array;
 
   // Fallback: combined list
   const combKey = `vb:day:${ymd}:combined`;
   const { raw: rawComb } = await kvGETraw(combKey, trace);
   const combValue = toJson(rawComb);
   const combItems = arrFromAny(combValue);
-  if (!items.length) {
-    items = filterAllowed(combItems.array);
+  if (!items.length && !dayPresent) {
+    items = combItems.array;
   }
 
   let meta = null;
   if (wantDebug) {
+    const histDayJsonMeta = { ...histDayValue.meta };
+    const histDayArrayMeta = { ...histDayItems.meta };
     const histJsonMeta = { ...histValue.meta };
     const histArrayMeta = { ...histItems.meta };
     const combJsonMeta = { ...combValue.meta };
     const combArrayMeta = { ...combItems.meta };
     meta = {
+      hist_day: { json: histDayJsonMeta, array: histDayArrayMeta },
       hist: { json: histJsonMeta, array: histArrayMeta },
       combined: { json: combJsonMeta, array: combArrayMeta },
     };
@@ -161,7 +183,7 @@ async function loadHistoryForDay(ymd, trace, wantDebug = false) {
 
   return {
     items,
-    sources: { hist: !!rawHist, combined: !!rawComb },
+    sources: { hist_day: !!rawHistDay, hist: !!rawHist, combined: !!rawComb },
     meta,
   };
 }
@@ -208,8 +230,12 @@ export default async function handler(req, res) {
       aggregated.push(...items);
     }
 
+    const beforeFilter = aggregated.length;
     const items = filterAllowed(aggregated);
+    const afterFilter = items.length;
     const roi = computeRoi(items);
+
+    trace.push({ history_filter: { before: beforeFilter, after: afterFilter, normalized: true } });
 
     const singleYmd = ymd || (queriedDays.length ? queriedDays[0] : null);
     return res.status(200).json({
