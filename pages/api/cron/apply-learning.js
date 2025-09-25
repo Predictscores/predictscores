@@ -1,10 +1,15 @@
 // pages/api/cron/apply-learning.js
 // Builds history KV records from learned value-bet snapshots while guarding against missing data.
+import kvHelpers from "../../../lib/kv-helpers";
+
+export const config = { runtime: "nodejs" };
+export const dynamic = "force-dynamic";
+
 const {
   kvBackends: sharedKvBackends,
   readKeyFromBackends,
   writeKeyToBackends,
-} = require("../../../lib/kv-helpers");
+} = kvHelpers;
 
 /* ---------- KV helpers ---------- */
 function kvEnv() {
@@ -781,21 +786,25 @@ function createKvClient(kvFlavors) {
 }
 
 async function persistHistory(ymd, history, trace, kvFlavors) {
-  const kv = createKvClient(kvFlavors);
   const size = Array.isArray(history) ? history.length : 0;
   const listKey = `hist:${ymd}`;
-  await setJsonWithTrace(kv, listKey, history, size, trace);
   const dayKey = `hist:day:${ymd}`;
+  if (!Array.isArray(kvFlavors) || kvFlavors.length === 0) {
+    trace.push({ kv: "set", key: listKey, size, ok: false, skipped: "no_backends" });
+    trace.push({ kv: "set", key: dayKey, size, ok: false, skipped: "no_backends" });
+    return;
+  }
+  const kv = createKvClient(kvFlavors);
+  await setJsonWithTrace(kv, listKey, history, size, trace);
   await setJsonWithTrace(kv, dayKey, { ymd, items: history }, size, trace);
 }
 
 async function setJsonWithTrace(kv, key, value, size, trace) {
   try {
     await kv.setJSON(key, value);
-    trace.push({ kv: "set", key, size });
+    trace.push({ kv: "set", key, size, ok: true });
   } catch (err) {
     trace.push({ kv: "set", key, size, ok: false, error: String(err?.message || err) });
-    throw err;
   }
 }
 
@@ -1078,10 +1087,17 @@ function isDebugEnabled(req) {
   return false;
 }
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
   const trace = [];
   const debug = isDebugEnabled(req);
+  const probeParam = Array.isArray(req?.query?.probe)
+    ? req.query.probe.find((value) => String(value).trim().length > 0)
+    : req?.query?.probe;
+  if (String(probeParam ?? "").trim() === "1") {
+    res.status(200).json({ ok: true, probe: true });
+    return;
+  }
   let currentPhase = "init";
   let ymd = null;
   let historyItems = [];
@@ -1091,7 +1107,13 @@ module.exports = async function handler(req, res) {
     ymd = resolveRequestedYmd(req, tzYmd, trace);
 
     currentPhase = "load";
-    const kvFlavors = kvBackends();
+    let kvFlavors = [];
+    try {
+      kvFlavors = kvBackends();
+    } catch (kvErr) {
+      trace.push({ error: { phase: "kv_init", message: String(kvErr?.message || kvErr) } });
+      kvFlavors = [];
+    }
     const context = { kvFlavors, trace };
     const { items } = await loadSnapshotsForDay(ymd, context);
 
@@ -1123,4 +1145,11 @@ module.exports = async function handler(req, res) {
       error: errorPayload,
     });
   }
-};
+}
+
+// Preserve CommonJS compatibility for Jest tests and legacy imports.
+if (typeof module !== "undefined") {
+  module.exports = handler;
+  module.exports.config = config;
+  module.exports.dynamic = dynamic;
+}
