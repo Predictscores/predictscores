@@ -742,8 +742,13 @@ async function readSnapshot(key, { label, sourceSlot } = {}, context) {
   } else {
     trace.push({ kv: "get", key, label, flavor: null, count: 0, skipped: "no_backends" });
   }
-  const parsed = parseCombinedPayload(value, { sourceSlot });
-  const filtered = filterH2HOnly(parsed.normalized || []);
+  let parsed = { normalized: [], inputCount: 0 };
+  try {
+    parsed = parseCombinedPayload(value, { sourceSlot }) || parsed;
+  } catch (err) {
+    trace.push({ source: label || key, key, parse_error: String(err?.message || err) });
+  }
+  const filtered = filterH2HOnly(Array.isArray(parsed.normalized) ? parsed.normalized : []);
   const deduped = dedupeByFixtureStrongest(filtered);
   trace.push({ source: label || key, key, size: deduped.length, input: parsed.inputCount ?? null });
   return { items: deduped, parsed };
@@ -763,10 +768,21 @@ async function loadSnapshotsForDay(ymd, context) {
   const slotSizes = {};
   let aggregated = [];
   for (const slot of ["am", "pm", "late"]) {
-    const attempt = { key: `vb:day:${ymd}:${slot}:combined`, label: `slot:${slot}`, sourceSlot: slot };
-    const { items } = await readSnapshot(attempt.key, attempt, context);
-    slotSizes[slot] = items.length;
-    if (items.length) aggregated = aggregated.concat(items);
+    const variants = [
+      { key: `vb:day:${ymd}:${slot}:combined`, label: `slot:${slot}:combined` },
+      { key: `vb:day:${ymd}:${slot}`, label: `slot:${slot}` },
+    ];
+    let slotItems = [];
+    for (const variant of variants) {
+      const attempt = { ...variant, sourceSlot: slot };
+      const { items } = await readSnapshot(attempt.key, attempt, context);
+      if (items.length) {
+        slotItems = items;
+        break;
+      }
+    }
+    slotSizes[slot] = slotItems.length;
+    if (slotItems.length) aggregated = aggregated.concat(slotItems);
   }
   const deduped = dedupeByFixtureStrongest(aggregated);
   context.trace.push({ chosen: "slots", size: deduped.length, slots: slotSizes });
@@ -775,13 +791,23 @@ async function loadSnapshotsForDay(ymd, context) {
 async function writeHistoryKey(key, payload, trace) {
   try {
     await kvSetJSON(key, payload);
-    trace.push({ kv: "set", key, size: Array.isArray(payload.items) ? payload.items.length : 0 });
+    const size = Array.isArray(payload)
+      ? payload.length
+      : Array.isArray(payload?.items)
+      ? payload.items.length
+      : 0;
+    trace.push({ kv: "set", key, size });
   } catch (err) {
-    trace.push({ kv: "set", key, size: Array.isArray(payload.items) ? payload.items.length : 0, error: String(err?.message || err) });
+    const size = Array.isArray(payload)
+      ? payload.length
+      : Array.isArray(payload?.items)
+      ? payload.items.length
+      : 0;
+    trace.push({ kv: "set", key, size, error: String(err?.message || err) });
   }
 }
 async function writeHistoryPayload(ymd, items, meta, trace) {
-  const payload = {
+  const payloadObject = {
     ymd,
     count: items.length,
     items,
@@ -790,8 +816,233 @@ async function writeHistoryPayload(ymd, items, meta, trace) {
       writtenAt: new Date().toISOString(),
     },
   };
-  await writeHistoryKey(`hist:${ymd}`, payload, trace);
-  await writeHistoryKey(`hist:day:${ymd}`, payload, trace);
+  await writeHistoryKey(`hist:${ymd}`, items, trace);
+  await writeHistoryKey(`hist:day:${ymd}`, payloadObject, trace);
+}
+
+
+function coerceId(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const numeric = Number(trimmed);
+    if (!Number.isNaN(numeric)) return numeric;
+    return trimmed;
+  }
+  return null;
+}
+
+function coerceName(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value === "object") {
+    const candidates = [
+      value.name,
+      value.full,
+      value.fullName,
+      value.fullname,
+      value.display,
+      value.displayName,
+      value.nickname,
+      value.short,
+      value.shortName,
+      value.team,
+      value.title,
+    ];
+    for (const candidate of candidates) {
+      const result = coerceName(candidate);
+      if (result) return result;
+    }
+  }
+  return "";
+}
+
+function firstValidId(candidates = []) {
+  for (const candidate of candidates) {
+    const id = coerceId(candidate);
+    if (id !== null && id !== undefined) {
+      if (typeof id === "string" && !id.trim()) continue;
+      return id;
+    }
+  }
+  return null;
+}
+
+function firstValidName(candidates = []) {
+  for (const candidate of candidates) {
+    const name = coerceName(candidate);
+    if (name) return name;
+  }
+  return "";
+}
+
+function extractLeagueMeta(entry) {
+  const leagueId = firstValidId([
+    entry?.league_id,
+    entry?.leagueId,
+    entry?.league?.id,
+    entry?.league?.league_id,
+    entry?.fixture?.league?.id,
+    entry?.fixture?.league?.league_id,
+    entry?.competition_id,
+    entry?.competitionId,
+  ]);
+  const leagueName = firstValidName([
+    entry?.league_name,
+    entry?.leagueName,
+    entry?.league?.name,
+    entry?.league?.league_name,
+    entry?.fixture?.league?.name,
+    entry?.fixture?.league?.league_name,
+    entry?.competition_name,
+    entry?.competitionName,
+  ]);
+  if (leagueId == null || !leagueName) return null;
+  return { id: leagueId, name: leagueName };
+}
+
+function extractTeamMeta(entry, side) {
+  const root = side === "home" ? "home" : "away";
+  const upper = root.charAt(0).toUpperCase() + root.slice(1);
+  const id = firstValidId([
+    entry?.teams?.[root]?.id,
+    entry?.teams?.[root]?.team_id,
+    entry?.teams?.[root]?.teamId,
+    entry?.fixture?.teams?.[root]?.id,
+    entry?.fixture?.teams?.[root]?.team_id,
+    entry?.fixture?.[`team_${root}_id`],
+    entry?.fixture?.[`team${upper}Id`],
+    entry?.[`team_${root}_id`],
+    entry?.[`team${upper}Id`],
+    entry?.[`${root}TeamId`],
+    entry?.[`teams_${root}_id`],
+    entry?.[`fixture_${root}_id`],
+    entry?.[`fixture`]?.[`teams_${root}_id`],
+  ]);
+  const name = firstValidName([
+    entry?.teams?.[root]?.name,
+    entry?.teams?.[root]?.team_name,
+    entry?.teams?.[root],
+    entry?.teams?.[`${root}_name`],
+    entry?.teams?.[`${root}Name`],
+    entry?.fixture?.teams?.[root]?.name,
+    entry?.fixture?.teams?.[root],
+    entry?.fixture?.[`team_${root}_name`],
+    entry?.fixture?.[`team${upper}Name`],
+    entry?.[`team_${root}_name`],
+    entry?.[`team${upper}Name`],
+    entry?.[`teams_${root}`],
+    entry?.[`teams_${root}_name`],
+    entry?.[`teams_${root}Name`],
+    entry?.[root],
+    entry?.[`${root}_team`],
+    entry?.[`${root}Team`],
+    entry?.[`${upper}Team`],
+    entry?.[`${root}_name`],
+    entry?.[`team_${root}`],
+  ]);
+  if (id == null || !name) return null;
+  return { id, name };
+}
+
+function mergeTeam(existing, required) {
+  const base = existing && typeof existing === "object" ? { ...existing } : {};
+  if (base.id == null) base.id = required.id;
+  if (base.team_id == null) base.team_id = required.id;
+  if (base.teamId == null) base.teamId = required.id;
+  if (!base.name) base.name = required.name;
+  if (!base.team_name) base.team_name = required.name;
+  if (!base.full && required.name) base.full = required.name;
+  return base;
+}
+
+function enforceHistoryRequirements(items = [], trace) {
+  const sanitized = [];
+  let dropped = 0;
+  for (const original of items || []) {
+    if (!original || typeof original !== "object") {
+      dropped += 1;
+      continue;
+    }
+    const fixtureId = coerceFixtureId(
+      original.fixture_id,
+      original.fixtureId,
+      original.fixture,
+      original.id,
+      original?.fixture?.id,
+      original.match_id,
+      original.matchId
+    );
+    const normalized = finalizeH2HEntry(original, fixtureId);
+    const marketLabel = String(
+      normalized.market || normalized.market_label || normalized.market_key || ""
+    ).trim();
+    const selectionLabel = String(
+      normalized.selection || normalized.selection_label || normalized.pick || ""
+    ).trim();
+    if (!marketLabel || !selectionLabel) {
+      dropped += 1;
+      continue;
+    }
+    const league = extractLeagueMeta(normalized);
+    if (!league) {
+      dropped += 1;
+      continue;
+    }
+    const homeTeam = extractTeamMeta(normalized, "home");
+    const awayTeam = extractTeamMeta(normalized, "away");
+    if (!homeTeam || !awayTeam) {
+      dropped += 1;
+      continue;
+    }
+    const prepared = { ...normalized };
+    prepared.league_id = prepared.league_id ?? league.id;
+    prepared.leagueId = prepared.leagueId ?? league.id;
+    prepared.league = {
+      ...(prepared.league && typeof prepared.league === "object" ? prepared.league : {}),
+      id: league.id,
+      name: league.name,
+    };
+    if (!prepared.league_name) prepared.league_name = league.name;
+    if (!prepared.league?.name) prepared.league.name = league.name;
+    const teams = prepared.teams && typeof prepared.teams === "object" ? { ...prepared.teams } : {};
+    teams.home = mergeTeam(teams.home, homeTeam);
+    teams.away = mergeTeam(teams.away, awayTeam);
+    prepared.teams = teams;
+    if (prepared.fixture && typeof prepared.fixture === "object") {
+      const fixtureClone = { ...prepared.fixture };
+      const fixtureTeams = fixtureClone.teams && typeof fixtureClone.teams === "object" ? { ...fixtureClone.teams } : {};
+      fixtureTeams.home = mergeTeam(fixtureTeams.home, homeTeam);
+      fixtureTeams.away = mergeTeam(fixtureTeams.away, awayTeam);
+      fixtureClone.teams = fixtureTeams;
+      if (fixtureClone.league && typeof fixtureClone.league === "object") {
+        fixtureClone.league = { ...fixtureClone.league, id: league.id, name: league.name };
+      }
+      prepared.fixture = fixtureClone;
+    }
+    if (!prepared.home && homeTeam.name) prepared.home = homeTeam.name;
+    if (!prepared.home_team && homeTeam.name) prepared.home_team = homeTeam.name;
+    if (!prepared.home_team_name && homeTeam.name) prepared.home_team_name = homeTeam.name;
+    if (!prepared.away && awayTeam.name) prepared.away = awayTeam.name;
+    if (!prepared.away_team && awayTeam.name) prepared.away_team = awayTeam.name;
+    if (!prepared.away_team_name && awayTeam.name) prepared.away_team_name = awayTeam.name;
+    if (prepared.team_home_id == null) prepared.team_home_id = homeTeam.id;
+    if (prepared.team_away_id == null) prepared.team_away_id = awayTeam.id;
+    if (prepared.home_id == null) prepared.home_id = homeTeam.id;
+    if (prepared.away_id == null) prepared.away_id = awayTeam.id;
+    sanitized.push(prepared);
+  }
+  if (trace && dropped) {
+    trace.push({ filter: "history_requirements", dropped, kept: sanitized.length });
+  }
+  return sanitized;
 }
 function ymdInTZ(tz = "Europe/Belgrade", d = new Date()) {
   const parts = new Intl.DateTimeFormat("en-GB", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(d);
@@ -804,6 +1055,7 @@ module.exports = async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
   const trace = [];
   let responseYmd = null;
+  let finalCount = 0;
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const tzYmd = ymdInTZ("Europe/Belgrade");
@@ -812,10 +1064,12 @@ module.exports = async function handler(req, res) {
     const kvFlavors = kvBackends();
     const context = { kvFlavors, trace };
     const { items, meta } = await loadSnapshotsForDay(ymd, context);
-    await writeHistoryPayload(ymd, items, meta, trace);
-    res.status(200).json({ ok: true, ymd, count: items.length, trace });
+    const historyItems = enforceHistoryRequirements(items, trace);
+    await writeHistoryPayload(ymd, historyItems, meta, trace);
+    finalCount = historyItems.length;
+    res.status(200).json({ ok: true, ymd, count: finalCount, trace });
   } catch (err) {
     trace.push({ error: String(err?.message || err), ymd: responseYmd });
-    res.status(200).json({ ok: true, ymd: responseYmd, count: 0, trace });
+    res.status(200).json({ ok: true, ymd: responseYmd, count: finalCount, trace });
   }
 };

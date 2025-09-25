@@ -42,6 +42,20 @@ describe("apply-learning history writer", () => {
               market_label: "H2H",
               model_prob: 0.61,
               odds: { price: 1.9 },
+              league_id: 77,
+              league_name: "Sample League",
+              league: { id: 77, name: "Sample League" },
+              teams: {
+                home: { id: 1001, name: "Alpha" },
+                away: { id: 1002, name: "Beta" },
+              },
+              fixture: {
+                teams: {
+                  home: { id: 1001, name: "Alpha" },
+                  away: { id: 1002, name: "Beta" },
+                },
+                league: { id: 77, name: "Sample League" },
+              },
             },
             {
               fixture_id: 202,
@@ -96,6 +110,15 @@ describe("apply-learning history writer", () => {
     expect(res.statusCode).toBe(200);
     expect(res.jsonPayload.ok).toBe(true);
     expect(res.jsonPayload.count).toBeGreaterThan(0);
+    const histArrayCall = pipelineCalls.find((cmds) => Array.isArray(cmds) && cmds[0]?.[1] === `hist:${ymd}`);
+    expect(histArrayCall).toBeDefined();
+    const histArrayPayload = histArrayCall[0][2];
+    const parsedHist = JSON.parse(histArrayPayload);
+    expect(Array.isArray(parsedHist)).toBe(true);
+    expect(parsedHist.length).toBeGreaterThan(0);
+    expect(parsedHist[0].league.name).toBe("Sample League");
+    expect(parsedHist[0].teams.home.name).toBe("Alpha");
+
     const histDayCall = pipelineCalls.find((cmds) => Array.isArray(cmds) && cmds[0]?.[1] === `hist:day:${ymd}`);
     expect(histDayCall).toBeDefined();
     expect(fetchMock).toHaveBeenCalled();
