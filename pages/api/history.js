@@ -96,6 +96,26 @@ const dedupKey = (e, normalizedMarketKey) => {
   return `${e?.fixture_id || e?.id || "?"}__${m}__${pick}`;
 };
 
+// helper: robustly parse KV payload into an array of items
+function parseHistPayload(raw) {
+  let val = raw;
+  if (typeof val === "string") {
+    try {
+      val = JSON.parse(val);
+    } catch {
+      /* leave as string */
+    }
+  }
+  if (Array.isArray(val)) return val;
+
+  if (val && typeof val === "object") {
+    if (Array.isArray(val.items)) return val.items;
+    if (Array.isArray(val.history)) return val.history;
+    if (val.data && Array.isArray(val.data.items)) return val.data.items;
+  }
+  return [];
+}
+
 function withHistoryMarketDisplay(entry, canonicalKey) {
   if (!entry || typeof entry !== "object") return entry;
   if (canonicalKey !== "1x2") return entry;
@@ -202,24 +222,25 @@ async function loadHistoryForDay(ymd, trace, wantDebug = false) {
   let usedSource = null;
 
   if (rawHistDay !== null) {
-    const payload = histDayValue?.value;
-    if (payload && typeof payload === "object" && Array.isArray(payload.items)) {
-      items = payload.items;
-    } else {
-      const parsedItems = arrFromAny(histDayValue);
-      items = parsedItems.array;
+    const parsed = parseHistPayload(histDayValue?.value ?? rawHistDay);
+    if (parsed.length > 0) {
+      items = parsed;
+      usedSource = "hist_day";
     }
-    usedSource = "hist_day";
   }
 
-  const histResp = rawHistDay === null ? await kvGETraw(`hist:${ymd}`, trace) : { raw: null };
+  const needHistFallback = items.length === 0;
+  const histResp = needHistFallback ? await kvGETraw(`hist:${ymd}`, trace) : { raw: null };
   const rawHist = histResp.raw;
   const histValue = toJson(rawHist);
   const histItems = arrFromAny(histValue);
 
-  if (rawHistDay === null && rawHist !== null) {
-    items = histItems.array;
-    usedSource = "hist";
+  if (needHistFallback && rawHist !== null) {
+    const parsedHist = parseHistPayload(histValue?.value ?? rawHist);
+    if (parsedHist.length > 0) {
+      items = parsedHist;
+      usedSource = "hist";
+    }
   }
 
   const combKey = `vb:day:${ymd}:combined`;
@@ -227,7 +248,7 @@ async function loadHistoryForDay(ymd, trace, wantDebug = false) {
   const combValue = toJson(rawComb);
   const combItems = arrFromAny(combValue);
 
-  if (rawHistDay === null && rawHist === null && !items.length) {
+  if (!items.length) {
     items = combItems.array;
     if (items.length) usedSource = "combined";
   }
@@ -309,7 +330,27 @@ export default async function handler(req, res) {
     const afterFilter = items.length;
     const roi = computeRoi(items);
 
-    const historyFilterInfo = { before: beforeFilter, after: afterFilter, normalized: true };
+    const usedList = Object.values(daySources)
+      .map((s) => s?.used)
+      .filter((v) => typeof v === "string" && v);
+    let filterSourceUsed = null;
+    if (usedList.length) {
+      const priority = ["hist_day", "hist", "combined"];
+      for (const candidate of priority) {
+        if (usedList.includes(candidate)) {
+          filterSourceUsed = candidate;
+          break;
+        }
+      }
+      if (!filterSourceUsed) filterSourceUsed = usedList[0];
+    }
+
+    const historyFilterInfo = {
+      before: beforeFilter,
+      after: afterFilter,
+      normalized: true,
+      source_used: filterSourceUsed || "none",
+    };
     if (wantDebug) {
       historyFilterInfo.sources_used = Object.fromEntries(
         Object.entries(daySources).map(([d, s]) => [d, s?.used || null])
