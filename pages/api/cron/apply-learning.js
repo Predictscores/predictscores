@@ -1,6 +1,10 @@
 // pages/api/cron/apply-learning.js
 // Builds history KV records from learned value-bet snapshots while guarding against missing data.
-const { kvBackends: sharedKvBackends, readKeyFromBackends } = require("../../../lib/kv-helpers");
+const {
+  kvBackends: sharedKvBackends,
+  readKeyFromBackends,
+  writeKeyToBackends,
+} = require("../../../lib/kv-helpers");
 
 /* ---------- KV helpers ---------- */
 function kvEnv() {
@@ -15,26 +19,6 @@ function kvEnv() {
     process.env.KV_REST_API_READ_ONLY_TOKEN ||
     "";
   return { url, token };
-}
-async function kvPipeline(cmds) {
-  const { url, token } = kvEnv();
-  if (!url || !token) throw new Error("KV env not set (URL/TOKEN).");
-  const r = await fetch(`${url}/pipeline`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify(cmds),
-    cache: "no-store",
-  });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`KV pipeline HTTP ${r.status}: ${t}`);
-  }
-  return r.json();
-}
-async function kvSetJSON(key, obj) {
-  const payload = JSON.stringify(obj);
-  await kvPipeline([["SET", key, payload]]);
-  return payload.length;
 }
 function kvBackends() {
   const shared = sharedKvBackends();
@@ -788,25 +772,25 @@ async function loadSnapshotsForDay(ymd, context) {
   context.trace.push({ chosen: "slots", size: deduped.length, slots: slotSizes });
   return { items: deduped, meta: { source: "slots", slotSizes } };
 }
-async function writeHistoryKey(key, payload, trace) {
+async function writeHistoryKey(key, payload, trace, kvFlavors) {
+  const size = Array.isArray(payload)
+    ? payload.length
+    : Array.isArray(payload?.items)
+    ? payload.items.length
+    : 0;
+  if (!Array.isArray(kvFlavors) || kvFlavors.length === 0) {
+    trace.push({ kv: "set", key, size, skipped: "no_backends" });
+    return;
+  }
   try {
-    await kvSetJSON(key, payload);
-    const size = Array.isArray(payload)
-      ? payload.length
-      : Array.isArray(payload?.items)
-      ? payload.items.length
-      : 0;
-    trace.push({ kv: "set", key, size });
+    const saves = await writeKeyToBackends(key, payload, { backends: kvFlavors });
+    const ok = Array.isArray(saves) ? saves.some((attempt) => attempt?.ok) : false;
+    trace.push({ kv: "set", key, size, ok, saves });
   } catch (err) {
-    const size = Array.isArray(payload)
-      ? payload.length
-      : Array.isArray(payload?.items)
-      ? payload.items.length
-      : 0;
     trace.push({ kv: "set", key, size, error: String(err?.message || err) });
   }
 }
-async function writeHistoryPayload(ymd, items, meta, trace) {
+async function writeHistoryPayload(ymd, items, meta, trace, kvFlavors) {
   const payloadObject = {
     ymd,
     count: items.length,
@@ -816,8 +800,8 @@ async function writeHistoryPayload(ymd, items, meta, trace) {
       writtenAt: new Date().toISOString(),
     },
   };
-  await writeHistoryKey(`hist:${ymd}`, items, trace);
-  await writeHistoryKey(`hist:day:${ymd}`, payloadObject, trace);
+  await writeHistoryKey(`hist:${ymd}`, items, trace, kvFlavors);
+  await writeHistoryKey(`hist:day:${ymd}`, payloadObject, trace, kvFlavors);
 }
 
 
@@ -1086,7 +1070,7 @@ module.exports = async function handler(req, res) {
     const context = { kvFlavors, trace };
     const { items, meta } = await loadSnapshotsForDay(ymd, context);
     const historyItems = enforceHistoryRequirements(items, trace);
-    await writeHistoryPayload(ymd, historyItems, meta, trace);
+    await writeHistoryPayload(ymd, historyItems, meta, trace, kvFlavors);
     finalCount = historyItems.length;
     res.status(200).json({ ok: true, ymd, count: finalCount, trace });
   } catch (err) {
