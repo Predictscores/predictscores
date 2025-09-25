@@ -1014,12 +1014,67 @@ function mergeTeam(existing, required) {
 function enforceHistoryRequirements(items = [], trace) {
   const sanitized = [];
   let dropped = 0;
+  const reasons = {
+    noMarket: 0,
+    noFixture: 0,
+    noTeams: 0,
+    noSelection: 0,
+    invalid: 0,
+  };
+
   const allowedMarkets = new Set(["1x2", "h2h"]);
+
   for (const original of items || []) {
     if (!original || typeof original !== "object") {
       dropped += 1;
+      reasons.invalid += 1;
       continue;
     }
+
+    const marketCandidates = [
+      original.market_key,
+      original.market,
+      original.market_label,
+      original.marketKey,
+      original.marketName,
+      original.market_display,
+      original.marketDisplay,
+      original.market_slug,
+      original.marketSlug,
+      original?.model?.market_key,
+      original?.model?.market,
+      original?.model?.market_label,
+      original?.model?.marketKey,
+      original?.model?.marketName,
+    ];
+
+    let marketKey = "";
+    for (const candidate of marketCandidates) {
+      const lowered = String(candidate ?? "").trim().toLowerCase();
+      if (!lowered) continue;
+      if (allowedMarkets.has(lowered)) {
+        marketKey = lowered;
+        break;
+      }
+    }
+
+    if (!marketKey) {
+      const labelCandidates = [original.market_label, original?.model?.market_label];
+      for (const label of labelCandidates) {
+        const upper = String(label ?? "").trim().toUpperCase();
+        if (upper === "1X2") {
+          marketKey = "1x2";
+          break;
+        }
+      }
+    }
+
+    if (!marketKey) {
+      dropped += 1;
+      reasons.noMarket += 1;
+      continue;
+    }
+
     const fixtureId = coerceFixtureId(
       original.fixture_id,
       original.fixtureId,
@@ -1029,35 +1084,32 @@ function enforceHistoryRequirements(items = [], trace) {
       original.match_id,
       original.matchId
     );
+
     if (fixtureId == null) {
       dropped += 1;
+      reasons.noFixture += 1;
       continue;
     }
+
     const normalized = finalizeH2HEntry(original, fixtureId);
-    const marketCandidates = [
-      normalized.market_key,
-      normalized.market,
-      normalized.market_label,
-      original.market_key,
-      original.market,
-      original.market_label,
-    ];
-    const marketKey = marketCandidates
-      .map((value) => String(value ?? "").trim().toLowerCase())
-      .find((value) => value && allowedMarkets.has(value));
     const selectionLabel = String(
       normalized.selection || normalized.selection_label || normalized.pick || ""
     ).trim();
-    if (!marketKey || !selectionLabel) {
+
+    if (!selectionLabel) {
       dropped += 1;
+      reasons.noSelection += 1;
       continue;
     }
+
     const homeTeam = extractTeamMeta(normalized, "home");
     const awayTeam = extractTeamMeta(normalized, "away");
     if (!homeTeam || !awayTeam) {
       dropped += 1;
+      reasons.noTeams += 1;
       continue;
     }
+
     const prepared = { ...normalized };
     const league = extractLeagueMeta(normalized);
     if (league) {
@@ -1071,21 +1123,23 @@ function enforceHistoryRequirements(items = [], trace) {
       if (!prepared.league_name) prepared.league_name = league.name;
       if (!prepared.league?.name) prepared.league.name = league.name;
     }
+
     const teams = prepared.teams && typeof prepared.teams === "object" ? { ...prepared.teams } : {};
     teams.home = mergeTeam(teams.home, homeTeam);
     teams.away = mergeTeam(teams.away, awayTeam);
     prepared.teams = teams;
-      if (prepared.fixture && typeof prepared.fixture === "object") {
-        const fixtureClone = { ...prepared.fixture };
-        const fixtureTeams = fixtureClone.teams && typeof fixtureClone.teams === "object" ? { ...fixtureClone.teams } : {};
-        fixtureTeams.home = mergeTeam(fixtureTeams.home, homeTeam);
-        fixtureTeams.away = mergeTeam(fixtureTeams.away, awayTeam);
-        fixtureClone.teams = fixtureTeams;
-        if (fixtureClone.league && typeof fixtureClone.league === "object" && league) {
-          fixtureClone.league = { ...fixtureClone.league, id: league.id, name: league.name };
-        }
-        prepared.fixture = fixtureClone;
+    if (prepared.fixture && typeof prepared.fixture === "object") {
+      const fixtureClone = { ...prepared.fixture };
+      const fixtureTeams = fixtureClone.teams && typeof fixtureClone.teams === "object" ? { ...fixtureClone.teams } : {};
+      fixtureTeams.home = mergeTeam(fixtureTeams.home, homeTeam);
+      fixtureTeams.away = mergeTeam(fixtureTeams.away, awayTeam);
+      fixtureClone.teams = fixtureTeams;
+      if (fixtureClone.league && typeof fixtureClone.league === "object" && league) {
+        fixtureClone.league = { ...fixtureClone.league, id: league.id, name: league.name };
       }
+      prepared.fixture = fixtureClone;
+    }
+
     if (!prepared.home && homeTeam.name) prepared.home = homeTeam.name;
     if (!prepared.home_team && homeTeam.name) prepared.home_team = homeTeam.name;
     if (!prepared.home_team_name && homeTeam.name) prepared.home_team_name = homeTeam.name;
@@ -1096,11 +1150,26 @@ function enforceHistoryRequirements(items = [], trace) {
     if (prepared.team_away_id == null) prepared.team_away_id = awayTeam.id;
     if (prepared.home_id == null) prepared.home_id = homeTeam.id;
     if (prepared.away_id == null) prepared.away_id = awayTeam.id;
+
+    const historyMarketKey = marketKey === "1x2" ? "h2h" : marketKey;
+    prepared.market_key = historyMarketKey;
+    if (!prepared.market || /^(1x2|h2h)$/i.test(String(prepared.market))) {
+      prepared.market = historyMarketKey;
+    }
+    prepared.market_label = "1X2";
+
     sanitized.push(prepared);
   }
+
   if (trace && typeof trace.push === "function") {
-    trace.push({ filter: "history_requirements", dropped, kept: sanitized.length });
+    trace.push({
+      filter: "history_requirements",
+      dropped,
+      kept: sanitized.length,
+      reasons,
+    });
   }
+
   return sanitized;
 }
 function ymdInTZ(tz = "Europe/Belgrade", d = new Date()) {
