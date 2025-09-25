@@ -70,6 +70,21 @@ describe("apply-learning history writer", () => {
               market_label: "Total Goals",
               model_prob: 0.52,
             },
+            {
+              fixture: {
+                id: 303,
+                teams: {
+                  home: { id: 3001, name: "Gamma" },
+                  away: { id: 3002, name: "Delta" },
+                },
+              },
+              selection: "Away",
+              market_key: "h2h",
+              teams: {
+                home: { id: 3001, name: "Gamma" },
+                away: { id: 3002, name: "Delta" },
+              },
+            },
           ],
         };
         return {
@@ -108,7 +123,8 @@ describe("apply-learning history writer", () => {
   });
 
   it("stores H2H picks in hist keys and responds with count", async () => {
-    const handler = require("../../../pages/api/cron/apply-learning");
+    const handlerModule = require("../../../pages/api/cron/apply-learning");
+    const handler = handlerModule.default || handlerModule;
     const req = {
       url: `/api/cron/apply-learning?ymd=${encodeURIComponent(ymd)}&debug=1`,
       headers: { host: "example.test", "x-forwarded-proto": "https" },
@@ -126,9 +142,20 @@ describe("apply-learning history writer", () => {
     const histArrayPayload = histArrayCall.body?.value;
     const parsedHist = JSON.parse(histArrayPayload);
     expect(Array.isArray(parsedHist)).toBe(true);
-    expect(parsedHist.length).toBeGreaterThan(0);
+    expect(parsedHist.length).toBe(2);
     expect(parsedHist[0].league.name).toBe("Sample League");
     expect(parsedHist[0].teams.home.name).toBe("Alpha");
+    const relaxedEntry = parsedHist.find((entry) => entry.fixture_id === 303);
+    expect(relaxedEntry).toBeDefined();
+    expect(relaxedEntry.teams.home.name).toBe("Gamma");
+    expect(relaxedEntry.teams.away.name).toBe("Delta");
+    expect(relaxedEntry.market_key.toLowerCase()).toBe("1x2");
+
+    expect(res.jsonPayload.trace).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ filter: "history_requirements", kept: 2 }),
+      ])
+    );
 
     const histDayCall = setCalls.find((call) => call.key === `hist:day:${ymd}`);
     expect(histDayCall).toBeDefined();
