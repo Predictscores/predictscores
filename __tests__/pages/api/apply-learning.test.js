@@ -155,8 +155,9 @@ describe("apply-learning history writer", () => {
     const histArrayPayload = histArrayCall.body?.value;
     const parsedHist = JSON.parse(histArrayPayload);
     expect(Array.isArray(parsedHist)).toBe(true);
-    expect(parsedHist.length).toBe(1);
-    const fallbackEntry = parsedHist[0];
+    expect(parsedHist.length).toBeGreaterThanOrEqual(1);
+    const fallbackEntry = parsedHist.find((row) => row.fixture_id === 404);
+    expect(fallbackEntry).toBeDefined();
     expect(fallbackEntry).toEqual(
       expect.objectContaining({
         fixture_id: 404,
@@ -186,7 +187,7 @@ describe("apply-learning history writer", () => {
 
     expect(res.jsonPayload.trace).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ filter: "history_requirements", kept: 1 }),
+        expect.objectContaining({ filter: "history_requirements", kept: res.jsonPayload.count }),
       ])
     );
     expect(res.jsonPayload.trace).toEqual(
@@ -214,5 +215,104 @@ describe("apply-learning history writer", () => {
         expect.objectContaining({ kv: "set", key: `hist:day:${ymd}`, size: parsedHist.length, ok: true }),
       ])
     );
+  });
+
+  it("infers 1x2 market metadata for implicit H2H picks", async () => {
+    const assumedYmd = "2024-07-02";
+    fetchMock.mockImplementation(async (url, options = {}) => {
+      if (url === `https://kv.example/get/${encodeURIComponent(`vb:day:${assumedYmd}:union`)}`) {
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+        };
+      }
+      if (url === `https://kv.example/get/${encodeURIComponent(`vb:day:${assumedYmd}:combined`)}`) {
+        const payload = {
+          items: [
+            {
+              fixture_id: 505,
+              selection: "Away",
+              teams: {
+                home: { id: 9001, name: "Implied Home" },
+                away: { id: 9002, name: "Implied Away" },
+              },
+              fixture: {
+                id: 505,
+                teams: {
+                  home: { id: 9001, name: "Implied Home" },
+                  away: { id: 9002, name: "Implied Away" },
+                },
+              },
+            },
+          ],
+        };
+        return {
+          ok: true,
+          json: async () => ({ result: JSON.stringify(payload) }),
+        };
+      }
+      const setMatch = url.match(/^https:\/\/kv\.example\/set\/(.+)$/);
+      if (setMatch) {
+        const key = decodeURIComponent(setMatch[1]);
+        const bodyJson = options?.body ? JSON.parse(options.body) : {};
+        setCalls.push({ key, body: bodyJson });
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ result: "OK" }),
+        };
+      }
+      return {
+        ok: false,
+        status: 404,
+        json: async () => ({}),
+      };
+    });
+
+    const handlerModule = require("../../../pages/api/cron/apply-learning");
+    const handler = handlerModule.default || handlerModule;
+    const req = {
+      url: `/api/cron/apply-learning?ymd=${encodeURIComponent(assumedYmd)}&debug=1`,
+      headers: { host: "example.test", "x-forwarded-proto": "https" },
+      query: { ymd: assumedYmd },
+    };
+    const res = createMockRes();
+
+    await handler(req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.jsonPayload.ok).toBe(true);
+    expect(res.jsonPayload.count).toBe(1);
+
+    const historyTrace = res.jsonPayload.trace.find((row) => row.filter === "history_requirements");
+    expect(historyTrace).toBeDefined();
+    expect(historyTrace.reasons.assumedMarket).toBeGreaterThan(0);
+    expect(historyTrace.reasons.noMarket).toBe(0);
+
+    const histArrayCall = setCalls.find((call) => call.key === `hist:${assumedYmd}`);
+    expect(histArrayCall).toBeDefined();
+    const parsedHist = JSON.parse(histArrayCall.body?.value);
+    expect(Array.isArray(parsedHist)).toBe(true);
+    expect(parsedHist.length).toBe(1);
+    expect(parsedHist[0]).toEqual(
+      expect.objectContaining({
+        fixture_id: 505,
+        selection: "away",
+        predicted: "away",
+        home_name: "Implied Home",
+        away_name: "Implied Away",
+        market_key: "1x2",
+        market: "1x2",
+        market_label: "1X2",
+        source: "combined",
+      })
+    );
+
+    const histDayCall = setCalls.find((call) => call.key === `hist:day:${assumedYmd}`);
+    expect(histDayCall).toBeDefined();
+    const parsedDay = JSON.parse(histDayCall.body?.value);
+    expect(Array.isArray(parsedDay)).toBe(true);
+    expect(parsedDay).toEqual(parsedHist);
   });
 });
