@@ -17,17 +17,40 @@ function extractKey(req) {
   }
 }
 
+const KEY_PREFIX_PATTERN = /^[a-z0-9][a-z0-9_-]*:/i;
+
 module.exports = async function handler(req, res) {
+  if (req.method !== "GET") {
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
+  }
+
   try {
     res.setHeader("Cache-Control", "no-store");
     const rawKey = extractKey(req);
     const key = String(rawKey || "").trim();
+
     if (!key) {
-      return res.status(200).json({ ok: true, key: null, hit: false, flavor: null, value: null });
+      return res.status(400).json({ ok: false, error: "Missing 'key' query parameter" });
+    }
+
+    if (!KEY_PREFIX_PATTERN.test(key)) {
+      return res.status(400).json({ ok: false, key, error: "Invalid key prefix" });
     }
 
     const backends = kvBackends();
-    const read = await readKeyFromBackends(key, { backends });
+    let read;
+
+    try {
+      read = await readKeyFromBackends(key, { backends, parseJson: false });
+    } catch (error) {
+      return res.status(500).json({
+        ok: false,
+        error: error?.message || String(error),
+        name: error?.name || null,
+        code: error?.code || null,
+      });
+    }
+
     const tried = Array.isArray(read?.tried)
       ? read.tried.map((attempt) => ({
           flavor: attempt?.flavor || "unknown",
@@ -37,18 +60,44 @@ module.exports = async function handler(req, res) {
         }))
       : [];
 
+    const raw = typeof read?.value === "undefined" ? null : read?.value;
+    const valueType = raw === null ? "null" : typeof raw;
+    let parsed = null;
+    let parsedType = null;
+
+    if (typeof raw === "string") {
+      const trimmed = raw.trim();
+      if (trimmed) {
+        try {
+          parsed = JSON.parse(trimmed);
+          parsedType = parsed === null ? "null" : Array.isArray(parsed) ? "array" : typeof parsed;
+        } catch {
+          parsed = null;
+          parsedType = null;
+        }
+      }
+    }
+
     const response = {
       ok: true,
       key,
       hit: Boolean(read?.hit),
       flavor: read?.flavor || null,
-      value: read?.value ?? null,
+      valueType,
+      parsedType,
+      raw,
+      parsed,
     };
 
     if (tried.length) response.tried = tried;
 
     return res.status(200).json(response);
   } catch (err) {
-    return res.status(200).json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || String(err),
+      name: err?.name || null,
+      code: err?.code || null,
+    });
   }
 };
