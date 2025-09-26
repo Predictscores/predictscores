@@ -1,0 +1,41 @@
+{
+  "tiers": {
+    "T1": {
+      "ids": [39, 40, 61, 78, 135, 140, 2, 3, 848],
+      "patterns": [
+        "Premier\\s+League",
+        "La\\s+Liga",
+        "Serie\\s+A",
+        "Bundesliga",
+        "Ligue\\s+1",
+        "Champions\\s+League",
+        "UEFA\\s*Champ"
+      ],
+      "target_ratio": 0.5
+    },
+    "T2": {
+      "ids": [41, 42, 88, 94, 95, 96, 99, 103, 144, 208, 210],
+      "patterns": [
+        "Championship",
+        "Eredivisie",
+        "Primeira",
+        "Liga\\s+Portugal",
+        "Super\\s+Lig",
+        "Pro\\s+League",
+        "Bundesliga\\s+2",
+        "Serie\\s+B",
+        "LaLiga\\s+2",
+        "Ligue\\s+2",
+        "Eerste\\s+Divisie"
+      ],
+      "target_ratio": 0.35
+    }
+  },
+  "denylist_patterns": [
+    "U-?\\d{2}",
+    "youth",
+    "reserve",
+    "women",
+    "futsal"
+  ]
+}

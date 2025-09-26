@@ -65,10 +65,10 @@ const {
   afxCacheSet,
 } = require("../../../lib/sources/apiFootball");
 const { saveCombinedAlias } = require("../../../lib/kv-helpers");
+const { isLeagueDenied } = require("../../../lib/leaguesConfig");
 
 /* ---------- utils ---------- */
 function canonicalSlot(x){ x=String(x||"auto").toLowerCase(); return x==="late"||x==="am"||x==="pm"?x:"auto"; }
-function isYouthLeague(name=""){ name=String(name||"").toLowerCase(); return /(u-?\d{2}|youth|reserve|women|futsal)/.test(name); }
 function kickoffISOFromAF(fix){ return fix?.fixture?.date || null; }
 function leagueFromAF(fix){ return { id: fix?.league?.id, name: fix?.league?.name, country: fix?.league?.country, season: fix?.league?.season }; }
 function teamsFromAF(fix){ return { home: fix?.teams?.home?.name, away: fix?.teams?.away?.name, home_id: fix?.teams?.home?.id, away_id: fix?.teams?.away?.id }; }
@@ -1143,7 +1143,7 @@ export default async function handler(req, res){
         return respond({ items: preserved, source: "budget" });
       }
       const mapped = list
-        .filter(f => !isYouthLeague(f?.league?.name))
+        .filter(f => !isLeagueDenied(f?.league))
         .filter(f => slotFilter(kickoffISOFromAF(f), slot))
         .map(f => {
           const dateISO = kickoffISOFromAF(f);
