@@ -24,6 +24,26 @@ describe("learning runtime helpers", () => {
     expect(resolveLeagueTier({ name: "Random League" })).toBe("T3");
   });
 
+  test("respects tier overrides from config", () => {
+    const config = {
+      tier_overrides: {
+        "id:555": "T1",
+        mls: "T2",
+      },
+      tier1_ids: [777],
+      tier2_ids: [888],
+      TIER1_RE: "(Custom Tier One)",
+      TIER2_RE: "(Custom Tier Two)",
+    };
+
+    expect(resolveLeagueTier({ id: 555 }, config)).toBe("T1");
+    expect(resolveLeagueTier({ name: "MLS" }, config)).toBe("T2");
+    expect(resolveLeagueTier({ id: 777 }, config)).toBe("T1");
+    expect(resolveLeagueTier({ id: 888 }, config)).toBe("T2");
+    expect(resolveLeagueTier({ name: "Custom Tier One" }, config)).toBe("T1");
+    expect(resolveLeagueTier({ name: "Custom Tier Two" }, config)).toBe("T2");
+  });
+
   test("normalizes market buckets", () => {
     expect(resolveMarketBucket("ou25")).toBe("OU2.5");
     expect(resolveMarketBucket("HT/FT")).toBe("HTFT");
