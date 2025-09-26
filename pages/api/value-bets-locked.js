@@ -742,6 +742,7 @@ async function readLearningFlags(trace) {
  * ========================= */
 function fromMarkets(fix){
   const out=[]; const m=fix?.markets||{}; const fid=fix.fixture_id||fix.fixture?.id; const ctx = buildModelContext(fix);
+  const tier = resolveLeagueTier(fix?.league || {});
 
   const push = (market, pick, pickCode, selectionLabel, rawPrice) => {
     const price = Number(rawPrice);
@@ -755,6 +756,7 @@ function fromMarkets(fix){
       odds: { price },
     };
     applyModelFields(cand, ctx);
+    cand.tier = tier;
     out.push(cand);
   };
 
@@ -786,6 +788,7 @@ function fromMarkets(fix){
 }
 function oneXtwoOffers(fix){
   const xs=[]; const x=fix?.markets?.['1x2']||{}; const fid=fix.fixture_id||fix.fixture?.id; const ctx = buildModelContext(fix);
+  const tier = resolveLeagueTier(fix?.league || {});
   const push=(code,label,price)=>{
     const p=Number(price);
     if(!Number.isFinite(p)||p<MIN_ODDS||p>MAX_ODDS) return;
@@ -793,7 +796,8 @@ function oneXtwoOffers(fix){
       fixture_id:fid, market:"1x2", pick:code, pick_code:code, selection_label:label, odds:{price:p},
       league:fix.league, league_name:fix.league?.name,
       league_country:fix.league?.country, teams:fix.teams, home:fix.home, away:fix.away,
-      kickoff:fix.kickoff, kickoff_utc:fix.kickoff_utc||fix.kickoff
+      kickoff:fix.kickoff, kickoff_utc:fix.kickoff_utc||fix.kickoff,
+      tier,
     };
     applyModelFields(cand, ctx);
     xs.push(cand);
@@ -840,6 +844,9 @@ function aliasItem(it){
   a.confidence = typeof it.confidence !== "undefined" ? it.confidence : (it.confidence_pct ?? 0);
   // legacy price on root
   if (it?.odds && typeof it.odds.price !== "undefined") a.price = Number(it.odds.price);
+  if (!a.tier) {
+    a.tier = resolveLeagueTier(it?.league || {});
+  }
   // legacy names
   if (it.home && !a.home_name) a.home_name = it.home;
   if (it.away && !a.away_name) a.away_name = it.away;
