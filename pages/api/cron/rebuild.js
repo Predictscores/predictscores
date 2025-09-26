@@ -9,6 +9,8 @@ function pickTZ() {
 const TZ = pickTZ();
 const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
 const hourInTZ = (d, tz) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour12:false, hour:"2-digit" }).format(d));
+const YMD_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+const firstQueryValue = (value) => (Array.isArray(value) ? value[0] : value);
 
 /* ---------- KV (Vercel KV or Upstash REST) ---------- */
 function kvBackends() {
@@ -19,7 +21,7 @@ function kvBackends() {
   if (bU && bT) out.push({ flavor:"upstash-redis", url:bU.replace(/\/+$/,""), tok:bT });
   return out;
 }
-async function kvGET(key, trace=[]) {
+async function kvGET(key, trace) {
   for (const b of kvBackends()) {
     try {
       const u = `${b.url}/get/${encodeURIComponent(key)}`;
@@ -29,14 +31,14 @@ async function kvGET(key, trace=[]) {
       const v = j?.result ?? j?.value ?? null;
       if (v==null) continue;
       const out = typeof v==="string" ? JSON.parse(v) : v;
-      trace.push({kv:"hit", key, flavor:b.flavor, size: (Array.isArray(out?.items)?out.items.length: (Array.isArray(out)?out.length:0))});
+      trace?.push({kv:"hit", key, flavor:b.flavor, size: (Array.isArray(out?.items)?out.items.length: (Array.isArray(out)?out.length:0))});
       return out;
     } catch {}
   }
-  trace.push({kv:"miss", key});
+  trace?.push({kv:"miss", key});
   return null;
 }
-async function kvSET(key, val, trace=[]) {
+async function kvSET(key, val, trace) {
   const saves = [];
   for (const b of kvBackends()) {
     try {
@@ -48,7 +50,7 @@ async function kvSET(key, val, trace=[]) {
       saves.push({ key, flavor:b.flavor, ok:false, error:String(e?.message||e) });
     }
   }
-  trace.push({kv:"set", key, saves});
+  trace?.push({kv:"set", key, saves});
   return saves;
 }
 
@@ -860,7 +862,7 @@ async function processFixture(fixture, ctx) {
   if (!meta.homeId) missing.push("homeId");
   if (!meta.awayId) missing.push("awayId");
   if (missing.length) {
-    ctx.trace.push({
+    ctx.trace?.push({
       model: {
         fixture: meta.fixtureId ?? null,
         status: "skip",
@@ -914,7 +916,7 @@ async function processFixture(fixture, ctx) {
 
   const model = computeModelFromFeatures(homeSummary, awaySummary, { h2h_edge: h2hSummary.edge });
   if (!model) {
-    ctx.trace.push({ model: { fixture: meta.fixtureId, status: "skip", reason: "model" } });
+    ctx.trace?.push({ model: { fixture: meta.fixtureId, status: "skip", reason: "model" } });
     return { updated: false };
   }
 
@@ -984,7 +986,7 @@ async function processFixture(fixture, ctx) {
     model_updated_at: new Date().toISOString(),
   };
 
-  ctx.trace.push({
+  ctx.trace?.push({
     model: {
       fixture: meta.fixtureId,
       status: "ok",
@@ -1056,11 +1058,19 @@ async function enrichFixturesForDay({ items, ymd, slot, trace, persistKeys, pers
 
 /* ---------- main ---------- */
 export default async function handler(req, res){
-  const trace = [];
+  const traceParam = firstQueryValue(req?.query?.trace);
+  const _trace = traceParam === "1" ? [] : undefined;
+  const trace = _trace;
   try{
     const now = new Date();
-    const ymd = ymdInTZ(now, TZ);
-    let slot = canonicalSlot(req.query.slot);
+
+    const rawYmd = String(firstQueryValue(req?.query?.ymd) || "").trim();
+    if (rawYmd && !YMD_REGEX.test(rawYmd)) {
+      return res.status(400).json({ ok:false, error:"invalid ymd" });
+    }
+    const ymd = rawYmd || ymdInTZ(now, TZ);
+
+    let slot = canonicalSlot(firstQueryValue(req?.query?.slot));
     if (slot==="auto") {
       const h = hourInTZ(now, TZ);
       slot = (h<10) ? "late" : (h<15) ? "am" : "pm";
@@ -1086,7 +1096,7 @@ export default async function handler(req, res){
         ymd,
         payload,
         from: "union",
-        trace,
+        trace: _trace,
       });
       if (count > 0) {
         combinedSynced = true;
@@ -1118,7 +1128,7 @@ export default async function handler(req, res){
         budget_exhausted: budgetStop,
         timed_out: stopReason === "time",
         stop_reason: stopReason || null,
-        trace
+        trace: _trace
       });
     };
 
@@ -1128,7 +1138,7 @@ export default async function handler(req, res){
       const list = Array.isArray(af?.response) ? af.response : null;
       if (!list) {
         budgetStop = true;
-        trace.push({ afx: "fixtures", ymd, budget: "exhausted" });
+        trace?.push({ afx: "fixtures", ymd, budget: "exhausted" });
         const preserved = fullItems.length ? fullItems : baseItems;
         return respond({ items: preserved, source: "budget" });
       }
