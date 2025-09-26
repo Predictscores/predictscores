@@ -4,7 +4,20 @@
 // izračunamo procentualne “hintove” (over2_5_pct, btts_pct, draw_pct).
 // Bezbedno: ne menja liste; samo piše meta ključeve.
 
-const { afxTeamStats, afxInjuries, afxH2H } = require("../../../lib/sources/apiFootball");
+const { afxTeamStats, afxInjuries, afxH2H, afxReadBudget } = require("../../../lib/sources/apiFootball");
+
+// Keep a small buffer so lower-priority enrichment does not consume all API credits.
+const SAFE_BUDGET_THRESHOLD = 320;
+
+function toBudgetNumber(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string") {
+    const num = Number(value.trim());
+    return Number.isFinite(num) ? num : null;
+  }
+  return null;
+}
 
 // --- KV helpers (REST) ---
 function toRestBase(s) {
@@ -387,7 +400,18 @@ export default async function handler(req, res) {
     const items = Array.isArray(data?.items) ? data.items : [];
 
     if (!items.length) {
-      return res.status(200).json({ ok: true, slot, ymd, enriched: 0, enriched_full: 0, stubbed: 0, reason: "no-items" });
+      return res.status(200).json({
+        ok: true,
+        slot,
+        ymd,
+        enriched: 0,
+        enriched_full: 0,
+        stubbed: 0,
+        reason: "no-items",
+        budget_exhausted: false,
+        budget_remaining: null,
+        budget_stop_reason: null,
+      });
     }
 
     let enriched = 0;        // ukupno zapisanih meta (stub + full)
@@ -396,13 +420,36 @@ export default async function handler(req, res) {
     const metaKeys = [];
     const metaListKey = `vb:meta:list:${ymd}:${slot}`;
 
+    let budgetStop = false;
+    let budgetStopReason = null;
+    let budgetRemaining = null;
+    let skipOutbound = false;
+
     for (const p of items) {
+      if (budgetStop) break;
       try {
         const fixture_id = p?.fixture_id;
         const homeId = p?.teams?.home_id || p?.home_id;
         const awayId = p?.teams?.away_id || p?.away_id;
         const leagueId = p?.league?.id || p?.league_id;
         const season = p?.league?.season || p?.season;
+
+        if (!skipOutbound) {
+          try {
+            const remainRaw = await afxReadBudget();
+            const remain = toBudgetNumber(remainRaw);
+            if (remain !== null) {
+              budgetRemaining = remain;
+              if (remain <= SAFE_BUDGET_THRESHOLD) {
+                budgetStop = true;
+                budgetStopReason = remain <= 0 ? "exhausted" : "threshold";
+                break;
+              }
+            }
+          } catch {
+            // ignore errors when probing budget
+          }
+        }
 
         if (!fixture_id) continue; // bez stabilnog ID-a nema ključa
 
@@ -430,14 +477,36 @@ export default async function handler(req, res) {
           continue;
         }
 
+        if (skipOutbound) {
+          budgetStop = true;
+          if (!budgetStopReason) budgetStopReason = "skip_outbound";
+          break;
+        }
+
         // Puni enrichment
-        const [statsH, statsA, injH, injA, h2h] = await Promise.all([
+        const remoteResults = await Promise.all([
           afxTeamStats(leagueId, homeId, season).catch(() => null),
           afxTeamStats(leagueId, awayId, season).catch(() => null),
           afxInjuries(homeId).catch(() => null),
           afxInjuries(awayId).catch(() => null),
           afxH2H(homeId, awayId, 10).catch(() => null),
-        ]);
+        ]).catch(() => null);
+
+        if (!remoteResults) {
+          skipOutbound = true;
+          budgetStop = true;
+          if (!budgetStopReason) budgetStopReason = "remote-error";
+          break;
+        }
+
+        if (remoteResults.every((value) => value === null || value === undefined)) {
+          skipOutbound = true;
+          budgetStop = true;
+          if (!budgetStopReason) budgetStopReason = "upstream-null";
+          break;
+        }
+
+        const [statsH, statsA, injH, injA, h2h] = remoteResults;
 
         // H2H procente računamo lokalno (bezbedno)
         let h2hCount = 0, over25 = 0, btts = 0, draws = 0;
@@ -487,7 +556,17 @@ export default async function handler(req, res) {
       await kvSet(metaListKey, { ymd, slot, keys: metaKeys, n: metaKeys.length, ts: Date.now() });
     }
 
-    return res.status(200).json({ ok: true, slot, ymd, enriched, enriched_full, stubbed });
+    return res.status(200).json({
+      ok: true,
+      slot,
+      ymd,
+      enriched,
+      enriched_full,
+      stubbed,
+      budget_exhausted: budgetStop,
+      budget_remaining: budgetRemaining,
+      budget_stop_reason: budgetStop ? budgetStopReason : null,
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
