@@ -212,26 +212,26 @@ function filterAllowed(arr) {
 }
 
 async function loadHistoryForDay(ymd, trace, wantDebug = false) {
+  const histKey = `hist:${ymd}`;
+  const { raw: histRespRaw } = await kvGETraw(histKey, trace);
+
+  let sourceUsed = "hist";
+  let arr = parseHistPayload(histRespRaw);
+
   const histDayKey = `hist:day:${ymd}`;
-  const { raw: rawHistDay } = await kvGETraw(histDayKey, trace, `hist:${ymd}`);
-
-  let sourceUsed = "hist_day";
-  let arr = parseHistPayload(rawHistDay);
-  const beforeHistDay = Array.isArray(arr) ? arr.length : 0;
-
-  let histRespRaw = null;
-  if (beforeHistDay === 0) {
-    const { raw } = await kvGETraw(`hist:${ymd}`, trace);
-    histRespRaw = raw;
-    const fromHist = parseHistPayload(raw);
-    if (fromHist.length > 0) {
-      arr = fromHist;
-      sourceUsed = "hist";
+  let rawHistDay = null;
+  if ((Array.isArray(arr) ? arr.length : 0) === 0) {
+    sourceUsed = "hist_day";
+    const resp = await kvGETraw(histDayKey, trace);
+    rawHistDay = resp.raw;
+    const fromHistDay = parseHistPayload(rawHistDay);
+    if (fromHistDay.length > 0) {
+      arr = fromHistDay;
     }
   }
 
   let combRespRaw = null;
-  if ((Array.isArray(arr) ? arr.length : 0) === 0) {
+  if (wantDebug && (Array.isArray(arr) ? arr.length : 0) === 0) {
     const { raw } = await kvGETraw(`vb:day:${ymd}:combined`, trace);
     combRespRaw = raw;
     const fromCombined = parseHistPayload(raw);

@@ -45,8 +45,6 @@ describe.each(kvResponseModes)(
         ok: true,
         json: async () => makeEnvelope(payload),
       });
-      fetchMock.mockResolvedValueOnce(miss());
-      fetchMock.mockResolvedValueOnce(miss());
     }
 
     beforeEach(() => {
@@ -152,8 +150,6 @@ describe("API history placeholder string fallback", () => {
     });
     fetchMock.mockResolvedValueOnce(cleared());
     fetchMock.mockResolvedValueOnce(secondaryHit());
-    fetchMock.mockResolvedValueOnce(cleared());
-    fetchMock.mockResolvedValueOnce(secondaryHit());
   }
 
   beforeEach(() => {
@@ -210,7 +206,7 @@ describe("API history placeholder string fallback", () => {
             flavor: "upstash-redis",
             hit: true,
           }),
-main
+ main
         ])
       );
     }
@@ -243,16 +239,6 @@ main
           }),
           expect.objectContaining({
             get: "hist:2024-06-02",
-            flavor: "upstash-redis",
-            hit: true,
-          }),
-          expect.objectContaining({
-            get: "vb:day:2024-06-02:combined",
-            flavor: "vercel-kv",
-            hit: false,
-          }),
-          expect.objectContaining({
-            get: "vb:day:2024-06-02:combined",
             flavor: "upstash-redis",
             hit: true,
           }),
