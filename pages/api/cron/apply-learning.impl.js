@@ -833,27 +833,34 @@ async function loadSnapshotsForDay(ymd, context) {
 
 function createKvClient(kvFlavors) {
   const backends = Array.isArray(kvFlavors) ? kvFlavors : [];
+  async function writeValue(key, value) {
+    if (!backends.length) {
+      const err = new Error("kv_not_configured");
+      err.code = "KV_NOT_CONFIGURED";
+      throw err;
+    }
+    if (typeof writeKeyToBackendsRef !== "function") {
+      const err = new Error("kv_writer_unavailable");
+      err.code = "KV_WRITE_UNAVAILABLE";
+      throw err;
+    }
+    const saves = await writeKeyToBackendsRef(key, value, { backends });
+    const ok = Array.isArray(saves) ? saves.some((attempt) => attempt?.ok) : false;
+    if (!ok) {
+      const err = new Error(`kv_write_failed:${key}`);
+      err.code = "KV_WRITE_FAILED";
+      err.saves = saves;
+      throw err;
+    }
+    return { ok, saves };
+  }
+
   return {
+    async set(key, value) {
+      return writeValue(key, value);
+    },
     async setJSON(key, value) {
-      if (!backends.length) {
-        const err = new Error("kv_not_configured");
-        err.code = "KV_NOT_CONFIGURED";
-        throw err;
-      }
-      if (typeof writeKeyToBackendsRef !== "function") {
-        const err = new Error("kv_writer_unavailable");
-        err.code = "KV_WRITE_UNAVAILABLE";
-        throw err;
-      }
-      const saves = await writeKeyToBackendsRef(key, value, { backends });
-      const ok = Array.isArray(saves) ? saves.some((attempt) => attempt?.ok) : false;
-      if (!ok) {
-        const err = new Error(`kv_write_failed:${key}`);
-        err.code = "KV_WRITE_FAILED";
-        err.saves = saves;
-        throw err;
-      }
-      return { ok, saves };
+      return writeValue(key, value);
     },
   };
 }
@@ -868,13 +875,15 @@ async function persistHistory(ymd, history, trace, kvFlavors) {
     return;
   }
   const kv = createKvClient(kvFlavors);
-  await setJsonWithTrace(kv, listKey, history, size, trace);
-  await setJsonWithTrace(kv, dayKey, history, size, trace);
+  const serializedHistory = JSON.stringify(Array.isArray(history) ? history : []);
+  await setJsonWithTrace(kv, listKey, serializedHistory, size, trace);
+  await setJsonWithTrace(kv, dayKey, serializedHistory, size, trace);
 }
 
 async function setJsonWithTrace(kv, key, value, size, trace) {
   try {
-    await kv.setJSON(key, value);
+    const serialized = typeof value === "string" ? value : JSON.stringify(value);
+    await kv.set(key, serialized);
     trace.push({ kv: "set", key, size, ok: true });
   } catch (err) {
     trace.push({ kv: "set", key, size, ok: false, error: String(err?.message || err) });
