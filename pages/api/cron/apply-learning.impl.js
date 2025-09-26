@@ -902,16 +902,12 @@ async function persistHistory(ymd, history, trace, kvFlavors, options = {}) {
     return;
   }
   const kv = createKvClient(kvFlavors);
-  const serializedHistory = JSON.stringify(Array.isArray(history) ? history : []);
-  await setJsonWithTrace(kv, listKey, serializedHistory, size, trace, meta);
-  await setJsonWithTrace(kv, dayKey, serializedHistory, size, trace, meta);
+main
 }
 
 async function setJsonWithTrace(kv, key, value, size, trace, meta = {}) {
   try {
-    const serialized = typeof value === "string" ? value : JSON.stringify(value);
-    await kv.set(key, serialized);
-    trace.push({ kv: "set", key, size, ok: true, ...meta });
+ main
   } catch (err) {
     trace.push({ kv: "set", key, size, ok: false, error: String(err?.message || err), ...meta });
   }
