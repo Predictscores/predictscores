@@ -740,8 +740,44 @@ async function readLearningFlags(trace) {
 /* =========================
  *  Candidate builders
  * ========================= */
+function resolveFixtureTier(fix) {
+  const direct = [
+    fix?.tier,
+    fix?.match_selector?.tier,
+    fix?.match_selector?.tier_key,
+    fix?.match_selector?.tierKey,
+    fix?.tier_key,
+    fix?.tierKey,
+    fix?.league?.tier,
+    fix?.league?.tier_key,
+    fix?.league?.tierKey,
+    fix?.league?.tier_level,
+    fix?.league?.tierLevel,
+  ];
+  for (const cand of direct) {
+    if (typeof cand === "string") {
+      const trimmed = cand.trim();
+      if (trimmed) return trimmed;
+    }
+    const num = Number(cand);
+    if (Number.isFinite(num)) {
+      return resolveLeagueTier({ tier: num });
+    }
+  }
+  if (fix?.league) {
+    const leagueTier = resolveLeagueTier(fix.league);
+    if (leagueTier) return leagueTier;
+  }
+  if (fix?.league_name || fix?.league_country) {
+    const fallback = resolveLeagueTier({ name: fix.league_name, country: fix.league_country });
+    if (fallback) return fallback;
+  }
+  return null;
+}
+
 function fromMarkets(fix){
   const out=[]; const m=fix?.markets||{}; const fid=fix.fixture_id||fix.fixture?.id; const ctx = buildModelContext(fix);
+  const tier = resolveFixtureTier(fix);
 
   const push = (market, pick, pickCode, selectionLabel, rawPrice) => {
     const price = Number(rawPrice);
@@ -753,6 +789,7 @@ function fromMarkets(fix){
       pick_code: pickCode,
       selection_label: selectionLabel,
       odds: { price },
+      tier,
     };
     applyModelFields(cand, ctx);
     out.push(cand);
@@ -780,12 +817,14 @@ function fromMarkets(fix){
     c.league=fix.league; c.league_name=fix.league?.name; c.league_country=fix.league?.country;
     c.teams=fix.teams; c.home=fix.home; c.away=fix.away;
     c.kickoff=fix.kickoff; c.kickoff_utc=fix.kickoff_utc||fix.kickoff;
+    if (typeof c.tier === "undefined") c.tier = tier;
     if (typeof c.model_prob !== "number") c.model_prob = c.model_prob != null ? Number(c.model_prob) : null;
   }
   return out;
 }
 function oneXtwoOffers(fix){
   const xs=[]; const x=fix?.markets?.['1x2']||{}; const fid=fix.fixture_id||fix.fixture?.id; const ctx = buildModelContext(fix);
+  const tier = resolveFixtureTier(fix);
   const push=(code,label,price)=>{
     const p=Number(price);
     if(!Number.isFinite(p)||p<MIN_ODDS||p>MAX_ODDS) return;
@@ -793,7 +832,8 @@ function oneXtwoOffers(fix){
       fixture_id:fid, market:"1x2", pick:code, pick_code:code, selection_label:label, odds:{price:p},
       league:fix.league, league_name:fix.league?.name,
       league_country:fix.league?.country, teams:fix.teams, home:fix.home, away:fix.away,
-      kickoff:fix.kickoff, kickoff_utc:fix.kickoff_utc||fix.kickoff
+      kickoff:fix.kickoff, kickoff_utc:fix.kickoff_utc||fix.kickoff,
+      tier,
     };
     applyModelFields(cand, ctx);
     xs.push(cand);
@@ -836,6 +876,7 @@ function applyUefaCap(items, cap){
 /* ===== Alias layer to match legacy frontend ===== */
 function aliasItem(it){
   const a = { ...it };
+  if (typeof it?.tier !== "undefined") a.tier = it.tier;
   // legacy confidence
   a.confidence = typeof it.confidence !== "undefined" ? it.confidence : (it.confidence_pct ?? 0);
   // legacy price on root
