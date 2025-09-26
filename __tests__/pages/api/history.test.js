@@ -101,7 +101,7 @@ describe("API history day loaders", () => {
     );
   });
 
-  it("skips combined fallback when debug is disabled", async () => {
+  it("attempts all fallbacks when debug is disabled", async () => {
     const miss = () => ({
       ok: true,
       json: async () => ({ result: null }),
@@ -111,6 +111,10 @@ describe("API history day loaders", () => {
     fetchMock.mockResolvedValueOnce(miss()); // hist secondary
     fetchMock.mockResolvedValueOnce(miss()); // hist_day primary
     fetchMock.mockResolvedValueOnce(miss()); // hist_day secondary
+    fetchMock.mockResolvedValueOnce(miss()); // union primary
+    fetchMock.mockResolvedValueOnce(miss()); // union secondary
+    fetchMock.mockResolvedValueOnce(miss()); // combined primary
+    fetchMock.mockResolvedValueOnce(miss()); // combined secondary
     global.fetch = fetchMock;
 
     const { default: handler } = require("../../../pages/api/history");
@@ -120,7 +124,7 @@ describe("API history day loaders", () => {
 
     await handler(req, res);
 
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock).toHaveBeenCalledTimes(8);
     const traceGets = res.jsonPayload.debug.trace
       .filter((entry) => entry.get)
       .map((entry) => entry.get);
@@ -129,9 +133,14 @@ describe("API history day loaders", () => {
       "hist:2024-06-03",
       "hist:day:2024-06-03",
       "hist:day:2024-06-03",
+      "vb:day:2024-06-03:union",
+      "vb:day:2024-06-03:union",
+      "vb:day:2024-06-03:combined",
+      "vb:day:2024-06-03:combined",
     ]);
     expect(res.jsonPayload.source["2024-06-03"].combined).toBe(false);
-    expect(res.jsonPayload.source["2024-06-03"].used).toBe("hist_day");
+    expect(res.jsonPayload.source["2024-06-03"].union).toBe(false);
+    expect(res.jsonPayload.source["2024-06-03"].used).toBeNull();
   });
 
   it("uses combined fallback only when debug is enabled", async () => {
@@ -148,6 +157,8 @@ describe("API history day loaders", () => {
     fetchMock.mockResolvedValueOnce(miss()); // hist secondary
     fetchMock.mockResolvedValueOnce(miss()); // hist_day primary
     fetchMock.mockResolvedValueOnce(miss()); // hist_day secondary
+    fetchMock.mockResolvedValueOnce(miss()); // union primary
+    fetchMock.mockResolvedValueOnce(miss()); // union secondary
     fetchMock.mockResolvedValueOnce(miss()); // combined primary
     fetchMock.mockResolvedValueOnce(combinedHit()); // combined secondary
     global.fetch = fetchMock;
@@ -159,7 +170,7 @@ describe("API history day loaders", () => {
 
     await handler(req, res);
 
-    expect(fetchMock).toHaveBeenCalledTimes(6);
+    expect(fetchMock).toHaveBeenCalledTimes(8);
     const traceGets = res.jsonPayload.debug.trace
       .filter((entry) => entry.get)
       .map((entry) => entry.get);
@@ -168,6 +179,8 @@ describe("API history day loaders", () => {
       "hist:2024-06-04",
       "hist:day:2024-06-04",
       "hist:day:2024-06-04",
+      "vb:day:2024-06-04:union",
+      "vb:day:2024-06-04:union",
       "vb:day:2024-06-04:combined",
       "vb:day:2024-06-04:combined",
     ]);

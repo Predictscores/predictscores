@@ -215,23 +215,38 @@ async function loadHistoryForDay(ymd, trace, wantDebug = false) {
   const histKey = `hist:${ymd}`;
   const { raw: histRespRaw } = await kvGETraw(histKey, trace);
 
-  let sourceUsed = "hist";
+  let sourceUsed = null;
   let arr = parseHistPayload(histRespRaw);
+  if (Array.isArray(arr) && arr.length > 0) {
+    sourceUsed = "hist";
+  }
 
   const histDayKey = `hist:day:${ymd}`;
   let rawHistDay = null;
-  if ((Array.isArray(arr) ? arr.length : 0) === 0) {
-    sourceUsed = "hist_day";
+  if (!Array.isArray(arr) || arr.length === 0) {
     const resp = await kvGETraw(histDayKey, trace);
     rawHistDay = resp.raw;
     const fromHistDay = parseHistPayload(rawHistDay);
     if (fromHistDay.length > 0) {
       arr = fromHistDay;
+      sourceUsed = "hist_day";
+    }
+  }
+
+  const unionKey = `vb:day:${ymd}:union`;
+  let unionRespRaw = null;
+  if (!Array.isArray(arr) || arr.length === 0) {
+    const { raw } = await kvGETraw(unionKey, trace);
+    unionRespRaw = raw;
+    const fromUnion = parseHistPayload(unionRespRaw);
+    if (fromUnion.length > 0) {
+      arr = fromUnion;
+      sourceUsed = "union";
     }
   }
 
   let combRespRaw = null;
-  if (wantDebug && (Array.isArray(arr) ? arr.length : 0) === 0) {
+  if (!Array.isArray(arr) || arr.length === 0) {
     const { raw } = await kvGETraw(`vb:day:${ymd}:combined`, trace);
     combRespRaw = raw;
     const fromCombined = parseHistPayload(raw);
@@ -247,6 +262,8 @@ async function loadHistoryForDay(ymd, trace, wantDebug = false) {
   const histDayItems = arrFromAny(histDayValue);
   const histValue = toJson(histRespRaw);
   const histItems = arrFromAny(histValue);
+  const unionValue = toJson(unionRespRaw);
+  const unionItems = arrFromAny(unionValue);
   const combValue = toJson(combRespRaw);
   const combItems = arrFromAny(combValue);
 
@@ -261,6 +278,10 @@ async function loadHistoryForDay(ymd, trace, wantDebug = false) {
         json: { ...histValue.meta },
         array: { ...histItems.meta },
       },
+      union: {
+        json: { ...unionValue.meta },
+        array: { ...unionItems.meta },
+      },
       combined: {
         json: { ...combValue.meta },
         array: { ...combItems.meta },
@@ -273,6 +294,7 @@ async function loadHistoryForDay(ymd, trace, wantDebug = false) {
     sources: {
       hist_day: rawHistDay !== null,
       hist: histRespRaw !== null,
+      union: unionRespRaw !== null,
       combined: combRespRaw !== null,
     },
     usedSource: sourceUsed,
@@ -333,7 +355,7 @@ export default async function handler(req, res) {
       .filter((v) => typeof v === "string" && v);
     let filterSourceUsed = null;
     if (usedList.length) {
-      const priority = ["hist_day", "hist", "combined"];
+      const priority = ["hist_day", "hist", "union", "combined"];
       for (const candidate of priority) {
         if (usedList.includes(candidate)) {
           filterSourceUsed = candidate;
