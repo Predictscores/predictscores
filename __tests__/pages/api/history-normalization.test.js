@@ -88,7 +88,7 @@ describe.each(kvResponseModes)("API history market normalization (%s)", (modeLab
 
     await handler(req, res);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(res.statusCode).toBe(200);
     expect(res.jsonPayload.history).toHaveLength(2);
     expect(res.jsonPayload.history.map((e) => e.market_key)).toEqual(
