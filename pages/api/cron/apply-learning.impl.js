@@ -1236,6 +1236,7 @@ function enforceHistoryRequirements(items = [], trace) {
     noTeams: 0,
     noSelection: 0,
     invalid: 0,
+    assumedMarket: 0,
   };
 
   for (const original of items || []) {
@@ -1271,6 +1272,17 @@ function enforceHistoryRequirements(items = [], trace) {
         if (candidate.trim().toLowerCase() === "1x2" && !explicitKnown) {
           has1x2 = true;
           break;
+        }
+      }
+    }
+
+    if (!has1x2) {
+      const normalizedSelection = normalizeHistorySelection(original);
+      if (normalizedSelection && ["home", "away", "draw"].includes(normalizedSelection)) {
+        const hasTeams = Boolean(extractTeamMeta(original, "home")) && Boolean(extractTeamMeta(original, "away"));
+        if (isLikelyH2H(original) || hasTeams) {
+          has1x2 = true;
+          reasons.assumedMarket += 1;
         }
       }
     }
