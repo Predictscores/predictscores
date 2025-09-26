@@ -8,6 +8,10 @@ function pickTZ() {
 const TZ = pickTZ();
 const hourInTZ = (d, tz) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour12: false, hour: "2-digit" }).format(d));
 const slotFromHour = h => (h < 10 ? "late" : h < 15 ? "am" : "pm");
+const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
+
+const YMD_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+const firstQueryValue = (value) => Array.isArray(value) ? value[0] : value;
 
 /* ---------- slot resolution ---------- */
 const canonicalSlot = (x) => {
@@ -49,16 +53,17 @@ function slotFromCronIdentifier(hint, now) {
 }
 
 function resolveSlot(req, now) {
-  const qSlot = canonicalSlot(req?.query?.slot);
+  const qSlotRaw = firstQueryValue(req?.query?.slot);
+  const qSlot = canonicalSlot(qSlotRaw);
   if (qSlot !== "auto") return qSlot;
 
   const cronHints = [
-    req?.query?.cron,
-    req?.query?.slot_hint,
-    req?.query?.id,
-    req?.query?.identifier,
-    req?.query?.cron_id,
-    req?.query?.schedule,
+    firstQueryValue(req?.query?.cron),
+    firstQueryValue(req?.query?.slot_hint),
+    firstQueryValue(req?.query?.id),
+    firstQueryValue(req?.query?.identifier),
+    firstQueryValue(req?.query?.cron_id),
+    firstQueryValue(req?.query?.schedule),
     req?.headers?.["x-vercel-cron"],
     req?.headers?.["x-vercel-cron-trigger"],
     req?.headers?.["x-vercel-schedule"],
@@ -75,13 +80,48 @@ function resolveSlot(req, now) {
   return slotFromHour(h);
 }
 
+function resolveYmd(req, now) {
+  const qYmd = String(firstQueryValue(req?.query?.ymd) || "").trim();
+  if (YMD_REGEX.test(qYmd)) return qYmd;
+  return ymdInTZ(now || new Date(), TZ);
+}
+
+function buildQueryString(reqQuery, resolved) {
+  const params = new URLSearchParams();
+  if (reqQuery && typeof reqQuery === "object") {
+    for (const [key, value] of Object.entries(reqQuery)) {
+      if (value == null) continue;
+      if (Array.isArray(value)) {
+        for (const v of value) {
+          if (v == null) continue;
+          params.append(key, String(v));
+        }
+      } else {
+        params.append(key, String(value));
+      }
+    }
+  }
+  for (const [key, value] of Object.entries(resolved)) {
+    if (value == null) continue;
+    params.set(key, String(value));
+  }
+  const qs = params.toString();
+  return qs ? `?${qs}` : "";
+}
+
 async function triggerInternal(req, path) {
   try {
     const proto = req.headers["x-forwarded-proto"] || "https";
     const host = req.headers["x-forwarded-host"] || req.headers.host;
     const origin = `${proto}://${host}`;
     const r = await fetch(`${origin}${path}`, { headers: { "x-internal-cron": "1" } });
-    return { ok: r.ok, status: r.status };
+    const text = await r.text().catch(() => "");
+    let body = null;
+    if (text) {
+      try { body = JSON.parse(text); }
+      catch { body = text; }
+    }
+    return { ok: r.ok, status: r.status, body, raw: text };
   } catch (e) {
     return { ok: false, status: 0, error: String(e?.message || e) };
   }
@@ -92,27 +132,36 @@ export default async function handler(req, res) {
     const startedAt = new Date().toISOString();
     const now = new Date();
     const slot = resolveSlot(req, now);
-    const slotParam = `slot=${encodeURIComponent(slot)}`;
+    const ymd = resolveYmd(req, now);
+    const queryString = buildQueryString(req?.query || {}, { slot, ymd });
 
-    // 1) Rebuild (lock feed)
-    const r1 = await triggerInternal(req, `/api/cron/rebuild?${slotParam}`);
+    const steps = [];
+    const notes = [];
 
-    // 2) Insights odmah nakon lock-a
-    const r2 = await triggerInternal(req, `/api/insights-build?${slotParam}`);
+    const rebuild = await triggerInternal(req, `/api/cron/rebuild${queryString}`);
+    steps.push({ step: "rebuild", status: rebuild.status, ok: rebuild.ok, body: rebuild.body, error: rebuild.error });
 
-    // 3) (opciono) Floats/Smart – best-effort; ignoriši ako nema rute
-    const r3 = await triggerInternal(req, "/api/locked-floats");
+    const refresh = await triggerInternal(req, `/api/cron/refresh-odds${queryString}`);
+    steps.push({ step: "refresh-odds", status: refresh.status, ok: refresh.ok, body: refresh.body, error: refresh.error });
+
+    const refreshBody = refresh?.body && typeof refresh.body === "object" ? refresh.body : null;
+    const refreshTraceLen = Array.isArray(refreshBody?.trace) ? refreshBody.trace.length : null;
+    const refreshUpdated = typeof refreshBody?.updated === "number" ? refreshBody.updated : null;
+    if (refreshTraceLen === 0 || refreshUpdated === 0) {
+      notes.push({ step: "refresh-odds", note: "no_updates", traceLength: refreshTraceLen, updated: refreshUpdated });
+    }
+
+    const apply = await triggerInternal(req, `/api/cron/apply-learning${queryString}`);
+    steps.push({ step: "apply-learning", status: apply.status, ok: apply.ok, body: apply.body, error: apply.error });
 
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).json({
-      ok: true,
+      ok: steps.every((s) => s.ok !== false),
       startedAt,
       slot,
-      steps: [
-        { step: "rebuild",  status: r1.status, ok: r1.ok },
-        { step: "insights", status: r2.status, ok: r2.ok },
-        { step: "floats",   status: r3.status, ok: r3.ok },
-      ],
+      ymd,
+      notes: notes.length ? notes : undefined,
+      steps,
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
