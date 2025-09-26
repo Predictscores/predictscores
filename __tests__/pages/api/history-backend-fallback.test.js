@@ -45,8 +45,6 @@ describe.each(kvResponseModes)(
         ok: true,
         json: async () => makeEnvelope(payload),
       });
-      fetchMock.mockResolvedValueOnce(miss());
-      fetchMock.mockResolvedValueOnce(miss());
     }
 
     beforeEach(() => {
@@ -83,7 +81,7 @@ describe.each(kvResponseModes)(
 
       await handler(req, res);
 
-      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
       expect(res.statusCode).toBe(200);
       expect(res.jsonPayload.count).toBe(1);
       expect(res.jsonPayload.history.map((e) => e.fixture_id)).toContain(
@@ -152,8 +150,6 @@ describe("API history placeholder string fallback", () => {
     });
     fetchMock.mockResolvedValueOnce(cleared());
     fetchMock.mockResolvedValueOnce(secondaryHit());
-    fetchMock.mockResolvedValueOnce(cleared());
-    fetchMock.mockResolvedValueOnce(secondaryHit());
   }
 
   beforeEach(() => {
@@ -192,7 +188,7 @@ describe("API history placeholder string fallback", () => {
 
       await handler(req, res);
 
-      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
       expect(res.statusCode).toBe(200);
       expect(res.jsonPayload.count).toBe(1);
       expect(res.jsonPayload.history.map((e) => e.fixture_id)).toContain(
@@ -207,16 +203,6 @@ describe("API history placeholder string fallback", () => {
           }),
           expect.objectContaining({
             get: "hist:2024-06-02",
-            flavor: "upstash-redis",
-            hit: true,
-          }),
-          expect.objectContaining({
-            get: "vb:day:2024-06-02:combined",
-            flavor: "vercel-kv",
-            hit: false,
-          }),
-          expect.objectContaining({
-            get: "vb:day:2024-06-02:combined",
             flavor: "upstash-redis",
             hit: true,
           }),
@@ -252,16 +238,6 @@ describe("API history placeholder string fallback", () => {
           }),
           expect.objectContaining({
             get: "hist:2024-06-02",
-            flavor: "upstash-redis",
-            hit: true,
-          }),
-          expect.objectContaining({
-            get: "vb:day:2024-06-02:combined",
-            flavor: "vercel-kv",
-            hit: false,
-          }),
-          expect.objectContaining({
-            get: "vb:day:2024-06-02:combined",
             flavor: "upstash-redis",
             hit: true,
           }),
