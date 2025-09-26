@@ -139,9 +139,9 @@ describe("apply-learning history writer", () => {
     const handlerModule = require("../../../pages/api/cron/apply-learning");
     const handler = handlerModule.default || handlerModule;
     const req = {
-      url: `/api/cron/apply-learning?ymd=${encodeURIComponent(ymd)}&debug=1`,
+      url: `/api/cron/apply-learning?ymd=${encodeURIComponent(ymd)}&trace=1`,
       headers: { host: "example.test", "x-forwarded-proto": "https" },
-      query: { ymd },
+      query: { ymd, trace: "1" },
     };
     const res = createMockRes();
 
@@ -275,9 +275,9 @@ describe("apply-learning history writer", () => {
     const handlerModule = require("../../../pages/api/cron/apply-learning");
     const handler = handlerModule.default || handlerModule;
     const req = {
-      url: `/api/cron/apply-learning?ymd=${encodeURIComponent(assumedYmd)}&debug=1`,
+      url: `/api/cron/apply-learning?ymd=${encodeURIComponent(assumedYmd)}&trace=1`,
       headers: { host: "example.test", "x-forwarded-proto": "https" },
-      query: { ymd: assumedYmd },
+      query: { ymd: assumedYmd, trace: "1" },
     };
     const res = createMockRes();
 

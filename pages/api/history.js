@@ -235,22 +235,26 @@ async function loadHistoryForDay(ymd, trace, wantDebug = false) {
 
   const unionKey = `vb:day:${ymd}:union`;
   let unionRespRaw = null;
+  let unionLen = 0;
   if (!Array.isArray(arr) || arr.length === 0) {
     const { raw } = await kvGETraw(unionKey, trace);
     unionRespRaw = raw;
     const fromUnion = parseHistPayload(unionRespRaw);
-    if (fromUnion.length > 0) {
+    unionLen = Array.isArray(fromUnion) ? fromUnion.length : 0;
+    if (unionLen > 0) {
       arr = fromUnion;
       sourceUsed = "union";
     }
   }
 
   let combRespRaw = null;
+  let combinedLen = 0;
   if (!Array.isArray(arr) || arr.length === 0) {
     const { raw } = await kvGETraw(`vb:day:${ymd}:combined`, trace);
     combRespRaw = raw;
     const fromCombined = parseHistPayload(raw);
-    if (fromCombined.length > 0) {
+    combinedLen = Array.isArray(fromCombined) ? fromCombined.length : 0;
+    if (combinedLen > 0) {
       arr = fromCombined;
       sourceUsed = "combined";
     }
@@ -298,6 +302,8 @@ async function loadHistoryForDay(ymd, trace, wantDebug = false) {
       combined: combRespRaw !== null,
     },
     usedSource: sourceUsed,
+    unionLen,
+    combinedLen,
     meta,
     before,
   };
@@ -337,8 +343,14 @@ export default async function handler(req, res) {
     const daySources = {};
     const dayMeta = wantDebug ? {} : null;
     for (const day of queriedDays) {
-      const { items, sources, usedSource, meta } = await loadHistoryForDay(day, trace, wantDebug);
-      daySources[day] = { ...sources, used: usedSource };
+      const { items, sources, usedSource, meta, unionLen, combinedLen } =
+        await loadHistoryForDay(day, trace, wantDebug);
+      daySources[day] = {
+        ...sources,
+        used: usedSource,
+        union_len: unionLen,
+        combined_len: combinedLen,
+      };
       if (wantDebug && meta) {
         dayMeta[day] = meta;
       }
@@ -386,6 +398,11 @@ export default async function handler(req, res) {
       day_sources: daySources,
       day_meta: wantDebug ? dayMeta : null,
     };
+    if (singleYmd && daySources[singleYmd]) {
+      debugInfo.sourceUsed = daySources[singleYmd].used ?? null;
+      debugInfo.union_len = daySources[singleYmd].union_len ?? null;
+      debugInfo.combined_len = daySources[singleYmd].combined_len ?? null;
+    }
     if (wantDebug) {
       debugInfo.history_filter = {
         ...(debugInfo.history_filter || {}),
