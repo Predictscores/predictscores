@@ -1,7 +1,27 @@
 // pages/api/kv/get.js
 // Lightweight KV inspector that never falls through to Next.js 404.
 
-const { kvBackends, readKeyFromBackends } = require("../../../lib/kv-helpers");
+const {
+  kvBackends,
+  readKeyFromBackends,
+  KvEnvMisconfigurationError,
+  PRODUCTION_MISCONFIG_CODE,
+} = require("../../../lib/kv-helpers");
+
+function respondWithProductionMisconfig(res, err) {
+  return res.status(500).json({
+    ok: false,
+    error: "Confirm env vars present in Production",
+    name: err?.name || "KvEnvMisconfigurationError",
+    code: PRODUCTION_MISCONFIG_CODE,
+  });
+}
+
+function isProductionMisconfig(error) {
+  if (!error) return false;
+  if (error instanceof KvEnvMisconfigurationError) return true;
+  return String(error?.code || "") === PRODUCTION_MISCONFIG_CODE;
+}
 
 function extractKey(req) {
   if (req?.query?.key != null) {
@@ -37,12 +57,23 @@ module.exports = async function handler(req, res) {
       return res.status(400).json({ ok: false, key, error: "Invalid key prefix" });
     }
 
-    const backends = kvBackends();
+    let backends;
+    try {
+      backends = kvBackends();
+    } catch (err) {
+      if (isProductionMisconfig(err)) {
+        return respondWithProductionMisconfig(res, err);
+      }
+      throw err;
+    }
     let read;
 
     try {
       read = await readKeyFromBackends(key, { backends, parseJson: false });
     } catch (error) {
+      if (isProductionMisconfig(error)) {
+        return respondWithProductionMisconfig(res, error);
+      }
       return res.status(500).json({
         ok: false,
         error: error?.message || String(error),
@@ -93,6 +124,9 @@ module.exports = async function handler(req, res) {
 
     return res.status(200).json(response);
   } catch (err) {
+    if (isProductionMisconfig(err)) {
+      return respondWithProductionMisconfig(res, err);
+    }
     return res.status(500).json({
       ok: false,
       error: err?.message || String(err),

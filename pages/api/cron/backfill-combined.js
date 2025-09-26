@@ -1,7 +1,28 @@
 // pages/api/cron/backfill-combined.js
 // Backfills vb:day:<YMD>:combined from vb:day:<YMD>:union.
 
-const { kvBackends, readKeyFromBackends, saveCombinedAlias } = require("../../../lib/kv-helpers");
+const {
+  kvBackends,
+  readKeyFromBackends,
+  saveCombinedAlias,
+  KvEnvMisconfigurationError,
+  PRODUCTION_MISCONFIG_CODE,
+} = require("../../../lib/kv-helpers");
+
+function isProductionMisconfig(error) {
+  if (!error) return false;
+  if (error instanceof KvEnvMisconfigurationError) return true;
+  return String(error?.code || "") === PRODUCTION_MISCONFIG_CODE;
+}
+
+function respondWithProductionMisconfig(res, err) {
+  return res.status(500).json({
+    ok: false,
+    error: "Confirm env vars present in Production",
+    name: err?.name || "KvEnvMisconfigurationError",
+    code: PRODUCTION_MISCONFIG_CODE,
+  });
+}
 
 function summarizeCounts(key, read, backends) {
   const summary = {};
@@ -66,7 +87,15 @@ module.exports = async function handler(req, res) {
 
     const debugMode = String(req.query?.debug || req.body?.debug || "") === "1";
     const trace = [];
-    const backends = kvBackends();
+    let backends;
+    try {
+      backends = kvBackends();
+    } catch (err) {
+      if (isProductionMisconfig(err)) {
+        return respondWithProductionMisconfig(res, err);
+      }
+      throw err;
+    }
 
     const combinedKey = `vb:day:${ymd}:combined`;
     const unionKey = `vb:day:${ymd}:union`;
@@ -113,6 +142,9 @@ module.exports = async function handler(req, res) {
 
     return res.status(200).json(response);
   } catch (err) {
+    if (isProductionMisconfig(err)) {
+      return respondWithProductionMisconfig(res, err);
+    }
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 };
