@@ -891,27 +891,72 @@ function createKvClient(kvFlavors) {
 
 async function persistHistory(ymd, history, trace, kvFlavors, options = {}) {
   const slot = typeof options?.slot === "string" && options.slot ? options.slot : "";
-  const size = Array.isArray(history) ? history.length : 0;
+  const kvClient = options?.kvClient || null;
+  const payload = Array.isArray(history) ? history : [];
+  const size = payload.length;
   const listKey = `hist:${ymd}`;
   const dayKey = `hist:day:${ymd}`;
   const meta = { ymd };
   if (slot) meta.slot = slot;
-  if (!Array.isArray(kvFlavors) || kvFlavors.length === 0) {
-    trace.push({ kv: "set", key: listKey, size, ok: false, skipped: "no_backends", ...meta });
-    trace.push({ kv: "set", key: dayKey, size, ok: false, skipped: "no_backends", ...meta });
+  const traceLog = trace && typeof trace.push === "function" ? trace : null;
+
+  const hasBackends = Array.isArray(kvFlavors) && kvFlavors.length > 0;
+  if (!kvClient && !hasBackends) {
+    if (traceLog) {
+      traceLog.push({ kv: "set", key: listKey, size, ok: false, skipped: "no_backends", ...meta });
+      traceLog.push({ kv: "set", key: dayKey, size, ok: false, skipped: "no_backends", ...meta });
+    }
     return;
   }
-  const kv = createKvClient(kvFlavors);
-main
+
+  const kv = kvClient || createKvClient(kvFlavors);
+  const listMeta = { ...meta, scope: "list" };
+  const dayMeta = { ...meta, scope: "day" };
+
+  await setJsonWithTrace(kv, listKey, payload, size, traceLog || trace, listMeta);
+  await setJsonWithTrace(kv, dayKey, payload, size, traceLog || trace, dayMeta);
 }
 
 async function setJsonWithTrace(kv, key, value, size, trace, meta = {}) {
+  const payload = Array.isArray(value) ? value : [];
+  const payloadSize = Array.isArray(payload) ? payload.length : typeof size === "number" ? size : 0;
+  const traceLog = trace && typeof trace.push === "function" ? trace : null;
+
   try {
- main
+    const setter =
+      typeof kv?.setJSON === "function"
+        ? kv.setJSON.bind(kv)
+        : typeof kv?.set === "function"
+        ? kv.set.bind(kv)
+        : null;
+    if (!setter) {
+      throw new Error("kv_set_unavailable");
+    }
+    const result = await setter(key, payload);
+    if (traceLog) {
+      const entry = { kv: "set", key, size: payloadSize, ok: true, ...meta };
+      if (result && typeof result === "object" && result.saves !== undefined) {
+        entry.saves = result.saves;
+      }
+      traceLog.push(entry);
+    }
+    return result;
   } catch (err) {
-    trace.push({ kv: "set", key, size, ok: false, error: String(err?.message || err), ...meta });
+    if (traceLog) {
+      traceLog.push({
+        kv: "set",
+        key,
+        size: payloadSize,
+        ok: false,
+        error: String(err?.message || err),
+        ...meta,
+      });
+    }
+    return null;
   }
 }
+
+export { persistHistory, setJsonWithTrace };
 
 
 function coerceId(value) {
@@ -1494,7 +1539,7 @@ function resolveRequestedSlot(req, trace, searchParams = null) {
   return normalized;
 }
 
-function isTraceRequested(req, searchParams = null) {
+function isTraceRequestedFromParams(req, searchParams = null) {
   const candidates = collectRequestParamCandidates(req, "trace", searchParams);
   if (!candidates.length) return false;
   return candidates.some((entry) => entry.value === "1");
@@ -1505,7 +1550,7 @@ function parseRequestParams(req, trace) {
   const searchParams = safeParseRequestSearchParams(req, trace);
   const ymd = resolveRequestedYmd(req, fallbackYmd, trace, searchParams);
   const slot = resolveRequestedSlot(req, trace, searchParams);
-  const traceRequested = isTraceRequested(req, searchParams);
+  const traceRequested = isTraceRequestedFromParams(req, searchParams);
   return { ymd, slot, traceRequested };
 }
 
@@ -1570,7 +1615,8 @@ export async function runApplyLearning(req, res) {
 
   res.setHeader("Cache-Control", "no-store");
   const trace = [];
- main
+  const { ymd: initialYmd, slot, traceRequested } = parseRequestParams(req, trace);
+  const _trace = traceRequested ? trace : [];
   const probeParam = Array.isArray(req?.query?.probe)
     ? req.query.probe.find((value) => String(value).trim().length > 0)
     : req?.query?.probe;
@@ -1631,7 +1677,11 @@ export async function runApplyLearning(req, res) {
       ymd,
       slot,
       count: historyItems.length,
- main
+    };
+    if (traceRequested) {
+      payload._trace = trace;
+    }
+    return res.status(200).json(payload);
   } catch (err) {
     const errorPayload = {
       phase: currentPhase,
