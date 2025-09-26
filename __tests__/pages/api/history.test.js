@@ -176,4 +176,58 @@ describe("API history day loaders", () => {
       "fx-combined-1"
     );
   });
+
+  it("treats plain array and wrapped history payloads the same", async () => {
+    const plainPayload = [
+      {
+        fixture_id: "plain-1",
+        market_key: "h2h",
+        pick: "home",
+        result: "win",
+        teams: {
+          home: { id: "p1h", name: "Plain Home" },
+          away: { id: "p1a", name: "Plain Away" },
+        },
+      },
+      {
+        fixture_id: "plain-2",
+        market_key: "h2h",
+        pick: "away",
+        result: "loss",
+        teams: {
+          home: { id: "p2h", name: "Plain Home 2" },
+          away: { id: "p2a", name: "Plain Away 2" },
+        },
+      },
+    ];
+    const wrappedPayload = {
+      history: plainPayload.map((entry, idx) => ({
+        ...entry,
+        fixture_id: `wrapped-${idx + 1}`,
+      })),
+    };
+
+    const { default: handler } = require("../../../pages/api/history");
+
+    const runWithPayload = async (payload) => {
+      const fetchMock = jest.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ result: JSON.stringify(payload) }),
+      });
+      global.fetch = fetchMock;
+      const req = { query: { ymd: "2024-06-05" } };
+      const res = createMockRes();
+      await handler(req, res);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      return res.jsonPayload;
+    };
+
+    const plainResult = await runWithPayload(plainPayload);
+    const wrappedResult = await runWithPayload(wrappedPayload);
+
+    expect(plainResult.count).toBe(plainResult.history.length);
+    expect(wrappedResult.count).toBe(wrappedResult.history.length);
+    expect(plainResult.count).toBe(wrappedResult.count);
+    expect(plainResult.count).toBe(plainPayload.length);
+  });
 });

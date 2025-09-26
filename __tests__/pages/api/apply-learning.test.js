@@ -206,7 +206,12 @@ describe("apply-learning history writer", () => {
     expect(fetchMock).toHaveBeenCalled();
     expect(res.jsonPayload.trace).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ kv: "set", key: `hist:day:${ymd}`, size: expect.any(Number) }),
+        expect.objectContaining({ kv: "set", key: `hist:${ymd}`, size: parsedHist.length, ok: true }),
+      ])
+    );
+    expect(res.jsonPayload.trace).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kv: "set", key: `hist:day:${ymd}`, size: parsedHist.length, ok: true }),
       ])
     );
   });
