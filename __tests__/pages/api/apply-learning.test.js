@@ -155,25 +155,38 @@ describe("apply-learning history writer", () => {
     const histArrayPayload = histArrayCall.body?.value;
     const parsedHist = JSON.parse(histArrayPayload);
     expect(Array.isArray(parsedHist)).toBe(true);
-    expect(parsedHist.length).toBe(3);
-    expect(parsedHist[0].league.name).toBe("Sample League");
-    expect(parsedHist[0].teams.home.name).toBe("Alpha");
-    const relaxedEntry = parsedHist.find((entry) => entry.fixture_id === 303);
-    expect(relaxedEntry).toBeDefined();
-    expect(relaxedEntry.teams.home.name).toBe("Gamma");
-    expect(relaxedEntry.teams.away.name).toBe("Delta");
-    expect(relaxedEntry.market_key.toLowerCase()).toBe("h2h");
-    const fallbackEntry = parsedHist.find((entry) => entry.fixture_id === 404);
-    expect(fallbackEntry).toBeDefined();
-    expect(fallbackEntry.teams.home.name).toBe("Omega FC");
-    expect(fallbackEntry.teams.home.id).toBeNull();
-    expect(fallbackEntry.teams.away.name).toBe("Sigma FC");
-    expect(fallbackEntry.teams.away.id).toBeNull();
-    expect(fallbackEntry.market_key.toLowerCase()).toBe("h2h");
+    expect(parsedHist.length).toBe(1);
+    const fallbackEntry = parsedHist[0];
+    expect(fallbackEntry).toEqual(
+      expect.objectContaining({
+        fixture_id: 404,
+        selection: "home",
+        predicted: "home",
+        home_name: "Omega FC",
+        away_name: "Sigma FC",
+        market_key: "1x2",
+        market: "1x2",
+        market_label: "1X2",
+        source: "combined",
+      })
+    );
+    expect(Object.keys(fallbackEntry).sort()).toEqual(
+      [
+        "away_name",
+        "fixture_id",
+        "home_name",
+        "market",
+        "market_key",
+        "market_label",
+        "predicted",
+        "selection",
+        "source",
+      ].sort()
+    );
 
     expect(res.jsonPayload.trace).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ filter: "history_requirements", kept: 3 }),
+        expect.objectContaining({ filter: "history_requirements", kept: 1 }),
       ])
     );
     expect(res.jsonPayload.trace).toEqual(
@@ -187,6 +200,9 @@ describe("apply-learning history writer", () => {
 
     const histDayCall = setCalls.find((call) => call.key === `hist:day:${ymd}`);
     expect(histDayCall).toBeDefined();
+    const histDayPayload = JSON.parse(histDayCall.body?.value);
+    expect(Array.isArray(histDayPayload)).toBe(true);
+    expect(histDayPayload).toEqual(parsedHist);
     expect(fetchMock).toHaveBeenCalled();
     expect(res.jsonPayload.trace).toEqual(
       expect.arrayContaining([

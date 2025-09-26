@@ -392,16 +392,25 @@ function normalizeValueBetEntry(entry, sourceSlot) {
   ];
   let market = "";
   let canonicalMarket = "";
+  let explicit1x2 = false;
   for (const candidate of marketCandidates) {
     if (typeof candidate === "string" && candidate.trim()) {
       const normalizedLabel = normalizeMarketLabel(candidate);
       if (normalizedLabel === "1X2") {
         canonicalMarket = "1X2";
         market = "1X2";
+        if (String(candidate).trim().toLowerCase() === "1x2") {
+          explicit1x2 = true;
+        }
         break;
       }
       if (!market) {
         market = candidate.trim();
+        if (market.toLowerCase() === "1x2") {
+          explicit1x2 = true;
+          canonicalMarket = "1X2";
+          break;
+        }
       }
     }
   }
@@ -480,6 +489,7 @@ function normalizeValueBetEntry(entry, sourceSlot) {
     normalized.market_label = "1X2";
     normalized.market_key = "1x2";
   }
+  normalized.__explicit_1x2 = Boolean(explicit1x2);
   if (sourceSlot && !normalized.source_slot) normalized.source_slot = sourceSlot;
   return normalized;
 }
@@ -518,6 +528,26 @@ function normalizeModelEntry(entry, sourceSlot) {
       : normalizedSelection === "away"
       ? "AWAY"
       : "DRAW";
+  const marketCandidates = [
+    entry.market_key,
+    entry.market,
+    entry.market_label,
+    entry.marketKey,
+    entry.marketName,
+    entry.market_display,
+    entry.marketDisplay,
+    entry.market_slug,
+    entry.marketSlug,
+    entry.market_type,
+    entry.marketType,
+  ];
+  let explicit1x2 = false;
+  for (const candidate of marketCandidates) {
+    if (typeof candidate === "string" && candidate.trim().toLowerCase() === "1x2") {
+      explicit1x2 = true;
+      break;
+    }
+  }
   const normalized = {
     ...entry,
     fixture_id: fixtureId,
@@ -530,6 +560,7 @@ function normalizeModelEntry(entry, sourceSlot) {
     pick: displayLabel,
     predicted: normalizedSelection,
   };
+  normalized.__explicit_1x2 = Boolean(explicit1x2);
   if (normalized.id == null) normalized.id = fixtureId;
   if (hasProb) {
     normalized.prob = probNum;
@@ -726,25 +757,6 @@ function finalizeH2HEntry(entry, fixtureId, fillCounts) {
       clone.model.fixture = effectiveFixture;
     }
   }
-  const selectionSource = clone.selection || clone.selection_label || clone.pick || "";
-  if (selectionSource) {
-    const label = String(selectionSource).trim().toUpperCase();
-    if (label) {
-      clone.selection = label;
-      clone.selection_label = label;
-      clone.pick = label;
-    }
-  }
-  const predicted = normalizeModelSelection(clone.predicted || clone.model?.predicted || clone.selection);
-  if (predicted && ["home", "away", "draw"].includes(predicted)) {
-    clone.predicted = predicted;
-    if (clone.model && typeof clone.model === "object") {
-      if (!clone.model.predicted) clone.model.predicted = predicted;
-    }
-  }
-  clone.market = "1X2";
-  clone.market_label = "1X2";
-  clone.market_key = "1x2";
   populateNormalizedTeams(clone, fillCounts);
   return clone;
 }
@@ -857,7 +869,7 @@ async function persistHistory(ymd, history, trace, kvFlavors) {
   }
   const kv = createKvClient(kvFlavors);
   await setJsonWithTrace(kv, listKey, history, size, trace);
-  await setJsonWithTrace(kv, dayKey, { ymd, items: history }, size, trace);
+  await setJsonWithTrace(kv, dayKey, history, size, trace);
 }
 
 async function setJsonWithTrace(kv, key, value, size, trace) {
@@ -1088,15 +1100,122 @@ function extractTeamMeta(entry, side) {
   return { id: id ?? null, name };
 }
 
-function mergeTeam(existing, required) {
-  const base = existing && typeof existing === "object" ? { ...existing } : {};
-  if (base.id == null) base.id = required.id;
-  if (base.team_id == null) base.team_id = required.id;
-  if (base.teamId == null) base.teamId = required.id;
-  if (!base.name) base.name = required.name;
-  if (!base.team_name) base.team_name = required.name;
-  if (!base.full && required.name) base.full = required.name;
-  return base;
+function normalizeHistorySlot(value) {
+  if (!value) return "";
+  const text = String(value).trim().toLowerCase();
+  if (!text) return "";
+  if (text === "am" || text === "pm" || text === "late") return text;
+  if (text === "morning") return "am";
+  if (text === "afternoon") return "pm";
+  if (text === "early") return "late";
+  return "";
+}
+
+function extractSlotValue(entry) {
+  if (!entry || typeof entry !== "object") return "";
+  const candidates = [
+    entry.slot,
+    entry.slot_key,
+    entry.slotKey,
+    entry.slot_name,
+    entry.slotName,
+    entry.history_slot,
+    entry.meta?.slot,
+    entry.meta?.slot_key,
+    entry.meta?.slotName,
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeHistorySlot(candidate);
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+function extractKickoffValue(entry) {
+  const candidates = [
+    entry?.kickoff,
+    entry?.kickoff_utc,
+    entry?.kickoff_iso,
+    entry?.kickoffUtc,
+    entry?.kickoffISO,
+    entry?.fixture?.kickoff,
+    entry?.fixture?.kickoff_utc,
+    entry?.fixture?.date,
+    entry?.fixture?.datetime,
+    entry?.fixture?.start,
+    entry?.datetime_local?.starting_at?.date_time,
+    entry?.time?.starting_at?.date_time,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (candidate instanceof Date && Number.isFinite(candidate.getTime?.())) {
+      return candidate.toISOString();
+    }
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      if (Math.abs(candidate) > 1e12) {
+        return new Date(candidate).toISOString();
+      }
+      if (Math.abs(candidate) > 1e6) {
+        return new Date(candidate * 1000).toISOString();
+      }
+    }
+    if (typeof candidate === "string") {
+      const trimmed = candidate.trim();
+      if (trimmed) return trimmed;
+    }
+  }
+  return "";
+}
+
+function extractModelProbability(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const candidates = [
+    entry.model_prob,
+    entry.modelProbability,
+    entry.model_prob_pct,
+    entry.prob,
+    entry.probability,
+    entry.model?.model_prob,
+    entry.model?.prob,
+    entry.model?.probability,
+    entry.model?.model_probability,
+  ];
+  for (const candidate of candidates) {
+    const num = Number(candidate);
+    if (Number.isFinite(num)) return num;
+  }
+  if (entry.model_probs && typeof entry.model_probs === "object") {
+    const rawSelection = normalizeModelSelection(
+      entry.model?.predicted ?? entry.predicted ?? entry.selection ?? entry.pick
+    );
+    const key = rawSelection === "home" ? "home" : rawSelection === "away" ? "away" : rawSelection === "draw" ? "draw" : null;
+    if (key && entry.model_probs[key] != null) {
+      const num = Number(entry.model_probs[key]);
+      if (Number.isFinite(num)) return num;
+    }
+  }
+  return null;
+}
+
+function normalizeHistorySelection(entry) {
+  if (!entry || typeof entry !== "object") return "";
+  const candidates = [
+    entry.selection,
+    entry.selection_label,
+    entry.pick,
+    entry.pick_code,
+    entry.predicted,
+    entry.model?.predicted,
+    entry.model?.selection,
+    extractModelRawSelection(entry),
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeModelSelection(candidate);
+    if (normalized && ["home", "away", "draw"].includes(normalized)) {
+      return normalized;
+    }
+  }
+  return "";
 }
 
 function enforceHistoryRequirements(items = [], trace) {
@@ -1109,8 +1228,6 @@ function enforceHistoryRequirements(items = [], trace) {
     noSelection: 0,
     invalid: 0,
   };
-
-  const allowedMarkets = new Set(["1x2", "h2h"]);
 
   for (const original of items || []) {
     if (!original || typeof original !== "object") {
@@ -1136,28 +1253,20 @@ function enforceHistoryRequirements(items = [], trace) {
       original?.model?.marketName,
     ];
 
-    let marketKey = "";
-    for (const candidate of marketCandidates) {
-      const lowered = String(candidate ?? "").trim().toLowerCase();
-      if (!lowered) continue;
-      if (allowedMarkets.has(lowered)) {
-        marketKey = lowered;
-        break;
-      }
-    }
-
-    if (!marketKey) {
-      const labelCandidates = [original.market_label, original?.model?.market_label];
-      for (const label of labelCandidates) {
-        const upper = String(label ?? "").trim().toUpperCase();
-        if (upper === "1X2") {
-          marketKey = "1x2";
+    const explicitFlag = original.__explicit_1x2;
+    let has1x2 = explicitFlag === true;
+    const explicitKnown = typeof explicitFlag === "boolean";
+    if (!has1x2) {
+      for (const candidate of marketCandidates) {
+        if (typeof candidate !== "string") continue;
+        if (candidate.trim().toLowerCase() === "1x2" && !explicitKnown) {
+          has1x2 = true;
           break;
         }
       }
     }
 
-    if (!marketKey) {
+    if (!has1x2) {
       dropped += 1;
       reasons.noMarket += 1;
       continue;
@@ -1180,11 +1289,9 @@ function enforceHistoryRequirements(items = [], trace) {
     }
 
     const normalized = finalizeH2HEntry(original, fixtureId);
-    const selectionLabel = String(
-      normalized.selection || normalized.selection_label || normalized.pick || ""
-    ).trim();
+    const normalizedSelection = normalizeHistorySelection({ ...normalized, fixture_id: fixtureId }) || "";
 
-    if (!selectionLabel) {
+    if (!normalizedSelection) {
       dropped += 1;
       reasons.noSelection += 1;
       continue;
@@ -1198,53 +1305,49 @@ function enforceHistoryRequirements(items = [], trace) {
       continue;
     }
 
-    const prepared = { ...normalized };
-    const league = extractLeagueMeta(normalized);
-    if (league) {
-      prepared.league_id = prepared.league_id ?? league.id;
-      prepared.leagueId = prepared.leagueId ?? league.id;
-      prepared.league = {
-        ...(prepared.league && typeof prepared.league === "object" ? prepared.league : {}),
-        id: league.id,
-        name: league.name,
-      };
-      if (!prepared.league_name) prepared.league_name = league.name;
-      if (!prepared.league?.name) prepared.league.name = league.name;
-    }
-
-    const teams = prepared.teams && typeof prepared.teams === "object" ? { ...prepared.teams } : {};
-    teams.home = mergeTeam(teams.home, homeTeam);
-    teams.away = mergeTeam(teams.away, awayTeam);
-    prepared.teams = teams;
-    if (prepared.fixture && typeof prepared.fixture === "object") {
-      const fixtureClone = { ...prepared.fixture };
-      const fixtureTeams = fixtureClone.teams && typeof fixtureClone.teams === "object" ? { ...fixtureClone.teams } : {};
-      fixtureTeams.home = mergeTeam(fixtureTeams.home, homeTeam);
-      fixtureTeams.away = mergeTeam(fixtureTeams.away, awayTeam);
-      fixtureClone.teams = fixtureTeams;
-      if (fixtureClone.league && typeof fixtureClone.league === "object" && league) {
-        fixtureClone.league = { ...fixtureClone.league, id: league.id, name: league.name };
+    const predictedCandidates = [
+      normalized.predicted,
+      original.predicted,
+      original.model?.predicted,
+      original.selection,
+      original.pick,
+    ];
+    let predicted = "";
+    for (const candidate of predictedCandidates) {
+      const normalizedCandidate = normalizeModelSelection(candidate);
+      if (normalizedCandidate && ["home", "away", "draw"].includes(normalizedCandidate)) {
+        predicted = normalizedCandidate;
+        break;
       }
-      prepared.fixture = fixtureClone;
+    }
+    if (!predicted) predicted = normalizedSelection;
+
+    const homeName = coerceName(homeTeam.name);
+    const awayName = coerceName(awayTeam.name);
+    if (!homeName || !awayName) {
+      dropped += 1;
+      reasons.noTeams += 1;
+      continue;
     }
 
-    if (!prepared.home && homeTeam.name) prepared.home = homeTeam.name;
-    if (!prepared.home_team && homeTeam.name) prepared.home_team = homeTeam.name;
-    if (!prepared.home_team_name && homeTeam.name) prepared.home_team_name = homeTeam.name;
-    if (!prepared.away && awayTeam.name) prepared.away = awayTeam.name;
-    if (!prepared.away_team && awayTeam.name) prepared.away_team = awayTeam.name;
-    if (!prepared.away_team_name && awayTeam.name) prepared.away_team_name = awayTeam.name;
-    if (prepared.team_home_id == null) prepared.team_home_id = homeTeam.id;
-    if (prepared.team_away_id == null) prepared.team_away_id = awayTeam.id;
-    if (prepared.home_id == null) prepared.home_id = homeTeam.id;
-    if (prepared.away_id == null) prepared.away_id = awayTeam.id;
+    const kickoff = extractKickoffValue(original) || extractKickoffValue(normalized);
+    const prob = extractModelProbability(original);
+    const slot = extractSlotValue(original);
 
-    const historyMarketKey = marketKey === "1x2" ? "h2h" : marketKey;
-    prepared.market_key = historyMarketKey;
-    if (!prepared.market || /^(1x2|h2h)$/i.test(String(prepared.market))) {
-      prepared.market = historyMarketKey;
-    }
-    prepared.market_label = "1X2";
+    const prepared = {
+      fixture_id: fixtureId,
+      selection: normalizedSelection,
+      predicted,
+      home_name: homeName,
+      away_name: awayName,
+      market_key: "1x2",
+      market: "1x2",
+      market_label: "1X2",
+      source: "combined",
+    };
+    if (kickoff) prepared.kickoff = kickoff;
+    if (prob != null) prepared.model_prob = prob;
+    if (slot) prepared.slot = slot;
 
     sanitized.push(prepared);
   }

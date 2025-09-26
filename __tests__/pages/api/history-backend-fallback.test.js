@@ -206,6 +206,7 @@ describe("API history placeholder string fallback", () => {
             flavor: "upstash-redis",
             hit: true,
           }),
+ main
         ])
       );
     }
