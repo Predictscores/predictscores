@@ -11,7 +11,7 @@
         "Champions\\s+League",
         "UEFA\\s*Champ"
       ],
-      "target_ratio": 0.5
+      "target_ratio": 0.7
     },
     "T2": {
       "ids": [41, 42, 88, 94, 95, 96, 99, 103, 144, 208, 210],
@@ -28,14 +28,21 @@
         "Ligue\\s+2",
         "Eerste\\s+Divisie"
       ],
-      "target_ratio": 0.35
+      "target_ratio": 0.2
+    },
+    "T3": {
+      "ids": [],
+      "patterns": [],
+      "target_ratio": 0.1
     }
   },
   "denylist_patterns": [
     "U-?\\d{2}",
     "youth",
-    "reserve",
+    "reserves?",
     "women",
+    "amateur",
+    "friendlies?\\s*B",
     "futsal"
   ]
 }
