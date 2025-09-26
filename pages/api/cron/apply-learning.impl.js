@@ -1375,10 +1375,11 @@ function enforceHistoryRequirements(items = [], trace) {
 
   if (trace && typeof trace.push === "function") {
     trace.push({
-      filter: "history_requirements",
-      dropped,
-      kept: sanitized.length,
-      reasons,
+      history_requirements: {
+        kept: sanitized.length,
+        dropped,
+        reasons,
+      },
     });
   }
 
@@ -1439,6 +1440,60 @@ function isDebugEnabled(req) {
   return false;
 }
 
+function isTraceRequested(req) {
+  const queryKeys = ["trace", "_trace"];
+  for (const key of queryKeys) {
+    const value = req?.query?.[key];
+    if (Array.isArray(value)) {
+      if (value.some((entry) => {
+        const normalized = String(entry).trim().toLowerCase();
+        return normalized === "1" || normalized === "true";
+      })) {
+        return true;
+      }
+    } else if (value !== undefined) {
+      const normalized = String(value).trim().toLowerCase();
+      if (normalized === "1" || normalized === "true") return true;
+    }
+  }
+
+  const rawUrl = typeof req?.url === "string" ? req.url : "";
+  if (rawUrl) {
+    try {
+      const host = req?.headers?.host || "localhost";
+      const parsed = new URL(rawUrl, `http://${host}`);
+      for (const key of queryKeys) {
+        const param = parsed.searchParams.get(key);
+        if (typeof param === "string") {
+          const normalized = param.trim().toLowerCase();
+          if (normalized === "1" || normalized === "true") return true;
+        }
+      }
+    } catch (err) {
+      // ignore URL parsing errors for trace detection
+    }
+  }
+
+  const headerKeys = ["x-trace", "x-debug-trace", "trace"];
+  for (const key of headerKeys) {
+    const value = req?.headers?.[key];
+    if (value === undefined) continue;
+    if (Array.isArray(value)) {
+      if (value.some((entry) => {
+        const normalized = String(entry).trim().toLowerCase();
+        return normalized === "1" || normalized === "true";
+      })) {
+        return true;
+      }
+    } else {
+      const normalized = String(value).trim().toLowerCase();
+      if (normalized === "1" || normalized === "true") return true;
+    }
+  }
+
+  return false;
+}
+
 export async function runApplyLearning(req, res) {
   if (req.query && req.query.probe === "1") {
     return res.status(200).json({ ok: true, probe: true });
@@ -1447,6 +1502,7 @@ export async function runApplyLearning(req, res) {
   res.setHeader("Cache-Control", "no-store");
   const trace = [];
   const debug = isDebugEnabled(req);
+  const traceRequested = isTraceRequested(req);
   const probeParam = Array.isArray(req?.query?.probe)
     ? req.query.probe.find((value) => String(value).trim().length > 0)
     : req?.query?.probe;
@@ -1506,24 +1562,32 @@ export async function runApplyLearning(req, res) {
     currentPhase = "persist";
     await persistHistory(ymd, historyItems, trace, kvFlavors);
 
-    return res.status(200).json({
+    const payload = {
       ok: true,
       ymd,
       count: historyItems.length,
       trace: debug ? trace : [],
-    });
+    };
+    if (traceRequested) {
+      payload._trace = trace;
+    }
+    return res.status(200).json(payload);
   } catch (err) {
     const errorPayload = {
       phase: currentPhase,
       message: err?.message || String(err),
       stack: err?.stack || null,
     };
-    return res.status(200).json({
+    const payload = {
       ok: false,
       ymd,
       count: 0,
       trace: debug ? trace : [],
       error: errorPayload,
-    });
+    };
+    if (traceRequested) {
+      payload._trace = trace;
+    }
+    return res.status(200).json(payload);
   }
 }
