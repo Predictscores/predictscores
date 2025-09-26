@@ -875,15 +875,20 @@ async function persistHistory(ymd, history, trace, kvFlavors) {
     return;
   }
   const kv = createKvClient(kvFlavors);
-  const serializedHistory = JSON.stringify(Array.isArray(history) ? history : []);
-  await setJsonWithTrace(kv, listKey, serializedHistory, size, trace);
-  await setJsonWithTrace(kv, dayKey, serializedHistory, size, trace);
+  const normalizedHistory = Array.isArray(history) ? history : [];
+  await setJsonWithTrace(kv, listKey, normalizedHistory, size, trace);
+  await setJsonWithTrace(kv, dayKey, normalizedHistory, size, trace);
 }
 
 async function setJsonWithTrace(kv, key, value, size, trace) {
   try {
-    const serialized = typeof value === "string" ? value : JSON.stringify(value);
-    await kv.set(key, serialized);
+    if (kv && typeof kv.setJSON === "function") {
+      await kv.setJSON(key, value);
+    } else if (kv && typeof kv.set === "function") {
+      await kv.set(key, value);
+    } else {
+      throw new Error("kv_client_missing_set");
+    }
     trace.push({ kv: "set", key, size, ok: true });
   } catch (err) {
     trace.push({ kv: "set", key, size, ok: false, error: String(err?.message || err) });
