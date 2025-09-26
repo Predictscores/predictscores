@@ -210,9 +210,7 @@ describe("API history placeholder string fallback", () => {
             flavor: "upstash-redis",
             hit: true,
           }),
-          expect.objectContaining({
-            history_filter: expect.objectContaining({ source_used: "hist_day" }),
-          }),
+main
         ])
       );
     }
