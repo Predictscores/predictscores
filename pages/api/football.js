@@ -1,5 +1,8 @@
 // pages/api/football.js
 import { arrFromAny, toJson } from "../../lib/kv-read";
+import learningRuntime from "../../lib/learning/runtime";
+
+const { resolveLeagueTier } = learningRuntime;
 
 export const config = { api: { bodyParser: false } };
 
@@ -32,21 +35,15 @@ const confidence = it => Number.isFinite(it?.confidence_pct) ? it.confidence_pct
 /* Caps / tier env (mogu se podešavati ENV-om, postoje safe default-i) */
 function intEnv(v, d, lo=0, hi=999) { const n = Number(v); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : d; }
 function numEnv(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; }
-function safeRegex(s) { try { return new RegExp(s, "i"); } catch { return /$a^/; } }
-
-const TIER1_RE  = safeRegex(process.env.TIER1_RE || "(Premier League|La Liga|Serie A|Bundesliga|Ligue 1|Champions League|UEFA\\s*Champ)");
-const TIER2_RE  = safeRegex(process.env.TIER2_RE || "(Championship|Eredivisie|Primeira|Liga Portugal|Super Lig|Pro League|Bundesliga 2|Serie B|LaLiga 2|Ligue 2|Eerste Divisie)");
-const TIER1_CAP = intEnv(process.env.TIER1_CAP, 7, 0, 15);
-const TIER2_CAP = intEnv(process.env.TIER2_CAP, 5, 0, 15);
-const TIER3_CAP = intEnv(process.env.TIER3_CAP, 3, 0, 15);
-
 const MAX_PER_LEAGUE = intEnv(process.env.VB_MAX_PER_LEAGUE, 2, 1, 10);
 const UEFA_DAILY_CAP = intEnv(process.env.UEFA_DAILY_CAP, 6, 1, 20);
 
 /* Tier scoring */
-function tierScore(leagueName="") {
-  if (TIER1_RE.test(leagueName)) return 3;
-  if (TIER2_RE.test(leagueName)) return 2;
+function tierScore(league) {
+  const node = typeof league === "string" ? { name: league } : league || {};
+  const tier = resolveLeagueTier(node);
+  if (tier === "T1") return 3;
+  if (tier === "T2") return 2;
   return 1;
 }
 
@@ -116,9 +113,8 @@ export default async function handler(req, res) {
     const picked = [];
 
     for (const it of items.sort((a,b)=>{
-      const la = String(a?.league?.name||"");
-      const lb = String(b?.league?.name||"");
-      const ta = tierScore(la), tb = tierScore(lb);
+      const ta = tierScore(a?.league);
+      const tb = tierScore(b?.league);
       if (tb!==ta) return tb-ta;
       return (confidence(b)-confidence(a));
     })) {
