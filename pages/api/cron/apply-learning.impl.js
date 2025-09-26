@@ -760,33 +760,43 @@ function finalizeH2HEntry(entry, fixtureId, fillCounts) {
   populateNormalizedTeams(clone, fillCounts);
   return clone;
 }
-function filterH2HOnly(items = [], fillCounts) {
+function filterH2HOnly(items = [], fillCounts, options = {}) {
+  const requestedSlot = typeof options?.slot === "string" ? options.slot.trim() : "";
   const out = [];
   for (const item of items || []) {
     if (!item || typeof item !== "object") continue;
     const fixtureId = coerceFixtureId(item.fixture_id, item.fixtureId, item.fixture, item.id, item?.fixture?.id);
     if (fixtureId == null) continue;
     if (!isLikelyH2H(item)) continue;
-    out.push(finalizeH2HEntry(item, fixtureId, fillCounts));
+    const prepared = finalizeH2HEntry(item, fixtureId, fillCounts);
+    if (requestedSlot && !prepared.slot) {
+      prepared.slot = requestedSlot.toLowerCase();
+    }
+    out.push(prepared);
   }
   return out;
 }
 async function readSnapshot(key, { sourceSlot } = {}, context = {}) {
   const { kvFlavors, trace } = context;
+  const contextYmd = typeof context?.ymd === "string" ? context.ymd : null;
+  const contextSlot = sourceSlot || (typeof context?.slot === "string" ? context.slot : null);
+  const traceMeta = {};
+  if (contextYmd) traceMeta.ymd = contextYmd;
+  if (contextSlot) traceMeta.slot = contextSlot;
   const readKey = typeof context?.readKey === "function" ? context.readKey : readKeyFromBackendsRef;
   let items = [];
   let ok = false;
 
   if (!Array.isArray(kvFlavors) || kvFlavors.length === 0) {
     if (trace && typeof trace.push === "function") {
-      trace.push({ kv: "get", key, ok: false, size: 0, skipped: "no_backends" });
+      trace.push({ kv: "get", key, ok: false, size: 0, skipped: "no_backends", ...traceMeta });
     }
     return { items };
   }
 
   if (typeof readKey !== "function") {
     if (trace && typeof trace.push === "function") {
-      trace.push({ kv: "get", key, ok: false, size: 0, skipped: "no_reader" });
+      trace.push({ kv: "get", key, ok: false, size: 0, skipped: "no_reader", ...traceMeta });
     }
     return { items };
   }
@@ -799,17 +809,28 @@ async function readSnapshot(key, { sourceSlot } = {}, context = {}) {
         items = parsed.normalized;
       }
     } catch (parseErr) {
-      trace.push({ error: { phase: "parse", key, message: String(parseErr?.message || parseErr) } });
+      trace.push({ error: { phase: "parse", key, message: String(parseErr?.message || parseErr), ...traceMeta } });
     }
     ok = Array.isArray(items) && items.length > 0;
   } catch (err) {
-    trace.push({ error: { phase: "read", key, message: String(err?.message || err) } });
+    trace.push({ error: { phase: "read", key, message: String(err?.message || err), ...traceMeta } });
   }
 
-  trace.push({ kv: "get", key, ok, size: Array.isArray(items) ? items.length : 0 });
+  trace.push({ kv: "get", key, ok, size: Array.isArray(items) ? items.length : 0, ...traceMeta });
   return { items: Array.isArray(items) ? items : [] };
 }
-async function loadSnapshotsForDay(ymd, context) {
+async function loadSnapshotsForDay(ymd, options = {}, context = {}) {
+  const requestedSlot = typeof options?.slot === "string" ? options.slot.trim().toLowerCase() : "";
+  if (requestedSlot) {
+    const slotKey = `vb:day:${ymd}:${requestedSlot}`;
+    const { items } = await readSnapshot(slotKey, { sourceSlot: requestedSlot }, context);
+    const deduped = dedupeByFixtureStrongest(items);
+    const traceMeta = { requestedSlot, ymd, size: deduped.length, slots: { [requestedSlot]: items.length } };
+    if (context?.trace && typeof context.trace.push === "function") {
+      context.trace.push(traceMeta);
+    }
+    return { items: deduped, meta: { source: slotKey, slot: requestedSlot } };
+  }
   const attempts = [`vb:day:${ymd}:union`, `vb:day:${ymd}:combined`];
   for (const key of attempts) {
     const { items } = await readSnapshot(key, {}, context);
@@ -827,7 +848,10 @@ async function loadSnapshotsForDay(ymd, context) {
     }
   }
   const combined = dedupeByFixtureStrongest(aggregated);
-  context.trace.push({ slots: slotSizes, size: combined.length });
+  const tracePayload = { slots: slotSizes, size: combined.length, ymd };
+  if (context?.trace && typeof context.trace.push === "function") {
+    context.trace.push(tracePayload);
+  }
   return { items: combined, meta: { source: "slots", slotSizes } };
 }
 
@@ -865,33 +889,27 @@ function createKvClient(kvFlavors) {
   };
 }
 
-async function persistHistory(ymd, history, trace, kvFlavors) {
+async function persistHistory(ymd, history, trace, kvFlavors, options = {}) {
+  const slot = typeof options?.slot === "string" && options.slot ? options.slot : "";
   const size = Array.isArray(history) ? history.length : 0;
   const listKey = `hist:${ymd}`;
   const dayKey = `hist:day:${ymd}`;
+  const meta = { ymd };
+  if (slot) meta.slot = slot;
   if (!Array.isArray(kvFlavors) || kvFlavors.length === 0) {
-    trace.push({ kv: "set", key: listKey, size, ok: false, skipped: "no_backends" });
-    trace.push({ kv: "set", key: dayKey, size, ok: false, skipped: "no_backends" });
+    trace.push({ kv: "set", key: listKey, size, ok: false, skipped: "no_backends", ...meta });
+    trace.push({ kv: "set", key: dayKey, size, ok: false, skipped: "no_backends", ...meta });
     return;
   }
   const kv = createKvClient(kvFlavors);
-  const normalizedHistory = Array.isArray(history) ? history : [];
-  await setJsonWithTrace(kv, listKey, normalizedHistory, size, trace);
-  await setJsonWithTrace(kv, dayKey, normalizedHistory, size, trace);
+main
 }
 
-async function setJsonWithTrace(kv, key, value, size, trace) {
+async function setJsonWithTrace(kv, key, value, size, trace, meta = {}) {
   try {
-    if (kv && typeof kv.setJSON === "function") {
-      await kv.setJSON(key, value);
-    } else if (kv && typeof kv.set === "function") {
-      await kv.set(key, value);
-    } else {
-      throw new Error("kv_client_missing_set");
-    }
-    trace.push({ kv: "set", key, size, ok: true });
+ main
   } catch (err) {
-    trace.push({ kv: "set", key, size, ok: false, error: String(err?.message || err) });
+    trace.push({ kv: "set", key, size, ok: false, error: String(err?.message || err), ...meta });
   }
 }
 
@@ -1397,51 +1415,97 @@ function ymdInTZ(tz = "Europe/Belgrade", d = new Date()) {
   return `${y}-${m}-${dd}`;
 }
 
-function resolveRequestedYmd(req, fallbackYmd, trace) {
-  const queryCandidate = req?.query?.ymd;
-  const fromQuery = typeof queryCandidate === "string" ? queryCandidate.trim() : String(queryCandidate || "").trim();
-  if (fromQuery) return fromQuery;
+function safeParseRequestSearchParams(req, trace) {
   const rawUrl = typeof req?.url === "string" ? req.url : "";
-  if (rawUrl) {
-    try {
-      const host = req?.headers?.host || "localhost";
-      const parsed = new URL(rawUrl, `http://${host}`);
-      const fromUrl = parsed.searchParams.get("ymd");
-      if (typeof fromUrl === "string" && fromUrl.trim()) {
-        return fromUrl.trim();
-      }
-    } catch (err) {
-      if (trace && typeof trace.push === "function") {
-        trace.push({ query: "ymd", source: "url", error: String(err?.message || err) });
-      }
+  if (!rawUrl) return null;
+  try {
+    const host = req?.headers?.host || "localhost";
+    const parsed = new URL(rawUrl, `http://${host}`);
+    return parsed.searchParams;
+  } catch (err) {
+    if (trace && typeof trace.push === "function") {
+      trace.push({ query: "params", source: "url", error: String(err?.message || err) });
     }
   }
-  return fallbackYmd;
+  return null;
 }
-function isDebugEnabled(req) {
-  const fromQuery = req?.query?.debug;
-  if (Array.isArray(fromQuery)) {
-    if (fromQuery.some((value) => String(value).trim() === "1")) return true;
-    if (fromQuery.some((value) => String(value).toLowerCase().trim() === "true")) return true;
-  } else if (fromQuery !== undefined) {
-    const value = String(fromQuery).trim();
-    if (value === "1" || value.toLowerCase() === "true") return true;
-  }
-  const rawUrl = typeof req?.url === "string" ? req.url : "";
-  if (rawUrl) {
-    try {
-      const host = req?.headers?.host || "localhost";
-      const parsed = new URL(rawUrl, `http://${host}`);
-      const debugParam = parsed.searchParams.get("debug");
-      if (typeof debugParam === "string") {
-        const trimmed = debugParam.trim();
-        if (trimmed === "1" || trimmed.toLowerCase() === "true") return true;
+
+function collectRequestParamCandidates(req, name, searchParams) {
+  const candidates = [];
+  const queryValue = req?.query?.[name];
+  if (Array.isArray(queryValue)) {
+    for (const value of queryValue) {
+      const trimmed = String(value ?? "").trim();
+      if (trimmed) {
+        candidates.push({ value: trimmed, source: "query" });
       }
-    } catch (err) {
-      // ignore parse errors for debug detection
+    }
+  } else if (queryValue !== undefined && queryValue !== null) {
+    const trimmed = String(queryValue).trim();
+    if (trimmed) {
+      candidates.push({ value: trimmed, source: "query" });
     }
   }
-  return false;
+  if (searchParams && typeof searchParams.getAll === "function") {
+    const urlValues = searchParams.getAll(name) || [];
+    for (const value of urlValues) {
+      if (typeof value !== "string") continue;
+      const trimmed = value.trim();
+      if (trimmed) {
+        candidates.push({ value: trimmed, source: "url" });
+      }
+    }
+  }
+  return candidates;
+}
+
+function resolveRequestedYmd(req, fallbackYmd, trace, searchParams = null) {
+  const candidates = collectRequestParamCandidates(req, "ymd", searchParams);
+  const chosen = candidates.find((entry) => entry?.value?.length);
+  if (!chosen) {
+    return fallbackYmd;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(chosen.value)) {
+    if (trace && typeof trace.push === "function") {
+      trace.push({ query: "ymd", source: chosen.source, value: chosen.value, error: "invalid_format" });
+    }
+    return fallbackYmd;
+  }
+  return chosen.value;
+}
+
+const VALID_REQUEST_SLOTS = new Set(["am", "pm", "late", "combined", "union"]);
+
+function resolveRequestedSlot(req, trace, searchParams = null) {
+  const candidates = collectRequestParamCandidates(req, "slot", searchParams);
+  const chosen = candidates.find((entry) => entry?.value?.length);
+  if (!chosen) return null;
+  const normalized = chosen.value.toLowerCase();
+  if (normalized === "auto") {
+    return null;
+  }
+  if (!VALID_REQUEST_SLOTS.has(normalized)) {
+    if (trace && typeof trace.push === "function") {
+      trace.push({ query: "slot", source: chosen.source, value: chosen.value, error: "invalid_slot" });
+    }
+    return null;
+  }
+  return normalized;
+}
+
+function isTraceRequested(req, searchParams = null) {
+  const candidates = collectRequestParamCandidates(req, "trace", searchParams);
+  if (!candidates.length) return false;
+  return candidates.some((entry) => entry.value === "1");
+}
+
+function parseRequestParams(req, trace) {
+  const fallbackYmd = ymdInTZ("UTC");
+  const searchParams = safeParseRequestSearchParams(req, trace);
+  const ymd = resolveRequestedYmd(req, fallbackYmd, trace, searchParams);
+  const slot = resolveRequestedSlot(req, trace, searchParams);
+  const traceRequested = isTraceRequested(req, searchParams);
+  return { ymd, slot, traceRequested };
 }
 
 export async function runApplyLearning(req, res) {
@@ -1451,7 +1515,8 @@ export async function runApplyLearning(req, res) {
 
   res.setHeader("Cache-Control", "no-store");
   const trace = [];
-  const debug = isDebugEnabled(req);
+  const { ymd: initialYmd, slot, traceRequested } = parseRequestParams(req, trace);
+  const _trace = traceRequested ? trace : null;
   const probeParam = Array.isArray(req?.query?.probe)
     ? req.query.probe.find((value) => String(value).trim().length > 0)
     : req?.query?.probe;
@@ -1460,7 +1525,7 @@ export async function runApplyLearning(req, res) {
   }
 
   let currentPhase = "init";
-  let ymd = null;
+  let ymd = initialYmd;
   let historyItems = [];
 
   try {
@@ -1484,10 +1549,6 @@ export async function runApplyLearning(req, res) {
       writeKeyToBackendsRef = fallbackWriteKeyToBackends;
     }
 
-    currentPhase = "resolve_ymd";
-    const tzYmd = ymdInTZ("Europe/Belgrade");
-    ymd = resolveRequestedYmd(req, tzYmd, trace);
-
     currentPhase = "load";
     let kvFlavors = [];
     try {
@@ -1496,12 +1557,12 @@ export async function runApplyLearning(req, res) {
       trace.push({ error: { phase: "kv_init", message: String(kvErr?.message || kvErr) } });
       kvFlavors = [];
     }
-    const context = { kvFlavors, trace, readKey: readKeyFromBackendsRef };
-    const { items } = await loadSnapshotsForDay(ymd, context);
+    const context = { kvFlavors, trace, readKey: readKeyFromBackendsRef, ymd, slot };
+    const { items } = await loadSnapshotsForDay(ymd, { slot }, context);
 
     currentPhase = "normalize";
     const teamFillCounts = { home: 0, away: 0 };
-    const filtered = filterH2HOnly(items, teamFillCounts);
+    const filtered = filterH2HOnly(items, teamFillCounts, { slot });
     if (trace && typeof trace.push === "function") {
       trace.push({ normalize: "teams", filled: { home: teamFillCounts.home, away: teamFillCounts.away } });
     }
@@ -1509,13 +1570,14 @@ export async function runApplyLearning(req, res) {
     historyItems = enforceHistoryRequirements(deduped, trace);
 
     currentPhase = "persist";
-    await persistHistory(ymd, historyItems, trace, kvFlavors);
+    await persistHistory(ymd, historyItems, trace, kvFlavors, { slot });
 
     return res.status(200).json({
       ok: true,
       ymd,
+      slot,
       count: historyItems.length,
-      trace: debug ? trace : [],
+      trace: _trace || [],
     });
   } catch (err) {
     const errorPayload = {
@@ -1526,8 +1588,9 @@ export async function runApplyLearning(req, res) {
     return res.status(200).json({
       ok: false,
       ymd,
+      slot,
       count: 0,
-      trace: debug ? trace : [],
+      trace: _trace || [],
       error: errorPayload,
     });
   }

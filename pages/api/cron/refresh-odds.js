@@ -14,7 +14,7 @@ function kvBackends() {
   if (bU && bT) out.push({ flavor:"upstash-redis", url:bU.replace(/\/+$/,""), tok:bT });
   return out;
 }
-async function kvGET(key, trace=[]) {
+async function kvGET(key, trace) {
   for (const b of kvBackends()) {
     try {
       const u = `${b.url}/get/${encodeURIComponent(key)}`;
@@ -23,14 +23,14 @@ async function kvGET(key, trace=[]) {
       const j = await r.json().catch(()=>null);
       const v = (j && ("result" in j ? j.result : j.value)) ?? null;
       if (v==null) continue;
-      trace.push({ get:key, ok:true, flavor:b.flavor, hit:true });
+      trace?.push({ get:key, ok:true, flavor:b.flavor, hit:true });
       return v;
     } catch {}
   }
-  trace.push({ get:key, ok:true, hit:false });
+  trace?.push({ get:key, ok:true, hit:false });
   return null;
 }
-async function kvSET(key, value, trace=[]) {
+async function kvSET(key, value, trace) {
   const v = typeof value === "string" ? value : JSON.stringify(value);
   let ok = false;
   for (const b of kvBackends()) {
@@ -42,7 +42,7 @@ async function kvSET(key, value, trace=[]) {
         body: JSON.stringify({ value: v })
       });
       ok = ok || r.ok;
-      trace.push({ kv:"set", key, flavor:b.flavor, ok: !!r.ok });
+      trace?.push({ kv:"set", key, flavor:b.flavor, ok: !!r.ok });
     } catch {}
   }
   return ok;
@@ -74,6 +74,12 @@ const BACKOFF_MINUTES_EMPTY = Number(process.env.ODDS_BACKOFF_MINUTES || 25);
 
 const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
 const hourInTZ = (d, tz) => Number(new Intl.DateTimeFormat("en-GB",{ timeZone:tz, hour12:false, hour:"2-digit"}).format(d));
+const YMD_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+const firstQueryValue = (value) => (Array.isArray(value) ? value[0] : value);
+const canonicalSlot = (x) => {
+  const v = String(x ?? "auto").toLowerCase();
+  return v === "late" || v === "am" || v === "pm" ? v : "auto";
+};
 function pickSlot(now) { const h=hourInTZ(now,TZ); return h<10?"late":h<15?"am":"pm"; }
 function capForSlot(slot){ if (slot==="late") return SLOT_ODDS_CAP_LATE; if (slot==="am") return SLOT_ODDS_CAP_AM; return SLOT_ODDS_CAP_PM; }
 function leagueTier(leagueName=""){ const s=String(leagueName).toLowerCase(); if(/uefa|champions|europa|conference/.test(s))return 1; if(/premier league|la liga|serie a|bundesliga|ligue 1|eredivisie|primeira|championship|mls/.test(s))return 2; return 3; }
@@ -196,7 +202,9 @@ function extractConsensusMarkets(afResponse){
  *  Handler
  * ========================= */
 export default async function handler(req, res){
-  const trace = [];
+  const traceParam = firstQueryValue(req?.query?.trace);
+  const _trace = traceParam === "1" ? [] : undefined;
+  const trace = _trace;
   try{
     // READ API KEY — supports your 'API_FOOTBALL_KEY'
     const apiKey =
@@ -211,9 +219,13 @@ export default async function handler(req, res){
     }
 
     const now = new Date();
-    const ymd = ymdInTZ(now, TZ);
-    let slot = String(req.query.slot||"auto").toLowerCase();
-    if (!["late","am","pm"].includes(slot)) slot = pickSlot(now);
+    const rawYmd = String(firstQueryValue(req?.query?.ymd) || "").trim();
+    if (rawYmd && !YMD_REGEX.test(rawYmd)) {
+      return res.status(400).json({ ok:false, error:"invalid ymd" });
+    }
+    const ymd = rawYmd || ymdInTZ(now, TZ);
+    let slot = canonicalSlot(firstQueryValue(req?.query?.slot));
+    if (slot === "auto") slot = pickSlot(now);
 
     const unionKey = `vb:day:${ymd}:${slot}`;
     const fullKey  = `vbl_full:${ymd}:${slot}`;
@@ -283,7 +295,7 @@ export default async function handler(req, res){
         skipped,
         items_len: items.length,
         budget_exhausted: budgetStop,
-        trace,
+        trace: _trace,
         had_full: hadFull,
         reason: "Stopped early after upstream budget/transport error before enriching fixtures; snapshot unchanged"
       });
@@ -304,7 +316,7 @@ export default async function handler(req, res){
       skipped,
       items_len: items.length,
       budget_exhausted: budgetStop,
-      trace,
+      trace: _trace,
       had_full: hadFull,
       enriched,
       persisted: shouldPersist
