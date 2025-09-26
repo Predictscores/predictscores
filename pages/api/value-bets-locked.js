@@ -777,7 +777,6 @@ function resolveFixtureTier(fix) {
 
 function fromMarkets(fix){
   const out=[]; const m=fix?.markets||{}; const fid=fix.fixture_id||fix.fixture?.id; const ctx = buildModelContext(fix);
-  const tier = resolveFixtureTier(fix);
 
   const push = (market, pick, pickCode, selectionLabel, rawPrice) => {
     const price = Number(rawPrice);
@@ -792,6 +791,7 @@ function fromMarkets(fix){
       tier,
     };
     applyModelFields(cand, ctx);
+    cand.tier = tier;
     out.push(cand);
   };
 
@@ -824,7 +824,6 @@ function fromMarkets(fix){
 }
 function oneXtwoOffers(fix){
   const xs=[]; const x=fix?.markets?.['1x2']||{}; const fid=fix.fixture_id||fix.fixture?.id; const ctx = buildModelContext(fix);
-  const tier = resolveFixtureTier(fix);
   const push=(code,label,price)=>{
     const p=Number(price);
     if(!Number.isFinite(p)||p<MIN_ODDS||p>MAX_ODDS) return;
@@ -881,6 +880,9 @@ function aliasItem(it){
   a.confidence = typeof it.confidence !== "undefined" ? it.confidence : (it.confidence_pct ?? 0);
   // legacy price on root
   if (it?.odds && typeof it.odds.price !== "undefined") a.price = Number(it.odds.price);
+  if (!a.tier) {
+    a.tier = resolveLeagueTier(it?.league || {});
+  }
   // legacy names
   if (it.home && !a.home_name) a.home_name = it.home;
   if (it.away && !a.away_name) a.away_name = it.away;
