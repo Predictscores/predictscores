@@ -20,6 +20,13 @@ function createMockRes() {
   };
 }
 
+function extractTrace(payload) {
+  if (!payload || typeof payload !== "object") return [];
+  if (Array.isArray(payload.trace)) return payload.trace;
+  if (Array.isArray(payload._trace)) return payload._trace;
+  return [];
+}
+
 describe("apply-learning history writer", () => {
   const ymd = "2024-07-01";
   let fetchMock;
@@ -185,19 +192,21 @@ describe("apply-learning history writer", () => {
       ].sort()
     );
 
-    expect(res.jsonPayload.trace).toEqual(
+    const responseTrace = extractTrace(res.jsonPayload);
+
+    expect(responseTrace).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           history_requirements: expect.objectContaining({ kept: res.jsonPayload.count }),
         }),
       ])
     );
-    expect(res.jsonPayload.trace).toEqual(
+    expect(responseTrace).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ normalize: "teams", filled: expect.objectContaining({ home: expect.any(Number), away: expect.any(Number) }) }),
       ])
     );
-    const historyTrace = res.jsonPayload.trace.find((row) => row.history_requirements);
+    const historyTrace = responseTrace.find((row) => row.history_requirements);
     expect(historyTrace).toBeDefined();
     expect(historyTrace.history_requirements.reasons.noTeams).toBe(0);
 
@@ -207,12 +216,12 @@ describe("apply-learning history writer", () => {
     expect(Array.isArray(histDayPayload)).toBe(true);
     expect(histDayPayload).toEqual(parsedHist);
     expect(fetchMock).toHaveBeenCalled();
-    expect(res.jsonPayload.trace).toEqual(
+    expect(responseTrace).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ kv: "set", key: `hist:${ymd}`, size: parsedHist.length, ok: true }),
       ])
     );
-    expect(res.jsonPayload.trace).toEqual(
+    expect(responseTrace).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ kv: "set", key: `hist:day:${ymd}`, size: parsedHist.length, ok: true }),
       ])
@@ -287,7 +296,9 @@ describe("apply-learning history writer", () => {
     expect(res.jsonPayload.ok).toBe(true);
     expect(res.jsonPayload.count).toBe(1);
 
-    const historyTrace = res.jsonPayload.trace.find((row) => row.history_requirements);
+    const responseTrace = extractTrace(res.jsonPayload);
+
+    const historyTrace = responseTrace.find((row) => row.history_requirements);
     expect(historyTrace).toBeDefined();
     expect(historyTrace.history_requirements.reasons.assumedMarket).toBeGreaterThan(0);
     expect(historyTrace.history_requirements.reasons.noMarket).toBe(0);
@@ -318,6 +329,130 @@ describe("apply-learning history writer", () => {
     expect(parsedDay).toEqual(parsedHist);
   });
 
+  it("falls back to :last snapshot when only last is populated", async () => {
+    const lastYmd = "2024-07-03";
+    fetchMock.mockImplementation(async (url, options = {}) => {
+      if (url === `https://kv.example/get/${encodeURIComponent(`vb:day:${lastYmd}:union`)}`) {
+        return {
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+        };
+      }
+      if (url === `https://kv.example/get/${encodeURIComponent(`vb:day:${lastYmd}:combined`)}`) {
+        const payload = { items: [] };
+        return {
+          ok: true,
+          json: async () => ({ result: JSON.stringify(payload) }),
+        };
+      }
+      if (url === `https://kv.example/get/${encodeURIComponent(`vb:day:${lastYmd}:last`)}`) {
+        const payload = {
+          items: [
+            {
+              fixture_id: 808,
+              selection: "Home",
+              market_label: "H2H",
+              model_prob: 0.64,
+              teams: {
+                home: { id: 7001, name: "Last Home" },
+                away: { id: 7002, name: "Last Away" },
+              },
+              fixture: {
+                id: 808,
+                teams: {
+                  home: { id: 7001, name: "Last Home" },
+                  away: { id: 7002, name: "Last Away" },
+                },
+              },
+            },
+            {
+              fixture_id: 808,
+              selection: "Home",
+              market_label: "H2H",
+              model_prob: 0.42,
+              teams: {
+                home: { id: 7001, name: "Last Home" },
+                away: { id: 7002, name: "Last Away" },
+              },
+              fixture: {
+                id: 808,
+                teams: {
+                  home: { id: 7001, name: "Last Home" },
+                  away: { id: 7002, name: "Last Away" },
+                },
+              },
+            },
+          ],
+        };
+        return {
+          ok: true,
+          json: async () => ({ result: JSON.stringify(payload) }),
+        };
+      }
+      const setMatch = url.match(/^https:\/\/kv\.example\/set\/(.+)$/);
+      if (setMatch) {
+        const key = decodeURIComponent(setMatch[1]);
+        const bodyJson = options?.body ? JSON.parse(options.body) : {};
+        setCalls.push({ key, body: bodyJson });
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ result: "OK" }),
+        };
+      }
+      return {
+        ok: false,
+        status: 404,
+        json: async () => ({}),
+      };
+    });
+
+    const handlerModule = require("../../../pages/api/cron/apply-learning");
+    const handler = handlerModule.default || handlerModule;
+    const req = {
+      url: `/api/cron/apply-learning?ymd=${encodeURIComponent(lastYmd)}&trace=1`,
+      headers: { host: "example.test", "x-forwarded-proto": "https" },
+      query: { ymd: lastYmd, trace: "1" },
+    };
+    const res = createMockRes();
+
+    await handler(req, res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.jsonPayload.ok).toBe(true);
+    expect(res.jsonPayload.count).toBe(1);
+
+    const histArrayCall = setCalls.find((call) => call.key === `hist:${lastYmd}`);
+    expect(histArrayCall).toBeDefined();
+    const parsedHist = JSON.parse(histArrayCall.body?.value);
+    expect(Array.isArray(parsedHist)).toBe(true);
+    expect(parsedHist).toHaveLength(1);
+    expect(parsedHist[0]).toEqual(
+      expect.objectContaining({
+        fixture_id: 808,
+        selection: "home",
+        home_name: "Last Home",
+        away_name: "Last Away",
+        source: "combined",
+      })
+    );
+
+    const histDayCall = setCalls.find((call) => call.key === `hist:day:${lastYmd}`);
+    expect(histDayCall).toBeDefined();
+    const parsedDay = JSON.parse(histDayCall.body?.value);
+    expect(Array.isArray(parsedDay)).toBe(true);
+    expect(parsedDay).toEqual(parsedHist);
+
+    const calledUrls = fetchMock.mock.calls.map(([calledUrl]) =>
+      typeof calledUrl === "string" ? decodeURIComponent(calledUrl) : calledUrl
+    );
+    expect(calledUrls.some((calledUrl) => calledUrl.includes(`vb:day:${lastYmd}:last`))).toBe(true);
+    expect(calledUrls.some((calledUrl) => calledUrl.includes(`vb:day:${lastYmd}:am`))).toBe(false);
+    expect(calledUrls.some((calledUrl) => calledUrl.includes(`vb:day:${lastYmd}:pm`))).toBe(false);
+    expect(calledUrls.some((calledUrl) => calledUrl.includes(`vb:day:${lastYmd}:late`))).toBe(false);
+  });
+
   it("exposes trace payload via _trace when requested", async () => {
     const handlerModule = require("../../../pages/api/cron/apply-learning");
     const handler = handlerModule.default || handlerModule;
@@ -332,12 +467,12 @@ describe("apply-learning history writer", () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.jsonPayload.ok).toBe(true);
-    expect(Array.isArray(res.jsonPayload.trace)).toBe(true);
-    expect(res.jsonPayload.trace.length).toBe(0);
-    expect(Array.isArray(res.jsonPayload._trace)).toBe(true);
-    expect(res.jsonPayload._trace.length).toBeGreaterThan(0);
+    const traceArray = Array.isArray(res.jsonPayload.trace) ? res.jsonPayload.trace : [];
+    expect(traceArray.length).toBe(0);
+    const debugTrace = Array.isArray(res.jsonPayload._trace) ? res.jsonPayload._trace : [];
+    expect(debugTrace.length).toBeGreaterThan(0);
 
-    const historyTrace = res.jsonPayload._trace.find((row) => row.history_requirements);
+    const historyTrace = debugTrace.find((row) => row.history_requirements);
     expect(historyTrace).toBeDefined();
     expect(historyTrace.history_requirements.kept).toBe(res.jsonPayload.count);
   });

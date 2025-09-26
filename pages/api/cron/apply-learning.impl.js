@@ -838,6 +838,14 @@ async function loadSnapshotsForDay(ymd, options = {}, context = {}) {
       return { items, meta: { source: key } };
     }
   }
+  const lastKey = `vb:day:${ymd}:last`;
+  {
+    const { items } = await readSnapshot(lastKey, { sourceSlot: "last" }, context);
+    if (items.length > 0) {
+      const deduped = dedupeByFixtureStrongest(items);
+      return { items: deduped, meta: { source: lastKey, slot: "last" } };
+    }
+  }
   let aggregated = [];
   const slotSizes = {};
   for (const slot of ["am", "pm", "late"]) {
