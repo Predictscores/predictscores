@@ -187,6 +187,9 @@ describe("apply-learning history writer", () => {
 
     const histDayCall = setCalls.find((call) => call.key === `hist:day:${ymd}`);
     expect(histDayCall).toBeDefined();
+    const histDayPayload = JSON.parse(histDayCall.body?.value);
+    expect(Array.isArray(histDayPayload)).toBe(true);
+    expect(histDayPayload).toEqual(parsedHist);
     expect(fetchMock).toHaveBeenCalled();
     expect(res.jsonPayload.trace).toEqual(
       expect.arrayContaining([

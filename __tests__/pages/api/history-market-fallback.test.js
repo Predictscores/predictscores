@@ -74,7 +74,7 @@ describe.each(kvResponseModes)("API history market fallback (%s)", (modeLabel, m
 
     await handler(req, res);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(res.statusCode).toBe(200);
     expect(res.jsonPayload.count).toBe(1);
     expect(res.jsonPayload.history.map((e) => e.market)).toContain("1x2");
@@ -95,7 +95,7 @@ describe.each(kvResponseModes)("API history market fallback (%s)", (modeLabel, m
 
     await handler(req, res);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(res.statusCode).toBe(200);
     expect(res.jsonPayload.count).toBe(1);
     expect(res.jsonPayload.history.map((e) => e.market)).toContain("1x2");

@@ -857,7 +857,7 @@ async function persistHistory(ymd, history, trace, kvFlavors) {
   }
   const kv = createKvClient(kvFlavors);
   await setJsonWithTrace(kv, listKey, history, size, trace);
-  await setJsonWithTrace(kv, dayKey, { ymd, items: history }, size, trace);
+  await setJsonWithTrace(kv, dayKey, history, size, trace);
 }
 
 async function setJsonWithTrace(kv, key, value, size, trace) {
