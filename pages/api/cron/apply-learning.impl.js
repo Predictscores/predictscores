@@ -904,6 +904,7 @@ async function persistHistory(ymd, history, trace, kvFlavors, options = {}) {
   const size = payload.length;
   const listKey = `hist:${ymd}`;
   const dayKey = `hist:day:${ymd}`;
+  const canonicalKey = `vb:day:${ymd}:last`;
   const meta = { ymd };
   if (slot) meta.slot = slot;
   const traceLog = trace && typeof trace.push === "function" ? trace : null;
@@ -913,6 +914,7 @@ async function persistHistory(ymd, history, trace, kvFlavors, options = {}) {
     if (traceLog) {
       traceLog.push({ kv: "set", key: listKey, size, ok: false, skipped: "no_backends", ...meta });
       traceLog.push({ kv: "set", key: dayKey, size, ok: false, skipped: "no_backends", ...meta });
+      traceLog.push({ kv: "set", key: canonicalKey, size, ok: false, skipped: "no_backends", ...meta });
     }
     return;
   }
@@ -920,9 +922,11 @@ async function persistHistory(ymd, history, trace, kvFlavors, options = {}) {
   const kv = kvClient || createKvClient(kvFlavors);
   const listMeta = { ...meta, scope: "list" };
   const dayMeta = { ...meta, scope: "day" };
+  const canonicalMeta = { ...meta, scope: "canonical" };
 
   await setJsonWithTrace(kv, listKey, payload, size, traceLog || trace, listMeta);
   await setJsonWithTrace(kv, dayKey, payload, size, traceLog || trace, dayMeta);
+  await setJsonWithTrace(kv, canonicalKey, payload, size, traceLog || trace, canonicalMeta);
 }
 
 async function setJsonWithTrace(kv, key, value, size, trace, meta = {}) {
