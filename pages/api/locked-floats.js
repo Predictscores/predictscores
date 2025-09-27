@@ -1,43 +1,27 @@
 // pages/api/locked-floats.js
-// Purpose: persist base UNION (as {items: [fixture_id,...]}) and build daily tickets.
-// Note: do NOT write vb:day:<ymd>:last here; apply-learning owns that.
+// Purpose: persist today's UNION as { items:[fixture_id,...] } and (if missing) write simple daily tickets.
+// NOTE: we DO NOT write vb:day:<ymd>:last here; apply-learning owns that.
 
 export const config = { api: { bodyParser: false } };
 
-/* ---------- timezone helpers ---------- */
-function pickTZ() {
+/* ---------- TZ helpers ---------- */
+const TZ = (() => {
   try {
     const raw = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
     new Intl.DateTimeFormat("en-CA", { timeZone: raw });
     return raw;
-  } catch {
-    return "Europe/Belgrade";
-  }
-}
-const TZ = pickTZ();
+  } catch { return "Europe/Belgrade"; }
+})();
 const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
 
-/* ---------- minimal AF adapters ---------- */
-async function afFetch(path) {
-  const base = "https://v3.football.api-sports.io";
-  const key = process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.env.API_FOOTBALL_KEY;
-  const r = await fetch(base + path, { headers: { "x-apisports-key": key } });
-  if (!r.ok) return null;
-  return r.json().catch(() => null);
-}
-const afFixturesByDate = (date, tz) =>
-  afFetch(`/fixtures?date=${encodeURIComponent(date)}&timezone=${encodeURIComponent(tz)}`);
-const afOddsByFixture = (fid) =>
-  afFetch(`/odds?fixture=${encodeURIComponent(fid)}`);
-
-/* ---------- KV helpers (Vercel KV / Upstash REST) ---------- */
-const KV_URL = process.env.KV_REST_API_URL?.replace(/\/+$/, "");
-const KV_TOK = process.env.KV_REST_API_TOKEN;
-const okKV = !!(KV_URL && KV_TOK);
-const J = (s) => { try { return JSON.parse(String(s || "")); } catch { return null; } };
+/* ---------- KV helpers (single backend: KV_REST_*) ---------- */
+const KV_URL = process.env.KV_REST_API_URL ? String(process.env.KV_REST_API_URL).replace(/\/+$/, "") : "";
+const KV_TOK = process.env.KV_REST_API_TOKEN || "";
+const kvOK = Boolean(KV_URL && KV_TOK);
+const J = (s) => { try { return JSON.parse(String(s ?? "")); } catch { return null; } };
 
 async function kvGet(key) {
-  if (!okKV) return null;
+  if (!kvOK) return null;
   const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
     headers: { Authorization: `Bearer ${KV_TOK}` },
     cache: "no-store",
@@ -47,7 +31,7 @@ async function kvGet(key) {
   return typeof j?.result === "string" ? j.result : null;
 }
 async function kvSet(key, val) {
-  if (!okKV) return false;
+  if (!kvOK) return false;
   const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${KV_TOK}`, "Content-Type": "application/json" },
@@ -55,6 +39,20 @@ async function kvSet(key, val) {
   });
   return r.ok;
 }
+
+/* ---------- API-FOOTBALL helpers ---------- */
+const AF_BASE = "https://v3.football.api-sports.io";
+const AF_KEY  = process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.env.API_FOOTBALL_KEY;
+
+async function af(path) {
+  const r = await fetch(AF_BASE + path, { headers: { "x-apisports-key": AF_KEY } });
+  if (!r.ok) return null;
+  return r.json().catch(() => null);
+}
+const fixturesByDate = (date, tz) =>
+  af(`/fixtures?date=${encodeURIComponent(date)}&timezone=${encodeURIComponent(tz)}`);
+const oddsByFixture = (fid) =>
+  af(`/odds?fixture=${encodeURIComponent(fid)}`);
 
 /* ---------- mapping ---------- */
 function baseFx(fx) {
@@ -69,14 +67,9 @@ function baseFx(fx) {
   };
 }
 
-/* ---------- quick tickets (BTTS/OU2.5/HT-FT) with bounded calls ---------- */
-const kts = (x) => {
-  const k = x?.fixture?.date || x?.date || null;
-  const d = k ? new Date(k) : null;
-  return Number.isFinite(d?.getTime?.()) ? d.getTime() : 0;
-};
-async function buildDailyTickets(fixtures) {
-  const take = fixtures.slice(0, 12);
+/* ---------- quick tickets (bounded) ---------- */
+async function buildTickets(fixtures) {
+  const take = fixtures.slice(0, 12); // cap calls
   const btts = [], ou25 = [], htft = [];
   let budgetStop = false;
 
@@ -84,18 +77,19 @@ async function buildDailyTickets(fixtures) {
     const fid = f?.fixture?.id || f?.id;
     if (!fid) continue;
 
-    const odds = await afOddsByFixture(fid);
+    const odds = await oddsByFixture(fid);
     if (!odds) { budgetStop = true; break; }
     const books = odds?.response?.[0]?.bookmakers || [];
 
-    // BTTS best price
+    // BTTS
     {
       let yes = [], no = [];
       for (const b of books) for (const bet of (b?.bets || [])) {
         const nm = String(bet?.name || "").toLowerCase();
         if (!nm.includes("both teams to score")) continue;
         for (const v of (bet?.values || [])) {
-          const lbl = String(v?.value || "").toLowerCase(); const odd = Number(v?.odd);
+          const lbl = String(v?.value || "").toLowerCase();
+          const odd = Number(v?.odd);
           if (!Number.isFinite(odd)) continue;
           if (lbl.includes("yes")) yes.push(odd); else if (lbl.includes("no")) no.push(odd);
         }
@@ -143,8 +137,9 @@ async function buildDailyTickets(fixtures) {
           (map[norm] ||= []).push(odd);
         }
       }
-      const best = Object.entries(map).map(([k, arr]) => [k, arr.length ? Math.min(...arr) : Infinity])
-                     .sort((a,b)=>a[1]-b[1])[0];
+      const best = Object.entries(map)
+        .map(([k, arr]) => [k, arr && arr.length ? Math.min(...arr) : Infinity])
+        .sort((a, b) => a[1] - b[1])[0];
       if (best && isFinite(best[1])) htft.push({
         ...baseFx(f), market: "HT-FT", market_label: "HT-FT",
         selection_label: best[0], market_odds: best[1],
@@ -152,37 +147,36 @@ async function buildDailyTickets(fixtures) {
     }
   }
 
-  const sortT = (a,b) => (kts(a) - kts(b));
-  return { btts: btts.sort(sortT), ou25: ou25.sort(sortT), htft: htft.sort(sortT), budgetStop };
+  return { btts, ou25, htft, budgetStop };
 }
 
 /* ---------- handler ---------- */
 export default async function handler(req, res) {
   try {
+    if (!kvOK) return res.status(200).json({ ok: false, error: "KV not configured (KV_REST_API_URL/TOKEN)" });
+
     const today = String(req.query.ymd || ymdInTZ(new Date(), TZ));
     const warm = String(req.query.warm || "") === "1";
 
-    if (!okKV) return res.status(200).json({ ok: false, error: "KV not configured" });
-
     if (!warm) return res.status(200).json({ ok: true, note: "locked-floats alive" });
 
-    // 1) Build base from AF fixtures
-    const fixturesResp = await afFixturesByDate(today, TZ);
-    const fixtures = Array.isArray(fixturesResp?.response) ? fixturesResp.response : [];
+    // Build base from AF fixtures
+    const fResp = await fixturesByDate(today, TZ);
+    const fixtures = Array.isArray(fResp?.response) ? fResp.response : [];
     const ids = fixtures.map(f => f?.fixture?.id || f?.id).filter(Boolean);
     const uniqIds = Array.from(new Set(ids));
 
-    // Persist UNION in the normalized shape
+    // Write UNION in normalized shape
     const ts = new Date().toISOString();
     await kvSet(`vb:day:${today}:union`, { ymd: today, ts, items: uniqIds });
 
-    // 2) Daily tickets (if missing)
+    // Tickets (only if missing)
     const tKey = `tickets:${today}`;
     const tRaw = await kvGet(tKey);
     let madeTickets = false, tCounts = { btts:0, ou25:0, htft:0 }, budgetStop=false;
 
     if (!tRaw) {
-      const { btts, ou25, htft, budgetStop: bs } = await buildDailyTickets(fixtures);
+      const { btts, ou25, htft, budgetStop: bs } = await buildTickets(fixtures);
       await kvSet(tKey, { ymd: today, ts, btts, ou25, htft });
       madeTickets = true; budgetStop = bs;
       tCounts = { btts: btts.length, ou25: ou25.length, htft: htft.length };
