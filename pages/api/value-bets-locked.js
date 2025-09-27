@@ -1,12 +1,27 @@
 // pages/api/value-bets-locked.js
-// Drop-in: returns today's locked list; never crashes on missing tier; includes basic meta.
+// Reads vb:day:<ymd>:last safely, no reliance on getKV() symbol.
 
-import { getKV } from '../../lib/kv-read'; // keep your existing helper path
+import * as kvlib from '../../lib/kv-read';
+
+async function getKvClient() {
+  if (typeof kvlib.getKV === 'function') {
+    const client = await kvlib.getKV();
+    if (client && typeof client.get === 'function' && typeof client.set === 'function') return client;
+  }
+  const kvGet = kvlib.kvGet || kvlib.get;
+  const kvSet = kvlib.kvSet || kvlib.set;
+  if (typeof kvGet === 'function' && typeof kvSet === 'function') {
+    return { get: kvGet, set: kvSet };
+  }
+  throw new Error('KV adapter: neither getKV() nor kvGet/kvSet found in lib/kv-read');
+}
+
+function ymdUTC(d = new Date()) { return d.toISOString().slice(0, 10); }
 
 export default async function handler(req, res) {
   try {
-    const kv = await getKV();
-    const ymd = new Date().toISOString().slice(0,10);
+    const kv = await getKvClient();
+    const ymd = ymdUTC();
     const lockKey = `vb:day:${ymd}:last`;
 
     const raw = await kv.get(lockKey);
@@ -19,15 +34,11 @@ export default async function handler(req, res) {
       tier: it?.tier ?? it?.league?.tier ?? null
     }));
 
-    return res.status(200).json({
+    res.status(200).json({
       items: safe,
-      meta: {
-        ymd,
-        source: doc ? 'vb-locked:kv:hit' : 'vb-locked:kv:miss',
-        ts: doc?.ts ?? null
-      }
+      meta: { ymd, source: doc ? 'vb-locked:kv:hit' : 'vb-locked:kv:miss', ts: doc?.ts ?? null }
     });
   } catch (e) {
-    return res.status(200).json({ items: [], meta: { error: String(e?.message || e) } });
+    res.status(200).json({ items: [], meta: { error: String(e?.message || e) } });
   }
 }
