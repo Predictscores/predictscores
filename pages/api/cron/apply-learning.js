@@ -1,5 +1,6 @@
 // pages/api/cron/apply-learning.js
-// Purpose: read today's UNION & snapshot, freeze into vbl_* keys, write history & freshness marker.
+// Consumes today's UNION and writes vbl_* + history + freshness marker.
+// Reads from BOTH KV backends; writes to BOTH.
 
 export const config = { api: { bodyParser: false } };
 
@@ -16,52 +17,86 @@ function inferSlotByTime(d = new Date()) {
   return "pm";
 }
 
-/* ---------- KV helpers (single backend: KV_REST_*) ---------- */
+/* ---------- Dual KV clients ---------- */
 const KV_URL = process.env.KV_REST_API_URL ? String(process.env.KV_REST_API_URL).replace(/\/+$/, "") : "";
 const KV_TOK = process.env.KV_REST_API_TOKEN || "";
-const kvOK = Boolean(KV_URL && KV_TOK);
+const hasKV = Boolean(KV_URL && KV_TOK);
+
+const R_URL = process.env.UPSTASH_REDIS_REST_URL ? String(process.env.UPSTASH_REDIS_REST_URL).replace(/\/+$/, "") : "";
+const R_TOK = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const hasR  = Boolean(R_URL && R_TOK);
+
 const J = (s) => { try { return JSON.parse(String(s ?? "")); } catch { return null; } };
 
-async function kvGet(key) {
-  if (!kvOK) return null;
+async function kvGetREST(key) {
+  if (!hasKV) return null;
   const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${KV_TOK}` },
-    cache: "no-store",
+    headers: { Authorization: `Bearer ${KV_TOK}` }, cache: "no-store",
   });
   if (!r.ok) return null;
   const j = await r.json().catch(() => null);
   return typeof j?.result === "string" ? j.result : null;
 }
-async function kvSet(key, val) {
-  if (!kvOK) return false;
+async function kvSetREST(key, val) {
+  if (!hasKV) return false;
+  const body = typeof val === "string" ? val : JSON.stringify(val);
   const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${KV_TOK}`, "Content-Type": "application/json" },
-    body: typeof val === "string" ? val : JSON.stringify(val),
+    body,
   });
   return r.ok;
 }
+async function kvGetUpstash(key) {
+  if (!hasR) return null;
+  const r = await fetch(`${R_URL}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${R_TOK}` }, cache: "no-store",
+  });
+  if (!r.ok) return null;
+  const j = await r.json().catch(() => null);
+  return typeof j?.result === "string" ? j.result : null;
+}
+async function kvSetUpstash(key, val) {
+  if (!hasR) return false;
+  const body = typeof val === "string" ? val : JSON.stringify(val);
+  const r = await fetch(`${R_URL}/set/${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${R_TOK}`, "Content-Type": "application/json" },
+    body,
+  });
+  return r.ok;
+}
+async function kvGetAny(key) {
+  const a = await kvGetREST(key);
+  if (a != null) return a;
+  return kvGetUpstash(key);
+}
+async function kvSetBoth(key, val) {
+  const r1 = await kvSetREST(key, val);
+  const r2 = await kvSetUpstash(key, val);
+  return r1 || r2;
+}
 
-/* ---------- normalize ---------- */
-function normalizeIds(maybe) {
-  if (!maybe) return [];
-  const arr = Array.isArray(maybe) ? maybe : (Array.isArray(maybe.items) ? maybe.items : []);
-  const out = [];
-  for (const x of arr) {
-    if (x == null) continue;
-    if (typeof x === "number" || typeof x === "string") { out.push(Number(x) || String(x)); continue; }
-    if (typeof x === "object") {
-      const id = x.id ?? x.fixture_id ?? x.fixture?.id;
-      if (id != null) out.push(Number(id) || String(id));
-    }
+/* ---------- normalize union ---------- */
+function normalizeIds(any) {
+  if (!any) return [];
+  const obj = typeof any === "string" ? J(any) ?? any : any;
+  if (Array.isArray(obj)) {
+    return Array.from(new Set(obj.map(x => (typeof x === "object" ? (x?.id ?? x?.fixture_id ?? x?.fixture?.id) : x)).filter(Boolean)));
   }
-  return Array.from(new Set(out));
+  if (typeof obj === "object") {
+    const arr = Array.isArray(obj.items) ? obj.items : (Array.isArray(obj.fixtures) ? obj.fixtures : []);
+    return Array.from(new Set(arr.map(x => (typeof x === "object" ? (x?.id ?? x?.fixture_id ?? x?.fixture?.id) : x)).filter(Boolean)));
+  }
+  return [];
 }
 
 /* ---------- handler ---------- */
 export default async function handler(req, res) {
   try {
-    if (!kvOK) return res.status(200).json({ ok: false, error: "KV not configured (KV_REST_API_URL/TOKEN)" });
+    if (!hasKV && !hasR) {
+      return res.status(200).json({ ok: false, error: "No KV configured (KV_REST_* or UPSTASH_REDIS_REST_*)." });
+    }
 
     const now = new Date();
     const ymd = String(req.query.ymd || belgradeYMD(now));
@@ -72,6 +107,7 @@ export default async function handler(req, res) {
     const snapshotLegacyKey = `vb:day:${ymd}:snapshot`;
     const snapshotIndexKey  = `vb:day:${ymd}:snapshot:index`;
     const unionKey          = `vb:day:${ymd}:union`;
+    const unionObjKey       = `vb:day:${ymd}:union:obj`;
     const vblSlotKey        = `vbl_full:${ymd}:${slot}`;
     const vblDayKey         = `vbl_full:${ymd}`;
     const historyKey        = `vb:history:${ymd}`;
@@ -80,19 +116,26 @@ export default async function handler(req, res) {
     const vbLockedMarker    = `vb-locked:kv:hit`;
 
     // Probes
-    const [snapLegacyRaw, snapIdxRaw, unionRaw, vblSlotRaw, vblDayRaw] = await Promise.all([
-      kvGet(snapshotLegacyKey), kvGet(snapshotIndexKey), kvGet(unionKey), kvGet(vblSlotKey), kvGet(vblDayKey)
+    const [snapLegacyRaw, snapIdxRaw, unionRaw, unionObjRaw, vblSlotRaw, vblDayRaw] = await Promise.all([
+      kvGetAny(snapshotLegacyKey), kvGetAny(snapshotIndexKey),
+      kvGetAny(unionKey), kvGetAny(unionObjKey),
+      kvGetAny(vblSlotKey), kvGetAny(vblDayKey),
     ]);
 
     const snapshotsLegacy = J(snapLegacyRaw) || snapLegacyRaw || null;
     const snapshotsIndex  = J(snapIdxRaw) || snapIdxRaw || null;
-    const unionData       = J(unionRaw);
-    const ids = normalizeIds(unionData);
+
+    const ids = (() => {
+      const a = normalizeIds(unionRaw);
+      if (a.length) return a;
+      return normalizeIds(unionObjRaw); // mirror written by locked-floats
+    })();
 
     const probes = {
       snapshot_legacy_key: snapshotLegacyKey,
       snapshot_index_key:  snapshotIndexKey,
       union_key:           unionKey,
+      union_obj_key:       unionObjKey,
       vbl_slot_key:        vblSlotKey,
       vbl_day_key:         vblDayKey,
       snapshot_legacy_len: Array.isArray(snapshotsLegacy?.items) ? snapshotsLegacy.items.length
@@ -106,40 +149,37 @@ export default async function handler(req, res) {
       vbl_day_len:          (J(vblDayRaw)?.items || []).length,
     };
 
-    if (ids.length === 0) {
-      await kvSet(lockKey, { ymd, slot, ts: new Date().toISOString(), reason: "empty-union" });
+    if (!ids.length) {
+      await kvSetBoth(lockKey, { ymd, slot, ts: new Date().toISOString(), reason: "empty-union" });
       return res.status(200).json({ ok: true, ymd, count: 0, wrote: { lockKey, historyKey }, sourceKey: null, probes });
     }
 
-    // Write slot doc
+    // Write slot + merge day
     const nowIso = new Date().toISOString();
-    await kvSet(vblSlotKey, { ymd, slot, ts: nowIso, items: ids });
+    await kvSetBoth(vblSlotKey, { ymd, slot, ts: nowIso, items: ids });
 
-    // Merge into day
     let dayItems = ids.slice();
-    const prevDayRaw = await kvGet(vblDayKey);
+    const prevDayRaw = await kvGetAny(vblDayKey);
     if (prevDayRaw) {
       const prev = J(prevDayRaw);
       if (Array.isArray(prev?.items)) {
-        const set = new Set([...prev.items, ...ids]);
-        dayItems = Array.from(set);
+        dayItems = Array.from(new Set([...prev.items, ...ids]));
       }
     }
-    await kvSet(vblDayKey, { ymd, ts: nowIso, items: dayItems });
+    await kvSetBoth(vblDayKey, { ymd, ts: nowIso, items: dayItems });
 
     // History & lock
-    await kvSet(historyKey, { ymd, ts: nowIso, items: ids, slot });
-    await kvSet(lockKey,    { ymd, ts: nowIso, last_slot: slot, count: ids.length });
+    await kvSetBoth(historyKey, { ymd, ts: nowIso, items: ids, slot });
+    await kvSetBoth(lockKey,    { ymd, ts: nowIso, last_slot: slot, count: ids.length });
 
     // Freshness markers for odds watcher & feed
     const marker = { ymd, ts: nowIso, last_odds_refresh: nowIso, items: ids.length };
-    await kvSet(vbLockedTodayKey, marker);
-    await kvSet(vbLockedMarker,   marker);
+    await kvSetBoth(vbLockedTodayKey, marker);
+    await kvSetBoth(vbLockedMarker,   marker);
 
     return res.status(200).json({
       ok: true,
-      ymd,
-      slot,
+      ymd, slot,
       count: ids.length,
       wrote: { vblSlotKey, vblDayKey, historyKey, lockKey, vbLockedTodayKey, vbLockedMarker },
       sourceKey: unionKey,
