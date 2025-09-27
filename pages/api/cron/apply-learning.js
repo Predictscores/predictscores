@@ -1,13 +1,13 @@
 // pages/api/cron/apply-learning.js
-// Calls impl and ALSO returns probe counts for snapshot/vbl_full/union (no new endpoints).
+// Calls the impl and returns probe counts for both legacy and chunked snapshot sources.
 
 import * as kvlib from '../../../lib/kv-read';
 import applyLearningImpl from './apply-learning.impl';
 
 async function getKvClient() {
   if (typeof kvlib.getKV === 'function') {
-    const client = await kvlib.getKV();
-    if (client && typeof client.get === 'function' && typeof client.set === 'function') return client;
+    const c = await kvlib.getKV();
+    if (c && typeof c.get === 'function' && typeof c.set === 'function') return c;
   }
   const kvGet = kvlib.kvGet, kvSet = kvlib.kvSet;
   if (typeof kvGet === 'function' && typeof kvSet === 'function') return { get: kvGet, set: kvSet };
@@ -24,7 +24,7 @@ function belgradeSlot(now = new Date()) {
 }
 function parseMaybeJson(raw) {
   if (!raw) return null;
-  if (typeof raw === 'string') { try { return JSON.parse(raw); } catch { /* ignore */ } }
+  if (typeof raw === 'string') { try { return JSON.parse(raw); } catch {} }
   return raw;
 }
 async function readArr(kv, key) {
@@ -41,19 +41,31 @@ export default async function handler(req, res) {
     const ymd = ymdUTC(now);
     const slot = belgradeSlot(now);
 
-    // Probes to confirm what exists in KV
-    const snapshotKey = `vb:day:${ymd}:snapshot`;
-    const unionKey    = `vb:day:${ymd}:union`;
-    const vblSlotKey  = `vbl_full:${ymd}:${slot}`;
-    const vblDayKey   = `vbl_full:${ymd}`;
+    // Probes (both legacy and chunked)
+    const snapshotKeyLegacy = `vb:day:${ymd}:snapshot`;
+    const unionKey          = `vb:day:${ymd}:union`;
+    const vblSlotKey        = `vbl_full:${ymd}:${slot}`;
+    const vblDayKey         = `vbl_full:${ymd}`;
+    const indexKey          = `vb:day:${ymd}:snapshot:index`;
 
-    const probe_snapshot_len = (await readArr(kv, snapshotKey)).length;
-    const probe_union_arr    = await readArr(kv, unionKey);
-    const probe_union_len    = probe_union_arr.length && typeof probe_union_arr[0] !== 'object'
-                               ? probe_union_arr.length
-                               : probe_union_arr.map(x => (x?.fixture?.id ?? x?.id)).filter(Boolean).length;
-    const probe_vbl_slot_len = (await readArr(kv, vblSlotKey)).length;
-    const probe_vbl_day_len  = (await readArr(kv, vblDayKey)).length;
+    const legacySnapLen = (await readArr(kv, snapshotKeyLegacy)).length;
+    const unionArr      = await readArr(kv, unionKey);
+    const unionLen      = unionArr.length && typeof unionArr[0] !== 'object'
+                          ? unionArr.length
+                          : unionArr.map(x => (x?.fixture?.id ?? x?.id)).filter(Boolean).length;
+    const vblSlotLen    = (await readArr(kv, vblSlotKey)).length;
+    const vblDayLen     = (await readArr(kv, vblDayKey)).length;
+
+    let chunkedLen = 0;
+    const idxRaw = await kv.get(indexKey);
+    const idxDoc = parseMaybeJson(idxRaw);
+    if (idxDoc && typeof idxDoc.chunks === 'number' && idxDoc.chunks > 0) {
+      // Sum lengths of all chunk parts
+      for (let i = 0; i < idxDoc.chunks; i++) {
+        const part = await readArr(kv, `vb:day:${ymd}:snapshot:${i}`);
+        chunkedLen += part.length;
+      }
+    }
 
     // Publish
     const out = await applyLearningImpl({ kv, todayYmd: ymd });
@@ -61,11 +73,16 @@ export default async function handler(req, res) {
     res.status(200).json({
       ...out,
       probes: {
-        snapshotKey, unionKey, vblSlotKey, vblDayKey,
-        snapshot_len: probe_snapshot_len,
-        union_len: probe_union_len,
-        vbl_slot_len: probe_vbl_slot_len,
-        vbl_day_len: probe_vbl_day_len,
+        snapshot_legacy_key: snapshotKeyLegacy,
+        snapshot_index_key: indexKey,
+        union_key: unionKey,
+        vbl_slot_key: vblSlotKey,
+        vbl_day_key: vblDayKey,
+        snapshot_legacy_len: legacySnapLen,
+        snapshot_chunked_len: chunkedLen,
+        union_len: unionLen,
+        vbl_slot_len: vblSlotLen,
+        vbl_day_len: vblDayLen,
       }
     });
   } catch (e) {
