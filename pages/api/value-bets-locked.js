@@ -1,13 +1,5 @@
 // pages/api/value-bets-locked.js
-// Reads today's canonical lock, and exposes a freshness stamp that workflows can use
-// to enforce cooldown. Compatible with both legacy and new freshness keys.
-//
-// Legacy keys it can read (if your refresh-odds writes them):
-//   - vb:last-odds
-//   - vb:last-odds:<slot>
-// Newer keys (if present):
-//   - vb:last_odds_refresh
-//   - vb:last_odds_refresh:<slot>
+// Reads today's lock and exposes a clean freshness stamp (handles double-encoded JSON).
 
 import * as kvlib from '../../lib/kv-read';
 
@@ -24,42 +16,47 @@ async function getKvClient() {
 function ymdUTC(d = new Date()) { return d.toISOString().slice(0, 10); }
 
 function belgradeSlot(now = new Date()) {
-  // Europe/Belgrade local hour (approx via UTC offset; precise tz rules not needed for coarse slotting)
   const belgrade = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Belgrade' }));
   const H = belgrade.getHours();
-  if (H < 10) return 'late';       // 00:00–09:59
-  if (H < 15) return 'am';         // 10:00–14:59
-  return 'pm';                     // 15:00–23:59
+  if (H < 10) return 'late';
+  if (H < 15) return 'am';
+  return 'pm';
 }
 
-function parseMaybeJson(raw) {
+function parseOnce(raw) {
   if (!raw) return null;
   if (typeof raw === 'string') {
-    try { return JSON.parse(raw); } catch { /* maybe a plain timestamp string */ }
+    try { return JSON.parse(raw); } catch { return raw; }
   }
   return raw;
 }
+function parseTwice(raw) {
+  const once = parseOnce(raw);
+  if (once && typeof once === 'string') {
+    try { return JSON.parse(once); } catch { /* leave as string */ }
+  }
+  return once;
+}
 
 async function readFreshness(kv, slot) {
-  // Prefer newer keys
-  const keysNew = [`vb:last_odds_refresh:${slot}`, `vb:last_odds_refresh`];
-  for (const k of keysNew) {
+  const candidates = [
+    `vb:last_odds_refresh:${slot}`,
+    `vb:last_odds_refresh`,
+    `vb:last-odds:${slot}`,
+    `vb:last-odds`,
+  ];
+  for (const k of candidates) {
     const raw = await kv.get(k);
-    const doc = parseMaybeJson(raw);
-    if (doc && (doc.ts || doc.timestamp)) {
-      return { ts: doc.ts || doc.timestamp, slot: doc.slot || slot, updated: doc.updated ?? null, source: k };
+    if (!raw) continue;
+    const doc = parseTwice(raw); // handles object, stringified object, or double-stringified
+    if (doc && typeof doc === 'object') {
+      const ts = doc.ts || doc.timestamp || doc.value?.ts || null;
+      const ymd = doc.ymd || null;
+      const updated = doc.updated ?? null;
+      if (ts) return { ts, ymd, slot: doc.slot || slot, updated, source: k };
     }
-  }
-  // Fallback to legacy keys (may be a plain ISO string)
-  const keysLegacy = [`vb:last-odds:${slot}`, `vb:last-odds`];
-  for (const k of keysLegacy) {
-    const raw = await kv.get(k);
-    if (typeof raw === 'string' && raw.length >= 10) {
-      return { ts: raw, slot, updated: null, source: k };
-    }
-    const doc = parseMaybeJson(raw);
-    if (doc && (doc.ts || doc.timestamp)) {
-      return { ts: doc.ts || doc.timestamp, slot, updated: doc.updated ?? null, source: k };
+    if (typeof doc === 'string' && doc.length >= 10) {
+      return { ts: doc, slot, updated: null, source: k };
     }
   }
   return null;
@@ -81,8 +78,7 @@ export default async function handler(req, res) {
       tier: it?.tier ?? it?.league?.tier ?? null
     }));
 
-    const slot = belgradeSlot();
-    const freshness = await readFreshness(kv, slot);
+    const freshness = await readFreshness(kv, belgradeSlot());
 
     res.status(200).json({
       items: safe,
@@ -90,7 +86,7 @@ export default async function handler(req, res) {
         ymd,
         source: doc ? 'vb-locked:kv:hit' : 'vb-locked:kv:miss',
         ts: doc?.ts ?? null,
-        last_odds_refresh: freshness // { ts, slot, updated, source } | null
+        last_odds_refresh: freshness
       }
     });
   } catch (e) {
