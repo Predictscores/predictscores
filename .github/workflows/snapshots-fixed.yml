@@ -2,24 +2,15 @@ name: Snapshots (AM/PM/LATE)
 
 on:
   schedule:
-    # Each slot keeps a single cron definition that runs at the intended Belgrade
-    # local time. GitHub evaluates the cron in UTC, so the timezone field keeps
-    # the trigger aligned with 10:00 (AM), 15:00 (PM) and 00:00 (LATE) even when
-    # daylight saving shifts. If slots change in the future, update both the
-    # hour below and the slot detection case-statement further down.
-
-    # AM slot — 10:00 Europe/Belgrade
+    # AM — 10:00 Europe/Belgrade
     - cron: "0 10 * * *"
       timezone: "Europe/Belgrade"
-
-    # PM slot — 15:00 Europe/Belgrade
+    # PM — 15:00 Europe/Belgrade
     - cron: "0 15 * * *"
       timezone: "Europe/Belgrade"
-
-    # LATE slot — 00:00 Europe/Belgrade (previous day UTC)
+    # LATE — 00:00 Europe/Belgrade
     - cron: "0 0 * * *"
       timezone: "Europe/Belgrade"
-
   workflow_dispatch:
     inputs:
       slot:
@@ -38,22 +29,19 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     env:
       TZ_DISPLAY: Europe/Belgrade
       FALLBACK_BASE: https://predictscores.vercel.app
-      # Default guard window (minutes) for slot detection; override via repo variable
-      # `SNAPSHOT_GUARD_MINUTES` to tune without editing the workflow.
       FREEZE_MINUTES: ${{ vars.SNAPSHOT_GUARD_MINUTES || '75' }}
       API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
 
     steps:
       - name: Check API key
         id: api_key
+        shell: bash
         env:
           SECRET_NAME: API_FOOTBALL_KEY
           API_KEY: ${{ env.API_FOOTBALL_KEY }}
-        shell: bash
         run: |
           set -euo pipefail
           if [ -z "${API_KEY:-}" ]; then
@@ -64,17 +52,17 @@ jobs:
             echo "has_key=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Ensure jq is available
+      - name: Ensure jq
         shell: bash
         run: |
           set -euo pipefail
           if ! command -v jq >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y jq
+            sudo apt-get update -y && sudo apt-get install -y jq
           fi
 
       - name: Compute context (slot/base/ymd + guard)
         id: ctx
+        shell: bash
         env:
           INP_SLOT: ${{ github.event.inputs.slot }}
           INP_BASE: ${{ github.event.inputs.base }}
@@ -82,13 +70,9 @@ jobs:
           SCH: ${{ github.event.schedule }}
           FREEZE_MINUTES: ${{ env.FREEZE_MINUTES }}
           FALLBACK_BASE: ${{ env.FALLBACK_BASE }}
-        shell: bash
         run: |
           set -euo pipefail
-
-          BASE="${INP_BASE:-}"
-          if [ -z "$BASE" ]; then BASE="${FALLBACK_BASE:-}"; fi
-
+          BASE="${INP_BASE:-}"; [ -z "$BASE" ] && BASE="${FALLBACK_BASE}"
           if [ "${INP_SLOT:-auto}" != "auto" ]; then
             SLOT="${INP_SLOT}"
           else
@@ -96,86 +80,58 @@ jobs:
               "0 10 * * *") SLOT="am" ;;
               "0 15 * * *") SLOT="pm" ;;
               "0 0 * * *")  SLOT="late" ;;
-              *)
-                H=$(TZ="${TZD:-Europe/Belgrade}" date +%H)
-                if   [ "$H" -lt 10 ]; then SLOT="late"
-                elif [ "$H" -lt 15 ]; then SLOT="am"
-                else                        SLOT="pm"
-                fi
-                ;;
+              *) H=$(TZ="${TZD}" date +%H)
+                 if   [ "$H" -lt 10 ]; then SLOT="late"
+                 elif [ "$H" -lt 15 ]; then SLOT="am"
+                 else                        SLOT="pm"
+                 fi;;
             esac
           fi
-
-          YMD=$(TZ="${TZD:-Europe/Belgrade}" date +%F)
+          YMD=$(TZ="${TZD}" date +%F)
 
           FM=${FREEZE_MINUTES:-75}
-          if ! [[ "$FM" =~ ^[0-9]+$ ]]; then
-            echo "::warning::FREEZE_MINUTES ('$FM') is not an integer, falling back to 75"
-            FM=75
-          fi
-          now_hm=$(TZ="${TZD:-Europe/Belgrade}" date +%H:%M)
-          H=${now_hm%%:*}; M=${now_hm##*:}
-          m=$((10#$H*60 + 10#$M))
-          mod=1440
-          am=600   # 10:00
-          pm=900   # 15:00
-          lt=0     # 00:00
-
-          # shortest circular distance helper (minutes in day)
-          dist() { local a=$1 b=$2; local d=$(( ( (a - b + mod) % mod ) )); if [ $d -gt $((mod/2)) ]; then echo $((mod - d)); else echo $d; fi; }
-
+          now_hm=$(TZ="${TZD}" date +%H:%M); H=${now_hm%%:*}; M=${now_hm##*:}
+          m=$((10#$H*60 + 10#$M)); mod=1440; am=600; pm=900; lt=0
+          dist() { local a=$1 b=$2; local d=$(( ( (a - b + mod) % mod ) )); [ $d -gt 720 ] && echo $((mod - d)) || echo $d; }
           d_am=$(dist "$m" "$am"); d_pm=$(dist "$m" "$pm"); d_lt=$(dist "$m" "$lt")
+          run_guard=false; case "$SLOT" in am) [ $d_am -le $FM ] && run_guard=true ;; pm) [ $d_pm -le $FM ] && run_guard=true ;; late) [ $d_lt -le $FM ] && run_guard=true ;; esac
 
-          run_guard=false
-          case "$SLOT" in
-            am)   (( d_am   <= FM )) && run_guard=true ;;
-            late) (( d_lt   <= FM )) && run_guard=true ;;
-            pm)   (( d_pm   <= FM )) && run_guard=true ;;
-          esac
+          echo "run=$run_guard" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE"    >> "$GITHUB_OUTPUT"
+          echo "slot=$SLOT"    >> "$GITHUB_OUTPUT"
+          echo "ymd=$YMD"      >> "$GITHUB_OUTPUT"
 
-          echo "Guard decision: run=$run_guard (slot=$SLOT, now=...$now_hm, guard_minutes=$FM, schedule=${SCH:-workflow_dispatch})"
-
-          {
-            echo "run=$run_guard"
-            echo "base=$BASE"
-            echo "slot=$SLOT"
-            echo "ymd=$YMD"
-            echo "guard_minutes=$FM"
-          } >> "$GITHUB_OUTPUT"
-
-      # 0) Warm — re-enabled so daily tickets & base snapshot are persisted
+      # 0) WARM — re-enabled so base snapshot & tickets get persisted
       - name: Warm locked-floats (daily tickets & base snapshot)
         if: steps.ctx.outputs.run == 'true'
+        shell: bash
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
           YMD:  ${{ steps.ctx.outputs.ymd }}
-        shell: bash
         run: |
           set -euo pipefail
           curl -fsSL "$BASE/api/locked-floats?warm=1&slot=$SLOT&ymd=$YMD" || true
 
-      # 1) Rebuild (pass 1)
       - name: Rebuild snapshot (pass 1)
         if: steps.ctx.outputs.run == 'true' && steps.api_key.outputs.has_key == 'true'
+        shell: bash
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
           YMD:  ${{ steps.ctx.outputs.ymd }}
-        shell: bash
         run: |
           set -euo pipefail
           curl -fsSL "$BASE/api/cron/rebuild?slot=$SLOT&ymd=$YMD&debug=1" | tee /tmp/rebuild-1.json
           sleep 2
 
-      # 2) Refresh odds (twice, spaced)
       - name: Refresh odds (double pass)
         if: steps.ctx.outputs.run == 'true' && steps.api_key.outputs.has_key == 'true'
+        shell: bash
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
           YMD:  ${{ steps.ctx.outputs.ymd }}
-        shell: bash
         run: |
           set -euo pipefail
           for i in 1 2; do
@@ -183,51 +139,47 @@ jobs:
             sleep 3
           done
 
-      # 3) Rebuild (final)
       - name: Rebuild snapshot (final)
         if: steps.ctx.outputs.run == 'true' && steps.api_key.outputs.has_key == 'true'
+        shell: bash
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
           YMD:  ${{ steps.ctx.outputs.ymd }}
-        shell: bash
         run: |
           set -euo pipefail
           curl -fsSL "$BASE/api/cron/rebuild?slot=$SLOT&ymd=$YMD&debug=1" | tee /tmp/rebuild-2.json
           sleep 2
 
-      # 4) Insights (grupiše specijale i zamrzava po slotu)
       - name: Build insights (tickets)
         if: steps.ctx.outputs.run == 'true' && steps.api_key.outputs.has_key == 'true'
+        shell: bash
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
           YMD:  ${{ steps.ctx.outputs.ymd }}
-        shell: bash
         run: |
           set -euo pipefail
           curl -fsSL "$BASE/api/cron/insights?slot=$SLOT&ymd=$YMD" | tee /tmp/insights.json
 
-      # 5) Apply learning (freezes today's picks)
       - name: Apply learning
         if: steps.ctx.outputs.run == 'true' && steps.api_key.outputs.has_key == 'true'
+        shell: bash
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
           YMD:  ${{ steps.ctx.outputs.ymd }}
-        shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "$BASE/api/cron/apply-learning?slot=$SLOT&ymd=$YMD" | tee /tmp/learn.json
+          curl -fsSL "$BASE/api/cron/apply-learning?slot=$SLOT&ymd=$YMD&debug=1" | tee /tmp/learn.json
 
-      # 6) Sanity check
       - name: Sanity check (locked feed)
         if: steps.api_key.outputs.has_key == 'true'
+        shell: bash
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
           YMD:  ${{ steps.ctx.outputs.ymd }}
-        shell: bash
         run: |
           set -euo pipefail
           curl -fsSL "$BASE/api/value-bets-locked?slot=$SLOT&ymd=$YMD&slim=1" | tee /tmp/locked.json
