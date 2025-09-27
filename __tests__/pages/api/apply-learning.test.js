@@ -215,6 +215,11 @@ describe("apply-learning history writer", () => {
     const histDayPayload = JSON.parse(histDayCall.body?.value);
     expect(Array.isArray(histDayPayload)).toBe(true);
     expect(histDayPayload).toEqual(parsedHist);
+    const canonicalCall = setCalls.find((call) => call.key === `vb:day:${ymd}:last`);
+    expect(canonicalCall).toBeDefined();
+    const canonicalPayload = JSON.parse(canonicalCall.body?.value);
+    expect(Array.isArray(canonicalPayload)).toBe(true);
+    expect(canonicalPayload).toEqual(parsedHist);
     expect(fetchMock).toHaveBeenCalled();
     expect(responseTrace).toEqual(
       expect.arrayContaining([
@@ -224,6 +229,11 @@ describe("apply-learning history writer", () => {
     expect(responseTrace).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ kv: "set", key: `hist:day:${ymd}`, size: parsedHist.length, ok: true }),
+      ])
+    );
+    expect(responseTrace).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kv: "set", key: `vb:day:${ymd}:last`, size: parsedHist.length, ok: true }),
       ])
     );
   });
@@ -327,6 +337,11 @@ describe("apply-learning history writer", () => {
     const parsedDay = JSON.parse(histDayCall.body?.value);
     expect(Array.isArray(parsedDay)).toBe(true);
     expect(parsedDay).toEqual(parsedHist);
+    const canonicalCall = setCalls.find((call) => call.key === `vb:day:${assumedYmd}:last`);
+    expect(canonicalCall).toBeDefined();
+    const canonicalPayload = JSON.parse(canonicalCall.body?.value);
+    expect(Array.isArray(canonicalPayload)).toBe(true);
+    expect(canonicalPayload).toEqual(parsedHist);
   });
 
   it("falls back to :last snapshot when only last is populated", async () => {
@@ -443,6 +458,11 @@ describe("apply-learning history writer", () => {
     const parsedDay = JSON.parse(histDayCall.body?.value);
     expect(Array.isArray(parsedDay)).toBe(true);
     expect(parsedDay).toEqual(parsedHist);
+    const canonicalCall = setCalls.find((call) => call.key === `vb:day:${lastYmd}:last`);
+    expect(canonicalCall).toBeDefined();
+    const canonicalPayload = JSON.parse(canonicalCall.body?.value);
+    expect(Array.isArray(canonicalPayload)).toBe(true);
+    expect(canonicalPayload).toEqual(parsedHist);
 
     const calledUrls = fetchMock.mock.calls.map(([calledUrl]) =>
       typeof calledUrl === "string" ? decodeURIComponent(calledUrl) : calledUrl
