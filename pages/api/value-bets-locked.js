@@ -1,95 +1,114 @@
 // pages/api/value-bets-locked.js
-// Reads today's lock and exposes a clean freshness stamp (handles double-encoded JSON).
+// Returns today's frozen value-bets from vbl_* keys and attaches freshness metadata.
+// Reads from BOTH possible KV backends (KV_REST_* and/or UPSTASH_REDIS_REST_*).
 
-import * as kvlib from '../../lib/kv-read';
+export const config = { api: { bodyParser: false } };
 
-async function getKvClient() {
-  if (typeof kvlib.getKV === 'function') {
-    const client = await kvlib.getKV();
-    if (client && typeof client.get === 'function' && typeof client.set === 'function') return client;
+/* ---------- slot & date helpers ---------- */
+function belgradeYMD(d = new Date()) {
+  try { return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Belgrade" }).format(d); }
+  catch { return new Intl.DateTimeFormat("en-CA").format(d); }
+}
+function inferSlotByTime(d = new Date()) {
+  const fmt = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Belgrade", hour: "2-digit", minute: "2-digit", hour12: false });
+  const [H] = fmt.format(d).split(":").map(Number);
+  if (H < 10) return "late";
+  if (H < 15) return "am";
+  return "pm";
+}
+
+/* ---------- Dual KV clients ---------- */
+const KV_URL = process.env.KV_REST_API_URL ? String(process.env.KV_REST_API_URL).replace(/\/+$/, "") : "";
+const KV_TOK = process.env.KV_REST_API_TOKEN || "";
+const hasKV = Boolean(KV_URL && KV_TOK);
+
+const R_URL = process.env.UPSTASH_REDIS_REST_URL ? String(process.env.UPSTASH_REDIS_REST_URL).replace(/\/+$/, "") : "";
+const R_TOK = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const hasR  = Boolean(R_URL && R_TOK);
+
+const J = (s) => { try { return JSON.parse(String(s ?? "")); } catch { return null; } };
+
+async function kvGetREST(key) {
+  if (!hasKV) return null;
+  const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${KV_TOK}` }, cache: "no-store",
+  });
+  if (!r.ok) return null;
+  const j = await r.json().catch(() => null);
+  return typeof j?.result === "string" ? j.result : null;
+}
+async function kvGetUpstash(key) {
+  if (!hasR) return null;
+  const r = await fetch(`${R_URL}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${R_TOK}` }, cache: "no-store",
+  });
+  if (!r.ok) return null;
+  const j = await r.json().catch(() => null);
+  return typeof j?.result === "string" ? j.result : null;
+}
+async function kvGetAny(key) {
+  const a = await kvGetREST(key);
+  if (a != null) return a;
+  return kvGetUpstash(key);
+}
+
+/* ---------- normalize ---------- */
+function idsFromDoc(raw) {
+  const doc = typeof raw === "string" ? (J(raw) ?? raw) : raw;
+  if (!doc) return [];
+  if (Array.isArray(doc)) return doc.filter(Boolean);
+  if (typeof doc === "object") {
+    if (Array.isArray(doc.items)) return doc.items.filter(Boolean);
   }
-  const kvGet = kvlib.kvGet, kvSet = kvlib.kvSet;
-  if (typeof kvGet === 'function' && typeof kvSet === 'function') return { get: kvGet, set: kvSet };
-  throw new Error('KV adapter: neither getKV() nor kvGet/kvSet found in lib/kv-read');
+  return [];
 }
 
-function ymdUTC(d = new Date()) { return d.toISOString().slice(0, 10); }
-
-function belgradeSlot(now = new Date()) {
-  const belgrade = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Belgrade' }));
-  const H = belgrade.getHours();
-  if (H < 10) return 'late';
-  if (H < 15) return 'am';
-  return 'pm';
-}
-
-function parseOnce(raw) {
-  if (!raw) return null;
-  if (typeof raw === 'string') {
-    try { return JSON.parse(raw); } catch { return raw; }
-  }
-  return raw;
-}
-function parseTwice(raw) {
-  const once = parseOnce(raw);
-  if (once && typeof once === 'string') {
-    try { return JSON.parse(once); } catch { /* leave as string */ }
-  }
-  return once;
-}
-
-async function readFreshness(kv, slot) {
-  const candidates = [
-    `vb:last_odds_refresh:${slot}`,
-    `vb:last_odds_refresh`,
-    `vb:last-odds:${slot}`,
-    `vb:last-odds`,
-  ];
-  for (const k of candidates) {
-    const raw = await kv.get(k);
-    if (!raw) continue;
-    const doc = parseTwice(raw); // handles object, stringified object, or double-stringified
-    if (doc && typeof doc === 'object') {
-      const ts = doc.ts || doc.timestamp || doc.value?.ts || null;
-      const ymd = doc.ymd || null;
-      const updated = doc.updated ?? null;
-      if (ts) return { ts, ymd, slot: doc.slot || slot, updated, source: k };
-    }
-    if (typeof doc === 'string' && doc.length >= 10) {
-      return { ts: doc, slot, updated: null, source: k };
-    }
-  }
-  return null;
-}
-
+/* ---------- handler ---------- */
 export default async function handler(req, res) {
   try {
-    const kv = await getKvClient();
-    const ymd = ymdUTC();
-    const lockKey = `vb:day:${ymd}:last`;
+    const now = new Date();
+    const ymd  = String(req.query.ymd || belgradeYMD(now));
+    const qSlot = String(req.query.slot || "").toLowerCase();
+    const slot  = (qSlot === "am" || qSlot === "pm" || qSlot === "late") ? qSlot : inferSlotByTime(now);
 
-    const raw = await kv.get(lockKey);
-    let doc = null;
-    try { doc = raw ? JSON.parse(raw) : null; } catch { doc = null; }
+    // Keys written by apply-learning
+    const vblSlotKey       = `vbl_full:${ymd}:${slot}`;
+    const vblDayKey        = `vbl_full:${ymd}`;
+    const freshnessToday   = `vb-locked:kv:hit:${ymd}`;
+    const freshnessGlobal  = `vb-locked:kv:hit`;
 
-    const items = Array.isArray(doc?.items) ? doc.items : [];
-    const safe = items.map((it) => ({
-      ...it,
-      tier: it?.tier ?? it?.league?.tier ?? null
-    }));
+    // Load frozen items
+    const [slotRaw, dayRaw, fTodayRaw, fGlobalRaw] = await Promise.all([
+      kvGetAny(vblSlotKey),
+      kvGetAny(vblDayKey),
+      kvGetAny(freshnessToday),
+      kvGetAny(freshnessGlobal),
+    ]);
 
-    const freshness = await readFreshness(kv, belgradeSlot());
+    let items = idsFromDoc(slotRaw);
+    if (!items.length) items = idsFromDoc(dayRaw);
 
-    res.status(200).json({
-      items: safe,
+    // Freshness/meta
+    const ft = J(fTodayRaw) || {};
+    const fg = J(fGlobalRaw) || {};
+    const ts = ft.ts || fg.ts || null;
+    const last_odds_refresh = ft.last_odds_refresh || fg.last_odds_refresh || null;
+
+    return res.status(200).json({
+      items,
       meta: {
         ymd,
-        source: doc ? 'vb-locked:kv:hit' : 'vb-locked:kv:miss',
-        ts: doc?.ts ?? null,
-        last_odds_refresh: freshness
-      }
+        slot,
+        source: "vb-locked:kv:hit",
+        ts,
+        last_odds_refresh,
+      },
     });
   } catch (e) {
-    res.status(200).json({ items: [], meta: { error: String(e?.message || e) } });
+    return res.status(200).json({
+      items: [],
+      meta: { ymd: String(req.query.ymd || belgradeYMD()), source: "vb-locked:kv:hit", ts: null, last_odds_refresh: null },
+      error: String(e?.message || e),
+    });
   }
 }
