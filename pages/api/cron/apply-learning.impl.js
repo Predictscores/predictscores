@@ -1,6 +1,6 @@
 // pages/api/cron/apply-learning.impl.js
 // Reads best-available candidates (chunked snapshot -> legacy snapshot -> vbl_full -> union)
-// and publishes vb:day:<ymd>:last + vb:history:<ymd> for the UI.
+// Publishes vb:day:<ymd>:last and vb:history:<ymd>
 
 function ymdUTC(d = new Date()) { return d.toISOString().slice(0, 10); }
 function belgradeSlot(now = new Date()) {
@@ -39,7 +39,7 @@ async function readChunkedSnapshot(kv, ymd) {
 }
 
 function normalize(it) {
-  // Snapshot chunks were saved slim; make a UI-friendly, stable shape.
+  // Slim snapshot → stable UI shape
   const id = it?.id ?? it?.fixture?.id ?? null;
   const leagueName = it?.league?.name ?? it?.league ?? null;
   const tier = it?.league?.tier ?? it?.tier ?? null;
@@ -61,7 +61,7 @@ export default async function applyLearningImpl({ kv, todayYmd }) {
   const ymd = todayYmd || ymdUTC(now);
   const slot = belgradeSlot(now);
 
-  // 1) Chunked snapshot (new, primary source)
+  // 1) Chunked snapshot (primary)
   let { key: sourceKey, items } = await readChunkedSnapshot(kv, ymd);
 
   // 2) Legacy single-key snapshot
@@ -70,7 +70,7 @@ export default async function applyLearningImpl({ kv, todayYmd }) {
     if (snap.items.length) { sourceKey = snap.key; items = snap.items; }
   }
 
-  // 3) vbl_full (enriched items from refresh-odds)
+  // 3) vbl_full (enriched items)
   if (!items.length) {
     const v1 = await readArr(kv, `vbl_full:${ymd}:${slot}`);
     const v2 = !v1.items.length ? await readArr(kv, `vbl_full:${ymd}`) : { items: [] };
@@ -78,7 +78,7 @@ export default async function applyLearningImpl({ kv, todayYmd }) {
     if (pick.items.length) { sourceKey = pick.key; items = pick.items; }
   }
 
-  // 4) Union (IDs only) — publish minimal if this is all we have
+  // 4) union (IDs only) → publish minimal if needed
   if (!items.length) {
     const u = await readArr(kv, `vb:day:${ymd}:union`);
     if (u.items.length && typeof u.items[0] !== 'object') {
@@ -100,7 +100,7 @@ export default async function applyLearningImpl({ kv, todayYmd }) {
   await kv.set(lockKey, JSON.stringify({ items: unique, ymd, ts, sourceKey }));
   await kv.set(historyKey, JSON.stringify({ items: unique, ymd, ts }));
 
-  // Simple telemetry
+  // Tiny telemetry
   const t = { t1: 0, t2: 0, t3: 0, nullish: 0 };
   for (const x of unique) {
     if (x.tier === 1) t.t1++; else if (x.tier === 2) t.t2++; else if (x.tier === 3) t.t3++; else t.nullish++;
