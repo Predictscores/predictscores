@@ -52,11 +52,11 @@ export default async function applyLearningImpl({ kv, todayYmd }) {
   const ymd = todayYmd || ymdUTC(now);
   const slot = belgradeSlot(now);
 
-  // Priority order: explicit -> snapshot -> vbl_full -> union
+  // Priority: explicit finals -> snapshot -> vbl_full -> union
   const tryKeys = [
     `vb:candidates:${ymd}:final`,
     `vb:day:${ymd}:final`,
-    `vb:day:${ymd}:snapshot`,        // ⬅️ your rebuild just wrote this (1684 items)
+    `vb:day:${ymd}:snapshot`,        // ⬅ rebuild writes this (you saw 1684 items)
     `vbl_full:${ymd}:${slot}`,
     `vbl_full:${ymd}`,
     `vb:day:${ymd}:union`,
@@ -69,7 +69,7 @@ export default async function applyLearningImpl({ kv, todayYmd }) {
     if (arr.length) { sourceKey = k; items = arr; break; }
   }
 
-  // If we only found a union (IDs), try to enrich from vbl_full
+  // If we only found union (IDs), try to enrich from vbl_full bank
   if (sourceKey && sourceKey.endsWith(':union')) {
     const ids = new Set(items.filter(Boolean));
     let bank = [];
