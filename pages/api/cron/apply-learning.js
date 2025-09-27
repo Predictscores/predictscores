@@ -1,16 +1,12 @@
 // pages/api/cron/apply-learning.js
-// Purpose: read today's UNION & chunked snapshot, freeze today's picks into vbl_* keys,
-// write history, and expose a freshness marker for odds watcher.
+// Purpose: read today's UNION & snapshot, freeze into vbl_* keys, write history & freshness marker.
 
 export const config = { api: { bodyParser: false } };
 
-/* ---------- timezone / slot ---------- */
+/* ---------- TZ & slot ---------- */
 function belgradeYMD(d = new Date()) {
-  try {
-    return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Belgrade" }).format(d);
-  } catch {
-    return new Intl.DateTimeFormat("en-CA").format(d);
-  }
+  try { return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Belgrade" }).format(d); }
+  catch { return new Intl.DateTimeFormat("en-CA").format(d); }
 }
 function inferSlotByTime(d = new Date()) {
   const fmt = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Belgrade", hour: "2-digit", minute: "2-digit", hour12: false });
@@ -20,14 +16,14 @@ function inferSlotByTime(d = new Date()) {
   return "pm";
 }
 
-/* ---------- KV helpers ---------- */
-const KV_URL = process.env.KV_REST_API_URL?.replace(/\/+$/, "");
-const KV_TOK = process.env.KV_REST_API_TOKEN;
-const okKV = !!(KV_URL && KV_TOK);
-const J = (s) => { try { return JSON.parse(String(s || "")); } catch { return null; } };
+/* ---------- KV helpers (single backend: KV_REST_*) ---------- */
+const KV_URL = process.env.KV_REST_API_URL ? String(process.env.KV_REST_API_URL).replace(/\/+$/, "") : "";
+const KV_TOK = process.env.KV_REST_API_TOKEN || "";
+const kvOK = Boolean(KV_URL && KV_TOK);
+const J = (s) => { try { return JSON.parse(String(s ?? "")); } catch { return null; } };
 
 async function kvGet(key) {
-  if (!okKV) return null;
+  if (!kvOK) return null;
   const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
     headers: { Authorization: `Bearer ${KV_TOK}` },
     cache: "no-store",
@@ -37,7 +33,7 @@ async function kvGet(key) {
   return typeof j?.result === "string" ? j.result : null;
 }
 async function kvSet(key, val) {
-  if (!okKV) return false;
+  if (!kvOK) return false;
   const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${KV_TOK}`, "Content-Type": "application/json" },
@@ -46,31 +42,26 @@ async function kvSet(key, val) {
   return r.ok;
 }
 
-/* ---------- normalization ---------- */
+/* ---------- normalize ---------- */
 function normalizeIds(maybe) {
   if (!maybe) return [];
-  if (Array.isArray(maybe)) {
-    const ids = [];
-    for (const x of maybe) {
-      if (x == null) continue;
-      if (typeof x === "number" || typeof x === "string") { ids.push(Number(x) || String(x)); continue; }
-      if (typeof x === "object") {
-        const id = x.id ?? x.fixture_id ?? x.fixture?.id;
-        if (id != null) ids.push(Number(id) || String(id));
-      }
+  const arr = Array.isArray(maybe) ? maybe : (Array.isArray(maybe.items) ? maybe.items : []);
+  const out = [];
+  for (const x of arr) {
+    if (x == null) continue;
+    if (typeof x === "number" || typeof x === "string") { out.push(Number(x) || String(x)); continue; }
+    if (typeof x === "object") {
+      const id = x.id ?? x.fixture_id ?? x.fixture?.id;
+      if (id != null) out.push(Number(id) || String(id));
     }
-    return Array.from(new Set(ids));
   }
-  if (typeof maybe === "object") {
-    return normalizeIds(maybe.items || maybe.fixtures || []);
-  }
-  return [];
+  return Array.from(new Set(out));
 }
 
 /* ---------- handler ---------- */
 export default async function handler(req, res) {
   try {
-    if (!okKV) return res.status(200).json({ ok: false, error: "KV not configured" });
+    if (!kvOK) return res.status(200).json({ ok: false, error: "KV not configured (KV_REST_API_URL/TOKEN)" });
 
     const now = new Date();
     const ymd = String(req.query.ymd || belgradeYMD(now));
@@ -86,7 +77,7 @@ export default async function handler(req, res) {
     const historyKey        = `vb:history:${ymd}`;
     const lockKey           = `vb:day:${ymd}:last`;
     const vbLockedTodayKey  = `vb-locked:kv:hit:${ymd}`;
-    const vbLockedMarker    = `vb-locked:kv:hit`; // global freshness marker (odds watcher reads this)
+    const vbLockedMarker    = `vb-locked:kv:hit`;
 
     // Probes
     const [snapLegacyRaw, snapIdxRaw, unionRaw, vblSlotRaw, vblDayRaw] = await Promise.all([
@@ -116,32 +107,31 @@ export default async function handler(req, res) {
     };
 
     if (ids.length === 0) {
-      // Nothing to learn from; still write lock marker so callers see we ran.
       await kvSet(lockKey, { ymd, slot, ts: new Date().toISOString(), reason: "empty-union" });
       return res.status(200).json({ ok: true, ymd, count: 0, wrote: { lockKey, historyKey }, sourceKey: null, probes });
     }
 
-    // Merge into day & write slot
+    // Write slot doc
     const nowIso = new Date().toISOString();
-    const slotDoc = { ymd, slot, ts: nowIso, items: ids };
-    await kvSet(vblSlotKey, slotDoc);
+    await kvSet(vblSlotKey, { ymd, slot, ts: nowIso, items: ids });
 
-    let dayDoc = { ymd, ts: nowIso, items: [] };
+    // Merge into day
+    let dayItems = ids.slice();
     const prevDayRaw = await kvGet(vblDayKey);
     if (prevDayRaw) {
       const prev = J(prevDayRaw);
-      dayDoc.items = Array.isArray(prev?.items) ? Array.from(new Set([...prev.items, ...ids])) : ids.slice();
-    } else {
-      dayDoc.items = ids.slice();
+      if (Array.isArray(prev?.items)) {
+        const set = new Set([...prev.items, ...ids]);
+        dayItems = Array.from(set);
+      }
     }
-    dayDoc.ts = nowIso;
-    await kvSet(vblDayKey, dayDoc);
+    await kvSet(vblDayKey, { ymd, ts: nowIso, items: dayItems });
 
     // History & lock
     await kvSet(historyKey, { ymd, ts: nowIso, items: ids, slot });
     await kvSet(lockKey,    { ymd, ts: nowIso, last_slot: slot, count: ids.length });
 
-    // Freshness markers for odds watcher and feed reader
+    // Freshness markers for odds watcher & feed
     const marker = { ymd, ts: nowIso, last_odds_refresh: nowIso, items: ids.length };
     await kvSet(vbLockedTodayKey, marker);
     await kvSet(vbLockedMarker,   marker);
