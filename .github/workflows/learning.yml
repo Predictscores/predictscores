@@ -1,18 +1,14 @@
 name: snapshots
 
 on:
-  # Keep manual runs
   workflow_dispatch: {}
-  # Run ONLY on schedule (Belgrade time windows)
   schedule:
     # 00:00 Europe/Belgrade
-    - cron: '0 22 * * *'   # UTC==22 → 00:00 CET/CEST
+    - cron: '0 22 * * *'
     # 10:00 Europe/Belgrade
-    - cron: '0 8 * * *'    # UTC==08 → 10:00 CET/CEST
+    - cron: '0 8 * * *'
     # 15:00 Europe/Belgrade
-    - cron: '0 13 * * *'   # UTC==13 → 15:00 CET/CEST
-
-# No push/PR triggers → no accidental API calls on merges
+    - cron: '0 13 * * *'
 
 concurrency:
   group: learning
@@ -24,6 +20,7 @@ jobs:
     timeout-minutes: 8
     env:
       BASE_URL: ${{ vars.BASE_URL || secrets.BASE_URL || 'https://predictscores.vercel.app' }}
+      COOLDOWN_MINUTES: 12
     permissions:
       contents: read
     steps:
@@ -40,13 +37,37 @@ jobs:
           echo "Belgrade hour: $H, slot: $SLOT"
 
       - name: Rebuild candidate snapshot
-        run: curl -fsSL "$BASE_URL/api/cron/rebuild?slot=${{ steps.slot.outputs.slot }}&debug=1"
+        run: curl -fsSL --max-time 60 "$BASE_URL/api/cron/rebuild?slot=${{ steps.slot.outputs.slot }}&debug=1"
+
+      - name: Read freshness and enforce cooldown
+        id: cool
+        run: |
+          set -euo pipefail
+          OUT=$(curl -fsS -A "gha-learning/1.2" --connect-timeout 10 --max-time 20 \
+                "$BASE_URL/api/value-bets-locked" || echo '{}')
+          TS=$(printf "%s" "$OUT" | jq -r 'try .meta.last_odds_refresh.ts catch ""' 2>/dev/null || echo "")
+          RAW="${COOLDOWN_MINUTES:-12}"
+          if ! [[ "$RAW" =~ ^[0-9]+$ ]]; then RAW=12; fi
+          COOLDOWN_SECS=$((RAW*60))
+          if [ -n "$TS" ] && EPOCH=$(date -d "$TS" +%s 2>/dev/null); then
+            NOW=$(date -u +%s)
+            AGE=$((NOW - EPOCH))
+            if [ "$AGE" -lt "$COOLDOWN_SECS" ]; then
+              echo "::notice::Cooldown active ($AGE s < $COOLDOWN_SECS s). Skipping refresh-odds."
+              echo "skip_refresh=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "skip_refresh=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip_refresh=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Refresh odds (AF consensus/median)
-        run: curl -fsSL "$BASE_URL/api/cron/refresh-odds?slot=${{ steps.slot.outputs.slot }}"
+        if: steps.cool.outputs.skip_refresh != 'true'
+        run: curl -fsSL --max-time 120 "$BASE_URL/api/cron/refresh-odds?slot=${{ steps.slot.outputs.slot }}"
 
       - name: Apply learning (writes vb:day:<ymd>:last)
-        run: curl -fsSL "$BASE_URL/api/cron/apply-learning?debug=1"
+        run: curl -fsSL --max-time 45 "$BASE_URL/api/cron/apply-learning?debug=1"
 
       - name: Build insights / freeze tickets
-        run: curl -fsSL "$BASE_URL/api/insights-build?slot=${{ steps.slot.outputs.slot }}&debug=1"
+        run: curl -fsSL --max-time 45 "$BASE_URL/api/insights-build?slot=${{ steps.slot.outputs.slot }}&debug=1"
