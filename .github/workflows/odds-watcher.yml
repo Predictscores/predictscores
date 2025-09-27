@@ -2,12 +2,11 @@ name: "Odds watcher"
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # watcher svakih 15 min (UTC)
-    - cron: "5 * * * *"      # scheduler svakog sata u :05 (UTC)
+    - cron: "*/15 * * * *"   # every 15m UTC
   workflow_dispatch:
     inputs:
       slot:
-        description: "am / pm / late (opciono ručno preglasavanje)"
+        description: "am / pm / late (optional override)"
         required: false
         default: ""
 
@@ -16,186 +15,78 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  run:
+  watch:
     runs-on: ubuntu-latest
-    env:
-      API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+    timeout-minutes: 7
     permissions:
       contents: read
-    timeout-minutes: 7
+    env:
+      API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+      BASE_URL: ${{ vars.BASE_URL || secrets.BASE_URL || 'https://predictscores.vercel.app' }}
+      # cooldown and safety caps
+      COOLDOWN_MINUTES: 12
     steps:
-      - name: Check API key
-        id: api_key
-        env:
-          SECRET_NAME: API_FOOTBALL_KEY
-          API_KEY: ${{ env.API_FOOTBALL_KEY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -z "${API_KEY:-}" ]; then
-            echo "::notice::Skipping API-dependent steps because secret ${SECRET_NAME} is not configured."
-            echo "has_key=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "API key from secret ${SECRET_NAME} is available; continuing with API-dependent steps."
-            echo "has_key=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Compute slot and minute (Europe/Belgrade)
+      - name: Compute slot (Europe/Belgrade)
         id: ctx
         run: |
           set -euo pipefail
           TZZ="Europe/Belgrade"
           H=$(TZ=$TZZ date +%H)
-          M=$(TZ=$TZZ date +%M)
           if [ -n "${{ github.event.inputs.slot }}" ]; then
             SLOT="${{ github.event.inputs.slot }}"
           else
-            if   [ "$H" -lt 10 ]; then SLOT=late
-            elif [ "$H" -lt 15 ]; then SLOT=am
-            else SLOT=pm; fi
+            if   [ "$H" -lt 10 ]; then SLOT="late";
+            elif [ "$H" -lt 15 ]; then SLOT="am";
+            else                       SLOT="pm"; fi
           fi
-          echo "slot=$SLOT"  >> "$GITHUB_OUTPUT"
-          echo "minute=$M"   >> "$GITHUB_OUTPUT"
-          echo "Local time $H:$M -> SLOT=$SLOT"
+          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
+          echo "Slot=$SLOT (Belgrade hour=$H)"
 
-      - name: Resolve BASE URL
-        id: base
-        env:
-          BASE_FROM_VARS: ${{ vars.BASE_URL }}
-          BASE_FROM_SECRETS: ${{ secrets.BASE_URL }}
-        run: |
-          set -euo pipefail
-          BASE="${BASE_FROM_VARS:-${BASE_FROM_SECRETS:-https://predictscores.vercel.app}}"
-          echo "base=$BASE" >> "$GITHUB_OUTPUT"
-          echo "Resolved BASE=$BASE"
-
-      - name: Ensure KV has items (self-warm if empty)
+      - name: Warm & read last refresh timestamp (via value-bets-locked)
         id: warm
-        if: steps.api_key.outputs.has_key == 'true'
         run: |
           set -euo pipefail
-          BASE="${{ steps.base.outputs.base }}"
-          SLOT="${{ steps.ctx.outputs.slot }}"
-          OUT=$(curl -fsS -A "gha-odds-watcher/1.1" --connect-timeout 10 --max-time 30 \
-                "$BASE/api/value-bets-locked?slot=$SLOT&n=1" || echo '{}')
-          N=$(printf "%s" "$OUT" | jq -r '(.items|length) // 0' 2>/dev/null || echo 0)
-          LAST=$(printf "%s" "$OUT" | jq -r 'try (.meta.last_odds_refresh.ts // "") catch ""' 2>/dev/null || echo "")
-          UPDATED=$(printf "%s" "$OUT" | jq -r 'try (.meta.last_odds_refresh.updated // "") catch ""' 2>/dev/null || echo "")
-          if [ "$LAST" = "null" ]; then LAST=""; fi
-          if [ "$UPDATED" = "null" ]; then UPDATED=""; fi
-          if [ -n "$LAST" ]; then
-            if [ -n "$UPDATED" ]; then
-              echo "Last odds refresh metadata: ts=$LAST updated=$UPDATED"
-            else
-              echo "Last odds refresh timestamp: $LAST"
-            fi
+          OUT=$(curl -fsS -A "gha-odds-watcher/1.2" --connect-timeout 10 --max-time 20 \
+                "$BASE_URL/api/value-bets-locked" || echo '{}')
+          TS=$(printf "%s" "$OUT" | jq -r 'try .meta.last_odds_refresh.ts catch ""' 2>/dev/null || echo "")
+          SRC=$(printf "%s" "$OUT" | jq -r 'try .meta.last_odds_refresh.source catch ""' 2>/dev/null || echo "")
+          if [ "$TS" = "null" ] || [ -z "$TS" ]; then
+            echo "ts=" >> "$GITHUB_OUTPUT"
+            echo "::notice::No freshness marker found; proceeding to refresh."
           else
-            echo "Last odds refresh timestamp unavailable"
+            echo "ts=$TS" >> "$GITHUB_OUTPUT"
+            echo "::notice::Found freshness marker from $SRC → $TS"
           fi
-          if [ "$N" -eq 0 ]; then
-            echo "KV empty -> warm via rebuild + short sleep"
-            curl -fsS -A "gha-odds-watcher/1.1" --connect-timeout 10 --max-time 120 \
-                 "$BASE/api/cron/rebuild?slot=$SLOT" || true
-            sleep 3
-          fi
-          echo "vb_locked_response_len=$N" >> "$GITHUB_OUTPUT"
-          echo "last_refresh_ts=$LAST" >> "$GITHUB_OUTPUT"
 
-      - name: Guard rebuild / refresh
-        id: guard
-        if: steps.api_key.outputs.has_key == 'true'
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          MINUTE: ${{ steps.ctx.outputs.minute }}
-          VB_LOCKED_LEN: ${{ steps.warm.outputs.vb_locked_response_len }}
-          LAST_REFRESH_TS: ${{ steps.warm.outputs.last_refresh_ts }}
-          COOLDOWN_MINUTES: ${{ vars.ODDS_WATCHER_COOLDOWN_MINUTES }}
-          COOLDOWN_MINUTES_SECRET: ${{ secrets.ODDS_WATCHER_COOLDOWN_MINUTES }}
+      - name: Enforce cooldown
+        id: cool
         run: |
           set -euo pipefail
-          EVENT="$EVENT_NAME"
-          MIN="$MINUTE"
-          LOCKED="${VB_LOCKED_LEN:-0}"
-          LAST="${LAST_REFRESH_TS:-}"
-          if [ "$LAST" = "null" ]; then LAST=""; fi
-          RAW_COOLDOWN="${COOLDOWN_MINUTES:-}"
-          if [ -z "$RAW_COOLDOWN" ]; then RAW_COOLDOWN="${COOLDOWN_MINUTES_SECRET:-}"; fi
-          if ! [[ "$RAW_COOLDOWN" =~ ^[0-9]+$ ]]; then RAW_COOLDOWN=12; fi
-          COOLDOWN="$RAW_COOLDOWN"
-          COOLDOWN_SECS=$((COOLDOWN*60))
-          AGE_LABEL="unknown"
-          AGE_SECS=""
-          RECENT="false"
-          if [ -n "$LAST" ]; then
-            if LAST_EPOCH=$(date -d "$LAST" +%s 2>/dev/null); then
-              NOW_EPOCH=$(date -u +%s)
-              AGE_SECS=$((NOW_EPOCH - LAST_EPOCH))
-              AGE_MIN=$((AGE_SECS/60))
-              AGE_LABEL="${AGE_SECS}s (~${AGE_MIN}m)"
-              if [ "$AGE_SECS" -lt "$COOLDOWN_SECS" ]; then
-                RECENT="true"
+          TS="${{ steps.warm.outputs.ts }}"
+          RAW="${COOLDOWN_MINUTES:-12}"
+          if ! [[ "$RAW" =~ ^[0-9]+$ ]]; then RAW=12; fi
+          COOLDOWN_SECS=$((RAW*60))
+          if [ -n "$TS" ]; then
+            if EPOCH=$(date -d "$TS" +%s 2>/dev/null); then
+              NOW=$(date -u +%s)
+              AGE=$((NOW - EPOCH))
+              if [ "$AGE" -lt "$COOLDOWN_SECS" ]; then
+                echo "::notice::Cooldown active ($AGE s < $COOLDOWN_SECS s). Skipping refresh."
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "skip=false" >> "$GITHUB_OUTPUT"
               fi
             else
-              AGE_LABEL="unparsed"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
             fi
-          fi
-          SHOULD_RUN="false"
-          REASON="scheduled run with data present"
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            SHOULD_RUN="true"
-            REASON="manual dispatch"
-          elif [ "$LOCKED" = "0" ]; then
-            SHOULD_RUN="true"
-            REASON="locked feed empty"
           else
-            if [ "$RECENT" = "true" ]; then
-              SHOULD_RUN="false"
-              REASON="recent odds refresh (${AGE_LABEL} ago < ${COOLDOWN}m cooldown)"
-            elif [ "$MIN" = "05" ]; then
-              SHOULD_RUN="true"
-              REASON="minute is 05"
-            fi
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
-          if [ "$SHOULD_RUN" = "true" ]; then
-            echo "Guard: proceeding with rebuild/refresh (reason: $REASON, minute=$MIN, locked_len=$LOCKED, event=$EVENT, last_refresh=$LAST, cooldown_m=$COOLDOWN, age=$AGE_LABEL)"
-          else
-            echo "Guard: skipping rebuild/refresh at $MIN (reason: $REASON, locked_len=$LOCKED, event=$EVENT, last_refresh=$LAST, cooldown_m=$COOLDOWN, age=$AGE_LABEL)"
-          fi
-          echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
 
-      - name: Rebuild KV (guarded)
-        if: steps.guard.outputs.should_run == 'true' && steps.api_key.outputs.has_key == 'true'
+      - name: Refresh odds (bounded)
+        if: steps.cool.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          BASE="${{ steps.base.outputs.base }}"
           SLOT="${{ steps.ctx.outputs.slot }}"
-          echo "Rebuilding KV for SLOT=$SLOT …"
-          curl -fsS \
-            -A "gha-odds-watcher/1.1" \
-            --connect-timeout 10 \
-            --max-time 180 \
-            --retry 2 --retry-all-errors --retry-delay 3 --retry-max-time 200 \
-            "$BASE/api/cron/rebuild?slot=$SLOT" || true
-
-      - name: Refresh odds for current slot (guarded)
-        if: steps.guard.outputs.should_run == 'true' && steps.api_key.outputs.has_key == 'true'
-        run: |
-          set -euo pipefail
-          BASE="${{ steps.base.outputs.base }}"
-          SLOT="${{ steps.ctx.outputs.slot }}"
-          echo "Refreshing odds for SLOT=$SLOT …"
-          curl -fsS \
-            -A "gha-odds-watcher/1.1" \
-            --connect-timeout 10 \
-            --max-time 180 \
-            --retry 2 --retry-all-errors --retry-delay 3 --retry-max-time 200 \
-            "$BASE/api/cron/refresh-odds?slot=$SLOT&force=1" || true
-
-      - name: Done
-        shell: bash
-        run: |
-          if [ "${{ steps.api_key.outputs.has_key }}" = "true" ]; then
-            echo "Done."
-          else
-            echo "Done. API-dependent steps were skipped because secret API_FOOTBALL_KEY is not configured."
-          fi
+          # IMPORTANT: do NOT force refresh; respect server-side guards
+          curl -fsSL --max-time 120 "$BASE_URL/api/cron/refresh-odds?slot=$SLOT"
