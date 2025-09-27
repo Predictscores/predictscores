@@ -1,49 +1,51 @@
 name: snapshots
 
 on:
+  # Keep manual runs
   workflow_dispatch: {}
-  push:
-    branches:
-      - main
+  # Run ONLY on schedule (Belgrade time windows)
   schedule:
     # 00:00 Europe/Belgrade
-    - cron: '0 0 * * *'
-      timezone: 'Europe/Belgrade'
+    - cron: '0 22 * * *'   # UTC==22 → 00:00 CET/CEST
     # 10:00 Europe/Belgrade
-    - cron: '0 10 * * *'
-      timezone: 'Europe/Belgrade'
+    - cron: '0 8 * * *'    # UTC==08 → 10:00 CET/CEST
     # 15:00 Europe/Belgrade
-    - cron: '0 15 * * *'
-      timezone: 'Europe/Belgrade'
+    - cron: '0 13 * * *'   # UTC==13 → 15:00 CET/CEST
+
+# No push/PR triggers → no accidental API calls on merges
 
 concurrency:
-  group: snapshots-${{ github.ref }}
-  cancel-in-progress: false
+  group: learning
+  cancel-in-progress: true
 
 jobs:
-  run:
+  learning:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 8
     env:
-      BASE_URL: https://predictscores.vercel.app
+      BASE_URL: ${{ vars.BASE_URL || secrets.BASE_URL || 'https://predictscores.vercel.app' }}
+    permissions:
+      contents: read
     steps:
-      - name: Compute slot (Europe/Belgrade)
+      - name: Compute Belgrade slot
         id: slot
         run: |
-          H=$(TZ='Europe/Belgrade' date +%H)
+          set -euo pipefail
+          TZZ="Europe/Belgrade"
+          H=$(TZ=$TZZ date +%H)
           if [ "$H" -lt 10 ]; then SLOT=late;
           elif [ "$H" -lt 15 ]; then SLOT=am;
           else SLOT=pm; fi
           echo "slot=$SLOT" >> $GITHUB_OUTPUT
           echo "Belgrade hour: $H, slot: $SLOT"
 
-      - name: Rebuild snapshot
+      - name: Rebuild candidate snapshot
         run: curl -fsSL "$BASE_URL/api/cron/rebuild?slot=${{ steps.slot.outputs.slot }}&debug=1"
 
-      - name: Refresh odds (OA→AF, median & consensus)
+      - name: Refresh odds (AF consensus/median)
         run: curl -fsSL "$BASE_URL/api/cron/refresh-odds?slot=${{ steps.slot.outputs.slot }}"
 
-      - name: Apply learning (history settle/calibration hook)
+      - name: Apply learning (writes vb:day:<ymd>:last)
         run: curl -fsSL "$BASE_URL/api/cron/apply-learning?debug=1"
 
       - name: Build insights / freeze tickets
