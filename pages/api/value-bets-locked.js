@@ -777,6 +777,7 @@ function resolveFixtureTier(fix) {
 
 function fromMarkets(fix){
   const out=[]; const m=fix?.markets||{}; const fid=fix.fixture_id||fix.fixture?.id; const ctx = buildModelContext(fix);
+  const tier = resolveFixtureTier(fix);
 
   const push = (market, pick, pickCode, selectionLabel, rawPrice) => {
     const price = Number(rawPrice);
@@ -824,6 +825,7 @@ function fromMarkets(fix){
 }
 function oneXtwoOffers(fix){
   const xs=[]; const x=fix?.markets?.['1x2']||{}; const fid=fix.fixture_id||fix.fixture?.id; const ctx = buildModelContext(fix);
+  const tier = resolveFixtureTier(fix);
   const push=(code,label,price)=>{
     const p=Number(price);
     if(!Number.isFinite(p)||p<MIN_ODDS||p>MAX_ODDS) return;
@@ -906,27 +908,62 @@ export default async function handler(req,res){
     if (!["late","am","pm"].includes(slot)) slot=pickSlotAuto(now);
     const weekend=isWeekend(ymd);
 
-    const unionKey=`vb:day:${ymd}:${slot}`;
     const fullKey =`vbl_full:${ymd}:${slot}`;
     const lastKey =`vb:last-odds:${slot}`;
-    const union=kvToItems(await kvGET(unionKey, trace));
     const full =kvToItems(await kvGET(fullKey,  trace));
     const lastRefresh=kvToObject(await kvGET(lastKey, trace));
-    const base = full.items.length ? full.items : union.items;
 
-    if (!base.length) {
+    const baseTrace = [];
+    let fallback = { items: [] };
+    let fallbackSource = null;
+    if (!full.items.length) {
+      const canonicalKey = `vb:day:${ymd}:last`;
+      const slotKey = `vb:day:${ymd}:${slot}`;
+      const legacyKeys = [`vb:day:${ymd}:union`, `vb:day:${ymd}:combined`];
+      const readOrder = [
+        { key: canonicalKey, source: "vb:day:last" },
+        { key: slotKey, source: `vb:day:${slot}` },
+        ...legacyKeys.map((key) => ({
+          key,
+          source: key.endsWith(":union") ? "vb:day:union" : "vb:day:combined",
+        })),
+      ];
+
+      for (const attempt of readOrder) {
+        const raw = await kvGET(attempt.key, trace);
+        const normalized = kvToItems(raw);
+        const entry = {
+          key: attempt.key,
+          source: attempt.source,
+          items: normalized.items.length,
+          used: false,
+        };
+        if (!fallbackSource && normalized.items.length) {
+          fallback = normalized;
+          fallbackSource = attempt.source;
+          entry.used = true;
+          baseTrace.push(entry);
+          break;
+        }
+        baseTrace.push(entry);
+      }
+    }
+
+    const baseItems = full.items.length ? full.items : fallback.items;
+
+    if (!baseItems.length) {
       return res.status(200).json({
         ok:true, ymd, slot, source:null,
         items:[], tickets:{ btts:[], ou25:[], fh_ou15:[], htft:[], BTTS:[], OU25:[], FH_OU15:[], HTFT:[] },
-        one_x_two: [], meta:{ last_odds_refresh: lastRefresh }, debug:{ trace }
+        one_x_two: [], meta:{ last_odds_refresh: lastRefresh }, debug:{ trace, base_candidates: baseTrace }
       });
     }
 
     const candidates = [];
-    for (const f of base) candidates.push(...fromMarkets(f));
+    for (const f of baseItems) candidates.push(...fromMarkets(f));
 
     const oneXtwoAll = [];
-    for (const f of base) oneXtwoAll.push(...oneXtwoOffers(f));
+    for (const f of baseItems) oneXtwoAll.push(...oneXtwoOffers(f));
 
     const bucketMap = new Map();
     const learningMeta = new Map();
@@ -977,7 +1014,7 @@ export default async function handler(req,res){
     const flags = await readLearningFlags(trace);
     const learningEnabled = Boolean(flags.enable_calib || flags.enable_evmin || flags.enable_league_adj);
     const shadowKey = `vb:shadow:${ymd}:${slot}`;
-    const baseSource = full.items.length ? "vbl_full" : "vb:day";
+    const baseSource = full.items.length ? "vbl_full" : fallbackSource;
 
     let finalItems = baselineItems;
     let finalTickets = baselineTicketsAliased;
@@ -1063,7 +1100,7 @@ export default async function handler(req,res){
       tickets: finalTickets,
       one_x_two: finalOneXtwo,
       meta: { last_odds_refresh: lastRefresh },
-      debug: { trace, learning: learningDebug },
+      debug: { trace, base_candidates: baseTrace, learning: learningDebug },
     });
   }catch(e){
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
