@@ -1,6 +1,6 @@
 // pages/api/locked-floats.js
-// Purpose: persist today's UNION as { items:[fixture_id,...] } and (if missing) write simple daily tickets.
-// NOTE: we DO NOT write vb:day:<ymd>:last here; apply-learning owns that.
+// Persists today's UNION of fixture IDs and (if missing) lightweight tickets.
+// Writes to BOTH KV backends (primary: KV_REST_*, fallback: UPSTASH_REDIS_REST_*).
 
 export const config = { api: { bodyParser: false } };
 
@@ -14,36 +14,72 @@ const TZ = (() => {
 })();
 const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
 
-/* ---------- KV helpers (single backend: KV_REST_*) ---------- */
+/* ---------- Dual KV clients ---------- */
+// Primary (Vercel KV REST)
 const KV_URL = process.env.KV_REST_API_URL ? String(process.env.KV_REST_API_URL).replace(/\/+$/, "") : "";
 const KV_TOK = process.env.KV_REST_API_TOKEN || "";
-const kvOK = Boolean(KV_URL && KV_TOK);
+const hasKV = Boolean(KV_URL && KV_TOK);
+
+// Legacy fallback (Upstash Redis REST)
+const R_URL = process.env.UPSTASH_REDIS_REST_URL ? String(process.env.UPSTASH_REDIS_REST_URL).replace(/\/+$/, "") : "";
+const R_TOK = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const hasR  = Boolean(R_URL && R_TOK);
+
 const J = (s) => { try { return JSON.parse(String(s ?? "")); } catch { return null; } };
 
-async function kvGet(key) {
-  if (!kvOK) return null;
+async function kvGetREST(key) {
+  if (!hasKV) return null;
   const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${KV_TOK}` },
-    cache: "no-store",
+    headers: { Authorization: `Bearer ${KV_TOK}` }, cache: "no-store",
   });
   if (!r.ok) return null;
   const j = await r.json().catch(() => null);
   return typeof j?.result === "string" ? j.result : null;
 }
-async function kvSet(key, val) {
-  if (!kvOK) return false;
+async function kvSetREST(key, val) {
+  if (!hasKV) return false;
+  const body = typeof val === "string" ? val : JSON.stringify(val);
   const r = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${KV_TOK}`, "Content-Type": "application/json" },
-    body: typeof val === "string" ? val : JSON.stringify(val),
+    body,
   });
   return r.ok;
+}
+async function kvGetUpstash(key) {
+  if (!hasR) return null;
+  const r = await fetch(`${R_URL}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${R_TOK}` }, cache: "no-store",
+  });
+  if (!r.ok) return null;
+  const j = await r.json().catch(() => null);
+  return typeof j?.result === "string" ? j.result : null;
+}
+async function kvSetUpstash(key, val) {
+  if (!hasR) return false;
+  const body = typeof val === "string" ? val : JSON.stringify(val);
+  const r = await fetch(`${R_URL}/set/${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${R_TOK}`, "Content-Type": "application/json" },
+    body,
+  });
+  return r.ok;
+}
+// Read: prefer KV_REST_*, else Upstash. Write: try both, succeed if at least one.
+async function kvGetAny(key) {
+  const a = await kvGetREST(key);
+  if (a != null) return a;
+  return kvGetUpstash(key);
+}
+async function kvSetBoth(key, val) {
+  const r1 = await kvSetREST(key, val);
+  const r2 = await kvSetUpstash(key, val);
+  return r1 || r2;
 }
 
 /* ---------- API-FOOTBALL helpers ---------- */
 const AF_BASE = "https://v3.football.api-sports.io";
 const AF_KEY  = process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.env.API_FOOTBALL_KEY;
-
 async function af(path) {
   const r = await fetch(AF_BASE + path, { headers: { "x-apisports-key": AF_KEY } });
   if (!r.ok) return null;
@@ -51,10 +87,9 @@ async function af(path) {
 }
 const fixturesByDate = (date, tz) =>
   af(`/fixtures?date=${encodeURIComponent(date)}&timezone=${encodeURIComponent(tz)}`);
-const oddsByFixture = (fid) =>
-  af(`/odds?fixture=${encodeURIComponent(fid)}`);
+const oddsByFixture = (fid) => af(`/odds?fixture=${encodeURIComponent(fid)}`);
 
-/* ---------- mapping ---------- */
+/* ---------- tickets (bounded) ---------- */
 function baseFx(fx) {
   const f = fx?.fixture || fx || {};
   const l = fx?.league || {};
@@ -67,9 +102,8 @@ function baseFx(fx) {
   };
 }
 
-/* ---------- quick tickets (bounded) ---------- */
 async function buildTickets(fixtures) {
-  const take = fixtures.slice(0, 12); // cap calls
+  const take = fixtures.slice(0, 12);
   const btts = [], ou25 = [], htft = [];
   let budgetStop = false;
 
@@ -153,31 +187,35 @@ async function buildTickets(fixtures) {
 /* ---------- handler ---------- */
 export default async function handler(req, res) {
   try {
-    if (!kvOK) return res.status(200).json({ ok: false, error: "KV not configured (KV_REST_API_URL/TOKEN)" });
+    if (!hasKV && !hasR) {
+      return res.status(200).json({ ok: false, error: "No KV configured (KV_REST_* or UPSTASH_REDIS_REST_*)." });
+    }
 
     const today = String(req.query.ymd || ymdInTZ(new Date(), TZ));
     const warm = String(req.query.warm || "") === "1";
-
     if (!warm) return res.status(200).json({ ok: true, note: "locked-floats alive" });
 
-    // Build base from AF fixtures
     const fResp = await fixturesByDate(today, TZ);
     const fixtures = Array.isArray(fResp?.response) ? fResp.response : [];
     const ids = fixtures.map(f => f?.fixture?.id || f?.id).filter(Boolean);
     const uniqIds = Array.from(new Set(ids));
 
-    // Write UNION in normalized shape
-    const ts = new Date().toISOString();
-    await kvSet(`vb:day:${today}:union`, { ymd: today, ts, items: uniqIds });
+    // Write UNION in BOTH backends in the **most permissive shape** (bare array),
+    // because some readers expect an array, others expect {items:[]}. We write both.
+    const arr = uniqIds;
+    const obj = { ymd: today, ts: new Date().toISOString(), items: uniqIds };
 
-    // Tickets (only if missing)
+    await kvSetBoth(`vb:day:${today}:union`, arr);           // bare array
+    await kvSetBoth(`vb:day:${today}:union:obj`, obj);       // object mirror (for readers using .items)
+
+    // Tickets (if missing)
     const tKey = `tickets:${today}`;
-    const tRaw = await kvGet(tKey);
+    const tRaw = await kvGetAny(tKey);
     let madeTickets = false, tCounts = { btts:0, ou25:0, htft:0 }, budgetStop=false;
 
     if (!tRaw) {
       const { btts, ou25, htft, budgetStop: bs } = await buildTickets(fixtures);
-      await kvSet(tKey, { ymd: today, ts, btts, ou25, htft });
+      await kvSetBoth(tKey, { ymd: today, btts, ou25, htft });
       madeTickets = true; budgetStop = bs;
       tCounts = { btts: btts.length, ou25: ou25.length, htft: htft.length };
     } else {
