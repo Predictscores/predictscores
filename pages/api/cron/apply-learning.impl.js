@@ -1,10 +1,8 @@
 // pages/api/cron/apply-learning.impl.js
-// Publishes today's list by reading best-available KV sources:
-// candidates/final -> snapshot -> vbl_full -> union
-// Writes: vb:day:<ymd>:last (UI lock) and vb:history:<ymd>.
+// Reads best-available candidates (chunked snapshot -> legacy snapshot -> vbl_full -> union)
+// Publishes vb:day:<ymd>:last and vb:history:<ymd>.
 
 function ymdUTC(d = new Date()) { return d.toISOString().slice(0, 10); }
-
 function belgradeSlot(now = new Date()) {
   const belgrade = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Belgrade' }));
   const H = belgrade.getHours();
@@ -12,33 +10,11 @@ function belgradeSlot(now = new Date()) {
   if (H < 15) return 'am';
   return 'pm';
 }
-
 function parseMaybeJson(raw) {
   if (!raw) return null;
-  if (typeof raw === 'string') {
-    try { return JSON.parse(raw); } catch { /* leave null */ }
-  }
+  if (typeof raw === 'string') { try { return JSON.parse(raw); } catch {} }
   return raw;
 }
-
-function normalize(it) {
-  const fx = it?.fixture ? it.fixture : it;
-  const league = it?.league || fx?.league || {};
-  const teams = it?.teams || fx?.teams || {};
-  return {
-    id: fx?.id ?? it?.id ?? null,
-    league: league?.name ?? league ?? null,
-    home: teams?.home?.name ?? it?.home ?? null,
-    away: teams?.away?.name ?? it?.away ?? null,
-    ko: fx?.date ?? it?.ko ?? it?.datetime ?? null,
-    market: it?.market ?? null,
-    pick: it?.pick ?? it?.selection ?? null,
-    odds: it?.odds ?? it?.price ?? null,
-    confidence: it?.confidence ?? it?.conf ?? null,
-    tier: it?.tier ?? league?.tier ?? null,
-  };
-}
-
 async function readArr(kv, key) {
   const raw = await kv.get(key);
   const doc = parseMaybeJson(raw);
@@ -47,37 +23,68 @@ async function readArr(kv, key) {
   return { key, items: arr };
 }
 
+async function readChunkedSnapshot(kv, ymd) {
+  const indexKey = `vb:day:${ymd}:snapshot:index`;
+  const raw = await kv.get(indexKey);
+  const idxDoc = parseMaybeJson(raw);
+  if (!idxDoc || typeof idxDoc.chunks !== 'number' || idxDoc.chunks < 1) return { key: null, items: [] };
+  const total = idxDoc.chunks;
+  const all = [];
+  for (let i = 0; i < total; i++) {
+    const k = `vb:day:${ymd}:snapshot:${i}`;
+    const { items } = await readArr(kv, k);
+    if (items.length) all.push(...items);
+  }
+  return { key: indexKey, items: all };
+}
+
+function normalize(it) {
+  // We saved a slim shape in snapshot; keep output compatible with UI
+  const id = it?.id ?? it?.fixture?.id ?? null;
+  const leagueName = it?.league?.name ?? it?.league ?? null;
+  const tier = it?.league?.tier ?? it?.tier ?? null;
+  const home = it?.teams?.home ?? it?.home ?? null;
+  const away = it?.teams?.away ?? it?.away ?? null;
+  const ko = it?.date ?? it?.fixture?.date ?? it?.ko ?? null;
+  return {
+    id, league: leagueName, home, away, ko,
+    market: it?.market ?? null,
+    pick: it?.pick ?? null,
+    odds: it?.odds ?? null,
+    confidence: it?.confidence ?? it?.conf ?? null,
+    tier,
+  };
+}
+
 export default async function applyLearningImpl({ kv, todayYmd }) {
   const now = new Date();
   const ymd = todayYmd || ymdUTC(now);
   const slot = belgradeSlot(now);
 
-  // Priority: explicit finals -> snapshot -> vbl_full -> union
-  const tryKeys = [
-    `vb:candidates:${ymd}:final`,
-    `vb:day:${ymd}:final`,
-    `vb:day:${ymd}:snapshot`,        // ⬅ rebuild writes this (you saw 1684 items)
-    `vbl_full:${ymd}:${slot}`,
-    `vbl_full:${ymd}`,
-    `vb:day:${ymd}:union`,
-  ];
+  // 1) Chunked snapshot
+  let { key: sourceKey, items } = await readChunkedSnapshot(kv, ymd);
 
-  let sourceKey = null;
-  let items = [];
-  for (const k of tryKeys) {
-    const { items: arr } = await readArr(kv, k);
-    if (arr.length) { sourceKey = k; items = arr; break; }
+  // 2) Legacy single snapshot
+  if (!items.length) {
+    const snap = await readArr(kv, `vb:day:${ymd}:snapshot`);
+    if (snap.items.length) { sourceKey = snap.key; items = snap.items; }
   }
 
-  // If we only found union (IDs), try to enrich from vbl_full bank
-  if (sourceKey && sourceKey.endsWith(':union')) {
-    const ids = new Set(items.filter(Boolean));
-    let bank = [];
-    for (const alt of [`vbl_full:${ymd}:${slot}`, `vbl_full:${ymd}`]) {
-      const { items: arr } = await readArr(kv, alt);
-      if (arr.length) { bank = arr; sourceKey = alt; break; }
+  // 3) vbl_full
+  if (!items.length) {
+    const v1 = await readArr(kv, `vbl_full:${ymd}:${slot}`);
+    const v2 = !v1.items.length ? await readArr(kv, `vbl_full:${ymd}`) : { items: [] };
+    const pick = v1.items.length ? v1 : v2;
+    if (pick.items.length) { sourceKey = pick.key; items = pick.items; }
+  }
+
+  // 4) union (IDs) — can’t enrich without bank; publish minimal if necessary
+  if (!items.length) {
+    const u = await readArr(kv, `vb:day:${ymd}:union`);
+    if (u.items.length && typeof u.items[0] !== 'object') {
+      items = u.items.map((id) => ({ id }));
+      sourceKey = u.key;
     }
-    items = bank.length ? bank.filter(x => ids.has(x?.fixture?.id ?? x?.id)) : [];
   }
 
   // Normalize & dedupe
@@ -86,14 +93,14 @@ export default async function applyLearningImpl({ kv, todayYmd }) {
   const unique = [];
   for (const x of mapped) { if (!seen.has(x.id)) { seen.add(x.id); unique.push(x); } }
 
-  // Write lock & history
+  // Publish
   const ts = new Date().toISOString();
   const lockKey = `vb:day:${ymd}:last`;
   const historyKey = `vb:history:${ymd}`;
   await kv.set(lockKey, JSON.stringify({ items: unique, ymd, ts, sourceKey }));
   await kv.set(historyKey, JSON.stringify({ items: unique, ymd, ts }));
 
-  // Minimal telemetry
+  // Telemetry
   const t = { t1: 0, t2: 0, t3: 0, nullish: 0 };
   for (const x of unique) {
     if (x.tier === 1) t.t1++; else if (x.tier === 2) t.t2++; else if (x.tier === 3) t.t3++; else t.nullish++;
