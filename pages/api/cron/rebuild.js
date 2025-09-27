@@ -88,7 +88,8 @@ async function fetchFixturesOnce(ymd, { signal } = {}) {
 
   if (!apiKey) return { items: [], source: 'no-key' };
 
-  const url = `https://v3.api-football.com/fixtures?date=${encodeURIComponent(ymd)}`;
+  // ✅ Host and date param fixed, timezone added:
+  const url = `https://v3.football.api-sports.io/fixtures?date=${encodeURIComponent(ymd)}&timezone=Europe/Belgrade`;
   const res = await fetch(url, { headers: { 'x-apisports-key': apiKey }, signal });
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
