@@ -1,9 +1,10 @@
 // pages/api/value-bets-locked.js
-// Returns today's frozen value-bets. Default: objects joined from snapshot.
+// Returns today's frozen value-bets.
+// Default: objects joined from snapshot; if snapshot rows aren't readable, falls back to API-Football fixtures.
 // Query params:
 //   ?ymd=YYYY-MM-DD
 //   ?slot=am|pm|late
-//   ?format=objects|ids   (default objects)
+//   ?format=objects|ids   (default: objects)
 //   ?limit=number         (default 500; 0 = no cap)
 //   ?fields=a,b,c         (for objects only)
 // Works with KV_REST_* and/or UPSTASH_REDIS_REST_*.
@@ -37,8 +38,7 @@ const J = (s) => { try { return JSON.parse(String(s ?? "")); } catch { return nu
 async function kvGetREST(key) {
   if (!hasKV) return null;
   const r = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${KV_TOK}` },
-    cache: "no-store",
+    headers: { Authorization: `Bearer ${KV_TOK}` }, cache: "no-store",
   });
   if (!r.ok) return null;
   const j = await r.json().catch(() => null);
@@ -47,8 +47,7 @@ async function kvGetREST(key) {
 async function kvGetUpstash(key) {
   if (!hasR) return null;
   const r = await fetch(`${R_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${R_TOK}` },
-    cache: "no-store",
+    headers: { Authorization: `Bearer ${R_TOK}` }, cache: "no-store",
   });
   if (!r.ok) return null;
   const j = await r.json().catch(() => null);
@@ -58,6 +57,18 @@ async function kvGetAny(key) {
   const a = await kvGetREST(key);
   if (a != null) return a;
   return kvGetUpstash(key);
+}
+
+/* ---------- API-Football fallback ---------- */
+const AF_BASE = "https://v3.football.api-sports.io";
+const AF_KEY  = process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.env.API_FOOTBALL_KEY;
+async function af(path) {
+  const r = await fetch(AF_BASE + path, { headers: { "x-apisports-key": AF_KEY } });
+  if (!r.ok) return null;
+  return r.json().catch(() => null);
+}
+async function afFixturesByDate(ymd, tz) {
+  return af(`/fixtures?date=${encodeURIComponent(ymd)}&timezone=${encodeURIComponent(tz)}`);
 }
 
 /* ---------- helpers ---------- */
@@ -90,28 +101,19 @@ function fxId(row) {
 async function loadSnapshotRows(ymd) {
   const idxKey = `vb:day:${ymd}:snapshot:index`;
   const legacyKey = `vb:day:${ymd}:snapshot`;
-  const seen = new Set(); // guard self-reference
+  const seen = new Set();
 
   const idxRaw = await kvGetAny(idxKey);
   const idx = typeof idxRaw === "string" ? (J(idxRaw) ?? idxRaw) : idxRaw;
 
-  // Case A: index itself is a chunk object (has items)
-  if (idx && typeof idx === "object" && Array.isArray(idx.items)) {
-    return idx.items;
-  }
-  // Case B: index is a direct array of rows
-  if (Array.isArray(idx) && idx.length && typeof idx[0] === "object") {
-    return idx;
-  }
+  // A) index already holds rows
+  if (idx && typeof idx === "object" && Array.isArray(idx.items)) return idx.items;
+  if (Array.isArray(idx) && idx.length && typeof idx[0] === "object") return idx;
 
-  // Case C: index is a string key or an array of chunk keys
+  // B) index lists chunk keys
   let chunkKeys = [];
   if (typeof idx === "string") {
-    if (idx === idxKey) {
-      // self-referential; skip to legacy
-    } else {
-      chunkKeys = [idx];
-    }
+    if (idx !== idxKey) chunkKeys = [idx];
   } else if (idx && typeof idx === "object" && Array.isArray(idx.chunks)) {
     chunkKeys = idx.chunks.filter(Boolean);
   } else if (Array.isArray(idx) && idx.length && typeof idx[0] === "string") {
@@ -122,20 +124,34 @@ async function loadSnapshotRows(ymd) {
   for (const ck of chunkKeys) {
     if (seen.has(ck)) continue;
     seen.add(ck);
-    if (ck === idxKey) continue; // avoid recursion
+    if (ck === idxKey) continue;
     const cRaw = await kvGetAny(ck);
     const arr = rowsFromChunk(cRaw);
     if (arr.length) rows.push(...arr);
   }
   if (rows.length) return rows;
 
-  // Case D: fallback to legacy snapshot
+  // C) legacy fallback
   const legRaw = await kvGetAny(legacyKey);
   const legacy = typeof legRaw === "string" ? (J(legRaw) ?? legRaw) : legRaw;
   if (Array.isArray(legacy)) return legacy;
   if (legacy && typeof legacy === "object" && Array.isArray(legacy.items)) return legacy.items;
 
   return [];
+}
+
+/* ---------- AF fallback join ---------- */
+function mapAfFixtureToRow(fx) {
+  const f = fx?.fixture || {};
+  const t = fx?.teams || {};
+  return {
+    id: f?.id ?? null,
+    date: f?.date ?? null,
+    teams: { home: t?.home?.name ?? null, away: t?.away?.name ?? null },
+    // markets not available from fixtures list; keep nulls so fields filter still works
+    market: null,
+    market_odds: null,
+  };
 }
 
 /* ---------- handler ---------- */
@@ -152,15 +168,14 @@ export default async function handler(req, res) {
     const allow = String(req.query.fields || "").trim();
     const whitelist = allow ? new Set(allow.split(",").map(s => s.trim()).filter(Boolean)) : null;
 
-    // load frozen ids (prefer slot, fallback day)
+    // frozen ids (prefer slot, fallback day)
     const vblSlotKey = `vbl_full:${ymd}:${slot}`;
     const vblDayKey  = `vbl_full:${ymd}`;
-
     const [slotRaw, dayRaw] = await Promise.all([ kvGetAny(vblSlotKey), kvGetAny(vblDayKey) ]);
     let ids = idsFromDoc(slotRaw);
     if (!ids.length) ids = idsFromDoc(dayRaw);
 
-    // Freshness
+    // freshness/meta
     const [ftRaw, fgRaw] = await Promise.all([
       kvGetAny(`vb-locked:kv:hit:${ymd}`),
       kvGetAny(`vb-locked:kv:hit`)
@@ -171,23 +186,44 @@ export default async function handler(req, res) {
     const last_odds_refresh = ft.last_odds_refresh || fg.last_odds_refresh || null;
 
     if (format === "ids") {
-      const out = (limit && limit > 0) ? ids.slice(0, limit) : ids;
+      const outIds = (limit && limit > 0) ? ids.slice(0, limit) : ids;
       return res.status(200).json({
-        items: out,
-        meta: { ymd, slot, source: "vb-locked:kv:hit", ts, last_odds_refresh, ids_total: ids.length, returned: out.length }
+        items: outIds,
+        meta: { ymd, slot, source: "vb-locked:kv:hit", ts, last_odds_refresh, ids_total: ids.length, returned: outIds.length }
       });
     }
 
-    // join to snapshot
-    const rows = await loadSnapshotRows(ymd);
+    // join via snapshot; if empty, fall back to AF fixtures
+    let rows = await loadSnapshotRows(ymd);
     const wanted = new Set(ids);
-    const out = [];
-    for (const row of rows) {
-      const id = fxId(row);
-      if (id == null) continue;
-      if (!wanted.has(id)) continue;
-      out.push(whitelist ? pickFields(row, whitelist) : row);
-      if (limit && out.length >= limit) break;
+    let out = [];
+
+    if (rows && rows.length) {
+      for (const row of rows) {
+        const id = fxId(row);
+        if (id == null) continue;
+        if (!wanted.has(id)) continue;
+        out.push(whitelist ? pickFields(row, whitelist) : row);
+        if (limit && out.length >= limit) break;
+      }
+    }
+
+    // Fallback path: AF fixtures of the day
+    if (!out.length && ids.length) {
+      const tz = process.env.TZ_DISPLAY || "Europe/Belgrade";
+      const afResp = await afFixturesByDate(ymd, tz);
+      const list = Array.isArray(afResp?.response) ? afResp.response : [];
+      if (list.length) {
+        const mapped = list.map(mapAfFixtureToRow);
+        const join = [];
+        for (const r of mapped) {
+          if (!r?.id) continue;
+          if (!wanted.has(r.id)) continue;
+          join.push(whitelist ? pickFields(r, whitelist) : r);
+          if (limit && join.length >= limit) break;
+        }
+        out = join;
+      }
     }
 
     return res.status(200).json({
