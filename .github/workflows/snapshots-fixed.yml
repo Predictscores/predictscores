@@ -68,15 +68,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          command -v jq >/dev/null 2>&1 || { sudo apt-get update -y && sudo apt-get install -y jq; }
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
 
-      - name: Resolve BASE, SLOT, YMD and guard window
+      - name: Compute context (slot/base/ymd + guard)
         id: ctx
         env:
-          INP_BASE: ${{ inputs.base }}
-          INP_SLOT: ${{ inputs.slot }}
-          SCH: ${{ github.event.schedule }}
+          INP_SLOT: ${{ github.event.inputs.slot }}
+          INP_BASE: ${{ github.event.inputs.base }}
           TZD: ${{ env.TZ_DISPLAY }}
+          SCH: ${{ github.event.schedule }}
+          FREEZE_MINUTES: ${{ env.FREEZE_MINUTES }}
+          FALLBACK_BASE: ${{ env.FALLBACK_BASE }}
         shell: bash
         run: |
           set -euo pipefail
@@ -112,31 +117,23 @@ jobs:
           H=${now_hm%%:*}; M=${now_hm##*:}
           m=$((10#$H*60 + 10#$M))
           mod=1440
+          am=600   # 10:00
+          pm=900   # 15:00
+          lt=0     # 00:00
 
-          circ_dist () {
-            local a b d e
-            a=${1:-0}; b=${2:-0}
-            d=$(( (a - b) % mod ))
-            (( d < 0 )) && d=$((d + mod))
-            e=$(( mod - d ))
-            if (( d < e )); then echo "$d"; else echo "$e"; fi
-          }
+          # shortest circular distance helper (minutes in day)
+          dist() { local a=$1 b=$2; local d=$(( ( (a - b + mod) % mod ) )); if [ $d -gt $((mod/2)) ]; then echo $((mod - d)); else echo $d; fi; }
 
-          t_late=0
-          t_am=$((10*60))
-          t_pm=$((15*60))
-          d_late=$(circ_dist "$m" "$t_late")
-          d_am=$(circ_dist "$m" "$t_am")
-          d_pm=$(circ_dist "$m" "$t_pm")
+          d_am=$(dist "$m" "$am"); d_pm=$(dist "$m" "$pm"); d_lt=$(dist "$m" "$lt")
 
           run_guard=false
           case "$SLOT" in
-            late) (( d_late <= FM )) && run_guard=true ;;
             am)   (( d_am   <= FM )) && run_guard=true ;;
+            late) (( d_lt   <= FM )) && run_guard=true ;;
             pm)   (( d_pm   <= FM )) && run_guard=true ;;
           esac
 
-          echo "Guard decision: run=$run_guard (slot=$SLOT, now=$now_hm, guard_minutes=$FM, schedule=${SCH:-workflow_dispatch})"
+          echo "Guard decision: run=$run_guard (slot=$SLOT, now=...$now_hm, guard_minutes=$FM, schedule=${SCH:-workflow_dispatch})"
 
           {
             echo "run=$run_guard"
@@ -146,9 +143,9 @@ jobs:
             echo "guard_minutes=$FM"
           } >> "$GITHUB_OUTPUT"
 
-      # 0) Warm — PRIVREMENO ISKLJUČEN da ne piše dnevni tickets:<ymd>
+      # 0) Warm — re-enabled so daily tickets & base snapshot are persisted
       - name: Warm locked-floats (daily tickets & base snapshot)
-        if: ${{ false }}   # <— jedina funkcionalna promena u fajlu
+        if: steps.ctx.outputs.run == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
           SLOT: ${{ steps.ctx.outputs.slot }}
@@ -171,8 +168,8 @@ jobs:
           curl -fsSL "$BASE/api/cron/rebuild?slot=$SLOT&ymd=$YMD&debug=1" | tee /tmp/rebuild-1.json
           sleep 2
 
-      # 2) Refresh odds (kratko, batch ×2)
-      - name: Refresh odds (batch, force)
+      # 2) Refresh odds (twice, spaced)
+      - name: Refresh odds (double pass)
         if: steps.ctx.outputs.run == 'true' && steps.api_key.outputs.has_key == 'true'
         env:
           BASE: ${{ steps.ctx.outputs.base }}
@@ -209,9 +206,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "$BASE/api/insights-build?slot=$SLOT&ymd=$YMD" | tee /tmp/insights.json
+          curl -fsSL "$BASE/api/cron/insights?slot=$SLOT&ymd=$YMD" | tee /tmp/insights.json
 
-      # 5) Apply learning
+      # 5) Apply learning (freezes today's picks)
       - name: Apply learning
         if: steps.ctx.outputs.run == 'true' && steps.api_key.outputs.has_key == 'true'
         env:
