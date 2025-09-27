@@ -128,8 +128,8 @@ export default async function handler(req, res) {
       if ((Date.now() - started) >= MAX_MS) break; // time budget
       if (!id) { skipped++; continue; }
 
-      // fetch odds for this fixture (1 call per id)
-      const url = `https://v3.api-football.com/odds?fixture=${encodeURIComponent(id)}`;
+      // ✅ Host fixed for odds endpoint:
+      const url = `https://v3.football.api-sports.io/odds?fixture=${encodeURIComponent(id)}`;
       let oddsDoc = null;
       try {
         const resp = await fetch(url, { headers: { 'x-apisports-key': apiKey }, signal: controller.signal });
