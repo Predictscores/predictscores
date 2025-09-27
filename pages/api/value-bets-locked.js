@@ -1,13 +1,13 @@
 // pages/api/value-bets-locked.js
 // Returns today's frozen value-bets.
-// Default: objects joined from snapshot; if snapshot rows aren't readable, falls back to API-Football fixtures.
+// Default: objects joined from snapshot; if snapshot rows aren't readable, falls back to API-Football fixtures,
+// and (NEW) enriches only the returned items with 1X2 odds + implied-probability confidence.
 // Query params:
 //   ?ymd=YYYY-MM-DD
 //   ?slot=am|pm|late
 //   ?format=objects|ids   (default: objects)
 //   ?limit=number         (default 500; 0 = no cap)
 //   ?fields=a,b,c         (for objects only)
-// Works with KV_REST_* and/or UPSTASH_REDIS_REST_*.
 
 export const config = { api: { bodyParser: false } };
 
@@ -59,7 +59,7 @@ async function kvGetAny(key) {
   return kvGetUpstash(key);
 }
 
-/* ---------- API-Football fallback ---------- */
+/* ---------- API-Football ---------- */
 const AF_BASE = "https://v3.football.api-sports.io";
 const AF_KEY  = process.env.NEXT_PUBLIC_API_FOOTBALL_KEY || process.env.API_FOOTBALL_KEY;
 async function af(path) {
@@ -69,6 +69,9 @@ async function af(path) {
 }
 async function afFixturesByDate(ymd, tz) {
   return af(`/fixtures?date=${encodeURIComponent(ymd)}&timezone=${encodeURIComponent(tz)}`);
+}
+async function afOddsByFixture(fid) {
+  return af(`/odds?fixture=${encodeURIComponent(fid)}`);
 }
 
 /* ---------- helpers ---------- */
@@ -140,7 +143,7 @@ async function loadSnapshotRows(ymd) {
   return [];
 }
 
-/* ---------- AF fallback join ---------- */
+/* ---------- AF fixture → minimal row ---------- */
 function mapAfFixtureToRow(fx) {
   const f = fx?.fixture || {};
   const t = fx?.teams || {};
@@ -148,10 +151,48 @@ function mapAfFixtureToRow(fx) {
     id: f?.id ?? null,
     date: f?.date ?? null,
     teams: { home: t?.home?.name ?? null, away: t?.away?.name ?? null },
-    // markets not available from fixtures list; keep nulls so fields filter still works
-    market: null,
+    market: "1X2",
+    selection_label: null,
     market_odds: null,
+    confidence: null, // will be enriched if we fetch odds
   };
+}
+
+/* ---------- enrich N rows with 1X2 odds -> confidence ---------- */
+async function enrichWithOdds1x2(rows) {
+  // mutate rows in place; keep total calls bounded by rows.length
+  for (const r of rows) {
+    const fid = r?.id;
+    if (!fid) continue;
+    const odds = await afOddsByFixture(fid);
+    const books = odds?.response?.[0]?.bookmakers || [];
+    // Collect best decimal odds per 1X2 selection
+    const best = { HOME: Infinity, DRAW: Infinity, AWAY: Infinity };
+    for (const b of books) {
+      for (const bet of (b?.bets || [])) {
+        const nm = String(bet?.name || "").toLowerCase();
+        if (!nm.includes("match winner") && !nm.includes("1x2")) continue;
+        for (const v of (bet?.values || [])) {
+          const label = String(v?.value || "").toUpperCase().replace(/\s+/g, "");
+          const odd = Number(v?.odd);
+          if (!Number.isFinite(odd)) continue;
+          if (label.includes("HOME") || label === "1") best.HOME = Math.min(best.HOME, odd);
+          else if (label.includes("DRAW") || label === "X") best.DRAW = Math.min(best.DRAW, odd);
+          else if (label.includes("AWAY") || label === "2") best.AWAY = Math.min(best.AWAY, odd);
+        }
+      }
+    }
+    // Choose favourite (smallest odds) and compute implied probability
+    const entries = Object.entries(best).filter(([,o]) => isFinite(o));
+    if (!entries.length) continue;
+    entries.sort((a,b)=>a[1]-b[1]);
+    const [sel, price] = entries[0];
+    const implied = price > 0 ? (1 / price) : 0; // 0..1
+    r.selection_label = sel;          // HOME/DRAW/AWAY
+    r.market_odds = price;            // decimal odds
+    r.confidence = Math.round(implied * 1000) / 10; // e.g. 57.3 (%)
+  }
+  return rows;
 }
 
 /* ---------- handler ---------- */
@@ -193,7 +234,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // join via snapshot; if empty, fall back to AF fixtures
+    // join via snapshot
     let rows = await loadSnapshotRows(ymd);
     const wanted = new Set(ids);
     let out = [];
@@ -201,34 +242,37 @@ export default async function handler(req, res) {
     if (rows && rows.length) {
       for (const row of rows) {
         const id = fxId(row);
-        if (id == null) continue;
-        if (!wanted.has(id)) continue;
-        out.push(whitelist ? pickFields(row, whitelist) : row);
+        if (id == null || !wanted.has(id)) continue;
+        out.push(row);
         if (limit && out.length >= limit) break;
       }
+      // if the snapshot already has confidence/odds, great; if not, we’ll still return objects
     }
 
-    // Fallback path: AF fixtures of the day
+    // AF fallback: fixtures + enrich TOP N with 1X2 odds to produce non-zero confidence
     if (!out.length && ids.length) {
       const tz = process.env.TZ_DISPLAY || "Europe/Belgrade";
       const afResp = await afFixturesByDate(ymd, tz);
       const list = Array.isArray(afResp?.response) ? afResp.response : [];
       if (list.length) {
         const mapped = list.map(mapAfFixtureToRow);
-        const join = [];
+        const filtered = [];
         for (const r of mapped) {
-          if (!r?.id) continue;
-          if (!wanted.has(r.id)) continue;
-          join.push(whitelist ? pickFields(r, whitelist) : r);
-          if (limit && join.length >= limit) break;
+          if (r?.id && wanted.has(r.id)) filtered.push(r);
+          if (limit && filtered.length >= limit) break;
         }
-        out = join;
+        // enrich only the returned rows (keeps API calls small)
+        await enrichWithOdds1x2(filtered);
+        out = filtered;
       }
     }
 
+    // optional field whitelist
+    const final = whitelist ? out.map(r => pickFields(r, whitelist)) : out;
+
     return res.status(200).json({
-      items: out,
-      meta: { ymd, slot, source: "vb-locked:kv:hit", ts, last_odds_refresh, ids_total: ids.length, returned: out.length }
+      items: final,
+      meta: { ymd, slot, source: "vb-locked:kv:hit", ts, last_odds_refresh, ids_total: ids.length, returned: final.length }
     });
   } catch (e) {
     return res.status(200).json({
