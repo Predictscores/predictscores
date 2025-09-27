@@ -1,4 +1,4 @@
-const { tieredFixtures, denylistedFixture } = require("../lib/matchSelector.fixtures");
+const { tieredFixtures, denylistedFixture, createFixture } = require("../lib/matchSelector.fixtures");
 const { isLeagueDenied } = require("../lib/leaguesConfig");
 const { resolveLeagueTier } = require("../lib/learning/runtime");
 
@@ -137,5 +137,35 @@ describe("value-bets locked tier output", () => {
     const tier1Count = Array.from(uniqueFixtureTiers.values()).filter((tier) => tier === "T1").length;
     const ratio = tier1Count / totalFixtures;
     expect(ratio).toBeGreaterThanOrEqual(0.7);
+  });
+
+  it("derives league tier when fixture lacks explicit tier", async () => {
+    const slot = "pm";
+    const dayKey = `vb:day:${ymd}:${slot}`;
+    const fullKey = `vbl_full:${ymd}:${slot}`;
+    const lastKey = `vb:last-odds:${slot}`;
+
+    const fixture = createFixture(3001, { id: 39, name: "Premier League" });
+    delete fixture.tier;
+    delete fixture.match_selector;
+
+    kvStore.set(dayKey, JSON.stringify({ items: [fixture] }));
+    kvStore.set(fullKey, JSON.stringify({ items: [] }));
+    kvStore.set(lastKey, JSON.stringify({ iso: "2024-08-01T07:45:00Z" }));
+
+    const { default: handler } = require("../pages/api/value-bets-locked");
+    const req = { query: { slot } };
+    const res = createMockRes();
+
+    await handler(req, res);
+
+    expect(res.statusCode).toBe(200);
+    const items = res.jsonPayload?.items || [];
+    const fixtureItems = items.filter((item) => item.fixture_id === fixture.fixture_id);
+    expect(fixtureItems.length).toBeGreaterThan(0);
+    const expectedTier = resolveLeagueTier(fixture.league);
+    fixtureItems.forEach((item) => {
+      expect(item.tier).toBe(expectedTier);
+    });
   });
 });

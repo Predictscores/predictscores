@@ -777,6 +777,7 @@ function resolveFixtureTier(fix) {
 
 function fromMarkets(fix){
   const out=[]; const m=fix?.markets||{}; const fid=fix.fixture_id||fix.fixture?.id; const ctx = buildModelContext(fix);
+  const resolvedTier = resolveFixtureTier(fix) ?? (fix?.league ? resolveLeagueTier(fix.league) : null);
 
   const push = (market, pick, pickCode, selectionLabel, rawPrice) => {
     const price = Number(rawPrice);
@@ -788,10 +789,10 @@ function fromMarkets(fix){
       pick_code: pickCode,
       selection_label: selectionLabel,
       odds: { price },
-      tier,
+      tier: resolvedTier,
     };
     applyModelFields(cand, ctx);
-    cand.tier = tier;
+    if (resolvedTier != null) cand.tier = resolvedTier;
     out.push(cand);
   };
 
@@ -817,13 +818,14 @@ function fromMarkets(fix){
     c.league=fix.league; c.league_name=fix.league?.name; c.league_country=fix.league?.country;
     c.teams=fix.teams; c.home=fix.home; c.away=fix.away;
     c.kickoff=fix.kickoff; c.kickoff_utc=fix.kickoff_utc||fix.kickoff;
-    if (typeof c.tier === "undefined") c.tier = tier;
+    if (typeof c.tier === "undefined" && resolvedTier != null) c.tier = resolvedTier;
     if (typeof c.model_prob !== "number") c.model_prob = c.model_prob != null ? Number(c.model_prob) : null;
   }
   return out;
 }
 function oneXtwoOffers(fix){
   const xs=[]; const x=fix?.markets?.['1x2']||{}; const fid=fix.fixture_id||fix.fixture?.id; const ctx = buildModelContext(fix);
+  const resolvedTier = resolveFixtureTier(fix) ?? (fix?.league ? resolveLeagueTier(fix.league) : null);
   const push=(code,label,price)=>{
     const p=Number(price);
     if(!Number.isFinite(p)||p<MIN_ODDS||p>MAX_ODDS) return;
@@ -832,9 +834,10 @@ function oneXtwoOffers(fix){
       league:fix.league, league_name:fix.league?.name,
       league_country:fix.league?.country, teams:fix.teams, home:fix.home, away:fix.away,
       kickoff:fix.kickoff, kickoff_utc:fix.kickoff_utc||fix.kickoff,
-      tier,
+      tier: resolvedTier,
     };
     applyModelFields(cand, ctx);
+    if (resolvedTier != null) cand.tier = resolvedTier;
     xs.push(cand);
   };
   if (x.home) push("1","Home",x.home);
@@ -874,15 +877,25 @@ function applyUefaCap(items, cap){
 
 /* ===== Alias layer to match legacy frontend ===== */
 function aliasItem(it){
+  const resolvedTier = (() => {
+    const direct = resolveFixtureTier(it);
+    if (direct) return direct;
+    if (it?.league) {
+      const leagueTier = resolveLeagueTier(it.league);
+      if (leagueTier) return leagueTier;
+    }
+    if (it?.league_name || it?.league_country) {
+      const fallback = resolveLeagueTier({ name: it.league_name, country: it.league_country });
+      if (fallback) return fallback;
+    }
+    return null;
+  })();
   const a = { ...it };
-  if (typeof it?.tier !== "undefined") a.tier = it.tier;
+  if (resolvedTier != null) a.tier = resolvedTier;
   // legacy confidence
   a.confidence = typeof it.confidence !== "undefined" ? it.confidence : (it.confidence_pct ?? 0);
   // legacy price on root
   if (it?.odds && typeof it.odds.price !== "undefined") a.price = Number(it.odds.price);
-  if (!a.tier) {
-    a.tier = resolveLeagueTier(it?.league || {});
-  }
   // legacy names
   if (it.home && !a.home_name) a.home_name = it.home;
   if (it.away && !a.away_name) a.away_name = it.away;
