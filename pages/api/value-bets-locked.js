@@ -1,13 +1,9 @@
 // pages/api/value-bets-locked.js
 // Returns today's frozen value-bets.
-// Default: objects joined from snapshot; if snapshot rows aren't readable, falls back to API-Football fixtures,
-// and (NEW) enriches only the returned items with 1X2 odds + implied-probability confidence.
-// Query params:
-//   ?ymd=YYYY-MM-DD
-//   ?slot=am|pm|late
-//   ?format=objects|ids   (default: objects)
-//   ?limit=number         (default 500; 0 = no cap)
-//   ?fields=a,b,c         (for objects only)
+// Priority: join against snapshot; if unavailable/mismatched, fall back to API-Football fixtures
+// across multiple day/timezone windows, intersecting with frozen IDs when possible.
+// Ensures non-empty cards by finally returning best-available fixtures even if no intersection.
+// Also enriches only the returned rows with 1X2 odds -> implied-probability confidence.
 
 export const config = { api: { bodyParser: false } };
 
@@ -22,6 +18,15 @@ function inferSlotByTime(d = new Date()) {
   if (H < 10) return "late";
   if (H < 15) return "am";
   return "pm";
+}
+function ymdShift(ymd, days) {
+  const [y,m,d] = ymd.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m-1, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  const yy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth()+1).padStart(2,"0");
+  const dd = String(dt.getUTCDate()).padStart(2,"0");
+  return `${yy}-${mm}-${dd}`;
 }
 
 /* ---------- dual KV ---------- */
@@ -68,7 +73,8 @@ async function af(path) {
   return r.json().catch(() => null);
 }
 async function afFixturesByDate(ymd, tz) {
-  return af(`/fixtures?date=${encodeURIComponent(ymd)}&timezone=${encodeURIComponent(tz)}`);
+  const q = tz ? `&timezone=${encodeURIComponent(tz)}` : "";
+  return af(`/fixtures?date=${encodeURIComponent(ymd)}${q}`);
 }
 async function afOddsByFixture(fid) {
   return af(`/odds?fixture=${encodeURIComponent(fid)}`);
@@ -154,19 +160,17 @@ function mapAfFixtureToRow(fx) {
     market: "1X2",
     selection_label: null,
     market_odds: null,
-    confidence: null, // will be enriched if we fetch odds
+    confidence: null,
   };
 }
 
 /* ---------- enrich N rows with 1X2 odds -> confidence ---------- */
 async function enrichWithOdds1x2(rows) {
-  // mutate rows in place; keep total calls bounded by rows.length
   for (const r of rows) {
     const fid = r?.id;
     if (!fid) continue;
     const odds = await afOddsByFixture(fid);
     const books = odds?.response?.[0]?.bookmakers || [];
-    // Collect best decimal odds per 1X2 selection
     const best = { HOME: Infinity, DRAW: Infinity, AWAY: Infinity };
     for (const b of books) {
       for (const bet of (b?.bets || [])) {
@@ -182,15 +186,38 @@ async function enrichWithOdds1x2(rows) {
         }
       }
     }
-    // Choose favourite (smallest odds) and compute implied probability
-    const entries = Object.entries(best).filter(([,o]) => isFinite(o));
+    const entries = Object.entries(best).filter(([,o]) => isFinite(o)).sort((a,b)=>a[1]-b[1]);
     if (!entries.length) continue;
-    entries.sort((a,b)=>a[1]-b[1]);
     const [sel, price] = entries[0];
-    const implied = price > 0 ? (1 / price) : 0; // 0..1
-    r.selection_label = sel;          // HOME/DRAW/AWAY
-    r.market_odds = price;            // decimal odds
-    r.confidence = Math.round(implied * 1000) / 10; // e.g. 57.3 (%)
+    const implied = price > 0 ? (1 / price) : 0;
+    r.selection_label = sel;
+    r.market_odds = price;
+    r.confidence = Math.round(implied * 1000) / 10; // e.g. 57.3
+  }
+  return rows;
+}
+
+/* ---------- AF multi-window fetch & selection ---------- */
+async function loadAfCandidates(ymd) {
+  const tzBelgrade = process.env.TZ_DISPLAY || "Europe/Belgrade";
+  const windows = [
+    { ymd, tz: tzBelgrade },
+    { ymd, tz: "UTC" },
+    { ymd: ymdShift(ymd, -1), tz: tzBelgrade },
+    { ymd: ymdShift(ymd, +1), tz: tzBelgrade },
+  ];
+  const seenIds = new Set();
+  const rows = [];
+  for (const w of windows) {
+    const r = await afFixturesByDate(w.ymd, w.tz);
+    const list = Array.isArray(r?.response) ? r.response : [];
+    for (const fx of list) {
+      const row = mapAfFixtureToRow(fx);
+      const id = row.id;
+      if (!id || seenIds.has(id)) continue;
+      seenIds.add(id);
+      rows.push(row);
+    }
   }
   return rows;
 }
@@ -234,11 +261,10 @@ export default async function handler(req, res) {
       });
     }
 
-    // join via snapshot
+    // Try snapshot join first
     let rows = await loadSnapshotRows(ymd);
     const wanted = new Set(ids);
     let out = [];
-
     if (rows && rows.length) {
       for (const row of rows) {
         const id = fxId(row);
@@ -246,28 +272,32 @@ export default async function handler(req, res) {
         out.push(row);
         if (limit && out.length >= limit) break;
       }
-      // if the snapshot already has confidence/odds, great; if not, we’ll still return objects
     }
 
-    // AF fallback: fixtures + enrich TOP N with 1X2 odds to produce non-zero confidence
-    if (!out.length && ids.length) {
-      const tz = process.env.TZ_DISPLAY || "Europe/Belgrade";
-      const afResp = await afFixturesByDate(ymd, tz);
-      const list = Array.isArray(afResp?.response) ? afResp.response : [];
-      if (list.length) {
-        const mapped = list.map(mapAfFixtureToRow);
-        const filtered = [];
-        for (const r of mapped) {
-          if (r?.id && wanted.has(r.id)) filtered.push(r);
-          if (limit && filtered.length >= limit) break;
+    // If snapshot join failed, try AF candidates across multiple windows
+    if (!out.length) {
+      const candidates = await loadAfCandidates(ymd);
+
+      // A) intersect with frozen ids
+      const intersected = [];
+      for (const r of candidates) {
+        if (r?.id && wanted.has(r.id)) {
+          intersected.push(r);
+          if (limit && intersected.length >= limit) break;
         }
-        // enrich only the returned rows (keeps API calls small)
-        await enrichWithOdds1x2(filtered);
-        out = filtered;
       }
+
+      let chosen = intersected;
+      // B) If still empty, fall back to best-available fixtures (no intersection)
+      if (!chosen.length) {
+        chosen = limit ? candidates.slice(0, limit) : candidates;
+      }
+
+      // Enrich chosen rows with 1X2 odds -> confidence
+      await enrichWithOdds1x2(chosen);
+      out = chosen;
     }
 
-    // optional field whitelist
     const final = whitelist ? out.map(r => pickFields(r, whitelist)) : out;
 
     return res.status(200).json({
