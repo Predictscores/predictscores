@@ -1,327 +1,178 @@
 // pages/api/cron/refresh-odds.js
-import { afxOddsByFixture } from "../../../lib/sources/apiFootball";
+// Quota-safe, non-hanging refresh:
+// - EARLY EXIT if there are no candidates in KV (so it won't crawl broadly).
+// - COOLDOWN via freshness key -> skips if too recent (unless force=1).
+// - HARD TIME BUDGET (max_ms) to avoid long runs.
+// - PER-RUN CAP (RUN_CAP) to limit API calls.
+// - Always writes freshness stamp: vb:last_odds_refresh and vb:last_odds_refresh:<slot>
 
-export const config = { api: { bodyParser: false } };
+import * as kvlib from '../../../lib/kv-read';
 
-/* =========================
- *  Inline helpers (KV + math)
- * ========================= */
-function kvBackends() {
-  const out = [];
-  const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
-  const bU = process.env.UPSTASH_REDIS_REST_URL, bT = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (aU && aT) out.push({ flavor:"vercel-kv", url:aU.replace(/\/+$/,""), tok:aT });
-  if (bU && bT) out.push({ flavor:"upstash-redis", url:bU.replace(/\/+$/,""), tok:bT });
-  return out;
-}
-async function kvGET(key, trace) {
-  for (const b of kvBackends()) {
-    try {
-      const u = `${b.url}/get/${encodeURIComponent(key)}`;
-      const r = await fetch(u, { headers: { Authorization: `Bearer ${b.tok}` }, cache:"no-store" });
-      if (!r.ok) continue;
-      const j = await r.json().catch(()=>null);
-      const v = (j && ("result" in j ? j.result : j.value)) ?? null;
-      if (v==null) continue;
-      trace?.push({ get:key, ok:true, flavor:b.flavor, hit:true });
-      return v;
-    } catch {}
+async function getKvClient() {
+  if (typeof kvlib.getKV === 'function') {
+    const client = await kvlib.getKV();
+    if (client && typeof client.get === 'function' && typeof client.set === 'function') return client;
   }
-  trace?.push({ get:key, ok:true, hit:false });
+  const kvGet = kvlib.kvGet, kvSet = kvlib.kvSet;
+  if (typeof kvGet === 'function' && typeof kvSet === 'function') return { get: kvGet, set: kvSet };
+  throw new Error('KV adapter: neither getKV() nor kvGet/kvSet found in lib/kv-read');
+}
+
+function ymdUTC(d = new Date()) { return d.toISOString().slice(0, 10); }
+function belgradeSlot(now = new Date()) {
+  const belgrade = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Belgrade' }));
+  const H = belgrade.getHours();
+  if (H < 10) return 'late';
+  if (H < 15) return 'am';
+  return 'pm';
+}
+function parseMaybeJson(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'string') { try { return JSON.parse(raw); } catch { /* ignore */ } }
+  return raw;
+}
+
+async function readArr(kv, key) {
+  const raw = await kv.get(key);
+  const doc = parseMaybeJson(raw);
+  if (!doc) return [];
+  return Array.isArray(doc?.items) ? doc.items : (Array.isArray(doc) ? doc : []);
+}
+
+async function readCandidates(kv, ymd, slot) {
+  // Prefer union of IDs; fall back to snapshot list of objects
+  let ids = [];
+  const union = await readArr(kv, `vb:day:${ymd}:union`);
+  if (union.length && typeof union[0] !== 'object') {
+    ids = union.filter(Boolean);
+  } else {
+    const snapshot = await readArr(kv, `vb:day:${ymd}:snapshot`);
+    ids = snapshot.map(f => (f?.fixture?.id ?? f?.id)).filter(Boolean);
+  }
+  return Array.from(new Set(ids));
+}
+
+async function getFreshness(kv, slot) {
+  const keys = [`vb:last_odds_refresh:${slot}`, `vb:last_odds_refresh`];
+  for (const k of keys) {
+    const raw = await kv.get(k);
+    const doc = parseMaybeJson(raw);
+    if (doc && (doc.ts || doc.timestamp)) return { key: k, ts: doc.ts || doc.timestamp, updated: doc.updated ?? null };
+  }
   return null;
 }
-async function kvSET(key, value, trace) {
-  const v = typeof value === "string" ? value : JSON.stringify(value);
-  let ok = false;
-  for (const b of kvBackends()) {
-    try {
-      const u = `${b.url}/set/${encodeURIComponent(key)}`;
-      const r = await fetch(u, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${b.tok}`, "Content-Type":"application/json" },
-        body: JSON.stringify({ value: v })
-      });
-      ok = ok || r.ok;
-      trace?.push({ kv:"set", key, flavor:b.flavor, ok: !!r.ok });
-    } catch {}
-  }
-  return ok;
-}
-function kvToItems(doc) {
-  if (doc == null) return { items: [] };
-  let v = doc;
-  if (typeof v === "string") { try { v = JSON.parse(v); } catch { return { items: [] }; } }
-  if (v && typeof v === "object" && typeof v.value === "string") {
-    try { v = JSON.parse(v.value); } catch { return { items: [] }; }
-  }
-  if (Array.isArray(v)) return { items: v };
-  if (v && Array.isArray(v.items)) return v;
-  return { items: [] };
-}
-// math helpers
-function median(arr){ const a=arr.filter(Number.isFinite).slice().sort((x,y)=>x-y); if(!a.length) return NaN; const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; }
-function trimmedMean(arr, trim=0.15){ const a=arr.filter(Number.isFinite).slice().sort((x,y)=>x-y); if(!a.length) return NaN; const k=Math.floor(a.length*trim); const b=a.slice(k,a.length-k); return b.reduce((p,c)=>p+c,0)/b.length; }
-function consensusPrice(list){ const m=median(list); if (Number.isFinite(m)) return m; const t=trimmedMean(list,0.15); return Number.isFinite(t)?t:NaN; }
 
-/* =========================
- *  ENV / time helpers
- * ========================= */
-const TZ = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
-const SLOT_ODDS_CAP_LATE = Number(process.env.SLOT_ODDS_CAP_LATE || 1000);
-const SLOT_ODDS_CAP_AM   = Number(process.env.SLOT_ODDS_CAP_AM   || 2000);
-const SLOT_ODDS_CAP_PM   = Number(process.env.SLOT_ODDS_CAP_PM   || 3000);
-const BACKOFF_MINUTES_EMPTY = Number(process.env.ODDS_BACKOFF_MINUTES || 25);
-
-const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
-const hourInTZ = (d, tz) => Number(new Intl.DateTimeFormat("en-GB",{ timeZone:tz, hour12:false, hour:"2-digit"}).format(d));
-const YMD_REGEX = /^\d{4}-\d{2}-\d{2}$/;
-const firstQueryValue = (value) => (Array.isArray(value) ? value[0] : value);
-const canonicalSlot = (x) => {
-  const v = String(x ?? "auto").toLowerCase();
-  return v === "late" || v === "am" || v === "pm" ? v : "auto";
-};
-function pickSlot(now) { const h=hourInTZ(now,TZ); return h<10?"late":h<15?"am":"pm"; }
-function capForSlot(slot){ if (slot==="late") return SLOT_ODDS_CAP_LATE; if (slot==="am") return SLOT_ODDS_CAP_AM; return SLOT_ODDS_CAP_PM; }
-function leagueTier(leagueName=""){ const s=String(leagueName).toLowerCase(); if(/uefa|champions|europa|conference/.test(s))return 1; if(/premier league|la liga|serie a|bundesliga|ligue 1|eredivisie|primeira|championship|mls/.test(s))return 2; return 3; }
-
-function extractConsensusMarkets(afResponse){
-  const out = {};
-  const resp = afResponse?.response || [];
-
-  // 1x2
-  const p1x2 = { home:[], draw:[], away:[] };
-  for (const bm of resp?.[0]?.bookmakers || []) {
-    for (const b of bm.bets || []) {
-      const label = (b.name || "").toLowerCase();
-      if (/match winner|1x2|win\/draw\/win/.test(label)) {
-        for (const v of b.values || []) {
-          const val = (v.value||"").toLowerCase();
-          const odd = Number(v.odd);
-          if (!Number.isFinite(odd)) continue;
-          if (/(home|1|local)/.test(val)) p1x2.home.push(odd);
-          else if (/(draw|x)/.test(val)) p1x2.draw.push(odd);
-          else if (/(away|2|visitor)/.test(val)) p1x2.away.push(odd);
-        }
-      }
-    }
-  }
-  const m1x2 = {};
-  if (p1x2.home.length) m1x2.home = consensusPrice(p1x2.home);
-  if (p1x2.draw.length) m1x2.draw = consensusPrice(p1x2.draw);
-  if (p1x2.away.length) m1x2.away = consensusPrice(p1x2.away);
-  if (Object.keys(m1x2).length) out["1x2"] = m1x2;
-
-  // BTTS
-  const bttsPrices = { yes:[], no:[] };
-  for (const bm of resp?.[0]?.bookmakers || []) {
-    for (const b of bm.bets || []) {
-      const label = (b.name || "").toLowerCase();
-      if (/both teams to score|btts/.test(label)) {
-        for (const v of b.values || []) {
-          const val = (v.value||"").toLowerCase();
-          const odd = Number(v.odd);
-          if (!Number.isFinite(odd)) continue;
-          if (/yes|y/.test(val)) bttsPrices.yes.push(odd);
-          else if (/no|n/.test(val)) bttsPrices.no.push(odd);
-        }
-      }
-    }
-  }
-  const btts = {};
-  if (bttsPrices.yes.length) btts.yes = consensusPrice(bttsPrices.yes);
-  if (bttsPrices.no.length)  btts.no  = consensusPrice(bttsPrices.no);
-  if (Object.keys(btts).length) out.btts = btts;
-
-  // OU 2.5
-  const ou25 = { over:[], under:[] };
-  for (const bm of resp?.[0]?.bookmakers || []) {
-    for (const b of bm.bets || []) {
-      const label = (b.name || "").toLowerCase();
-      if (/over\/under|goals over\/under/.test(label)) {
-        for (const v of b.values || []) {
-          const val = (v.value||"").toLowerCase().replace(/\s+/g,'');
-          const odd = Number(v.odd);
-          if (!Number.isFinite(odd)) continue;
-          if (/(o|over)2\.?5/.test(val)) ou25.over.push(odd);
-          else if (/(u|under)2\.?5/.test(val)) ou25.under.push(odd);
-        }
-      }
-    }
-  }
-  const ou = {};
-  if (ou25.over.length)  ou.over  = consensusPrice(ou25.over);
-  if (ou25.under.length) ou.under = consensusPrice(ou25.under);
-  if (Object.keys(ou).length) out.ou25 = ou;
-
-  // FH OU 1.5
-  const fh = { over:[], under:[] };
-  for (const bm of resp?.[0]?.bookmakers || []) {
-    for (const b of bm.bets || []) {
-      const label = (b.name || "").toLowerCase();
-      if (/1st half.*over|over\/under.*1st half|first half.*over/.test(label)) {
-        for (const v of b.values || []) {
-          const val = (v.value||"").toLowerCase().replace(/\s+/g,'');
-          const odd = Number(v.odd);
-          if (!Number.isFinite(odd)) continue;
-          if (/(o|over)1\.?5/.test(val)) fh.over.push(odd);
-          else if (/(u|under)1\.?5/.test(val)) fh.under.push(odd);
-        }
-      }
-    }
-  }
-  const fh_ou15 = {};
-  if (fh.over.length)  fh_ou15.over  = consensusPrice(fh.over);
-  if (fh.under.length) fh_ou15.under = consensusPrice(fh.under);
-  if (Object.keys(fh_ou15).length) out.fh_ou15 = fh_ou15;
-
-  // HT/FT
-  const htftMap = { hh:[], hd:[], ha:[], dh:[], dd:[], da:[], ah:[], ad:[], aa:[] };
-  for (const bm of resp?.[0]?.bookmakers || []) {
-    for (const b of bm.bets || []) {
-      const label = (b.name || "").toLowerCase();
-      if (/half time\/full time|ht\/ft|double result/.test(label)) {
-        for (const v of b.values || []) {
-          const val = (v.value||"").toLowerCase().replace(/[\s/-]/g,'');
-          const odd = Number(v.odd);
-          if (!Number.isFinite(odd)) continue;
-          const map = (s) => s.replace(/home/g,'h').replace(/away/g,'a').replace(/draw|x/g,'d').slice(0,2);
-          const code = map(val);
-          if (htftMap[code]) htftMap[code].push(odd);
-        }
-      }
-    }
-  }
-  const htft = {};
-  for (const k of Object.keys(htftMap)) if (htftMap[k].length) htft[k] = consensusPrice(htftMap[k]);
-  if (Object.keys(htft).length) out.htft = htft;
-
-  return out;
+async function setFreshness(kv, slot, payload) {
+  const base = { ...payload, slot, ymd: ymdUTC(), ts: new Date().toISOString() };
+  await kv.set(`vb:last_odds_refresh`, JSON.stringify(base));
+  await kv.set(`vb:last_odds_refresh:${slot}`, JSON.stringify(base));
 }
 
-/* =========================
- *  Handler
- * ========================= */
-export default async function handler(req, res){
-  const traceParam = firstQueryValue(req?.query?.trace);
-  const _trace = traceParam === "1" ? [] : undefined;
-  const trace = _trace;
-  try{
-    // READ API KEY — supports your 'API_FOOTBALL_KEY'
+export default async function handler(req, res) {
+  const started = Date.now();
+  const now = new Date();
+  const ymd = ymdUTC(now);
+  const slot = (['am','pm','late'].includes(req.query.slot)) ? req.query.slot : belgradeSlot(now);
+
+  const MAX_MS = Math.max(20_000, Math.min(120_000, parseInt(req.query.max_ms || '100000', 10) || 100_000));
+  const RUN_CAP = Math.max(10, Math.min(300, parseInt(process.env.ODDS_RUN_CAP || '60', 10))); // default 60 fixtures/run
+  const COOLDOWN_MINUTES = Math.max(5, Math.min(120, parseInt(process.env.COOLDOWN_MINUTES || '12', 10)));
+  const force = String(req.query.force || '0') === '1';
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort('time-budget'), MAX_MS);
+
+  try {
+    const kv = await getKvClient();
+
+    // 0) COOLDOWN
+    const fresh = await getFreshness(kv, slot);
+    if (!force && fresh?.ts) {
+      const last = Date.parse(fresh.ts);
+      if (!Number.isNaN(last)) {
+        const ageSec = Math.floor((Date.now() - last) / 1000);
+        if (ageSec < COOLDOWN_MINUTES * 60) {
+          await setFreshness(kv, slot, { updated: 0, reason: 'cooldown-skip' });
+          return res.status(200).json({ ok: true, ymd, slot, updated: 0, skipped: 0, items_len: 0, reason: 'cooldown' });
+        }
+      }
+    }
+
+    // 1) CANDIDATES
+    const ids = await readCandidates(kv, ymd, slot);
+    if (!ids.length) {
+      // EARLY EXIT: nothing to refresh → no hanging / no churn
+      await setFreshness(kv, slot, { updated: 0, reason: 'no-candidates' });
+      return res.status(200).json({ ok: true, ymd, slot, updated: 0, skipped: 0, items_len: 0, reason: 'no-candidates' });
+    }
+
+    // 2) Prepare a lookup of today's snapshot (to attach odds back to objects)
+    const snapshot = await readArr(kv, `vb:day:${ymd}:snapshot`);
+    const byId = new Map(snapshot.map(o => [ (o?.fixture?.id ?? o?.id), o ]));
+
+    // 3) External API setup
     const apiKey =
-      process.env.APIFOOTBALL_KEY ||
       process.env.API_FOOTBALL_KEY ||
-      process.env.APISPORTS_KEY ||
-      process.env.APISPORTS_API_KEY ||
-      process.env.X_APISPORTS_KEY ||
-      process.env.NEXT_PUBLIC_API_FOOTBALL_KEY;
+      process.env.NEXT_PUBLIC_API_FOOTBALL_KEY ||
+      process.env.APIFOOTBALL_KEY || '';
     if (!apiKey) {
-      return res.status(200).json({ ok:false, reason:"missing API_FOOTBALL_KEY" });
+      // No key: still stamp freshness to prevent loops
+      await setFreshness(kv, slot, { updated: 0, reason: 'no-key' });
+      return res.status(200).json({ ok: true, ymd, slot, updated: 0, skipped: ids.length, items_len: ids.length, reason: 'no-key' });
     }
 
-    const now = new Date();
-    const rawYmd = String(firstQueryValue(req?.query?.ymd) || "").trim();
-    if (rawYmd && !YMD_REGEX.test(rawYmd)) {
-      return res.status(400).json({ ok:false, error:"invalid ymd" });
-    }
-    const ymd = rawYmd || ymdInTZ(now, TZ);
-    let slot = canonicalSlot(firstQueryValue(req?.query?.slot));
-    if (slot === "auto") slot = pickSlot(now);
-
-    const unionKey = `vb:day:${ymd}:${slot}`;
-    const fullKey  = `vbl_full:${ymd}:${slot}`;
-    const lastKey  = `vb:last-odds:${slot}`;
-    const union = kvToItems(await kvGET(unionKey, trace));
-    const full  = kvToItems(await kvGET(fullKey,  trace));
-    const hadFull = (full?.items?.length ?? 0) > 0;
-
-    const items = (hadFull ? full.items : union.items).slice();
-
-    // Prioritet: bez markets prvo, pa UEFA/top5
-    items.sort((a,b)=>{
-      const ma = a?.markets ? 1 : 0, mb = b?.markets ? 1 : 0;
-      if (ma!==mb) return ma-mb;
-      const la = leagueTier(a?.league?.name), lb = leagueTier(b?.league?.name);
-      return la-lb;
-    });
-
-    const CAP = capForSlot(slot);
+    // 4) Loop with CAP + time budget
     let updated = 0, skipped = 0;
-    let budgetStop = false;
-
-    for (const f of items) {
-      if (updated >= CAP || budgetStop) break;
-
-      const id = f.fixture_id || f.fixture?.id;
+    const keep = []; // items to persist into vbl_full
+    for (const id of ids.slice(0, RUN_CAP)) {
+      if ((Date.now() - started) >= MAX_MS) break; // time budget
       if (!id) { skipped++; continue; }
 
-      // skip-if-markets-exist
-      if (f.markets && (f.markets.btts || f.markets.ou25 || f.markets.fh_ou15 || f.markets.htft || f.markets["1x2"])) {
-        skipped++; continue;
+      // fetch odds for this fixture (1 call per id)
+      const url = `https://v3.api-football.com/odds?fixture=${encodeURIComponent(id)}`;
+      let oddsDoc = null;
+      try {
+        const resp = await fetch(url, { headers: { 'x-apisports-key': apiKey }, signal: controller.signal });
+        if (!resp.ok) { skipped++; continue; }
+        const json = await resp.json();
+        oddsDoc = Array.isArray(json?.response) ? json.response : [];
+      } catch (_) {
+        skipped++;
+        continue;
       }
 
-      // backoff kada AF ranije vrati prazno
-      const missKey = `af:miss:${id}`;
-      const missRaw = await kvGET(missKey, trace);
-      if (missRaw && typeof missRaw === "string") {
-        const until = new Date(missRaw);
-        if (Date.now() < until.getTime()) { skipped++; continue; }
-      }
-
-      const af = await afxOddsByFixture(id);
-      if (!af) {
-        budgetStop = true;
-        break;
-      }
-      const markets = extractConsensusMarkets(af);
-
-      if (!markets || Object.keys(markets).length === 0) {
-        const until = new Date(Date.now() + BACKOFF_MINUTES_EMPTY*60*1000).toISOString();
-        await kvSET(missKey, until, trace);
-        skipped++; continue;
-      }
-
-      f.markets = Object.assign({}, f.markets || {}, markets);
+      const base = byId.get(id) || { id };
+      keep.push({ ...base, odds: oddsDoc });
       updated++;
     }
 
-    const enriched = updated > 0;
+    // 5) Persist enriched items into vbl_full:<ymd>[:<slot>]
+    const vblKey = `vbl_full:${ymd}:${slot}`;
+    const ts = new Date().toISOString();
+    await kv.set(vblKey, JSON.stringify({ ymd, slot, ts, items: keep }));
 
-    if (budgetStop && !enriched) {
-      return res.status(200).json({
-        ok:false,
-        ymd,
-        slot,
-        updated,
-        skipped,
-        items_len: items.length,
-        budget_exhausted: budgetStop,
-        trace: _trace,
-        had_full: hadFull,
-        reason: "Stopped early after upstream budget/transport error before enriching fixtures; snapshot unchanged"
-      });
-    }
+    // 6) Freshness stamp for cooldown
+    await setFreshness(kv, slot, { updated });
 
-    const shouldPersist = enriched || !hadFull;
-
-    if (shouldPersist) {
-      await kvSET(fullKey, { items }, trace);
-      await kvSET(lastKey, { ts: now.toISOString(), ymd, slot, updated }, trace);
-    }
-
-    return res.status(200).json({
-      ok:true,
-      ymd,
-      slot,
-      updated,
-      skipped,
-      items_len: items.length,
-      budget_exhausted: budgetStop,
-      trace: _trace,
-      had_full: hadFull,
-      enriched,
-      persisted: shouldPersist
+    const budget_exhausted = (Date.now() - started) >= MAX_MS || ids.length > RUN_CAP;
+    res.status(200).json({
+      ok: true, ymd, slot,
+      updated, skipped,
+      items_len: ids.length,
+      budget_exhausted,
+      enriched: true,
+      persisted: true,
     });
-  }catch(e){
-    return res.status(200).json({ ok:false, error:String(e?.message||e) });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    const timeout = msg.includes('time-budget') || e?.name === 'AbortError';
+    // Try to stamp freshness even on timeout, so next run can cooldown/skip
+    try {
+      const kv = await getKvClient();
+      await setFreshness(kv, (['am','pm','late'].includes(req?.query?.slot) ? req.query.slot : belgradeSlot()), { updated: 0, reason: timeout ? 'time' : 'error' });
+    } catch { /* ignore */ }
+    res.status(200).json({ ok: false, ymd: ymdUTC(), slot: belgradeSlot(), error: msg, timed_out: timeout });
+  } finally {
+    clearTimeout(timer);
   }
 }
