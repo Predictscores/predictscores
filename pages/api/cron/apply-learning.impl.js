@@ -1,6 +1,6 @@
 // pages/api/cron/apply-learning.impl.js
 // Reads best-available candidates (chunked snapshot -> legacy snapshot -> vbl_full -> union)
-// Publishes vb:day:<ymd>:last and vb:history:<ymd>.
+// and publishes vb:day:<ymd>:last + vb:history:<ymd> for the UI.
 
 function ymdUTC(d = new Date()) { return d.toISOString().slice(0, 10); }
 function belgradeSlot(now = new Date()) {
@@ -26,9 +26,9 @@ async function readArr(kv, key) {
 async function readChunkedSnapshot(kv, ymd) {
   const indexKey = `vb:day:${ymd}:snapshot:index`;
   const raw = await kv.get(indexKey);
-  const idxDoc = parseMaybeJson(raw);
-  if (!idxDoc || typeof idxDoc.chunks !== 'number' || idxDoc.chunks < 1) return { key: null, items: [] };
-  const total = idxDoc.chunks;
+  const idx = parseMaybeJson(raw);
+  if (!idx || typeof idx.chunks !== 'number' || idx.chunks < 1) return { key: null, items: [] };
+  const total = idx.chunks;
   const all = [];
   for (let i = 0; i < total; i++) {
     const k = `vb:day:${ymd}:snapshot:${i}`;
@@ -39,7 +39,7 @@ async function readChunkedSnapshot(kv, ymd) {
 }
 
 function normalize(it) {
-  // We saved a slim shape in snapshot; keep output compatible with UI
+  // Snapshot chunks were saved slim; make a UI-friendly, stable shape.
   const id = it?.id ?? it?.fixture?.id ?? null;
   const leagueName = it?.league?.name ?? it?.league ?? null;
   const tier = it?.league?.tier ?? it?.tier ?? null;
@@ -61,16 +61,16 @@ export default async function applyLearningImpl({ kv, todayYmd }) {
   const ymd = todayYmd || ymdUTC(now);
   const slot = belgradeSlot(now);
 
-  // 1) Chunked snapshot
+  // 1) Chunked snapshot (new, primary source)
   let { key: sourceKey, items } = await readChunkedSnapshot(kv, ymd);
 
-  // 2) Legacy single snapshot
+  // 2) Legacy single-key snapshot
   if (!items.length) {
     const snap = await readArr(kv, `vb:day:${ymd}:snapshot`);
     if (snap.items.length) { sourceKey = snap.key; items = snap.items; }
   }
 
-  // 3) vbl_full
+  // 3) vbl_full (enriched items from refresh-odds)
   if (!items.length) {
     const v1 = await readArr(kv, `vbl_full:${ymd}:${slot}`);
     const v2 = !v1.items.length ? await readArr(kv, `vbl_full:${ymd}`) : { items: [] };
@@ -78,7 +78,7 @@ export default async function applyLearningImpl({ kv, todayYmd }) {
     if (pick.items.length) { sourceKey = pick.key; items = pick.items; }
   }
 
-  // 4) union (IDs) — can’t enrich without bank; publish minimal if necessary
+  // 4) Union (IDs only) — publish minimal if this is all we have
   if (!items.length) {
     const u = await readArr(kv, `vb:day:${ymd}:union`);
     if (u.items.length && typeof u.items[0] !== 'object') {
@@ -93,14 +93,14 @@ export default async function applyLearningImpl({ kv, todayYmd }) {
   const unique = [];
   for (const x of mapped) { if (!seen.has(x.id)) { seen.add(x.id); unique.push(x); } }
 
-  // Publish
+  // Publish UI lock + history
   const ts = new Date().toISOString();
   const lockKey = `vb:day:${ymd}:last`;
   const historyKey = `vb:history:${ymd}`;
   await kv.set(lockKey, JSON.stringify({ items: unique, ymd, ts, sourceKey }));
   await kv.set(historyKey, JSON.stringify({ items: unique, ymd, ts }));
 
-  // Telemetry
+  // Simple telemetry
   const t = { t1: 0, t2: 0, t3: 0, nullish: 0 };
   for (const x of unique) {
     if (x.tier === 1) t.t1++; else if (x.tier === 2) t.t2++; else if (x.tier === 3) t.t3++; else t.nullish++;
