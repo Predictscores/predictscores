@@ -1,32 +1,38 @@
-export const config = { runtime: "nodejs" };
-export const dynamic = "force-dynamic";
+// pages/api/cron/apply-learning.js
+// Thin route that loads impl, builds the date, and passes a KV client (with adapter).
+
+import * as kvlib from '../../../lib/kv-read';
+
+async function getKvClient() {
+  // Support both shapes: getKV() OR {kvGet, kvSet}
+  if (typeof kvlib.getKV === 'function') {
+    const client = await kvlib.getKV();
+    if (client && typeof client.get === 'function' && typeof client.set === 'function') return client;
+  }
+  const kvGet = kvlib.kvGet || kvlib.get;
+  const kvSet = kvlib.kvSet || kvlib.set;
+  if (typeof kvGet === 'function' && typeof kvSet === 'function') {
+    return { get: kvGet, set: kvSet };
+  }
+  throw new Error('KV adapter: neither getKV() nor kvGet/kvSet found in lib/kv-read');
+}
+
+function ymdUTC(d = new Date()) {
+  // Use UTC to be stable within Actions; UI/slots can still be Belgrade-aware elsewhere
+  return d.toISOString().slice(0, 10);
+}
 
 export default async function handler(req, res) {
-  if (req?.query?.probe === "1") {
-    return res.status(200).json({ ok: true, probe: true });
-  }
-
   try {
-    const mod = await import("./apply-learning.impl");
-    const run = mod?.runApplyLearning;
-    if (typeof run !== "function") {
-      throw new Error("impl missing");
-    }
+    const impl = (await import('./apply-learning.impl.js')).default;
+    if (typeof impl !== 'function') throw new Error('apply-learning impl export is not a function');
 
-    try {
-      return await run(req, res);
-    } catch (err) {
-      const message = err?.message || String(err);
-      return res.status(200).json({
-        ok: false,
-        error: { phase: "run", message },
-      });
-    }
-  } catch (err) {
-    const message = err?.message || String(err);
-    return res.status(200).json({
-      ok: false,
-      error: { phase: "import", message },
-    });
+    const kv = await getKvClient();
+    const todayYmd = ymdUTC();
+
+    const out = await impl({ kv, todayYmd });
+    res.status(200).json(out);
+  } catch (e) {
+    res.status(200).json({ ok: false, error: { phase: 'import/run', message: String(e?.message || e) } });
   }
 }
